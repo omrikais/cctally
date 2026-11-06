@@ -1624,13 +1624,16 @@ def test_claude_idle_clock_advances_only_weekly_domain_freshness(monkeypatch):
         domain_freshness={"hero": "fresh", "quota": "fresh", "sessions": "fresh"},
     )
     # #556 S1 §4.1: the clock now advances two axes from different evidence,
-    # so the fixture has to carry the boundary as well as the capture.
+    # so the fixture has to carry the boundary as well as the capture. #1018
+    # twin: the quota axis ages from the confirming weekly reading, and its
+    # label comes from the one derivation the envelope shares.
     current_week = SimpleNamespace(
-        latest_snapshot_at=NOW, week_end_at=NOW + dt.timedelta(days=3),
+        latest_snapshot_at=NOW, latest_weekly_reading_at=NOW,
+        week_end_at=NOW + dt.timedelta(days=3),
     )
     monkeypatch.setattr(tui, "_get_oauth_usage_config", lambda _config: {})
     monkeypatch.setattr(
-        tui,
+        sys.modules["cctally"],
         "_freshness_label",
         lambda age, _config: "stale" if age > 3600 else "fresh",
     )
@@ -2956,6 +2959,7 @@ def test_retained_codex_source_keeps_private_clock_data_for_idle_budget_refresh(
         )
         tui = ns["_cctally_tui"]
         initial_bundle = tui._tui_build_source_bundle(
+            claude_input_identity=tui._tui_read_claude_input_identity(stats),
             stats_conn=stats,
             now_utc=initial_now,
             display_tz_name="UTC",
@@ -2972,6 +2976,7 @@ def test_retained_codex_source_keeps_private_clock_data_for_idle_budget_refresh(
         # Exercise the production retained-source path, rather than a hand
         # constructed partial state.
         degraded_bundle = tui._tui_build_source_bundle(
+            claude_input_identity=tui._tui_read_claude_input_identity(stats),
             stats_conn=stats,
             now_utc=initial_now,
             display_tz_name="UTC",
@@ -3895,6 +3900,7 @@ def _install_observations(monkeypatch, source_module, observations):
 
 def _build_tick_bundle(tui, stats, *, now_utc, prior_bundle=None, raw_config=None):
     return tui._tui_build_source_bundle(
+        claude_input_identity=tui._tui_read_claude_input_identity(stats),
         stats_conn=stats,
         now_utc=now_utc,
         display_tz_name="UTC",
@@ -4633,6 +4639,7 @@ def _s5_build_claude_budget_domain(tmp_path, monkeypatch, *, budget, seed_spend=
         if mutate is not None:
             mutate(ns, cache, stats)
         bundle = tui._tui_build_source_bundle(
+            claude_input_identity=tui._tui_read_claude_input_identity(stats),
             stats_conn=stats,
             now_utc=now_utc,
             display_tz_name="UTC",
@@ -4689,6 +4696,7 @@ def _s5_build_bundle(ns, tui, *, budget, now_utc, prior_bundle=None,
         if seed is not None:
             seed(ns, cache)
         return tui._tui_build_source_bundle(
+            claude_input_identity=tui._tui_read_claude_input_identity(stats),
             stats_conn=stats,
             now_utc=now_utc,
             display_tz_name=display_tz_name,
@@ -5139,6 +5147,7 @@ def _s5_reclock_env(tmp_path, monkeypatch):
 
 def _s5_build_reclock_bundle(tui, stats, *, now_utc, prior_bundle=None):
     return tui._tui_build_source_bundle(
+        claude_input_identity=tui._tui_read_claude_input_identity(stats),
         stats_conn=stats,
         now_utc=now_utc,
         display_tz_name="UTC",

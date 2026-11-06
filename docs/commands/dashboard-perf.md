@@ -249,4 +249,4 @@ The record itself is always on and lives in a pure kernel, `bin/_lib_tick_stats.
 
 - `docs/commands/dashboard.md` — the dashboard itself
 - `docs/backend-performance.md` — the measured backend performance record
-- `cctally doctor` — the read-only health report
+- `cctally doctor` — the health report (read-only except its disposable journal-scan cache)

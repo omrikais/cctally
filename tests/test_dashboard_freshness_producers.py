@@ -38,7 +38,7 @@ def test_clean_idle_tick_advances_the_stamp(mods):
     out = tui._tui_build_idle_snapshot(
         _prior(tui, last_sync_at=100.0), now_utc=NOW,
         precompute_envelope=False, runtime_bind=None, raw_config={}, errors=[],
-        codex_dependency=None,
+        codex_dependency=None, claude_input_identity=None,
     )
     assert out.last_sync_at is not None
     assert out.last_sync_at > 100.0
@@ -51,6 +51,7 @@ def test_idle_tick_with_an_error_preserves_the_prior_stamp(mods):
         _prior(tui, last_sync_at=100.0), now_utc=NOW,
         precompute_envelope=False, runtime_bind=None, raw_config={},
         errors=["milestones: boom"], codex_dependency=None,
+        claude_input_identity=None,
     )
     assert out.last_sync_at == 100.0
     assert out.last_sync_error
@@ -63,6 +64,7 @@ def test_idle_tick_with_an_error_and_no_prior_success_stays_none(mods):
         _prior(tui, last_sync_at=None), now_utc=NOW,
         precompute_envelope=False, runtime_bind=None, raw_config={},
         errors=["milestones: boom"], codex_dependency=None,
+        claude_input_identity=None,
     )
     assert out.last_sync_at is None
 

@@ -289,7 +289,7 @@ def _seed_correction(*, drop_table=None):
     conn = sqlite3.connect(_cctally_core.DB_PATH)
     try:
         conn.execute(
-            "INSERT INTO claude_weekly_observation_index VALUES (?,?,?)",
+            "INSERT INTO claude_weekly_observation_index (observation_id, account_key, captured_at_utc) VALUES (?,?,?)",
             ("obs-1", "acct-a", "2026-08-01T10:00:00+00:00"))
         conn.execute(
             "INSERT INTO claude_weekly_correction_history VALUES (?,?,?)",

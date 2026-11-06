@@ -931,6 +931,21 @@ def _self_test_create_cache_db() -> None:
     print("OK: create_cache_db")
 
 
+def make_git_repository_marker(root: "Path | str") -> None:
+    """Make ``root/.git`` a directory the project resolver counts (#976).
+
+    Since #976 a `.git` DIRECTORY marks a repository only when it holds
+    ``HEAD`` and the ``objects/`` and ``refs/`` directories, so a fixture that
+    models a project repository with a bare ``mkdir(".git")`` would resolve
+    as no-git. Idempotent; a `.git` FILE (worktree) still counts by presence
+    and needs no helper.
+    """
+    git_dir = Path(root) / ".git"
+    (git_dir / "objects").mkdir(parents=True, exist_ok=True)
+    (git_dir / "refs").mkdir(parents=True, exist_ok=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+
 def seed_session_file(
     conn: sqlite3.Connection,
     *,

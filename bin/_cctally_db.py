@@ -504,8 +504,10 @@ def _stats_corruption_guidance() -> str:
 # #195: the cache_meta flag cache migration 030 sets to arm the one-time
 # cost-side re-walk that lands the cache-write TTL split on existing rows.
 # `sync_cache` reads it to select SESSION_ENTRY_UPSERT_SQL_REWALK (the chained
-# ON CONFLICT variant) and clears it at the end of a clean, non-targeted full
-# walk. Deliberately NOT `claude_ingest_walk_complete` — see the migration's
+# ON CONFLICT variant) and clears it at the end of a non-targeted full walk
+# that is clean on disk (fully clean, or #916 residual-only: its only defect
+# is orphan rows, and each orphan's own -1 cursor keeps selecting the chained
+# variant per file if it reappears). Deliberately NOT `claude_ingest_walk_complete` — see the migration's
 # docstring for why reusing that marker is both unnecessary and over-broad.
 CACHE_CREATION_SPLIT_REWALK_KEY = "cache_creation_split_rewalk_pending"
 
@@ -4158,20 +4160,29 @@ def _codex_accounting_ledger_ddl() -> tuple[str, ...]:
         "UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 "
         "WHERE key='codex_accounting_mutation_seq';"
     )
+    # #971 spec D1: the paths a thread row names, as an index-backed UNION.
+    # Arm 1 is the conversation arm; arm 2 is the alias arm, which only ever
+    # matched through a real entry join, so it is the matching files that have
+    # at least one entry. UNION supplies the DISTINCT, and every comparison
+    # stays ``=``, so a NULL matches nothing in either arm. The unary ``+`` on
+    # arm 1's root term is load-bearing: without it the planner seeks
+    # idx_codex_entries_root_path inside the INSERT's join with cache_meta and
+    # walks the whole root's history. Arm 2 seeks idx_codex_files_root_thread.
     def thread_paths(image: str) -> str:
         return f"""
-            SELECT DISTINCT entries.source_root_key, entries.source_path
+            SELECT entries.source_root_key, entries.source_path
               FROM codex_session_entries AS entries
-              LEFT JOIN codex_session_files AS files
-                ON files.source_root_key = entries.source_root_key
-               AND files.path = entries.source_path
-             WHERE (
-                    entries.source_root_key = {image}.source_root_key
-                AND entries.conversation_key = {image}.conversation_key
-             ) OR (
-                    files.source_root_key = {image}.source_root_key
-                AND files.last_native_thread_id = {image}.native_thread_id
-             )
+             WHERE +entries.source_root_key = {image}.source_root_key
+               AND entries.conversation_key = {image}.conversation_key
+            UNION
+            SELECT files.source_root_key, files.path
+              FROM codex_session_files AS files
+             WHERE files.source_root_key = {image}.source_root_key
+               AND files.last_native_thread_id = {image}.native_thread_id
+               AND EXISTS (
+                    SELECT 1 FROM codex_session_entries AS present
+                     WHERE present.source_root_key = files.source_root_key
+                       AND present.source_path = files.path)
         """
     old_thread_paths = thread_paths("OLD")
     new_thread_paths = thread_paths("NEW")
@@ -4269,6 +4280,9 @@ def _codex_accounting_ledger_ddl() -> tuple[str, ...]:
              WHERE key='codex_accounting_mutation_seq';
         END
         """,
+        # #971 spec D1: the alias arm of thread_paths() seeks this index.
+        "CREATE INDEX IF NOT EXISTS idx_codex_files_root_thread "
+        "ON codex_session_files(source_root_key, last_native_thread_id)",
         "DROP TRIGGER IF EXISTS trg_codex_accounting_thread_ins",
         f"""
         CREATE TRIGGER trg_codex_accounting_thread_ins
@@ -4722,22 +4736,33 @@ def _codex_quota_latest_base_match(image: str) -> str:
 
 
 def _codex_quota_latest_recompute_sql(image: str, *, only_if_absent: bool) -> str:
-    """Re-derive one partition's maximum from the physical rows (one seek)."""
-    absent_clause = (
-        " AND NOT EXISTS (SELECT 1 FROM codex_quota_partition_latest"
+    """Re-derive one partition's maximum through bounded index probes.
+
+    #971 spec D2: the maximum is a SCALAR subquery, which SQLite answers with
+    the min/max short-circuit on idx_qws_partition_capture; the earlier
+    FROM-subquery form filtered on ``latest IS NOT NULL`` read the whole
+    partition instead. With ``only_if_absent`` the CASE evaluates the
+    aggregate only when no summary row survives, which for a deleted
+    non-latest row is never.
+    """
+    aggregate = (
+        "(SELECT MAX(unixepoch(captured_at_utc)) FROM quota_window_snapshots"
+        f" WHERE {_codex_quota_latest_validity_sql('')}"
+        f" AND {_codex_quota_latest_base_match(image)})"
+    )
+    latest = (
+        "CASE WHEN EXISTS (SELECT 1 FROM codex_quota_partition_latest"
         f" WHERE {_codex_quota_latest_summary_match(image)})"
-        if only_if_absent else ""
+        f" THEN NULL ELSE {aggregate} END"
+        if only_if_absent else aggregate
     )
     return (
         "INSERT INTO codex_quota_partition_latest ("
         + ", ".join(_CODEX_QUOTA_LATEST_KEY_COLUMNS)
         + ", latest_capture_epoch)"
         f" SELECT {', '.join(_codex_quota_latest_key_exprs(image + '.'))},"
-        " latest FROM (SELECT MAX(unixepoch(captured_at_utc)) AS latest"
-        " FROM quota_window_snapshots"
-        f" WHERE {_codex_quota_latest_validity_sql('')}"
-        f" AND {_codex_quota_latest_base_match(image)})"
-        f" WHERE latest IS NOT NULL{absent_clause}"
+        f" latest FROM (SELECT {latest} AS latest)"
+        " WHERE latest IS NOT NULL"
     )
 
 
@@ -5497,6 +5522,11 @@ CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         kind, name, "_apply_codex_retained_identity_inventory",
         "051_codex_retained_identities")
       for kind, name in _CODEX_RETAINED_IDENTITY_OBJECTS),
+    # #971 spec D4: migration 052's handler re-runs the accounting helper.
+    SchemaDeliveryObject(
+        "index", "idx_codex_files_root_thread",
+        "_apply_codex_accounting_change_ledger",
+        "052_codex_delete_trigger_plans"),
 )
 
 
@@ -5654,9 +5684,9 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     ``add_column_if_missing``). Does NOT run the dispatcher and does NOT include
     the Codex ``last_total_tokens`` ALTER, which carries a one-time purge
     side-effect that stays in ``open_cache_db``. The eager dispatcher can run
-    024 under the dispatcher's global writer flock, after which that handler
-    acquires its Codex flock and only deletes Codex-derived rows; it neither
-    reads nor requires ``last_total_tokens``.
+    024 under the dispatcher's global writer flock; since #983 that handler
+    only arms the guarded Codex byte-zero replay (one ``cache_meta`` row) and
+    neither reads nor requires ``last_total_tokens``.
     Normal ``open_cache_db`` remains responsible for the ALTER and its historic
     purge, so leaving it outside this shared schema is safe.
     """
@@ -6112,8 +6142,9 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "session_files", "session_id", "TEXT")
     add_column_if_missing(conn, "session_files", "project_path", "TEXT")
     # #294 S1: old Codex accounting rows have no truthful provider-root or
-    # conversation identity, so the linkage remains nullable until migration
-    # 024 clears them for a source-derived reingest. Existing report selectors
+    # conversation identity, so the linkage remains nullable until the guarded
+    # byte-zero replay migration 024 arms re-derives them from source (#983).
+    # Existing report selectors
     # intentionally keep selecting their shipped columns only.
     add_column_if_missing(conn, "codex_session_entries", "source_root_key", "TEXT")
     add_column_if_missing(conn, "codex_session_entries", "conversation_key", "TEXT")
@@ -8410,8 +8441,10 @@ def _acquire_cache_db_codex_provider_flock(
     """Take the Codex provider flock inside the dispatcher's global flock.
 
     Production dispatchers already hold the global cache writer flock. The
-    provider-local lock remains inside handlers 024–027 so direct migration
-    tests and provider-scoped coordination retain their fail-closed behavior.
+    provider-local lock remains inside the handlers that write Codex-derived
+    tables (025, 034, 043, 047) so direct migration tests and provider-scoped
+    coordination retain their fail-closed behavior. Since #983 the legacy
+    024/026/027 handlers only arm the replay marker and take no lock.
     """
     provider_path = _cache_db_codex_lock_path_for_conn(conn)
     if provider_path is None:
@@ -9374,59 +9407,38 @@ def _023_conversation_sessions_enrichment_columns(conn: sqlite3.Connection) -> N
 
 @cache_migration("024_codex_fused_ingest_rebuild")
 def _024_codex_fused_ingest_rebuild(conn: sqlite3.Connection) -> None:
-    """Clear stale Codex cache state for #294 S1's fused source reingest.
+    """Arm the guarded byte-zero Codex replay for #294 S1's fused reingest.
 
-    Pre-S1 Codex rows lack provider-root identity, qualified conversation
-    linkage, quota observations, and physical event payloads. Those facts are
-    not recoverable from the cache, so this migration clears only the Codex
-    accounting/file surface and partial S1 derived rows; the next normal Codex
-    sync rederives them from rollout source. Claude tables and Claude quota
-    snapshots remain untouched.
+    Originally this migration cleared the Codex accounting, file, quota,
+    thread, event and root families directly, because pre-S1 rows lack
+    provider-root identity, qualified conversation linkage, quota observations
+    and physical event payloads, none of which the cache can recover on its
+    own. The next Codex sync then rederived them from the rollouts.
 
-    The cache dispatcher holds maintenance + global writer exclusion; this
-    handler then takes ``cache.db.codex.lock`` before ``BEGIN IMMEDIATE`` — the same
-    fcntl-then-SQLite order as ``sync_codex_cache``. Contention raises
-    ``MigrationGateNotMet`` before any DML, so both ordinary and eager cache
-    dispatch defer without a partial clear. The DELETE-only transition is safe
-    to retry after a crash between this commit and the dispatcher's separate
-    marker stamp: rerunning against its own empty Codex state is a no-op. Never
-    self-stamp; the dispatcher owns ``schema_migrations`` and ``user_version``.
+    Since #983 that repair is the guarded byte-zero replay ``sync_codex_cache``
+    performs: this handler arms ``CODEX_REPLAY_FROM_ZERO_KEY`` through
+    ``arm_codex_replay_from_zero`` and nothing else, and the sync ORs the
+    marker into its own ``rebuild``. (Over a replay heal record left by the
+    #982 executor the helper also marks that record for a fresh clear, so a
+    refill in progress cannot swallow the re-arm.) The clear then
+    runs under the cache writer flocks after the #416 D1 identity snapshot
+    (which also resolves pre-S1 NULL-root cursors to their configured root),
+    the #485 root-evidence partition and the #968 compressed preflight. On a
+    Python without a zstd decoder that preflight refuses and keeps every
+    retained row and the marker, a recoverable state the next sync with a
+    decoder replays. Clearing here instead destroyed retained compressed-only
+    history and emptied the D1 snapshot.
+
+    No provider flock, no DML on a Codex family, no sequence bump and no
+    certificate change: one ``cache_meta`` row is all it writes, so a mid-walk
+    sync has nothing to interleave with. Idempotent: re-running rewrites the
+    same marker. NO self-stamp — the dispatcher central-stamps on a clean
+    return (#140).
     """
-    held = _acquire_cache_db_codex_provider_flock(
-        conn, migration="024 fused-ingest rebuild (#294 S1)"
-    )
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.execute("DELETE FROM codex_session_entries")
-            conn.execute("DELETE FROM codex_session_files")
-            conn.execute("DELETE FROM quota_window_snapshots WHERE source = 'codex'")
-            conn.execute("DELETE FROM codex_conversation_threads")
-            conn.execute("DELETE FROM codex_conversation_events")
-            conn.execute("DELETE FROM codex_source_roots")
-            # F3 (#313): clearing Codex quota state without invalidating the
-            # quota-projection certificate would leave a stale-valid cert
-            # (cache sequence unchanged) that lets the reconcile short-circuit
-            # skip over now-deleted data. Delete it in the same transaction.
-            conn.execute(
-                "DELETE FROM cache_meta WHERE key='codex_quota_projection_certificate'"
-            )
-            # #496 S5b §4.3, the identical hazard one layer over: this deletes
-            # every Codex `quota_window_snapshots` row while the journal still
-            # retains the observations behind them, and it does NOT bump
-            # `codex_physical_mutation_seq`, so a stored coverage certificate
-            # would stay stale-VALID and the next rebuild's fast path would skip
-            # a replay over a cache holding zero Codex quota rows. Reachable
-            # through `db skip 024` followed by `db unskip 024`. Same
-            # transaction as the deletes.
-            import _cctally_cache
-            _cctally_cache._invalidate_codex_journal_coverage_certificate(conn)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    finally:
-        _release_cache_db_writer_flocks(held)
+    import _cctally_cache
+
+    _cctally_cache.arm_codex_replay_from_zero(conn)
+    conn.commit()
 
 
 @cache_migration("025_codex_conversation_normalization")
@@ -9475,76 +9487,60 @@ def _025_codex_conversation_normalization(conn: sqlite3.Connection) -> None:
 
 @cache_migration("026_codex_conversation_key_backfill")
 def _026_codex_conversation_key_backfill(conn: sqlite3.Connection) -> None:
-    """Arm a byte-zero Codex replay for missing conversation-key metadata (#312).
+    """Arm the guarded byte-zero Codex replay for missing conversation keys (#312).
 
     Historical accounting rows predate the source-derived conversation-key
-    enrichment.  The cache cannot truthfully recover those keys on its own, so
-    clear exactly the existing Codex-derived families and let the next Codex
-    sync replay retained rollout data from byte zero.  This shares the runtime
-    clear helper with ``sync_codex_cache(rebuild=True)`` so new or future Codex
-    families cannot drift from the migration's destructive scope.
+    enrichment, and the cache cannot truthfully recover those keys on its own.
+    Originally this migration cleared every Codex-derived family itself so the
+    next Codex sync replayed the retained rollouts from byte zero.
 
-    The cache dispatcher holds maintenance + global writer exclusion; this
-    handler then takes the Codex flock before ``BEGIN IMMEDIATE``. Contention
-    defers through ``MigrationGateNotMet``
-    before any DML; after a handler/data commit but before the dispatcher's
-    central stamp, a rerun against the empty state is a byte-idempotent no-op.
-    The physical mutation sequence advances only when the shared clear actually
-    changed persisted Codex state. The handler never self-stamps.
+    Since #983 that repair is the guarded byte-zero replay ``sync_codex_cache``
+    performs: this handler only arms ``CODEX_REPLAY_FROM_ZERO_KEY`` (through
+    ``arm_codex_replay_from_zero``, like every arming site), and the
+    sync's rebuild path clears and replays behind the #416 D1 identity
+    snapshot, the #485 root-evidence partition and the #968 compressed
+    preflight. Without a zstd decoder the preflight refuses and the retained
+    rows stay (recoverable once a decoder exists) instead of being cleared out
+    of band.
+
+    No provider flock, no row change, no sequence bump, no certificate change.
+    Idempotent: re-running rewrites the same marker. NO self-stamp — the
+    dispatcher central-stamps on a clean return (#140).
     """
-    held = _acquire_cache_db_codex_provider_flock(
-        conn, migration="026 conversation-key backfill (#312)"
-    )
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            import _cctally_cache
+    import _cctally_cache
 
-            if _cctally_cache._clear_codex_derived_rows(conn):
-                _cctally_cache._bump_codex_physical_mutation_seq(conn)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    finally:
-        _release_cache_db_writer_flocks(held)
+    _cctally_cache.arm_codex_replay_from_zero(conn)
+    conn.commit()
 
 
 @cache_migration("027_codex_fork_preamble_rebuild")
 def _027_codex_fork_preamble_rebuild(conn: sqlite3.Connection) -> None:
-    """Replay Codex rollouts after suppressing copied fork-preamble accounting.
+    """Arm the guarded byte-zero Codex replay that drops copied fork-preamble
+    accounting.
 
     Forked/subagent JSONL can retain parent ``token_count`` records before the
-    child's first model-bearing ``turn_context``.  Older ingest projected those
-    copied records into ``codex_session_entries`` as ``model='unknown'``, double
-    counting usage already present in the parent rollout.  The source records
-    remain authoritative, so clear all re-derivable Codex families and let the
-    corrected fused parser replay them from byte zero.
+    child's first model-bearing ``turn_context``. Older ingest projected those
+    copied records into ``codex_session_entries`` as ``model='unknown'``,
+    double counting usage already present in the parent rollout. Originally
+    this migration cleared every re-derivable Codex family itself so the
+    corrected fused parser replayed the source from byte zero.
 
-    The cache dispatcher holds maintenance + global writer exclusion; this
-    handler then takes the Codex flock before ``BEGIN IMMEDIATE``. Contention
-    defers before DML; a markerless retry
-    against already-cleared state is a no-op. The shared clear helper keeps this
-    migration aligned with runtime rebuild scope and advances the physical
-    mutation sequence only when state actually changed. The dispatcher owns the
-    migration marker.
+    Since #983 that repair is the guarded byte-zero replay ``sync_codex_cache``
+    performs: this handler only arms ``CODEX_REPLAY_FROM_ZERO_KEY`` (through
+    ``arm_codex_replay_from_zero``, like every arming site), and the
+    sync's rebuild path clears and replays behind the identity snapshot, the
+    root-evidence partition and the compressed preflight. Until it runs the
+    copied rows remain what the previous binary showed; without a zstd decoder
+    the state is kept and recoverable rather than cleared.
+
+    No provider flock, no row change, no sequence bump, no certificate change.
+    Idempotent: re-running rewrites the same marker. NO self-stamp — the
+    dispatcher central-stamps on a clean return (#140).
     """
-    held = _acquire_cache_db_codex_provider_flock(
-        conn, migration="027 fork-preamble rebuild"
-    )
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            import _cctally_cache
+    import _cctally_cache
 
-            if _cctally_cache._clear_codex_derived_rows(conn):
-                _cctally_cache._bump_codex_physical_mutation_seq(conn)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    finally:
-        _release_cache_db_writer_flocks(held)
+    _cctally_cache.arm_codex_replay_from_zero(conn)
+    conn.commit()
 
 
 #: Pages 028 returns per committed transaction when it reclaims the dropped
@@ -9813,8 +9809,12 @@ def _030_session_entries_cache_creation_split(conn: sqlite3.Connection) -> None:
     ``session_entries``, so its absence from disk leaves no orphan, and
     fixtures seed exactly such rows to stay out of the orphan set. The next
     successful ingest of a surviving file overwrites the sentinel with its real
-    size, so it is transient for everything still on disk. Only these two
-    readers exist; grep ``session_files`` before adding a third.
+    size, so it is transient for everything still on disk. #916 added a third
+    reader: ``sync_cache``'s per-file UPSERT selection treats a negative
+    ``size_bytes`` as a file still owed its re-walk and replays it with the
+    chained-conflict variant even after the flag below has retired (a pre-030
+    orphan whose transcript reappears). Only these three readers exist; grep
+    ``session_files`` before adding a fourth.
 
     Unlike the truncation path this does NOT wipe session_entries: rows are
     preserved and UPSERTed in place, which is why sync_cache must use the
@@ -9842,8 +9842,13 @@ def _030_session_entries_cache_creation_split(conn: sqlite3.Connection) -> None:
       020's deliberately LOUD duplicate-physical-key backstop intact on every
       other ingest path, which is the resolution the spec states it prefers.
 
-    ``sync_cache`` clears the flag at the end of a clean, non-targeted full walk
-    — the same condition under which it (re)writes ``claude_ingest_walk_complete``.
+    ``sync_cache`` clears the flag at the end of a non-targeted full walk that
+    is clean on disk: the condition under which it (re)writes
+    ``claude_ingest_walk_complete``, and also a #916 residual-only walk (clean
+    on disk, its only defect orphan rows), which writes the
+    ``claude_ingest_walk_orphan_residual`` token instead. The only files still
+    owed the re-walk after a residual-only walk are absent orphans, and each
+    one's own ``-1`` cursor selects the chained variant if it reappears.
 
     Idempotent: re-running re-arms a walk that is already correct. NO self-stamp
     — the dispatcher central-stamps on a clean return (#140); the handler commits
@@ -10062,13 +10067,13 @@ def _034_codex_window_spend_adoption(conn: sqlite3.Connection) -> None:
     empty are candidates, so a re-run over its own output writes nothing. NO
     self-stamp — the dispatcher central-stamps on a clean return (#140).
 
-    Takes the Codex provider flock like handlers 024-027: this writes a
+    Takes the Codex provider flock like handler 025: this writes a
     Codex-derived table, so a mid-walk ``sync_codex_cache`` must not interleave.
     On contention it DEFERS (``MigrationGateNotMet``) before touching any data —
     the safe side, and free here because that same sync runs the identical pass
     at its own end anyway.
 
-    ``BEGIN IMMEDIATE`` before the read, like handler 024: the pass reads the
+    ``BEGIN IMMEDIATE`` before the read, like handler 025: the pass reads the
     folded window evidence and then writes back a plan derived from it, so it
     must hold the write lock for the whole read-then-write rather than upgrade
     part way through it.
@@ -10101,17 +10106,20 @@ def _035_codex_thread_source_inference_replay(conn: sqlite3.Connection) -> None:
     The repair must re-read the rollout bytes: the retained events carry NULL
     conversation keys and the in-place normalization replay preserves them.
 
-    Writes a marker ONLY. ``sync_codex_cache`` consumes it and ORs it into its
+    Writes a marker ONLY, through ``arm_codex_replay_from_zero`` (which, over
+    a #982 replay heal record, also marks that record for a fresh clear).
+    ``sync_codex_cache`` consumes it and ORs it into its
     own ``rebuild``, which is what makes the rebuild path capture
     ``rebuild_known_identities`` BEFORE the clear. Clearing here instead would
     delete ``codex_session_files`` out of band, leaving the next ordinary sync
     with an empty snapshot — every re-read rollout would fall through to the
     live-``auth.json`` branch and pre-mechanism Codex spend would be
-    re-attributed to whoever is authenticated now (#416 spec D1). Migrations 026
-    and 027 predate that snapshot and are already stamped, so this would be the
-    first migration to hit it live.
+    re-attributed to whoever is authenticated now (#416 spec D1). Migrations
+    024, 026 and 027 used to clear out of band exactly that way, and a store
+    still below them reaches them on its next upgrade, so since #983 they arm
+    this same marker instead of clearing.
 
-    No provider flock: unlike handlers 024-027 and 034 this writes one
+    No provider flock: unlike handlers 025 and 034 this writes one
     ``cache_meta`` row and touches no Codex-derived table, so a concurrent
     ``sync_codex_cache`` has nothing to interleave with — and if one is mid-walk,
     arming the marker simply defers the replay to the following sync.
@@ -10121,7 +10129,7 @@ def _035_codex_thread_source_inference_replay(conn: sqlite3.Connection) -> None:
     """
     import _cctally_cache
 
-    _set_cache_meta(conn, _cctally_cache.CODEX_REPLAY_FROM_ZERO_KEY, "1")
+    _cctally_cache.arm_codex_replay_from_zero(conn)
     conn.commit()
 
 
@@ -10433,7 +10441,7 @@ def _043_codex_window_attributions(conn: sqlite3.Connection) -> None:
     retracted, so a re-run over its own output writes nothing but the cursor.
     NO self-stamp — the dispatcher central-stamps on a clean return (#140).
 
-    Takes the Codex provider flock like handlers 024-027 and 034: this writes a
+    Takes the Codex provider flock like handlers 025 and 034: this writes a
     Codex-derived table, so a mid-walk ``sync_codex_cache`` must not interleave.
     On contention it DEFERS (``MigrationGateNotMet``) before touching any data,
     which is free here because that same sync rehydrates this table at its own
@@ -10606,7 +10614,7 @@ def _047_spill_free_read_paths(conn: sqlite3.Connection) -> None:
     It also delivers ``idx_codex_window_attributions_read_order`` (Amendment 1
     item 1, ``c901-design-2``), the window-attribution read's assertion order.
 
-    Takes the Codex provider flock like handlers 024-027, 034 and 043, because
+    Takes the Codex provider flock like handlers 025, 034 and 043, because
     the summary is Codex-derived, and DEFERS (``MigrationGateNotMet``) before
     any DDL when a Codex sync holds it. Idempotent: every object uses IF NOT
     EXISTS or drop-then-create, and a re-derivation over its own output writes
@@ -10805,6 +10813,38 @@ def _051_codex_retained_identities(conn: sqlite3.Connection) -> None:
     central-stamps on a clean return (#140).
     """
     _apply_codex_retained_identity_inventory(conn)
+    conn.commit()
+
+
+@cache_migration("052_codex_delete_trigger_plans")
+def _052_codex_delete_trigger_plans(conn: sqlite3.Connection) -> None:
+    """#971 spec D4: deliver the bounded thread and partition-latest triggers.
+
+    The schema apply is version-gated, so a store already at head 51 never
+    receives the rewritten trigger bodies or ``idx_codex_files_root_thread``
+    from ``_apply_cache_schema``; only a registered migration reaches it. The
+    two shared helpers drop and re-create their triggers (the accounting one
+    also creates the index). With all five summary objects present the
+    partition-latest summary is NOT re-bootstrapped, so no history is scanned
+    and no row changes.
+
+    Downgrade: an older head-51 binary opening a head-52 store through
+    ``open_cache_db`` sees the gate open (52 != 51), reinstalls its own
+    slower but equivalent bodies, and the dispatcher's version-ahead recovery
+    trims this marker; ``db recover --db cache`` on a raw connection keeps the
+    new bodies, which name no index and stay correct. A re-upgrade opens the
+    gate again and restores them.
+
+    Takes no provider flock: the dispatcher runs it under the opener's
+    maintenance-exclusive and global writer exclusion. The accounting
+    helper's DROP/CREATE pairs ride the transaction its ``cache_meta`` INSERT
+    opens implicitly, the summary helper joins it as a savepoint, and the
+    closing commit publishes every replacement at once. Re-running is a
+    no-op. NO self-stamp — the dispatcher central-stamps on a clean return
+    (#140).
+    """
+    _apply_codex_accounting_change_ledger(conn)
+    _apply_codex_quota_latest_summary(conn)
     conn.commit()
 
 

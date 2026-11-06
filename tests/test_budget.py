@@ -171,6 +171,7 @@ def test_f1_structural_forecast_uses_project_linear():
 
 from conftest import load_script, redirect_paths  # noqa: E402
 from _fixture_builders import (  # noqa: E402
+    make_git_repository_marker,
     seed_session_entry,
     seed_session_file,
 )
@@ -274,7 +275,7 @@ def test_budget_set_project_cwd_resolves_git_root(pjns, monkeypatch, tmp_path):
     """`budget set 25 --project` (bare) inside a git repo writes
     budget.projects[<repo_root>] == 25.0."""
     repo = tmp_path / "myrepo"
-    (repo / ".git").mkdir(parents=True)
+    make_git_repository_marker(repo)
     monkeypatch.chdir(repo)
     rc = pjns["cmd_budget"](
         _pj_budget_args(action="set", amount="25", project="__CWD__")
@@ -316,7 +317,7 @@ def test_budget_set_project_explicit_subdir_resolves_to_git_root(pjns, tmp_path)
     ever match it. Without git-root resolution on the explicit-path branch the
     stored sub-dir key never matches → permanent $0."""
     monorepo = tmp_path / "monorepo"
-    (monorepo / ".git").mkdir(parents=True)
+    make_git_repository_marker(monorepo)
     subdir = monorepo / "packages" / "foo"
     subdir.mkdir(parents=True)
     rc = pjns["cmd_budget"](

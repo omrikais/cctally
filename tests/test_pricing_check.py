@@ -41,8 +41,9 @@ def test_no_suppression_expires_before_the_pricing_snapshot_date():
     analytic clock to PRICING_SNAPSHOT_DATE. An entry authored with an `expires`
     earlier than that date is already expired at the pin, which would make those
     goldens report a lapse the operator never let happen — and it is a defect in
-    its own right, because the snapshot date is the day every suppression was
-    last verified against the vendor. This guard is deliberately model-agnostic
+    its own right, because the snapshot date is the date of the latest
+    pricing sync, and a suppression already lapsed by then should have been
+    re-verified in that sync. This guard is deliberately model-agnostic
     so it outlives whichever suppressions currently carry a date.
     """
     early = [e for e in pricing.PRICING_DRIFT_ALLOWLIST
@@ -57,7 +58,8 @@ def test_no_suppression_expires_before_the_pricing_snapshot_date():
 
 # Vendor-verified per-MTok rates for the current Claude generation, as
 # (input, output, 5-minute cache write, cache read) per-token costs, taken from
-# platform.claude.com/docs/en/about-claude/pricing at PRICING_SNAPSHOT_DATE.
+# platform.claude.com/docs/en/about-claude/pricing at each card's own sync (see
+# the CLAUDE_MODEL_PRICING header log), not necessarily at PRICING_SNAPSHOT_DATE.
 # The two WRITE multipliers are uniform and derived (5-minute write 1.25x base
 # input, 1-hour write 2x). Cache READS are model-specific and are therefore
 # stored per model: the two 5.1 point releases read at 0.025x base input and
@@ -349,6 +351,20 @@ def test_committed_snapshot_matches_live_tables():
     assert res.missing_from_us == [], res.missing_from_us
 
 
+def test_committed_snapshot_carries_the_989_identifiers():
+    # The two snapshot tests above only see the rows the fixture carries, so
+    # they would pass vacuously if these upstream rows were dropped. Each one
+    # was a live `missing_from_us` finding on 2026-11-05 (#989).
+    import json
+    snap = json.loads((pathlib.Path(__file__).resolve().parent
+                       / "fixtures" / "pricing" / "litellm_scoped.json").read_text())
+    scoped = pc.scope_litellm(snap)
+    for model in ("gpt-5.5-cyber-preview", "gpt-6.1-terra",
+                  "gpt-6-rosalind", "gpt-6-astra-law"):
+        assert model in scoped, model
+        assert scoped[model]["litellm_provider"] == "openai", model
+
+
 def test_table_shapes_clean_on_live_tables():
     # gpt-5.3-codex-spark is the one documented all-zero sentinel.
     problems = pc.check_table_shapes(
@@ -371,8 +387,8 @@ _CCTALLY = pathlib.Path(__file__).resolve().parents[1] / "bin" / "cctally"
 # feeds the actionability predicate, so an unpinned run is a test scheduled to
 # change verdict on a calendar date rather than on a code change: from the day
 # after Sol's cutover (#643) every clean run here goes exit 0 -> 1 untouched.
-# The pin is PRICING_SNAPSHOT_DATE, the day the tables and every current
-# suppression were last verified against the vendor; it matches PINNED_AS_OF in
+# The pin is PRICING_SNAPSHOT_DATE, the date of the latest pricing sync (a
+# targeted sync re-verifies only the cards it names); it matches PINNED_AS_OF in
 # bin/cctally-pricing-check-test, and
 # test_no_suppression_expires_before_the_pricing_snapshot_date holds the floor
 # both depend on. Tests that exercise a cutover pass their own date instead.
@@ -834,6 +850,17 @@ _GPT_56_SOL_LITELLM = {
 }
 
 
+# LiteLLM's openai-provider row for the preview identifier we alias to
+# gpt-5.5-cyber instead of pricing directly (#989): its model-only suppression
+# is stale in any snapshot that lacks the row.
+_GPT_55_CYBER_PREVIEW_LITELLM = {
+    "litellm_provider": "openai",
+    "input_cost_per_token": 1.25e-05,
+    "cache_read_input_token_cost": 1.25e-06,
+    "output_cost_per_token": 7.5e-05,
+}
+
+
 def _litellm_with_allowlisted_preview(body=None):
     """A sparse LiteLLM fake that still carries every allowlisted divergence.
 
@@ -845,6 +872,7 @@ def _litellm_with_allowlisted_preview(body=None):
         "claude-mythos-preview": dict(_MYTHOS_PREVIEW_LITELLM),
         "gpt-5.6": dict(_GPT_56_SOL_LITELLM),
         "gpt-5.6-sol": dict(_GPT_56_SOL_LITELLM),
+        "gpt-5.5-cyber-preview": dict(_GPT_55_CYBER_PREVIEW_LITELLM),
     }
     snap.update(body or {})
     return snap

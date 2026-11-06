@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ConversationReader, ProviderThreadNav, deriveReaderTitle } from './ConversationReader';
+import { ConversationReader, ProviderThreadNav, deriveReaderTitle, formatReaderBranch } from './ConversationReader';
 import { OutlinePanel } from './OutlinePanel';
 import { _resetForTests, dispatch, getState, subscribeStore, updateSnapshot } from '../store/store';
 import type { Envelope } from '../types/envelope';
@@ -2530,6 +2530,22 @@ describe('deriveReaderTitle (#188 promoted command)', () => {
   });
 });
 
+// ---- #1037 — the reader header's branch slot ----------------------------
+describe('formatReaderBranch (#1037)', () => {
+  const base = { git_branch: null as string | null };
+  it.each([
+    ['a recorded branch', { git_branch: 'main' }, 'main'],
+    ['a branch beside a status', { git_branch: 'feat/x', provider_meta: { source: 'codex', conversation_key: 'k', git_branch_status: 'recorded' } }, 'feat/x'],
+    ['a Codex not-recorded status', { ...base, provider_meta: { source: 'codex', conversation_key: 'k', git_branch_status: 'not_recorded' } }, 'no branch recorded'],
+    ['an unreadable status', { ...base, provider_meta: { source: 'codex', conversation_key: 'k', git_branch_status: 'unreadable' } }, '—'],
+    ['no status (old server)', { ...base, provider_meta: { source: 'codex', conversation_key: 'k' } }, '—'],
+    ['a Claude null branch', base, '—'],
+    ['an empty branch string', { git_branch: '' }, '—'],
+  ])('%s', (_label, detail, expected) => {
+    expect(formatReaderBranch(detail as Parameters<typeof formatReaderBranch>[0])).toBe(expected);
+  });
+});
+
 // ---- #205 S3 (F6) — reader meta model abbreviation on mobile ----------
 describe('reader meta model abbreviation (#205 S3 F6)', () => {
   function multiModelDetail() {
@@ -2572,6 +2588,22 @@ describe('reader meta model abbreviation (#205 S3 F6)', () => {
     await waitFor(() => expect(container.querySelector('.conv-reader-meta')).not.toBeNull());
     const meta = container.querySelector('.conv-reader-meta')!.textContent!;
     expect(meta).toContain('claude-haiku-4-5-20251001');
+  });
+
+  // #1037 (operator decision O1) — a Codex conversation whose retained git
+  // metadata names no branch says so in both header variants; base rendered
+  // `—` for every Codex header.
+  it.each(['compact', 'wide'] as const)('shows "no branch recorded" for a not-recorded Codex branch (%s header)', async (band) => {
+    stubResponsiveMedia(metaBand(band));
+    _resetForTests();
+    mockFetchOnce({
+      ...detail([makeItem({ uuid: 'h1' })]),
+      git_branch: null,
+      provider_meta: { source: 'codex', conversation_key: 'v1.x', git_branch_status: 'not_recorded' },
+    });
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('.conv-reader-meta')).not.toBeNull());
+    expect(container.querySelector('.conv-reader-meta')!.textContent).toContain('proj · no branch recorded · $3.50');
   });
 
   // #304 S2 (Codex F6) — the focus-return last resort (.conv-reader) must work

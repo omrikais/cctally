@@ -818,7 +818,8 @@ def test_t5_the_1022_to_1023_transition_reconstructs_releases(
         app, monkeypatch):
     """Detects an epoch transition that loses recovery facts: a store whose
     index is still the 1022 shape (certificates and envelope, no axis
-    state) and epoch rebuilds to 1023 with the one-axis and two-axis
+    state) and epoch rebuilds to the current `STATS_INDEX_EPOCH` with the
+    one-axis and two-axis
     releases, coverage and outcomes live ingest held."""
     import sqlite3
     import _cctally_core as core
@@ -851,7 +852,7 @@ def test_t5_the_1022_to_1023_transition_reconstructs_releases(
     store.resolve_stats_epoch_mismatch().close()
     conn = sqlite3.connect(core.DB_PATH)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1023
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == core.STATS_INDEX_EPOCH
     finally:
         conn.close()
     assert T.quarantine_state(app) == live_state

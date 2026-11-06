@@ -31,13 +31,14 @@ from conftest import load_script, redirect_paths
 
 FIXED = dt.datetime(2026, 9, 5, 12, 0, 0, tzinfo=dt.timezone.utc)
 PREVIOUS_EPOCH = 1012
-#: The CURRENT head, not the 1013 this module is named for. Two assertions
-#: below mean "the epoch a store ends up at": the head constant itself, and the
-#: epoch an upgraded 1012 store reaches, which is always the head rather than
-#: the intermediate epoch that first added these objects. #869 moved the
-#: head to 1016, then #901 moved it to 1017, then #825/#832 to 1018, then #797/#823/#840 to 1019, then #1019/#1014 to 1020, then #943 to 1021, then #1015 to 1022, then #948 to 1023. Everything else here — what
-#: epoch 1013 ADDED, and the prose recording it — is historical fact and stays.
-NEW_EPOCH = 1023
+#: The CURRENT head, not the 1013 this module is named for: the epoch an
+#: upgraded 1012 store reaches is always the head rather than the intermediate
+#: epoch that first added these objects. They arrived at epoch 1013; the
+#: later history is the comment above `STATS_INDEX_EPOCH` in
+#: `bin/_cctally_core.py`.
+#: Everything else here — what epoch 1013 ADDED, and the prose recording it —
+#: is historical fact and stays.
+NEW_EPOCH = _cctally_core.STATS_INDEX_EPOCH
 DEBOUNCE_TABLE = "weekly_reset_debounce_state"
 ORIGIN_INDEX = "idx_week_reset_events_origin"
 LEGACY_TUPLE_INDEX = "idx_week_reset_events_legacy_tuple"
@@ -88,7 +89,7 @@ def _resolve_epoch_transition():
 
 
 def test_a1_the_epoch_is_bumped_and_the_legacy_registry_is_untouched():
-    assert _cctally_core.STATS_INDEX_EPOCH == NEW_EPOCH
+    assert _cctally_core.STATS_INDEX_EPOCH >= 1013
     assert _cctally_core.LEGACY_STATS_HEAD == 13
     import _cctally_db
     assert len(_cctally_db._STATS_MIGRATIONS) == 13, "the registry is FROZEN"
@@ -194,6 +195,13 @@ def test_a1_the_new_objects_appear_on_an_upgraded_install_via_rebuild(ns):
         conn.execute(f"DROP INDEX IF EXISTS {ORIGIN_INDEX}")
         conn.execute(f"DROP INDEX IF EXISTS {LEGACY_TUPLE_INDEX}")
         conn.execute(f"DROP TABLE IF EXISTS {DEBOUNCE_TABLE}")
+        # #1050's content-revision triggers name every column and are not
+        # part of the epoch-1012 index; SQLite refuses the drop under them.
+        for (name,) in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND tbl_name='week_reset_events' "
+                "AND name LIKE 'trg_content_revision_%'").fetchall():
+            conn.execute(f"DROP TRIGGER {name}")
         conn.execute(
             "ALTER TABLE week_reset_events DROP COLUMN origin_observation_id")
         conn.execute(f"PRAGMA user_version = {PREVIOUS_EPOCH}")

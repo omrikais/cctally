@@ -599,7 +599,16 @@ _init_paths_from_env()
 # `outcome_quarantine_episodes`, `outcome_quarantine_bounds` and
 # `outcome_quarantine_axis_state`, so an index built without them is not
 # current. No numbered migration; `DERIVATION_FRONTIER_EPOCH` is unchanged.
-STATS_INDEX_EPOCH = 1023
+# 1023 -> 1024 (#1018 twin spec 5.1): current-week freshness from confirming
+# weekly readings. `claude_weekly_observation_index` gains `weekly_percent`,
+# `weekly_resets_at_utc`, `weekly_reading_genuine` and
+# `weekly_freshness_eligible`, and the partial covering index
+# `idx_claude_weekly_observation_index_freshness` serves the confirmation
+# lookup, so an index built without them is not current. The index
+# population and `captured_at_utc` are unchanged. No numbered migration;
+# `DERIVATION_FRONTIER_EPOCH` is unchanged.
+# Bump checklist (partners, regenerate commands, tripwires): tests/test_stats_index_epoch_pin.py.
+STATS_INDEX_EPOCH = 1024
 LEGACY_STATS_HEAD = 13
 
 
@@ -1070,6 +1079,16 @@ _STATS_INGEST_LOCK_HELD = contextvars.ContextVar(
 )
 _STATS_INTERRUPTED_RECOVERY_SUPPRESSED = contextvars.ContextVar(
     "cctally_stats_interrupted_recovery_suppressed", default=0
+)
+#: #1005: the active diagnostic maintenance-wait allowance, or None outside a
+#: `_cctally_store.bounded_diagnostic_waits` scope. The value is a mutable
+#: record with one attribute, `remaining_s`, shared by every nested scope and
+#: charged by `_cctally_store.diagnostic_flock`. Kept here for the same reason
+#: as the two above: a store-owned ContextVar would be replaced by an empty one
+#: when `load_script()` reloads the siblings, and a scope entered before the
+#: reload would silently stop bounding.
+_STATS_DIAGNOSTIC_WAIT_ALLOWANCE = contextvars.ContextVar(
+    "cctally_stats_diagnostic_wait_allowance", default=None
 )
 
 
@@ -2413,6 +2432,10 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                     conn, _STATS_MIGRATIONS, "stats.db"
                 )
                 _reconcile_incomplete_quota_projection(conn)
+            # #1050 §4.3: a `current` store costs two reads and no lock; an
+            # index published by an older binary (or never installed) gets
+            # its content-revision objects here, without an epoch bump.
+            _ensure_stats_content_revision(conn, live=_target_path is None)
             return conn
         if _target_path is None:
             if _uv > LEGACY_STATS_HEAD:
@@ -2474,6 +2497,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                 _reconcile_durable_applied_migration_errors(
                     conn, _STATS_MIGRATIONS, "stats.db"
                 )
+            _ensure_stats_content_revision(conn, live=_target_path is None)
             return conn
         # PR-3: everything below is pending schema, migration or cutover work;
         # it sorts under FILE, and the writer temp store is selected again
@@ -2876,18 +2900,38 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # credit detection, never pruned. `account_key` is the account live
         # ingest reads after the cutover-aware legacy normalization;
         # `captured_at_utc` is canonical full-precision UTC.
+        #
+        # #1018 twin epoch 1024 (spec 5.1): the record's raw weekly value, its
+        # nearest-hour normalized reset (the second-precision spelling of
+        # `claude_oauth_samples.weekly_resets_at_utc`, used only for
+        # equality), whether it is a genuine weekly reading for this row's
+        # account, and whether it may confirm a displayed weekly value
+        # (genuine, both values present, captured strictly before the reset,
+        # not held by the effective reviewed decision). The partial index
+        # covers the one confirmation lookup.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS claude_weekly_observation_index (
-                observation_id  TEXT PRIMARY KEY,
-                account_key     TEXT NOT NULL,
-                captured_at_utc TEXT NOT NULL
+                observation_id            TEXT PRIMARY KEY,
+                account_key               TEXT NOT NULL,
+                captured_at_utc           TEXT NOT NULL,
+                weekly_percent            REAL,
+                weekly_resets_at_utc      TEXT,
+                weekly_reading_genuine    INTEGER NOT NULL DEFAULT 0,
+                weekly_freshness_eligible INTEGER NOT NULL DEFAULT 0
             )
             """
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_claude_weekly_observation_index_window "
             "ON claude_weekly_observation_index (account_key, captured_at_utc)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "idx_claude_weekly_observation_index_freshness "
+            "ON claude_weekly_observation_index "
+            "(account_key, weekly_resets_at_utc, weekly_percent, "
+            "captured_at_utc DESC) WHERE weekly_freshness_eligible = 1"
         )
         # Every decision of every reviewed weekly op (not only the latest),
         # with the DECODED disposition: a `weekly_axis_retractions` member is
@@ -3903,8 +3947,29 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                     except Exception:
                         pass
                     raise
+            # #1050 §4.3: the fresh, scratch and cutover schema apply install
+            # the content-revision objects once the store is at the epoch, so
+            # a scratch replay is tracked from its first row and is published
+            # with them. After the cutover rather than before it: the
+            # cutover's `journal_id` stamping is bookkeeping, and tracking it
+            # would only cost one trigger per legacy row. A legacy store that
+            # a deferred migration keeps below the epoch is not installed.
+            if conn.execute(
+                "PRAGMA user_version"
+            ).fetchone()[0] == STATS_INDEX_EPOCH:
+                _ensure_stats_content_revision(
+                    conn, live=_target_path is None)
         _cctally_store.apply_writer_temp_store(conn)
         return conn
+
+
+def _ensure_stats_content_revision(conn, *, live: bool) -> str:
+    """#1050: install or repair stats.db's content-revision objects (the pure
+    kernel `_lib_stats_content_revision`, a proven leaf). A `current` store is
+    two reads; contention leaves the store as it is for the next open."""
+    import _lib_stats_content_revision
+    return _lib_stats_content_revision.ensure_stats_content_revision(
+        conn, live=live)
 
 
 # === WeekRef cluster ================================================

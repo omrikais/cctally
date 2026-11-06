@@ -425,6 +425,17 @@ class Tree:
         self.worktree_cwd = self.worktree / "sub"
         self.thread_w = "01a19010-0000-7000-8000-00000000e901"
         self.rollout_w = self.sessions / f"rollout-2026-10-05T09-10-00-{self.thread_w}.jsonl"
+        # #976: a removed worktree's cwd below a stray non-repository `.git/`
+        # (a worktree container's), inside a repository whose `.git` is a
+        # directory; the marker rule stats each `.git` directory's HEAD,
+        # objects and refs, which the capture records as probe entries (the
+        # repository's) and recorded absences (the stray's). Removed with the
+        # worktree after the capture.
+        self.repo_root = self.worktree.parent / "repo"
+        self.repo_stray = self.repo_root / ".worktrees" / ".git"
+        self.repo_cwd = self.repo_root / ".worktrees" / "gone" / "sub"
+        self.thread_r = "01a19010-0000-7000-8000-00000000e902"
+        self.rollout_r = self.sessions / f"rollout-2026-10-05T09-12-00-{self.thread_r}.jsonl"
 
     def build(self) -> None:
         _write_lines(self.rollout_a, codex_lines(self.thread_a, self.at, 3, 0, "A"))
@@ -459,6 +470,13 @@ class Tree:
         (self.worktree / ".git").write_text("gitdir: /bench/frozen-selftest/.git/worktrees/9d52\n")
         _write_lines(self.rollout_w, codex_lines(self.thread_w, self.at + 70, 2, 0, "W",
                                                  cwd=str(self.worktree_cwd)))
+        for sub in ("objects", "refs"):
+            (self.repo_root / ".git" / sub).mkdir(parents=True)
+        (self.repo_root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        (self.repo_stray / "worktrees" / "x").mkdir(parents=True)
+        (self.repo_stray / "worktrees" / "x" / "CCTALLY_COMMIT_MSG").write_text("m\n")
+        _write_lines(self.rollout_r, codex_lines(self.thread_r, self.at + 75, 1, 0, "R",
+                                                 cwd=str(self.repo_cwd)))
         # Codex's state database: the title the freeze must keep is committed
         # only in the WAL - a reader pins it, so a PASSIVE checkpoint stays
         # incomplete - and both connections stay open through the capture
@@ -1107,6 +1125,23 @@ class SelfTest:
         self.native_project = json.loads(out.stdout or "{}") if out.returncode == 0 else {}
         self.check("control.projectResolvesGitRoot",
                    self.native_project.get("gitRoot") == str(wt), (out.stdout, out.stderr[-500:]))
+        # #976: the repository's `.git` children are probe entries, the stray
+        # container's are recorded absences, and the product skips the stray
+        repo, stray = t.repo_root / ".git", t.repo_stray
+        children = ("HEAD", "objects", "refs")
+        self.check("capture.repoMarkerProbes",
+                   (probes.get(str(repo)) or {}).get("type") == "dir"
+                   and (probes.get(str(stray)) or {}).get("type") == "dir"
+                   and all(str(repo / c) in probes for c in children)
+                   and all(str(stray / c) in absences for c in children)
+                   and str(t.repo_cwd.parent) in absences,
+                   {"probes": sorted(probes), "summary": self.manifest.get("probes")})
+        out = run([PY, __file__, "project", "--tree", str(self.tree_dir), "--cwd",
+                   str(t.repo_cwd)], env=env_for(t, self.base / "unused"), timeout=60)
+        self.native_repo_project = json.loads(out.stdout or "{}") if out.returncode == 0 else {}
+        self.check("control.repoProjectSkipsStrayMarker",
+                   self.native_repo_project.get("gitRoot") == str(t.repo_root),
+                   (out.stdout, out.stderr[-500:]))
         # Amendment 14 P1: probe entries at and below the memory link's
         # denied target, for the cwds equal to it and below it: the target's
         # own `.git` (present), each component below it and each one's `.git`
@@ -1398,6 +1433,24 @@ class SelfTest:
                    and json.loads(now.stdout or "{}") != self.native_project, now.stdout)
         fam = self.family(receipts)
         self.check("project.familyValid", fam["valid"], fam["problems"])
+        # #976: the same for the removed worktree below the stray container:
+        # the walk reads the `.git` directories' child probes and absences
+        # with no `unmapped-open` or `traversal`, and resolves the repository
+        cwd = str(self.tree.repo_cwd)
+        receipts = self.base / "project-repo-receipts"
+        out = self.launch([PY, __file__, "project", "--tree", str(self.tree_dir),
+                           "--cwd", cwd], env, receipts, timeout=120)
+        frozen = json.loads(out.stdout or "{}") if out.returncode == 0 else {}
+        self.check("project.repo.frozenEqualsNativeControl",
+                   frozen and frozen == self.native_repo_project,
+                   {"frozen": frozen, "control": self.native_repo_project,
+                    "rc": out.returncode, "stderr": out.stderr[-500:]})
+        now = run([PY, __file__, "project", "--tree", str(self.tree_dir), "--cwd", cwd],
+                  env=env, timeout=60)
+        self.check("project.repo.liveNowDiffers", now.returncode == 0
+                   and json.loads(now.stdout or "{}") != self.native_repo_project, now.stdout)
+        fam = self.family(receipts)
+        self.check("project.repo.familyValid", fam["valid"], fam["problems"])
         # Amendment 14 P1: the same for the Claude sessions whose cwd is the
         # memory link's denied target and a directory below it, after the
         # target's `.git` and the directories below it were removed: the

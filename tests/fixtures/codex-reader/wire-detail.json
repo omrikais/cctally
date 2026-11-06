@@ -1,6 +1,8 @@
 {
   "children": [],
   "conversation_key": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+  "git_branch": "fixture-branch",
+  "git_branch_status": "recorded",
   "items": [
     {
       "blocks": [
@@ -422,6 +424,7 @@
     "total": 8
   },
   "parent": null,
+  "project_label": "project-red",
   "session_index": {
     "sessions": {},
     "truncated": false

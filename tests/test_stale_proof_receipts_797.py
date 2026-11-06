@@ -837,6 +837,792 @@ def test_compact_samples_equivalence_for_proven_stale_low(sp, monkeypatch):
     assert not check(drop_latest)
 
 
+# --- #1064: the prepared sample view ---------------------------------------------------
+#
+# The reference below is a verbatim copy of the predicates and readers of
+# `bin/_lib_stale_proof.py` at d6bd99e65, before the prepared view: compiled
+# into its own namespace over the kernel's unchanged primitives and records,
+# it is the independent behaviour test 1 compares the kernel against.
+
+_REFERENCE_1064 = r'''
+def _interval(text: str | None) -> tuple[int, int] | None:
+    """The ``[start, end)`` nanosecond interval a canonical instant denotes."""
+    if not isinstance(text, str):
+        return None
+    try:
+        start = _activity.instant_key(text)
+        digits = _activity.instant_precision(text)
+    except ValueError:
+        return None
+    return start, start + 10 ** (9 - min(digits, 9))
+
+
+def after(a: str | None, b: str | None) -> bool:
+    """Whether instant ``a`` is proven to follow instant ``b``."""
+    ia, ib = _interval(a), _interval(b)
+    return ia is not None and ib is not None and ia[0] >= ib[1]
+
+
+def _before_epoch(text: str | None, epoch: int) -> bool:
+    """Whether instant ``text`` is proven to precede the exact second ``epoch``."""
+    interval = _interval(text)
+    return interval is not None and interval[1] <= epoch * _NS
+
+
+def _at_or_after_epoch(text: str | None, epoch: int) -> bool:
+    interval = _interval(text)
+    return interval is not None and interval[0] >= epoch * _NS
+
+
+def _instant_order(text: str) -> int:
+    interval = _interval(text)
+    return -1 if interval is None else interval[0]
+
+def _window_text(window: int) -> str:
+    return _samples.normalize_weekly_reset(int(window))
+
+
+def _sample_window(sample) -> str | None:
+    if sample.weekly_resets_at_utc is None:
+        return None
+    try:
+        return _samples.weekly_window(sample.weekly_resets_at_utc)
+    except ValueError:
+        return None
+
+
+def _in_window(samples: Iterable, window: int) -> list:
+    text = _window_text(window)
+    return [s for s in samples
+            if s.weekly_percent is not None and _sample_window(s) == text]
+
+
+def _five_in_window(samples: Iterable, window: int) -> list:
+    """The samples of one five-hour window, by canonical key equality."""
+    return [s for s in samples
+            if s.five_hour_percent is not None and s.five_hour_window_key is not None
+            and int(s.five_hour_window_key) == int(window)]
+
+
+def _axis_window(samples: Iterable, axis: str, window: int) -> list:
+    return (_five_in_window(samples, window) if axis == FIVE_HOUR
+            else _in_window(samples, window))
+
+
+def _axis_value(sample, axis: str) -> float:
+    return float(sample.five_hour_percent if axis == FIVE_HOUR else sample.weekly_percent)
+
+
+def _latest(samples: Iterable):
+    best = None
+    for s in samples:
+        if best is None or (_instant_order(s.requested_at_utc), s.observation_id) > (
+                _instant_order(best.requested_at_utc), best.observation_id):
+            best = s
+    return best
+
+
+# --- the proof -----------------------------------------------------------------------
+
+
+def proven_stale(sigma: SampleIdentity, samples: Iterable, *, after_utc: str,
+                 advertised_reset_epoch: int | None = None):
+    """The latest provider sample proving σ stale, or None.
+
+    A sample proves σ stale when it is in σ's authoritative window, its
+    request instant ``q`` follows both ``t_m`` and ``after_utc``, its raw
+    value is strictly more than `TOLERANCE_PP` below σ's, and its response
+    was captured before the member's advertised reset (the window's reset
+    when the member advertised none). On the five-hour axis the window is
+    the canonical key and the value is the sample's raw five-hour percent."""
+    if sigma.axis not in AXES:
+        return None
+    reset = sigma.window if advertised_reset_epoch is None else int(advertised_reset_epoch)
+    proving = [
+        s for s in _axis_window(samples, sigma.axis, sigma.window)
+        if _axis_value(s, sigma.axis) < sigma.percent - TOLERANCE_PP
+        and after(s.requested_at_utc, sigma.activity_at_utc)
+        and after(s.requested_at_utc, after_utc)
+        and _before_epoch(s.captured_at_utc, reset)
+    ]
+    return _latest(proving)
+
+
+def proven_stale_low(bound_utc: str, samples: Iterable, *, axis: str, window: int,
+                     percent: float, advertised_reset_epoch: int | None = None):
+    """The latest provider sample proving a member's LOW stale, or None
+    (#1019 spec 4.1, Q1).
+
+    A sample proves it when it is in the member's exact window (weekly: the
+    normalized reset; five-hour: the canonical key; the caller passes only
+    the member's own account's samples), its request instant ``q`` follows
+    ``bound_utc`` (`drop_bound`) under the precision intervals, its raw axis
+    value is strictly more than `TOLERANCE_PP` ABOVE ``percent``, and its
+    response was captured before the member's advertised reset (the
+    window's reset when it advertised none). No receipt, no ``e_σ``, and no
+    baseline or threshold cutoff."""
+    if axis not in AXES or _interval(bound_utc) is None:
+        return None
+    reset = int(window) if advertised_reset_epoch is None else int(advertised_reset_epoch)
+    proving = [
+        s for s in _axis_window(samples, axis, window)
+        if _axis_value(s, axis) > float(percent) + TOLERANCE_PP
+        and after(s.requested_at_utc, bound_utc)
+        and _before_epoch(s.captured_at_utc, reset)
+    ]
+    return _latest(proving)
+
+def earn_receipts(members: Sequence[Member], accounted: Accounted, samples: Iterable, *,
+                  completed_at_utc: str, index_identity: str) -> tuple[Receipt, ...]:
+    """The receipts a covered, completed derivation earns for ``members``.
+
+    (i) A member whose value equals exactly the accounted value earns a
+    maximal receipt; ties earn independently. (ii) Otherwise a weekly member
+    below the accounted value earns provider support when the admitted
+    provider sample that supports the completed accounting — the current
+    segment's latest, B — was requested after its ``t_m`` and reads raw at
+    or above its value. An older, higher sample the accounting has since
+    moved below supports nothing, and neither does the MAX-clamped stored
+    value. A pending or retained low, a projection fill, a numerically
+    dominating member and unknown evidence never earn. On the five-hour axis
+    the accounted value is the `statusline` source's detector baseline under
+    the current credit generation and only (i) exists: that baseline holds
+    no provider samples."""
+    if accounted.axis not in AXES or accounted.percent is None:
+        return ()
+    segment = [s for s in _in_window(samples, accounted.window)
+               if accounted.floor_epoch is None
+               or _at_or_after_epoch(s.captured_at_utc, accounted.floor_epoch)]
+    generation = tuple((c.event_id, c.event_revision) for c in accounted.credits
+                       if c.axis == accounted.axis)
+    latest = _latest(segment)
+    earned = []
+    for m in members:
+        s = m.sigma
+        if s.axis != accounted.axis or s.window != accounted.window:
+            continue
+        support = None
+        if s.percent == accounted.percent:
+            path = "maximal"
+        elif accounted.axis == FIVE_HOUR:
+            continue
+        else:
+            support = latest
+            if (support is None or s.percent > accounted.percent
+                    or float(support.weekly_percent) < s.percent
+                    or not after(support.requested_at_utc, s.activity_at_utc)):
+                continue
+            path = "provider_support"
+        earned.append(Receipt(
+            sigma=s, path=path, account_key=accounted.account_key,
+            window=accounted.window, support_id=accounted.support_id,
+            support_hash=accounted.support_hash,
+            accounted_percent=float(accounted.percent),
+            provider_observation_id=None if support is None else support.observation_id,
+            provider_percent=None if support is None else float(support.weekly_percent),
+            provider_requested_at_utc=None if support is None else support.requested_at_utc,
+            provider_window=None if support is None else _sample_window(support),
+            detector_policy=accounted.detector_policy, credits=generation,
+            coverage=accounted.coverage, completed_at_utc=completed_at_utc,
+            index_identity=index_identity))
+    return tuple(earned)
+
+
+def receipt_valid(receipt: Receipt, transitions: Iterable[CreditTransition], *,
+                  index_identity: str, supports: Collection[str] | None = None) -> bool:
+    """Whether ``receipt`` stays valid against every current credit of its
+    account and window (the weekly rows of the section 4.4 table).
+
+    The index identity must match (a rebuild, re-upgrade or epoch change
+    invalidates). Every credit of the receipt's generation must still be
+    present at its revision (a corrected or tombstoned event invalidates).
+    A credit after the receipt survives only when its causal low is an
+    admitted provider sample requested after ``e_σ`` or a status-line reading
+    (R15); every other or unordered credit invalidates. When ``supports`` is
+    given, the receipt's supporting observation and its provider sample B
+    must still be among them (a held, retracted or tombstoned support
+    invalidates).
+
+    The five-hour rows: a `statusline`-source credit survives (its causal low
+    is the source's own arming observation, R15). A credit confirmed by
+    another source survives only when its baseline observation is an
+    admitted provider sample requested after ``t_m`` whose RAW five-hour
+    value is at least σ's, and its ARMING observation — never the later
+    confirming one — is a provider sample requested after ``e_σ``; every
+    other or unordered credit invalidates. Supports are not checked on this
+    axis: the accounted baseline is detector state, not a stored row."""
+    if receipt.sigma.axis not in AXES or receipt.index_identity != index_identity:
+        return False
+    five = receipt.sigma.axis == FIVE_HOUR
+    if supports is not None and not five:
+        if receipt.support_id is not None and receipt.support_id not in supports:
+            return False
+        if (receipt.provider_observation_id is not None
+                and receipt.provider_observation_id not in supports):
+            return False
+    current = {}
+    for t in transitions:
+        if t.axis == receipt.sigma.axis:
+            current[t.event_id] = t
+    generation = dict(receipt.credits)
+    for event_id, revision in generation.items():
+        t = current.get(event_id)
+        if t is None or t.event_revision != revision:
+            return False
+    for event_id, t in current.items():
+        if event_id in generation:
+            continue
+        if t.causal_kind == "statusline":
+            continue
+        if five:
+            if (t.causal_kind == "provider"
+                    and t.baseline_percent is not None
+                    and float(t.baseline_percent) >= receipt.sigma.percent
+                    and after(t.baseline_requested_at_utc,
+                              receipt.sigma.activity_at_utc)
+                    and after(t.arming_requested_at_utc, receipt.completed_at_utc)):
+                continue
+            return False
+        if t.causal_kind == "provider" and after(t.requested_at_utc,
+                                                 receipt.completed_at_utc):
+            continue
+        return False
+    return True
+
+
+def refusal_facts(axis: str, members: Sequence[Member], samples: Iterable,
+                  receipts: Iterable[Receipt], transitions: Iterable[CreditTransition], *,
+                  index_identity: str, supports: Collection[str] | None = None,
+                  drop_members: Sequence[DropMember] = ()
+                  ) -> dict[str, MemberFacts]:
+    """Per-member facts for one axis, keyed by contributor token.
+
+    A member is refused only when it holds a valid receipt for its exact σ
+    and a sample requested after both ``t_m`` and ``e_σ`` proves it stale.
+    A member without a receipt is eligible with no proof reported; one whose
+    receipt is invalid is eligible with its proof reported. Each axis is
+    decided on its own members, samples and credits.
+
+    #1019 (spec 4.1): every ``drop_members`` entry gets its drop facts from
+    `proven_stale_low`, independently of ``receipts``, so one call per axis
+    yields complete facts; a token with drop facts only keeps the rise
+    fields of `ALL_ELIGIBLE`."""
+    if axis not in AXES:
+        return {}
+    samples = list(samples)
+    transitions = list(transitions)
+    by_sigma: dict[str, list[Receipt]] = {}
+    for r in receipts:
+        by_sigma.setdefault(r.sigma.key(), []).append(r)
+    facts: dict[str, MemberFacts] = {}
+    for m in members:
+        s = m.sigma
+        if s.axis != axis:
+            continue
+        held = sorted(by_sigma.get(s.key(), ()),
+                      key=lambda r: _instant_order(r.completed_at_utc))
+        if not held:
+            facts[s.token] = ALL_ELIGIBLE
+            continue
+        valid = [r for r in held
+                 if receipt_valid(r, transitions, index_identity=index_identity,
+                                  supports=supports)]
+        reset = m.advertised_reset_epoch
+        if valid:
+            strict = proven_stale(s, samples, after_utc=valid[0].completed_at_utc,
+                                  advertised_reset_epoch=reset)
+        else:
+            strict = None
+        proof = strict or proven_stale(s, samples, after_utc=s.activity_at_utc,
+                                       advertised_reset_epoch=reset)
+        facts[s.token] = MemberFacts(
+            refused=bool(valid) and strict is not None,
+            proof_observation_id=None if proof is None else proof.observation_id,
+            receipt_valid=bool(valid))
+    for d in drop_members:
+        if d.axis != axis:
+            continue
+        low = proven_stale_low(d.bound_utc, samples, axis=axis, window=d.window,
+                               percent=d.percent,
+                               advertised_reset_epoch=d.advertised_reset_epoch)
+        facts[d.token] = dataclasses.replace(
+            facts.get(d.token, ALL_ELIGIBLE), drop_refused=low is not None,
+            drop_proof_observation_id=None if low is None else low.observation_id)
+    return facts
+
+def compact_samples(samples: Iterable, *, window: int,
+                    floor_epoch: int | None, axis: str = WEEKLY) -> tuple:
+    """A subset of the window's samples that yields the same `proven_stale`,
+    `proven_stale_low` and `earn_receipts` answers for every member (all pick the latest
+    qualifying sample, and qualification is monotone in ``q`` within one
+    value): per weekly value, the latest sample and the latest captured at
+    or after the floor, plus every sample captured within an hour of the
+    window's reset (a member's advertised reset may precede the window).
+    ``axis`` selects the window identity and value (five-hour: the canonical
+    key and the raw five-hour percent)."""
+    margin = int(window) - _RESET_MARGIN_SECONDS
+    keep: dict[str, object] = {}
+    latest: dict[float, object] = {}
+    latest_floor: dict[float, object] = {}
+    for s in _axis_window(samples, axis, window):
+        if not _before_epoch(s.captured_at_utc, margin):
+            keep[s.observation_id] = s
+            continue
+        v = _axis_value(s, axis)
+        latest[v] = _latest([x for x in (latest.get(v), s) if x is not None])
+        if floor_epoch is None or _at_or_after_epoch(s.captured_at_utc, floor_epoch):
+            latest_floor[v] = _latest([x for x in (latest_floor.get(v), s) if x is not None])
+    for s in [*latest.values(), *latest_floor.values()]:
+        keep[s.observation_id] = s
+    return tuple(sorted(keep.values(),
+                        key=lambda s: (_instant_order(s.requested_at_utc), s.observation_id)))
+
+'''
+
+
+def _reference_kernel(sp):
+    import types
+    namespace = {
+        "dataclasses": dataclasses, "_activity": sp._activity, "_samples": sp._samples,
+        "TOLERANCE_PP": 1.0, "_RESET_MARGIN_SECONDS": 3600, "_NS": 1_000_000_000,
+        "WEEKLY": "sevenDay", "FIVE_HOUR": "fiveHour", "AXES": ("sevenDay", "fiveHour"),
+        "Receipt": sp.Receipt, "MemberFacts": sp.MemberFacts,
+        "ALL_ELIGIBLE": sp.ALL_ELIGIBLE,
+    }
+    exec(compile("from __future__ import annotations\n" + _REFERENCE_1064,
+                 "<_lib_stale_proof at d6bd99e65>", "exec"), namespace)
+    return types.SimpleNamespace(**namespace)
+
+
+def _raw(obs, q, captured, *, weekly=None, reset=RESET_ISO, five=None, key=None):
+    return samples_lib.OAuthSample(
+        account_key=ACCOUNT, observation_id=obs, requested_at_utc=q,
+        captured_at_utc=captured, weekly_percent=weekly, weekly_resets_at_utc=reset,
+        five_hour_percent=five,
+        five_hour_resets_at_utc=None if five is None else FIVE_RESET_ISO,
+        five_hour_window_key=key)
+
+
+def _instant_text(epoch_s: int, digits: int, frac: int) -> str:
+    import datetime as _dt
+    base = _dt.datetime.fromtimestamp(epoch_s, tz=_dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S")
+    return base + ("" if digits == 0 else "." + f"{frac:09d}"[:digits]) + "Z"
+
+
+#: Request instant of the tie clusters: the latest qualifying sample of the
+#: low weekly rises (weekly) and of the low five-hour rises (five).
+_TQ = "2026-10-24T03:30:00.000000Z"
+_TQ5 = "2026-10-22T11:00:00.000000Z"
+
+
+def _edge_samples() -> dict:
+    """The deterministic edge clusters, by population name. Within each
+    list the order is significant (complete-key duplicates keep theirs)."""
+    return {
+        # Order ties broken by observation id, and complete-key ties
+        # (equal request instant and observation id, different captures)
+        # resolved by original position, on both axes.
+        "ties": [
+            _raw("o:tie1", _TQ, "2026-10-24T03:30:01Z", weekly=10.0),
+            _raw("o:tie2", _TQ, "2026-10-24T03:30:02Z", weekly=10.0),
+            _raw("o:tie2", _TQ, "2026-10-24T03:30:03Z", weekly=10.0),
+            _raw("o:ftie1", _TQ5, "2026-10-22T11:00:01Z", weekly=40.0, five=3.0,
+                 key=FIVE_KEY),
+            _raw("o:ftie2", _TQ5, "2026-10-22T11:00:02Z", weekly=40.0, five=3.0,
+                 key=FIVE_KEY),
+            _raw("o:ftie2", _TQ5, "2026-10-22T11:00:03Z", weekly=40.0, five=3.0,
+                 key=FIVE_KEY),
+        ],
+        # The tolerance boundary: 60.0 is not more than 1 pp below 61, nor
+        # 59.99 more than 1 pp above 58.99.
+        "tolerance": [
+            _raw("o:tolA", "2026-10-23T01:00:00.000000Z", "2026-10-23T01:00:01Z",
+                 weekly=60.0),
+            _raw("o:tolB", "2026-10-23T00:00:00.000000Z", "2026-10-23T00:00:01Z",
+                 weekly=59.99),
+        ],
+        # The reset boundary: a capture ending exactly at the reset is before
+        # it; one starting at it is not. Both lie in the near-reset margin.
+        "reset": [
+            _raw("o:atreset", "2026-10-24T04:59:58.000000Z", "2026-10-24T04:59:59Z",
+                 weekly=90.0),
+            _raw("o:pastreset", "2026-10-24T04:59:59.500000Z", "2026-10-24T05:00:00Z",
+                 weekly=90.0),
+        ],
+        # The floor boundary: a capture starting exactly at the floor is in
+        # the segment; the later-requested one captured a second earlier is
+        # not.
+        "floor": [
+            _raw("o:atfloor", "2026-10-19T08:53:19.000000Z", "2026-10-19T08:53:20Z",
+                 weekly=33.3),
+            _raw("o:prefloor", "2026-10-19T08:53:25.000000Z", "2026-10-19T08:53:19Z",
+                 weekly=33.3),
+        ],
+        # Precision overlap: q .15 lies inside the bound .1's interval.
+        "overlap": [
+            _raw("o:ov", "2026-10-23T10:00:00.150000Z", "2026-10-23T10:00:01Z",
+                 weekly=99.5),
+        ],
+        # An unparsable request instant (order -1) and capture instant, and
+        # an integer-epoch weekly window.
+        "malformed": [
+            _raw("o:badq", "not-an-instant", "2026-10-23T01:00:00Z", weekly=10.0),
+            _raw("o:badcap", "2026-10-23T02:00:00.000000Z", "bad", weekly=50.0),
+            _raw("o:intwin", "2026-10-24T03:00:00.000000Z", "2026-10-24T03:00:01Z",
+                 weekly=51.0, reset=RESET),
+        ],
+        # `_latest` selects an unparsable request instant over a pre-1970
+        # one, so the provider support it picks earns nothing.
+        "epoch": [
+            _raw("o:old", "1969-12-31T23:59:58.000000Z", "1969-12-31T23:59:59Z",
+                 weekly=90.0),
+            _raw("o:noq", "garbage", "1969-12-31T23:59:59Z", weekly=90.0),
+        ],
+        # A five-hour key whose conversion raises: every five-hour reader of
+        # this population raises it, at the same call.
+        "raise": [
+            _raw("o:fine", "2026-10-22T10:00:00.000000Z", "2026-10-22T10:00:01Z",
+                 weekly=40.0, five=4.0, key=FIVE_KEY),
+            _raw("o:raise", "2026-10-22T10:30:00.000000Z", "2026-10-22T10:30:01Z",
+                 weekly=40.0, five=4.0, key="x"),
+        ],
+        # Outside the read_samples domain, through the kernel's unprepared
+        # fallback: a value `float` accepts that is not a number, and an
+        # order tie of identities that do not compare (today's `_latest`
+        # and sort raise only when they compare them).
+        "fallback": [
+            _raw("o:str", "2026-10-23T05:00:00.000000Z", "2026-10-23T05:00:01Z",
+                 weekly="50"),
+            _raw(None, _TQ5, "2026-10-22T11:00:01Z", weekly=40.0, five=3.0, key=FIVE_KEY),
+            _raw("o:y", _TQ5, "2026-10-22T11:00:02Z", weekly=40.0, five=30.0,
+                 key=FIVE_KEY),
+        ],
+    }
+
+
+def _random_samples(rng) -> list:
+    out = []
+    start = 1792620000  # 2026-10-21T22:00:00Z
+    for i in range(rng.randint(10, 30)):
+        q = _instant_text(start + rng.randint(0, 2 * 86400 - 7200),
+                          rng.choice((0, 1, 3, 6, 9)), rng.randint(0, 999_999_999))
+        captured = rng.choice((q[:19] + "Z", q[:19] + "Z", "bad"))
+        out.append(_raw(
+            f"o:r{i}", q, captured,
+            weekly=rng.choice((None, 0.0, 1.0, 18.0, 19.0, 19.5, 50.0, 51.0, 52.0,
+                               73.0, 74.0, 75.0, 83.0, 84.0)),
+            reset=rng.choice((RESET_ISO, RESET_ISO, RESET_ISO, RESET, RESET + 1200,
+                              "2026-10-17T05:00:00Z", None, "garbage"))))
+    five_start = 1792656000  # 2026-10-22T08:00:00Z
+    for i in range(rng.randint(5, 15)):
+        q = _instant_text(five_start + rng.randint(0, 16200),
+                          rng.choice((0, 3, 6)), rng.randint(0, 999_999_999))
+        five = rng.choice((None, 3.0, 4.0, 5.0, 15.0, 20.0, 21.0, 22.0))
+        out.append(_raw(
+            f"o:f{i}", q, rng.choice((q[:19] + "Z", q[:19] + "Z", "bad")),
+            weekly=rng.choice((None, 40.0)),
+            five=five, key=rng.choice((FIVE_KEY, FIVE_KEY, FIVE_KEY - 18000, None))))
+    return out
+
+
+def _merge_in_order(rng, base: list, extra: list) -> list:
+    """``extra`` inserted at random positions of ``base``, its own order kept."""
+    out = list(base)
+    positions = sorted(rng.randint(0, len(base)) for _ in extra)
+    for offset, (pos, item) in enumerate(zip(positions, extra)):
+        out.insert(pos + offset, item)
+    return out
+
+
+def _attempt(call):
+    try:
+        return ("ok", call())
+    except Exception as exc:  # noqa: BLE001 - the exception IS the outcome
+        return ("raise", type(exc).__name__, str(exc))
+
+
+def _norm(value):
+    """A result with every provider sample replaced by its object identity,
+    so a returned sample is compared as the very object, not an equal one."""
+    if isinstance(value, dict):
+        return {k: _norm(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return tuple(_norm(v) for v in value)
+    if hasattr(value, "observation_id") and hasattr(value, "captured_at_utc"):
+        return ("sample", id(value))
+    return value
+
+
+def test_prepared_view_matches_reference_oracle(sp):
+    """#1064 test 1 (accuracy: a different refusal, drop fact, receipt,
+    proof or compacted set after the prepared-view rewrite). Every public
+    reader, called with a shared prepared view and with a plain list, returns
+    exactly what today's code (the verbatim reference) returns, raises
+    exactly what it raises, and returns the very sample objects it returns,
+    over generated populations that make every enumerated outcome occur."""
+    import random
+    ref = _reference_kernel(sp)
+    prepare = getattr(sp, "prepare", tuple)
+    rng = random.Random(1064)
+    E2 = "2026-10-23T12:00:00.000000Z"
+    weekly = [member(sp, *spec[:1], percent=spec[1], t_m=spec[2], reset=spec[3])
+              for spec in (("w30", 30, T_M, RESET),
+                           ("w60", 60, "2026-10-22T09:00:00Z", None),
+                           ("w74", 74, T_M, RESET),
+                           ("w74b", 74, "2026-10-23T10:00:00.1Z", RESET - 60),
+                           ("w82", 82, T_M, None),
+                           ("w83", 83, T_M, RESET),
+                           ("w95", 95, "1969-12-31T00:00:00.000Z", RESET),
+                           ("t61", 61, T_M, RESET))]
+    five = [five_member(sp, name, percent=pct, t_m=t_m, reset=reset)
+            for name, pct, t_m, reset in (("f5", 5.0, T_M5, FIVE_RESET),
+                                          ("f20", 20.0, T_M5, None),
+                                          ("f22", 22.0, "2026-10-22T08:00:00Z",
+                                           FIVE_RESET))]
+    by_name = {m.sigma.token: name for name, m in zip(
+        ("w30", "w60", "w74", "w74b", "w82", "w83", "w95", "t61"), weekly)}
+    by_name.update({m.sigma.token: n for n, m in zip(("f5", "f20", "f22"), five)})
+
+    def drop(name, bound, percent, reset, *, axis="sevenDay", window=RESET):
+        return sp.DropMember(_token(name), bound, axis, float(percent), window, reset)
+
+    drops = [drop("d0", "2026-10-21T00:00:00Z", 0, RESET),
+             drop("d18", T_M, 18, None),
+             drop("d50", "2026-10-22T09:00:00.000Z", 50, RESET - 60),
+             drop("d70", "2026-10-23T00:00:00Z", 70, RESET),
+             drop("d98a", "2026-10-23T10:00:00.1Z", 98, RESET),
+             drop("d98b", "2026-10-23T10:00:00.000Z", 98, RESET),
+             drop("dshift", T_M, 18, None, window=RESET + 600),
+             drop("t5899", T_M, 58.99, RESET)]
+    five_drops = [drop("e3", T_M5, 3, FIVE_RESET, axis="fiveHour", window=FIVE_KEY),
+                  drop("e15", "2026-10-22T10:00:00Z", 15, None, axis="fiveHour",
+                       window=FIVE_KEY)]
+    names = {d.token: n for n, d in zip(
+        ("d0", "d18", "d50", "d70", "d98a", "d98b", "dshift", "t5899", "e3", "e15"),
+        drops + five_drops)}
+    bad = credit(sp, "wr:early", q="2026-10-22T09:00:00.000000Z")
+    accounteds = {"a83": accounted(sp, 83.0), "a74": accounted(sp, 74.0, floor=None),
+                  "a30": accounted(sp, 30.0), "anone": accounted(sp, None),
+                  "five20": five_accounted(sp, 20.0)}
+    transitions = {"none": [], "late": [credit(sp, "wr:late",
+                                               q="2026-10-23T23:00:00.000000Z")],
+                   "early": [bad], "sl": [credit(sp, "wr:sl", kind="statusline")]}
+    five_transitions = {
+        "none": [], "sl": [five_credit(sp, "fhc:sl", kind="statusline")],
+        "provider": [five_credit(sp, "fhc:p", arming="2026-10-22T08:00:00.000000Z",
+                                 baseline="2026-10-22T07:00:00.000000Z",
+                                 baseline_percent=10.0)]}
+    epoch_member = member(sp, "ep", percent=80, t_m="1969-12-31T00:00:00.000Z")
+
+    def calls(pop, name):
+        """``(label, axis, call(impl, samples))`` for one population."""
+        out = []
+        for m in weekly + five:
+            tag = by_name[m.sigma.token]
+            for after_tag, after in (("own", m.sigma.activity_at_utc), ("e", E),
+                                     ("e2", E2), ("e5", E5)):
+                out.append((f"stale:{tag}:{after_tag}", m.sigma.axis,
+                            lambda k, s, m=m, after=after: k.proven_stale(
+                                m.sigma, s, after_utc=after,
+                                advertised_reset_epoch=m.advertised_reset_epoch)))
+        for d in drops + five_drops:
+            for reset_tag, reset in (("", d.advertised_reset_epoch), (":noreset", None)):
+                out.append((f"low:{names[d.token]}{reset_tag}", d.axis,
+                            lambda k, s, d=d, reset=reset: k.proven_stale_low(
+                                d.bound_utc, s, axis=d.axis, window=d.window,
+                                percent=d.percent, advertised_reset_epoch=reset)))
+        for tag, acc in accounteds.items():
+            out.append((f"earn:{tag}", "sevenDay", lambda k, s, acc=acc: k.earn_receipts(
+                weekly + five, acc, s, completed_at_utc=E, index_identity="ix")))
+        if name == "epoch":
+            out.append(("earn:epoch", "sevenDay", lambda k, s: k.earn_receipts(
+                [epoch_member], accounted(sp, 85.0, floor=None), s,
+                completed_at_utc=E, index_identity="ix")))
+        # Receipts: earned now, and re-earned at E2 under the credit that
+        # invalidates the first generation.
+        held = []
+        for tag in ("a83", "a74", "a30", "five20"):
+            held.extend(ref.earn_receipts(weekly + five, accounteds[tag], list(pop),
+                                          completed_at_utc=E, index_identity="ix"))
+        again = list(ref.earn_receipts(weekly, accounted(sp, 83.0, credits=(bad,)),
+                                       list(pop), completed_at_utc=E2,
+                                       index_identity="ix"))
+        for t_tag, trans in transitions.items():
+            for s_tag, supports in (("all", None), ("support", frozenset({"o:support"}))):
+                out.append((f"refusal:w:{t_tag}:{s_tag}", "sevenDay",
+                            lambda k, s, trans=trans, supports=supports: k.refusal_facts(
+                                "sevenDay", weekly, s, held, trans, index_identity="ix",
+                                supports=supports, drop_members=drops)))
+        out.append(("refusal:w:reearned", "sevenDay", lambda k, s: k.refusal_facts(
+            "sevenDay", weekly, s, held + again, [bad], index_identity="ix",
+            drop_members=drops)))
+        out.append(("refusal:w:rebuilt", "sevenDay", lambda k, s: k.refusal_facts(
+            "sevenDay", weekly, s, held, [], index_identity="other",
+            drop_members=drops)))
+        for t_tag, trans in five_transitions.items():
+            out.append((f"refusal:f:{t_tag}", "fiveHour",
+                        lambda k, s, trans=trans: k.refusal_facts(
+                            "fiveHour", five, s, held, trans, index_identity="ix",
+                            drop_members=five_drops)))
+        for tag, kwargs in (("w:floor", dict(window=RESET, floor_epoch=FLOOR)),
+                            ("w:nofloor", dict(window=RESET, floor_epoch=None)),
+                            ("w:shifted", dict(window=RESET + 600, floor_epoch=FLOOR)),
+                            ("f:nofloor", dict(window=FIVE_KEY, floor_epoch=None,
+                                               axis="fiveHour")),
+                            ("f:floor", dict(window=FIVE_KEY, floor_epoch=FIVE_KEY - 7200,
+                                             axis="fiveHour"))):
+            out.append((f"compact:{tag}", "fiveHour" if tag.startswith("f") else "sevenDay",
+                        lambda k, s, kwargs=kwargs: k.compact_samples(s, **kwargs)))
+        reearned = any(
+            r1.sigma.key() == r2.sigma.key()
+            and not ref.receipt_valid(r1, [bad], index_identity="ix")
+            and ref.receipt_valid(r2, [bad], index_identity="ix")
+            for r1 in held for r2 in again)
+        return out, reearned
+
+    edges = _edge_samples()
+    merged = [s for key in ("ties", "tolerance", "reset", "floor", "overlap", "malformed")
+              for s in edges[key]]
+    populations = [(key, list(edges[key])) for key in edges]
+    for _ in range(25):
+        populations.append(("random", _merge_in_order(rng, _random_samples(rng), merged)))
+
+    obj = {f"{s.observation_id}@{s.captured_at_utc}": s
+           for _key, pop in populations for s in pop}
+    targeted = {
+        ("ties", "stale:w74:own"): ("obs_tie", lambda r: r is obj["o:tie2@2026-10-24T03:30:02Z"]),
+        ("ties", "stale:f5:own"): ("complete_key_tie",
+                                   lambda r: r is obj["o:ftie2@2026-10-22T11:00:02Z"]),
+        ("ties", "compact:w:floor"): ("compact_dup_identity", lambda r: any(
+            s is obj["o:tie2@2026-10-24T03:30:02Z"] for s in r) and not any(
+            s is obj["o:tie2@2026-10-24T03:30:03Z"] for s in r)),
+        ("tolerance", "stale:t61:own"): ("tolerance_rise",
+                                        lambda r: r is obj["o:tolB@2026-10-23T00:00:01Z"]),
+        ("tolerance", "low:t5899"): ("tolerance_drop",
+                                     lambda r: r is obj["o:tolA@2026-10-23T01:00:01Z"]),
+        ("reset", "low:d0"): ("reset_boundary",
+                              lambda r: r is obj["o:atreset@2026-10-24T04:59:59Z"]),
+        ("floor", "compact:w:floor"): ("floor_boundary", lambda r: any(
+            s is obj["o:atfloor@2026-10-19T08:53:20Z"] for s in r)),
+        ("overlap", "low:d98a"): ("precision_overlap_refused", lambda r: r is None),
+        ("overlap", "low:d98b"): ("precision_overlap_ordered",
+                                  lambda r: r is obj["o:ov@2026-10-23T10:00:01Z"]),
+        ("epoch", "earn:epoch"): ("unparsable_q_selected", lambda r: r == () and (
+            ref._latest(ref._in_window(edges["epoch"], RESET)).observation_id == "o:noq")),
+        ("epoch", "stale:w95:own"): ("pre_epoch_proof",
+                                     lambda r: r is obj["o:old@1969-12-31T23:59:59Z"]),
+    }
+    seen = set()
+    for name, pop in populations:
+        view = prepare(pop)
+        if any(s.weekly_percent is None for s in pop):
+            seen.add("missing_value")
+        battery, reearned = calls(pop, name)
+        if reearned:
+            seen.add("reearned")
+        for label, axis, call in battery:
+            want = _attempt(lambda: call(ref, list(pop)))
+            for variant, samples in (("list", lambda: list(pop)), ("view", lambda: view)):
+                got = _attempt(lambda: call(sp, samples()))
+                assert _norm(got) == _norm(want), (name, label, variant, got, want)
+            if want[0] == "raise":
+                assert name == "fallback" or (name == "raise" and axis == "fiveHour"), (
+                    name, label, want)
+                seen.add("raise_same" if name == "raise" else "fallback_raise")
+                continue
+            result = want[1]
+            check = targeted.get((name, label))
+            if check is not None:
+                flag, predicate = check
+                assert predicate(result), (name, label, result)
+                seen.add(flag)
+            if label.startswith("earn:"):
+                seen.update("earned_" + r.path for r in result)
+            elif label.startswith("refusal:"):
+                for token, f in result.items():
+                    if f.refused:
+                        seen.update(("rise_refused", axis + "_refused"))
+                    elif f.proof_observation_id is not None:
+                        seen.add("rise_allowed")
+                    if token in names:
+                        seen.add("drop_refused" if f.drop_refused else "drop_allowed")
+                        if f.drop_refused:
+                            seen.add(axis + "_refused")
+            elif label.startswith("compact:"):
+                margin = RESET - 3600 if axis == "sevenDay" else FIVE_KEY - 3600
+                for s in result:
+                    interval = ref._interval(s.captured_at_utc)
+                    if interval is None:
+                        seen.add("unparsable_capture_kept")
+                    elif interval[1] > margin * 1_000_000_000:
+                        seen.add("margin_kept")
+                    if isinstance(s.weekly_resets_at_utc, int) and axis == "sevenDay":
+                        seen.add("int_window")
+    required = {"earned_maximal", "earned_provider_support", "reearned", "rise_refused",
+                "rise_allowed", "drop_refused", "drop_allowed", "sevenDay_refused",
+                "fiveHour_refused", "margin_kept", "unparsable_capture_kept",
+                "int_window", "missing_value", "raise_same", "obs_tie",
+                "complete_key_tie", "compact_dup_identity", "tolerance_rise",
+                "tolerance_drop", "reset_boundary", "floor_boundary",
+                "precision_overlap_refused", "precision_overlap_ordered",
+                "unparsable_q_selected", "pre_epoch_proof"}
+    assert required <= seen, "outcomes that never occurred: " + repr(sorted(required - seen))
+
+
+def _clear_kernel_memos(sp):
+    for value in list(vars(sp).values()):
+        clear = getattr(value, "cache_clear", None)
+        if callable(clear):
+            clear()
+
+
+def test_parser_work_scales_with_samples_not_members(sp, monkeypatch):
+    """#1064 test 2 (machine safety: a status-line reducer pass held the
+    selected-state lock for up to an hour at full CPU, because every member's
+    proof re-parsed every sample's instants and re-normalized its weekly
+    window). The parses and normalizations of one kernel call are
+    proportional to its samples, not to samples x members: more samples than
+    the memo bound, every instant and weekly reset unique (so eviction cannot
+    hide repeated parsing), every sample qualifying for every member's
+    proof, and member populations m and 4m."""
+    n = 70_000
+    start = RESET - 4 * 86400
+    pop = [sample(f"o:{i}", q=_instant_text(start + i, 6, i * 1000),
+                  weekly=50.0, reset=f"2026-10-24T05:00:00.{i:06d}Z")
+           for i in range(n)]
+    drops = [sp.DropMember(_token(f"d{j}"), "2026-10-01T00:00:00Z", "sevenDay",
+                           10.0, RESET, RESET) for j in range(8)]
+    counts = {"parse": 0, "window": 0}
+    real_key, real_window = sp._activity.instant_key, sp._samples.weekly_window
+
+    def instant_key(text):
+        counts["parse"] += 1
+        return real_key(text)
+
+    def weekly_window(value):
+        counts["window"] += 1
+        return real_window(value)
+
+    monkeypatch.setattr(sp._activity, "instant_key", instant_key)
+    monkeypatch.setattr(sp._samples, "weekly_window", weekly_window)
+
+    def work(m):
+        _clear_kernel_memos(sp)
+        counts.update(parse=0, window=0)
+        facts = sp.refusal_facts("sevenDay", [], pop, (), (), index_identity="ix",
+                                 drop_members=drops[:m])
+        assert [f.drop_proof_observation_id for f in facts.values()] == [f"o:{n - 1}"] * m
+        return counts["parse"] + counts["window"], dict(counts)
+
+    small, small_counts = work(2)
+    large, large_counts = work(8)
+    assert small >= n, small_counts
+    assert large / small < 1.5, (
+        f"parser work multiplies with members: m=2 {small_counts}, m=8 {large_counts}, "
+        f"ratio {large / small:.2f}")
+
+
 # =============================================================================
 # Part 2: the real intake, detached reducer and record kernel
 # (`tests/_stale_contributor_trace.py`).
@@ -1268,3 +2054,116 @@ def test_five_hour_statusline_credit_resolves_as_statusline(monkeypatch, tmp_pat
     (credit,) = _five_credits_of(t)
     assert credit.causal_kind == "statusline"
     assert credit.event_revision and credit.event_id.startswith("fhc")
+
+
+# --- #1064: one prepared view per snapshot owner -----------------------------------
+
+
+def test_one_view_per_stale_inputs_owner(monkeypatch, tmp_path):
+    """#1064 test 3 (machine safety and accuracy: a pass that re-prepares
+    one snapshot's samples per kernel call keeps the minutes-long hold; a
+    view reused across snapshots answers for the wrong one). Through the
+    real reducer: the classification that serves two evaluations of one
+    pass prepares its samples exactly once, two classifications with
+    different answers get their own views, and every refusal fact, refuted
+    support, receipt map, render cache and render decision equals the one
+    computed with the views disabled (each kernel call preparing its own)."""
+    import collections
+    import contextlib
+    t = S.Trace(monkeypatch, tmp_path)
+    sl = t.sl
+    sp = importlib.import_module("_lib_stale_proof")
+    state = {"reference": False}
+    prepared: collections.Counter = collections.Counter()
+    alive = []
+    real_prepare = getattr(sp, "prepare", None)
+    if real_prepare is not None:
+        def prepare(samples):
+            if not state["reference"] and isinstance(samples, tuple) and samples:
+                prepared[id(samples)] += 1
+                alive.append(samples)
+            return real_prepare(samples)
+        monkeypatch.setattr(sp, "prepare", prepare)
+
+    @contextlib.contextmanager
+    def views_disabled():
+        saved = []
+        for cls in (sl._StaleInputs, sl._StaleCache):
+            for name, field in (("sample_view", "samples"),
+                                ("five_sample_view", "five_samples")):
+                saved.append((cls, name, cls.__dict__.get(name)))
+                setattr(cls, name, property(lambda self, f=field: getattr(self, f)))
+        state["reference"] = True
+        try:
+            yield
+        finally:
+            state["reference"] = False
+            for cls, name, original in saved:
+                if original is None:
+                    delattr(cls, name)
+                else:
+                    setattr(cls, name, original)
+
+    mismatches, owners, answers = [], [], {}
+
+    def compared(name):
+        real = getattr(sl, name)
+
+        def wrapper(*args, **kwargs):
+            got = real(*args, **kwargs)
+            if not state["reference"]:
+                with views_disabled():
+                    want = real(*args, **kwargs)
+                if got != want:
+                    mismatches.append((name, got, want))
+                if name == "_stale_member_facts" and args[0] is not None:
+                    answers.setdefault(id(args[0]), []).append(got)
+            return got
+        monkeypatch.setattr(sl, name, wrapper)
+
+    for name in ("_stale_member_facts", "_refuted_supports", "_completion_receipts",
+                 "_receipt_work", "_render_member_facts"):
+        compared(name)
+    real_reduce = sl._reduce_evaluation
+
+    def reduce(account_key, evaluation, transition, *, classified, **kwargs):
+        owners.append(classified.stale)
+        return real_reduce(account_key, evaluation, transition, classified=classified,
+                           **kwargs)
+
+    monkeypatch.setattr(sl, "_reduce_evaluation", reduce)
+
+    a = t.session("idle82")
+    a.respond("2026-10-21T22:50:00Z")
+    t.oauth(83, at=DAY + "09:00:00Z")
+    t.render(a, 82, at=DAY + "09:00:30Z")
+    assert len(t.receipts()) == 1
+    t.oauth(0, at=DAY + "09:10:00Z")
+    b = t.session("idle81")
+    b.respond("2026-10-21T22:51:00Z")
+    # The first render's arrival stays in the intake (no worker runs for
+    # it), so the next render's pass reduces both evaluations.
+    real_worker = sl._continuation_worker
+    monkeypatch.setattr(sl, "_continuation_worker", sl._release_reservation)
+    t.render(a, 82, at=DAY + "09:10:30Z")
+    monkeypatch.setattr(sl, "_continuation_worker", real_worker)
+    first = len(owners)
+    t.render(b, 81, at=DAY + "09:10:40Z")
+    batch = [o for o in owners[first:] if o is not None]
+
+    assert not mismatches, mismatches
+    served = collections.Counter(id(o) for o in batch if o.samples)
+    assert served and max(served.values()) >= 2, (
+        "no classification served two evaluations of one pass", len(batch))
+    shared = next(o for o in batch if served[id(o)] >= 2)
+    assert prepared[id(shared.samples)] == 1, (
+        "the shared snapshot's samples were prepared "
+        f"{prepared[id(shared.samples)]} times")
+    assert prepared and max(prepared.values()) == 1, prepared
+    distinct = {id(o): o for o in owners if o is not None and o.samples}
+    used = [o for o in distinct.values() if prepared[id(o.samples)] == 1]
+    assert len(used) >= 2, "fewer than two classifications read their samples"
+    assert len({id(o.sample_view) for o in used}) == len(used), "a view was shared"
+    assert len({repr(answers.get(id(o))) for o in used}) >= 2, (
+        "the classifications' answers do not differ: the test cannot tell their "
+        "views apart")

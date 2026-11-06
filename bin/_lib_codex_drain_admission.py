@@ -1,5 +1,10 @@
 """Waiting requests and the drain-admission gate (#968 spec 5.7, 5.12).
 
+Drain workers yield to two signals, both reported by ``fresh_requests``:
+immutable Codex requests that end only by expiry (below), and one
+process-owned Claude waiter whose expiring record bounds it (#1055, after the
+Codex request section).
+
 A Codex hook never waits for a lock. When it meets cache contention it
 publishes a uniquely named, immutable request record under the data
 directory (outside every SQLite store, because a contended hook cannot write
@@ -19,8 +24,24 @@ monotonic clock. A worker observing a request, or restarting, never renews it;
 a wall-clock jump cannot extend it (the wall age only shortens freshness, and
 a NEGATIVE wall age — an mtime ahead of the wall clock after a backward step —
 counts as fresh, bounded by the monotonic lifetime); a malformed record or one
-from an incompatible clock is expired and removed. Stdlib only; no cctally
-imports.
+from an incompatible clock is expired and removed.
+
+The Claude waiter (#1055 spec 4.1-4.3). A Claude hook whose single attempt on
+``cache.db.lock`` is refused while it sees an admitted drain unit (the Codex
+provider lock and the gate both busy) registers on ``claude-cache-waiter.lock``:
+one ``LOCK_EX | LOCK_NB`` attempt, never retried, then an owner-written
+record ``cctally-claude-waiter v1 <pid> <expiry_ns>`` (expiry on this module's
+monotonic clock). The record is written at registration (expiry: the hook's
+acquisition deadline) and once on acquiring the writer lock (expiry: now plus
+the hold allowance); nothing else renews it, least of all an observation.
+Drains probe the file read-only with ``LOCK_SH | LOCK_NB``: the waiter is
+fresh only while the probe is refused AND the record parses, is unexpired and
+is at most ``max(T, hold allowance)`` ahead. A fresh waiter is reported as the
+reserved sentinel after the Codex ids, so every admission check, recheck and
+backoff yields to it unchanged; with no fresh waiter the value is exactly the
+Codex ids. The release truncates the record before unlocking; a killed hook's
+lock is released by the kernel; the file is never unlinked. Stdlib only; no
+cctally imports.
 """
 from __future__ import annotations
 
@@ -39,6 +60,24 @@ GATE_FILE_NAME = "codex-drain-admission.lock"
 POLL_SECONDS = 5.0
 _RECORD_VERSION = 1
 
+# #1055: the Claude waiter. Module constants read at call time (monkeypatchable,
+# not configuration).
+CLAUDE_WAITER_FILE_NAME = "claude-cache-waiter.lock"
+#: Reserved id; a generated Codex id is ``<mono>-<pid>-<hex>``, never this.
+CLAUDE_WAITER_SENTINEL = "claude-waiter"
+#: T: how long a refused Claude hook may wait for ``cache.db.lock``.
+CLAUDE_HOOK_DRAIN_WAIT_SECONDS = 5.0
+CLAUDE_HOOK_DRAIN_POLL_SECONDS = 0.05
+#: How long the waiter stays fresh once its hook holds ``cache.db.lock``.
+CLAUDE_WAITER_HOLD_ALLOWANCE_SECONDS = 15.0
+#: The drain's step while only the Claude waiter is fresh.
+SHORT_POLL_SECONDS = 0.05
+#: How recent an observed waiter must be for ``_drain_backoff``'s short step.
+CLAUDE_WAITER_RECENT_SECONDS = 1.0
+_WAITER_MAGIC = "cctally-claude-waiter"
+_WAITER_VERSION = "v1"
+_WAITER_RECORD_MAX = 128
+
 # Module attributes so tests can drive a deterministic schedule.
 _monotonic_ns: Callable[[], int] = time.monotonic_ns
 _sleep: Callable[[float], None] = time.sleep
@@ -46,6 +85,17 @@ _sleep: Callable[[float], None] = time.sleep
 #: are released. Production leaves it None; the fairness test synchronizes on
 #: it instead of sleeping (review P2-7).
 _after_finish: Optional[Callable[[], None]] = None
+#: Per-process hint: ``os.path.realpath(app_dir)`` -> the ``_monotonic_ns``
+#: time of the last probe that found a fresh waiter. It selects a sleep
+#: interval only; empty checks never renew it.
+_claude_waiter_observed: "dict[str, int]" = {}
+
+
+def _clear_claude_waiter_hint() -> None:
+    _claude_waiter_observed.clear()
+
+
+os.register_at_fork(after_in_child=_clear_claude_waiter_hint)
 
 
 def _request_dir(app_dir) -> pathlib.Path:
@@ -97,7 +147,18 @@ def _is_fresh(path: pathlib.Path, now_mono: int, now_wall: float) -> bool:
 
 
 def fresh_requests(app_dir) -> "list[str]":
-    """Ids of fresh requests; expired or malformed records are removed one by one."""
+    """Ids of fresh requests; expired or malformed records are removed one by one.
+
+    A fresh Claude waiter follows the Codex ids as ``CLAUDE_WAITER_SENTINEL``;
+    it is probed even when the request directory is missing or unreadable.
+    """
+    fresh = _fresh_codex_requests(app_dir)
+    if claude_waiter_fresh(app_dir):
+        fresh.append(CLAUDE_WAITER_SENTINEL)
+    return fresh
+
+
+def _fresh_codex_requests(app_dir) -> "list[str]":
     directory = _request_dir(app_dir)
     try:
         entries = sorted(directory.iterdir())
@@ -125,6 +186,154 @@ def fresh_requests(app_dir) -> "list[str]":
             except OSError:
                 pass
     return fresh
+
+
+def _waiter_path(app_dir) -> pathlib.Path:
+    return pathlib.Path(app_dir) / CLAUDE_WAITER_FILE_NAME
+
+
+def _hint_key(app_dir) -> str:
+    return os.path.realpath(os.fspath(app_dir))
+
+
+def _waiter_bound_ns() -> int:
+    return round(max(CLAUDE_HOOK_DRAIN_WAIT_SECONDS,
+                     CLAUDE_WAITER_HOLD_ALLOWANCE_SECONDS) * 1e9)
+
+
+def _parse_waiter_expiry(data: bytes) -> "int | None":
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if not text.endswith("\n"):
+        return None
+    parts = text[:-1].split(" ")
+    if (len(parts) != 4 or parts[0] != _WAITER_MAGIC
+            or parts[1] != _WAITER_VERSION
+            or not parts[2].isdigit() or not parts[3].isdigit()):
+        return None
+    return int(parts[3])
+
+
+class ClaudeWaiter:
+    """The one process-owned Claude waiter (#1055 spec 4.1)."""
+
+    def __init__(self, fd: int):
+        self._fd: "int | None" = fd
+
+    @classmethod
+    def register(cls, app_dir, *, deadline_ns: int) -> "ClaudeWaiter | None":
+        """One non-blocking exclusive attempt; None when another waiter or a
+        drain probe holds the file at that instant (never retried)."""
+        try:
+            fd = os.open(_waiter_path(app_dir), os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        waiter = cls(fd)
+        try:
+            waiter._write(deadline_ns)
+        except OSError:
+            waiter.release()
+            return None
+        return waiter
+
+    def _write(self, expiry_ns: int) -> None:
+        record = (f"{_WAITER_MAGIC} {_WAITER_VERSION} {os.getpid()} "
+                  f"{int(expiry_ns)}\n").encode("ascii")
+        os.pwrite(self._fd, record, 0)
+        os.ftruncate(self._fd, len(record))
+
+    def mark_holding(self) -> None:
+        """Rewrite the record once the hook holds ``cache.db.lock``: fresh for
+        the hold allowance from now. A failed write leaves the registration
+        record, which only ends the yield sooner."""
+        if self._fd is None:
+            return
+        try:
+            self._write(int(_monotonic_ns())
+                        + round(CLAUDE_WAITER_HOLD_ALLOWANCE_SECONDS * 1e9))
+        except OSError:
+            pass
+
+    def release(self) -> None:
+        """Truncate the record, unlock, close. Idempotent; never raises
+        ``OSError``."""
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        for step in (lambda: os.ftruncate(fd, 0),
+                     lambda: fcntl.flock(fd, fcntl.LOCK_UN),
+                     lambda: os.close(fd)):
+            try:
+                step()
+            except OSError:
+                pass
+
+
+def claude_waiter_fresh(app_dir) -> bool:
+    """The drain-side probe: never creates the file, holds no lock past the
+    call, and stamps the observation hint when the waiter is fresh."""
+    try:
+        fd = os.open(_waiter_path(app_dir), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        except OSError:
+            return False
+        else:
+            return False                # no waiter; close releases the probe
+        try:
+            data = os.pread(fd, _WAITER_RECORD_MAX, 0)
+        except OSError:
+            return False
+    finally:
+        os.close(fd)
+    expiry = _parse_waiter_expiry(data)
+    if expiry is None:
+        return False
+    now = int(_monotonic_ns())
+    if not (now < expiry and expiry - now <= _waiter_bound_ns()):
+        return False
+    _claude_waiter_observed[_hint_key(app_dir)] = now
+    return True
+
+
+def claude_waiter_recently_observed(app_dir) -> bool:
+    """True when this process found a fresh waiter less than
+    ``CLAUDE_WAITER_RECENT_SECONDS`` ago (a sleep-interval hint only)."""
+    stamp = _claude_waiter_observed.get(_hint_key(app_dir))
+    if stamp is None:
+        return False
+    age = int(_monotonic_ns()) - stamp
+    return 0 <= age < round(CLAUDE_WAITER_RECENT_SECONDS * 1e9)
+
+
+def lock_busy(path) -> bool:
+    """A shared non-blocking probe on its own descriptor, closed at once.
+    A missing file or any non-contention error is no evidence (False)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return False
 
 
 class DrainGate:
@@ -207,8 +416,17 @@ def finish(admission: Admission,
 
 def wait_until_no_fresh_requests(
         app_dir, *, should_continue: Optional[Callable[[], bool]] = None) -> None:
-    """Sleep in bounded steps until no request is fresh (requests expire)."""
-    while fresh_requests(app_dir):
+    """Sleep in bounded steps until nothing is fresh (requests expire; the
+    Claude waiter's record bounds it). The set is re-classified after every
+    sleep: the Claude sentinel alone takes ``SHORT_POLL_SECONDS``, any set
+    holding a Codex request ``POLL_SECONDS``."""
+    while True:
+        fresh = fresh_requests(app_dir)
+        if not fresh:
+            return
         if should_continue is not None and not should_continue():
             return
-        _sleep(POLL_SECONDS)
+        if fresh == [CLAUDE_WAITER_SENTINEL]:
+            _sleep(SHORT_POLL_SECONDS)
+        else:
+            _sleep(POLL_SECONDS)

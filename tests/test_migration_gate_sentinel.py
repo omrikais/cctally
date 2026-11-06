@@ -147,6 +147,32 @@ def test_marker_withheld_when_001_not_applied_at_start(driver):
     assert conn.execute("SELECT 1 FROM cache_meta WHERE key=?", (MARKER,)).fetchone() is None
 
 
+@pytest.mark.parametrize("applied_at_start", [True, False])
+def test_residual_token_requires_001_applied_at_start(driver, applied_at_start):
+    """#916. Detects: a residual-only walk writing its token although cache
+    001 was not applied when the walk began. Migration 001 deletes only the
+    walk-complete marker, so a token written across that straddle would
+    survive 001 and certify the dashboard frontier over a pre-dedup store.
+    The applied case is the positive control."""
+    ns, conn = driver
+    ns["sync_cache"](conn)
+    sess = pathlib.Path(conn.execute("SELECT path FROM session_files").fetchone()[0])
+    gone = sess.with_name("gone.jsonl")
+    gone.write_text(_assistant_line("m2", "r2"))
+    ns["sync_cache"](conn)
+    gone.unlink()
+    if not applied_at_start:
+        conn.execute("DELETE FROM schema_migrations WHERE name='001_dedup_highest_wins'")
+        conn.commit()
+    stats = ns["sync_cache"](conn)
+    token = conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_orphan_residual'"
+    ).fetchone()
+    assert (token is not None) == applied_at_start, stats
+    assert stats.full_walk_residual_only == applied_at_start, stats
+    assert conn.execute("SELECT 1 FROM cache_meta WHERE key=?", (MARKER,)).fetchone() is None
+
+
 def test_rebuild_clears_then_rewrites_marker(driver):
     """A rebuild clears the marker atomically with the wipe, then the same
     run's clean walk re-establishes it (the marker tracks THIS walk)."""

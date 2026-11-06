@@ -189,6 +189,54 @@ else:
                 f"{kind}: usdCoverage {actual_coverage!r} "
                 f"!= {expected['usdCoverage']!r}"
             )
+        # #1022: the Claude short-context oracle also states the population's
+        # evaluability and gap codes and the published maximum fraction. Those
+        # are the fields an undecided request guessed at, or a fraction above
+        # 1.0, would move while support and cost stayed plausible.
+        if "gapCodes" in expected:
+            got_evaluability = got["population"].get("evaluabilityCoverage")
+            if expected["evaluabilityCoverage"] is None:
+                if got_evaluability is not None:
+                    problems.append(
+                        f"{kind}: evaluabilityCoverage {got_evaluability!r} "
+                        "should be absent"
+                    )
+            elif (got_evaluability is None
+                    or abs(got_evaluability
+                           - expected["evaluabilityCoverage"]) > 1e-12):
+                problems.append(
+                    f"{kind}: evaluabilityCoverage {got_evaluability!r} "
+                    f"!= {expected['evaluabilityCoverage']!r}"
+                )
+            got_gaps = got["population"].get("gapCodes")
+            if got_gaps is None and expected["gapCodes"] == []:
+                got_gaps = []
+            if got_gaps != expected["gapCodes"]:
+                problems.append(
+                    f"{kind}: gapCodes {got_gaps!r} "
+                    f"!= {expected['gapCodes']!r}"
+                )
+            want_fraction = expected["maxContextWindowFraction"]
+            if got["rows"]:
+                got_fraction = (got["rows"][0]["evidence"]
+                                ["maxContextWindowFraction"]["value"])
+                if want_fraction is None:
+                    if got_fraction is not None:
+                        problems.append(
+                            f"{kind}: maxContextWindowFraction "
+                            f"{got_fraction!r} should be absent"
+                        )
+                elif (got_fraction is None
+                        or abs(got_fraction - want_fraction) > 1e-12):
+                    problems.append(
+                        f"{kind}: maxContextWindowFraction {got_fraction!r} "
+                        f"!= {want_fraction!r}"
+                    )
+            elif want_fraction is not None:
+                problems.append(
+                    f"{kind}: maxContextWindowFraction {want_fraction!r} "
+                    "expected and no row published"
+                )
         if len(got["rows"]) != len(expected["subjects"]):
             problems.append(
                 f"{kind}: {len(got['rows'])} rows != "

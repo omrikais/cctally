@@ -42,7 +42,7 @@ def test_idle_snapshot_forces_hydrating_false(monkeypatch, tmp_path):
         _cctally_tui._tui_empty_snapshot(NOW), hydrating=True
     )
     idle = _cctally_tui._tui_build_idle_snapshot(
-        prior, now_utc=NOW, precompute_envelope=False,
+        prior, claude_input_identity=None, now_utc=NOW, precompute_envelope=False,
         runtime_bind=None, raw_config={}, errors=[], codex_dependency=None,
     )
     assert idle.hydrating is False

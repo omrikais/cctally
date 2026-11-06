@@ -1,4 +1,12 @@
-"""Regression coverage for cache migration 027 (fork-preamble accounting)."""
+"""Regression coverage for cache migration 027 (fork-preamble accounting, #983).
+
+027 originally cleared every re-derivable Codex family out of band so the
+corrected fused parser would replay the rollouts and drop the copied
+fork-preamble ``model='unknown'`` rows. Since #983 the handler only arms
+``CODEX_REPLAY_FROM_ZERO_KEY``; the guarded replay inside ``sync_codex_cache``
+performs the repair, so a decoder-less upgrade keeps its retained history
+(recoverable) instead of losing it.
+"""
 from __future__ import annotations
 
 import fcntl
@@ -21,6 +29,16 @@ FIXTURE_DIR = (
 PRE_DB = FIXTURE_DIR / "pre.sqlite"
 POST_DB = FIXTURE_DIR / "post.sqlite"
 IDEMPOTENCY_COVERED = True
+
+REPLAY_MARKER = "codex_replay_from_zero_pending"
+#: cache_meta rows the handler must not touch (the pre-#983 handler deleted or
+#: bumped each of them).
+CODEX_META = (
+    ("codex_physical_mutation_seq", "7"),
+    ("codex_quota_projection_certificate", "stale"),
+    ("codex_journal_coverage_certificate", '{"sequence":7}'),
+    ("codex_journal_coverage_progress", '{"cursor":1}'),
+)
 
 
 def _seed_existing_cache(tmp_path, monkeypatch):
@@ -63,10 +81,8 @@ def _seed_existing_cache(tmp_path, monkeypatch):
             "VALUES ('/codex/fork.jsonl', 100, 1, 100, '2026-07-19T00:00:00Z', "
             "'child', 'gpt-5.6-sol', 10023, 'root-a')"
         )
-        conn.execute(
-            "INSERT INTO cache_meta(key, value) VALUES "
-            "('codex_physical_mutation_seq', '7'), "
-            "('codex_quota_projection_certificate', 'stale')"
+        conn.executemany(
+            "INSERT INTO cache_meta(key, value) VALUES (?, ?)", CODEX_META
         )
         conn.commit()
     finally:
@@ -94,43 +110,54 @@ def test_cache_registry_027_is_contiguous_after_026(tmp_path, monkeypatch):
     assert db._CACHE_MIGRATIONS[idx].seq == 27
 
 
-def test_027_clears_rederivable_codex_state_and_is_idempotent(tmp_path, monkeypatch):
+def _counts(conn):
+    return tuple(
+        conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("codex_session_entries", "codex_session_files",
+                      "codex_source_roots"))
+
+
+def test_the_marker_name_matches_the_constant_the_sync_consumes(tmp_path, monkeypatch):
+    """A drifted literal would arm a marker nothing reads."""
+    _seed_existing_cache(tmp_path, monkeypatch)
+    assert sys.modules["_cctally_cache"].CODEX_REPLAY_FROM_ZERO_KEY == REPLAY_MARKER
+
+
+def test_027_only_arms_the_replay_and_is_idempotent(tmp_path, monkeypatch):
+    """#983: the out-of-band clear destroyed retained history on a
+    decoder-less upgrade. The copied fork-preamble row stays until the guarded
+    replay re-derives it; only the replay marker changes here."""
     db, core = _seed_existing_cache(tmp_path, monkeypatch)
     conn = sqlite3.connect(core.CACHE_DB_PATH)
     try:
+        before = list(conn.iterdump())
+        assert _meta(conn, REPLAY_MARKER) is None
         _handler(db)(conn)
-        assert conn.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM codex_session_files").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM codex_source_roots").fetchone()[0] == 0
-        assert _meta(conn, "codex_physical_mutation_seq") == "8"
-        assert _meta(conn, "codex_quota_projection_certificate") is None
+        assert _meta(conn, REPLAY_MARKER) == "1"
+        assert [line for line in conn.iterdump()
+                if REPLAY_MARKER not in line] == before
+        assert _counts(conn) == (1, 1, 1)
+        for key, value in CODEX_META:
+            assert _meta(conn, key) == value, key
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = ?", (MIGRATION,)
+        ).fetchone()[0] == 0, "handler must never self-stamp"
 
         dump = list(conn.iterdump())
         _handler(db)(conn)
         assert list(conn.iterdump()) == dump
+        db._stamp_applied(conn, MIGRATION, "2026-07-19T12:00:00Z")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = ?", (MIGRATION,)
+        ).fetchone()[0] == 1
     finally:
         conn.close()
-
-
-def test_027_defers_before_dml_when_codex_flock_is_held(tmp_path, monkeypatch):
-    db, core = _seed_existing_cache(tmp_path, monkeypatch)
-    conn = sqlite3.connect(core.CACHE_DB_PATH)
-    lock_path = pathlib.Path(str(core.CACHE_DB_PATH) + ".codex.lock")
-    with open(lock_path, "w") as held:
-        fcntl.flock(held, fcntl.LOCK_EX)
-        try:
-            _handler(db)(conn)
-        except db.MigrationGateNotMet as exc:
-            assert "027" in str(exc)
-        else:
-            raise AssertionError("027 must defer while Codex sync owns the flock")
-        assert conn.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0] == 1
-    conn.close()
 
 
 def test_027_defers_before_dml_when_global_writer_flock_is_held(
     tmp_path, monkeypatch
 ):
+    """The dispatcher's own writer exclusion (not the handler) defers 027."""
     db, core = _seed_existing_cache(tmp_path, monkeypatch)
     lock_path = pathlib.Path(str(core.CACHE_DB_PATH) + ".lock")
     with open(lock_path, "w") as held:
@@ -142,6 +169,7 @@ def test_027_defers_before_dml_when_global_writer_flock_is_held(
             assert conn.execute(
                 "SELECT COUNT(*) FROM codex_session_entries"
             ).fetchone()[0] == 1
+            assert _meta(conn, REPLAY_MARKER) is None
         finally:
             conn.close()
 
@@ -155,13 +183,14 @@ def test_027_per_migration_goldens_pin_codex_replay_arm():
             "SELECT COUNT(*) FROM schema_migrations WHERE name = ?", (MIGRATION,)
         ).fetchone()[0] == 0
         assert pre.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0] == 1
+        assert _meta(pre, REPLAY_MARKER) is None
         assert post.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE name = ?", (MIGRATION,)
         ).fetchone()[0] == 1
-        assert post.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0] == 0
-        assert post.execute("SELECT COUNT(*) FROM codex_session_files").fetchone()[0] == 0
-        assert _meta(post, "codex_physical_mutation_seq") == "8"
-        assert _meta(post, "codex_quota_projection_certificate") is None
+        assert _counts(post) == _counts(pre)
+        assert _meta(post, REPLAY_MARKER) == "1"
+        for key in ("codex_physical_mutation_seq", "codex_quota_projection_certificate"):
+            assert _meta(post, key) == _meta(pre, key), key
     finally:
         pre.close()
         post.close()

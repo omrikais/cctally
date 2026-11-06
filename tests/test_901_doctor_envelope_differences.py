@@ -15,6 +15,9 @@ Owner A's final commit (tests/fixtures/901/doctor-baseline/). Required:
 - #997 adds exactly the Rebuild worker check and one OK count.
 - #944 adds exactly the Claude cost attribution check (OK, zero rows) and
   one OK count.
+- #1018 adds exactly five freshness-evidence details to the Latest usage
+  snapshot check: no accepted reading, no unavailable reason, and an
+  effective freshness equal to the baseline snapshot.
 A whole-golden refresh cannot pass this: any other byte difference fails.
 """
 
@@ -32,6 +35,7 @@ import pytest
 BIN = os.path.join(os.path.dirname(__file__), "..", "bin")
 sys.path.insert(0, BIN)
 doctor = importlib.import_module("_lib_doctor")
+_cctally_core = importlib.import_module("_cctally_core")
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BASELINE = ROOT / "tests" / "fixtures" / "901" / "doctor-baseline"
@@ -70,14 +74,15 @@ NEW_CATEGORY = {
 # Revision 9 (§5.3a, 901-PA-001 a) adds one cache migration after Owner A's
 # final commit. The doctor's registry views must grow by exactly that entry.
 #: #825/#832 (spec section 6, 8) authorizes two further differences, each
-#: asserted exactly: the stats epoch moves 1017 -> 1018, and since #797/#823/#840
-#: (spec 4.6 B6) to 1019 and #1019/#1014 (spec 4.7 C6) to 1020, then #943 to 1021 and #1015 to 1022 and #948 to 1023 (the `db.version_ahead`
-#: details and summary), and the journal category gains `journal.legacy_writer`
+#: asserted exactly: the stats epoch moves from the baseline's 1017 to the
+#: current epoch (#825/#832 moved it to 1018; the later history is the comment
+#: above `STATS_INDEX_EPOCH` in `bin/_cctally_core.py`) in the `db.version_ahead`
+#: details and summary, and the journal category gains `journal.legacy_writer`
 #: right after `journal.protocol`. On every fixture that leg is OK and reports
 #: either an unavailable summary or no cutover yet.
 # #968 adds cache migration 049; the registry views grow by that entry too.
 BASE_STATS_EPOCH = 1017
-ACCOUNT_BOUND_STATS_EPOCH = 1023
+ACCOUNT_BOUND_STATS_EPOCH = _cctally_core.STATS_INDEX_EPOCH
 LEGACY_WRITER_ID = "journal.legacy_writer"
 LEGACY_WRITER_AFTER = "journal.protocol"
 LEGACY_WRITER_SUMMARIES = (
@@ -253,6 +258,7 @@ ADDED_CACHE_MIGRATIONS = (
     "049_codex_rollout_containers",
     "050_preserve_claude_cost_attribution",
     "051_codex_retained_identities",
+    "052_codex_delete_trigger_plans",
 )
 
 
@@ -292,6 +298,35 @@ def _with_registry_growth(check):
                               + pending[last_cache + 1:])
         chk["summary"] = re.sub(
             r"^(\d+) pending", lambda m: f"{int(m.group(1)) + n} pending", chk["summary"])
+    return chk
+
+
+#: #1018 (spec revision 5): `data.latest_snapshot_age` gains exactly five
+#: freshness-evidence details. No doctor fixture holds an accepted reading or
+#: unreadable stats evidence, so the reading keys and the reason are null and
+#: the effective freshness is the baseline's snapshot (null when it has none).
+FRESHNESS_ID = "data.latest_snapshot_age"
+
+
+def _with_freshness_evidence(check):
+    """The baseline check with the #1018 details; any other check is
+    returned unchanged."""
+    if check["id"] != FRESHNESS_ID:
+        return check
+    chk = copy.deepcopy(check)
+    details = chk["details"]
+    assert not {"latest_reading_at", "latest_reading_age_s",
+                "freshness_unavailable_reason", "effective_freshness_at",
+                "effective_freshness_age_s"} & set(details)
+    details.update({
+        "latest_reading_at": None,
+        "latest_reading_age_s": None,
+        "freshness_unavailable_reason": None,
+        "effective_freshness_at": details.get("latest_snapshot_at"),
+        "effective_freshness_age_s": (
+            details.get("latest_snapshot_age_s")
+            if details.get("latest_snapshot_at") is not None else None),
+    })
     return chk
 
 
@@ -370,8 +405,8 @@ def test_only_the_authorized_doctor_differences(scenario):
                 assert (c_chk["id"], c_chk["title"]) == (b_chk["id"], b_chk["title"])
                 assert c_chk.get("remediation") == b_chk.get("remediation")
             else:
-                assert c_chk == _with_account_bound_epoch(
-                    _with_registry_growth(b_chk))
+                assert c_chk == _with_freshness_evidence(
+                    _with_account_bound_epoch(_with_registry_growth(b_chk)))
     assert remapped == 1
 
     # Counts, severity and the identity slice follow from those verdicts alone.

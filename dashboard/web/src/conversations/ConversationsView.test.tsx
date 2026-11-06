@@ -177,6 +177,12 @@ const searchResult = {
       project_label: 'repo-a',
       ts: '2026-05-13T09:10:00Z',
       snippet: 'the [flock] serializes writers',
+      // #1036 — the rail highlights only the server's structured matched parts.
+      snippet_parts: [
+        { text: 'the ', match: false },
+        { text: 'flock', match: true },
+        { text: ' serializes writers', match: false },
+      ],
       cost_usd: 0.05,
     },
   ],

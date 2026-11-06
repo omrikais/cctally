@@ -2,7 +2,7 @@
 residual gates (A session-id shared, B uuid-less coverage gap, C surviving
 key overlap), degraded conversation_messages, and marker re-establishment."""
 from __future__ import annotations
-import json, pathlib
+import json, os, pathlib
 import pytest
 from conftest import load_script, redirect_paths
 
@@ -473,3 +473,174 @@ def test_prune_with_an_unwritable_journal_prunes_nothing(env, monkeypatch,
     assert ("[cache-sync] prune-orphans skipped: the cctally journal could not"
             " be written.") in capsys.readouterr().err
     assert _counts(conn, conversations, str(gone))[:2] == (1, 1)
+
+
+# ---------------------------------------------------------------------------
+# #916: a full walk whose only defect is residual orphan rows writes the
+# `claude_ingest_walk_orphan_residual` token instead of the walk-complete
+# marker. The accounting frontier accepts either; every other reader of the
+# marker (the upgrade gate, the dashboard debug state) still sees it absent.
+# ---------------------------------------------------------------------------
+
+_MARKER = "claude_ingest_walk_complete"
+_TOKEN = "claude_ingest_walk_orphan_residual"
+
+
+def _meta(conn, key):
+    row = conn.execute("SELECT value FROM cache_meta WHERE key=?", (key,)).fetchone()
+    return None if row is None else row[0]
+
+
+def _residual_store(ns, conn, conversations, projects, *, prunable=False):
+    """Two surviving transcripts and one deleted one. Unless ``prunable``, the
+    deleted one has no ``uuid``, so gate B keeps it a residual."""
+    keep = projects / "-proj-keep" / "k.jsonl"
+    other = projects / "-proj-keep" / "o.jsonl"
+    gone = projects / "-proj-gone" / "g.jsonl"
+    _write(keep, "KEEP", [_assistant("mk", "rk", uuid="uk")])
+    _write(other, "OTHER", [_assistant("mo", "ro", uuid="uo")])
+    _write(gone, "GONE", [_assistant("mg", "rg", uuid="ug" if prunable else None)])
+    _sync(ns, conn, conversations)
+    assert _meta(conn, _MARKER) is not None, "guard: the store starts complete"
+    import os; os.remove(gone)
+    return keep, other, gone
+
+
+def _append(path, sid, *lines):
+    with path.open("a") as fh:
+        for ln in lines:
+            ln = dict(ln); ln["sessionId"] = sid
+            fh.write(json.dumps(ln) + "\n")
+
+
+def test_a_residual_only_walk_leaves_the_marker_absent(env):
+    """#916 A7. Detects: certifying the frontier by writing the walk-complete
+    marker over orphan rows, which would let the upgrade gate stamp the
+    008/009/010 recomputes over data that no longer has a source."""
+    ns, conn, conversations, projects = env
+    keep, other, gone = _residual_store(ns, conn, conversations, projects)
+    stats = ns["sync_cache"](conn)
+
+    assert _meta(conn, _TOKEN) is not None
+    assert _meta(conn, _MARKER) is None
+    assert stats.full_walk_complete is False
+    assert stats.full_walk_residual_only is True
+    assert stats.orphan_residual_count == 1
+    assert json.loads(_meta(conn, _TOKEN))["orphans"] == 1
+    import _cctally_db as db
+    with pytest.raises(db.MigrationGateNotMet):
+        db._gate_001_post_ingest_completed(conn, [projects], data_present=True)
+
+
+def test_identical_residual_walks_write_nothing_and_a_changed_set_rewrites_once(env):
+    """#916 A8 (#901 W8). Detects: a residual-only walk rewriting its token on
+    every dashboard tick, and a changed orphan set leaving a stale token."""
+    ns, conn, conversations, projects = env
+    keep, other, gone = _residual_store(ns, conn, conversations, projects)
+    ns["sync_cache"](conn)
+    first = _meta(conn, _TOKEN)
+    assert first is not None
+
+    before = conn.total_changes
+    ns["sync_cache"](conn)
+    assert conn.total_changes == before, "an identical residual-only walk wrote"
+    assert _meta(conn, _TOKEN) == first
+
+    import os; os.remove(other)
+    ns["sync_cache"](conn)
+    second = _meta(conn, _TOKEN)
+    assert second != first
+    assert json.loads(second)["orphans"] == 2
+    assert json.loads(second)["fingerprint"] != json.loads(first)["fingerprint"]
+
+    before = conn.total_changes
+    ns["sync_cache"](conn)
+    assert conn.total_changes == before, "the rewritten token was rewritten again"
+    assert _meta(conn, _TOKEN) == second
+
+
+def test_residual_token_lifecycle(env):
+    """#916 A9. Detects: a targeted live-tail walk disturbing the token, and a
+    cleared residual leaving the token beside the marker it replaces."""
+    ns, conn, conversations, projects = env
+    keep, other, gone = _residual_store(
+        ns, conn, conversations, projects, prunable=True)
+    ns["sync_cache"](conn)
+    token = _meta(conn, _TOKEN)
+    assert token is not None
+
+    _append(keep, "KEEP", _assistant("mk2", "rk2", uuid="uk2"))
+    targeted = ns["sync_cache"](conn, only_paths={str(keep)})
+    assert targeted.targeted_clean and targeted.files_processed == 1, targeted
+    assert _meta(conn, _TOKEN) == token, "a targeted walk touched the token"
+    assert _meta(conn, _MARKER) is None
+
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.pruned_files == 1 and res.residual_paths == [], res
+    stats = ns["sync_cache"](conn)
+    assert stats.full_walk_complete and not stats.full_walk_residual_only
+    assert _meta(conn, _MARKER) is not None
+    assert _meta(conn, _TOKEN) is None, "the marker and the token are exclusive"
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="chmod-0 unreadable injection has no effect when running as root",
+)
+def test_an_on_disk_defect_beside_an_orphan_withdraws_the_token(env):
+    """#916 A9. Detects: a walk that skipped an on-disk file keeping a token
+    that vouches every on-disk source was ingested."""
+    import _lib_ingest_frontier as frontier
+    ns, conn, conversations, projects = env
+    keep, other, gone = _residual_store(ns, conn, conversations, projects)
+    ns["sync_cache"](conn)
+    assert _meta(conn, _TOKEN) is not None
+
+    _append(other, "OTHER", _assistant("mo2", "ro2", uuid="uo2"))
+    other.chmod(0)
+    try:
+        stats = ns["sync_cache"](conn)
+    finally:
+        other.chmod(0o644)
+    assert stats.files_failed == 1, "guard: the unreadable file must fail its read"
+    assert _meta(conn, _TOKEN) is None and _meta(conn, _MARKER) is None
+    assert not frontier.provider_sync_certifiable("full", stats), stats
+
+    recovered = ns["sync_cache"](conn)
+    assert recovered.full_walk_residual_only and _meta(conn, _TOKEN) is not None
+
+
+def test_residual_walks_leave_orphan_rows_and_ingest_appends_once(env):
+    """#916 A5. Detects: residual-only walks (the walks a certified orphan
+    store runs: targeted for a ticketed append, full at expiry) losing or
+    double-counting accounting rows, either the orphan's retained rows or
+    bytes appended to a surviving transcript."""
+    ns, conn, conversations, projects = env
+    keep, other, gone = _residual_store(ns, conn, conversations, projects)
+
+    def orphan_rows():
+        return conn.execute(
+            "SELECT * FROM session_entries WHERE source_path=? ORDER BY line_offset",
+            (str(gone),)).fetchall()
+
+    first = ns["sync_cache"](conn)
+    retained = orphan_rows()
+    assert len(retained) == 1
+    second = ns["sync_cache"](conn)
+    assert first.full_walk_residual_only and second.full_walk_residual_only
+    assert orphan_rows() == retained
+
+    _append(keep, "KEEP", _assistant("mk2", "rk2", uuid="uk2"),
+            _assistant("mk3", "rk3", uuid="uk3"))
+    targeted = ns["sync_cache"](conn, only_paths={str(keep)})
+    assert targeted.targeted_clean and targeted.files_processed == 1, targeted
+    full = ns["sync_cache"](conn)
+    assert full.full_walk_residual_only and full.files_processed == 0, full
+
+    # Each logical message exactly once: a re-read under a fresh physical key
+    # or a lost append changes this multiset (the physical key itself is
+    # UNIQUE, so it cannot show a double count).
+    assert sorted(conn.execute(
+        "SELECT msg_id, req_id FROM session_entries WHERE source_path=?",
+        (str(keep),)).fetchall()) == [("mk", "rk"), ("mk2", "rk2"), ("mk3", "rk3")]
+    assert orphan_rows() == retained

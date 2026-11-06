@@ -873,6 +873,123 @@ _READ_HEADS = ("SELECT", "PRAGMA", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
                "RELEASE", "WITH", "ATTACH", "DETACH", "EXPLAIN", "--")
 
 
+def test_reconcile_repairs_in_atomic_batches_and_survives_a_failed_batch(env):
+    """#972 §5.4: the per-pass rollup reconcile rewrites drifted rollups in
+    bounded batches, each atomic with its render revision. A database error in
+    one batch loses only that batch (earlier ones stay committed), fails the
+    pass, and the next full pass repairs the rest; a settled pass writes
+    nothing."""
+    size = env.cache.CODEX_ROLLUP_RECONCILE_BATCH
+    count = size + 6
+    for index in range(count):
+        env.rollout(f"r{index:03d}", f"recon{index:03d}", 1)
+    store = env.store("store")
+    try:
+        store.run_pass()
+        keys = store.keys()
+        assert len(keys) == count
+        labels = {k: store.conn.execute(
+            "SELECT project_key, project_label FROM codex_conversation_rollups "
+            "WHERE conversation_key=?", (k,)).fetchone() for k in keys}
+        store.conn.execute("UPDATE codex_conversation_rollups "
+                           "SET project_key='stale', project_label='stale'")
+        store.conn.commit()
+        revisions = store.render_revisions()
+        real = env.cache._recompute_codex_rollups
+        batches: list[list[str]] = []
+
+        def reconcile_spy(conn, conversation_keys, **kwargs):
+            if kwargs.get("attribution_cache") is None:   # a walk batch
+                return real(conn, conversation_keys, **kwargs)
+            batches.append(sorted(conversation_keys))
+            real(conn, conversation_keys, **kwargs)
+            if len(batches) == 2 and failing:
+                raise sqlite3.OperationalError("injected: reconcile batch 2")
+            return None
+
+        def project(key):
+            return store.conn.execute(
+                "SELECT project_key, project_label FROM codex_conversation_rollups "
+                "WHERE conversation_key=?", (key,)).fetchone()
+
+        failing = True
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(env.cache, "_recompute_codex_rollups", reconcile_spy)
+            with pytest.raises(sqlite3.OperationalError, match="batch 2"):
+                store.run_pass()
+            assert not store.conn.in_transaction
+            assert batches == [sorted(keys)[:size], sorted(keys)[size:]]
+            first, second = batches
+            after = store.render_revisions()
+            assert all(project(k) == labels[k] for k in first)
+            assert len({after[k] for k in first}) == 1      # one revision
+            assert all(after[k] > revisions[k] for k in first)
+            assert all(project(k) == ("stale", "stale") for k in second)
+            assert all(after[k] == revisions[k] for k in second)
+
+            batches.clear()
+            failing = False
+            trace = store.run_pass()
+            assert trace.stats.rollups_reattributed == len(second)
+            assert batches == [second]
+            repaired = store.render_revisions()
+            assert all(project(k) == labels[k] for k in keys)
+            assert len({repaired[k] for k in second}) == 1
+            assert all(repaired[k] > after[first[0]] for k in second)
+            assert all(repaired[k] == after[k] for k in first)
+
+            batches.clear()
+            trace = store.run_pass()
+            assert trace.stats.rollups_reattributed == 0
+            assert batches == []                  # no reconcile transaction
+            assert store.render_revisions() == repaired
+            assert not any("codex_conversation_rollups" in s.lower()
+                           and s.lstrip().upper().startswith(("INSERT", "UPDATE"))
+                           for t in trace.transactions for s in t.statements)
+    finally:
+        store.close()
+
+
+def test_rollup_writer_derives_every_key_before_its_first_write(env):
+    """#972 §5.8 rule 5. The first rollup write takes the conversations write
+    lock; deriving later keys after it held that lock across their full-row
+    loads (seconds per reconcile batch on a large store), stalling every
+    other writer. Every derivation read must precede the first write, for a
+    call that both upserts and deletes."""
+    for index in range(3):
+        env.rollout(f"w{index}", f"order{index}", 1)
+    store = env.store("store")
+    try:
+        store.run_pass()
+        keys = store.keys()
+        assert len(keys) == 3
+        statements: list[str] = []
+        conn = store.conn
+        conn.execute("BEGIN")
+        conn.set_trace_callback(statements.append)
+        try:
+            env.cache._recompute_codex_rollups(
+                conn, [*keys, "v1.no-such-conversation"], inputs_changed=True)
+        finally:
+            conn.set_trace_callback(None)
+            conn.rollback()
+        derivation_tables = ("codex_conversation_messages",
+                             "codex_conversation_threads",
+                             "codex_conversation_rollups")
+        reads = [i for i, sql in enumerate(statements)
+                 if sql.lstrip().upper().startswith(("SELECT", "WITH"))
+                 and any(t in sql for t in derivation_tables)]
+        writes = [i for i, sql in enumerate(statements)
+                  if sql.lstrip().upper().startswith(
+                      ("INSERT", "UPDATE", "DELETE", "REPLACE"))]
+        assert reads and writes
+        assert any(statements[i].lstrip().upper().startswith("DELETE")
+                   for i in writes)
+        assert max(reads) < min(writes), statements
+    finally:
+        store.close()
+
+
 def _claude_line(session: str, number: int, text: str) -> str:
     return json.dumps({
         "type": "assistant",

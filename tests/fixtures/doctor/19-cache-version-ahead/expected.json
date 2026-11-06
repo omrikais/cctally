@@ -189,12 +189,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 51,
+                        "registry_size": 52,
                         "user_version": 99
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 99 / 51 known",
+                    "summary": "version 99 / 52 known",
                     "title": "cache.db"
                 },
                 {
@@ -212,11 +212,11 @@
                     "details": {
                         "cache.db": {
                             "ahead": true,
-                            "registry_size": 51,
+                            "registry_size": 52,
                             "user_version": 99
                         },
                         "stats.db": {
-                            "epoch": 1023,
+                            "epoch": 1024,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -225,7 +225,7 @@
                     "id": "db.version_ahead",
                     "remediation": "Auto-heals on next command, or run `cctally db recover --db cache`",
                     "severity": "warn",
-                    "summary": "cache.db ahead (v99 > known v51) \u2014 auto-heals",
+                    "summary": "cache.db ahead (v99 > known v52) \u2014 auto-heals",
                     "title": "Version ahead"
                 },
                 {
@@ -331,7 +331,8 @@
                                     "048_codex_quota_physical_group_order",
                                     "049_codex_rollout_containers",
                                     "050_preserve_claude_cost_attribution",
-                                    "051_codex_retained_identities"
+                                    "051_codex_retained_identities",
+                                    "052_codex_delete_trigger_plans"
                                 ],
                                 "skipped": []
                             },
@@ -359,7 +360,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/64 applied",
+                    "summary": "0/65 applied",
                     "title": "Migrations"
                 },
                 {
@@ -620,13 +621,17 @@
                             [
                                 "cache.db",
                                 "051_codex_retained_identities"
+                            ],
+                            [
+                                "cache.db",
+                                "052_codex_delete_trigger_plans"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "64 pending",
+                    "summary": "65 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -822,6 +827,11 @@
             "checks": [
                 {
                     "details": {
+                        "effective_freshness_age_s": 2,
+                        "effective_freshness_at": "2026-05-13T14:22:29+00:00",
+                        "freshness_unavailable_reason": null,
+                        "latest_reading_age_s": null,
+                        "latest_reading_at": null,
                         "latest_snapshot_age_s": 2,
                         "latest_snapshot_at": "2026-05-13T14:22:29+00:00"
                     },

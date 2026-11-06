@@ -450,6 +450,14 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
     "_lib_ingest_frontier.py": 8,
     "_lib_snapshot_cache.py": 1,
+    # Three (#1050), each over a hardcoded Claude stats table set:
+    # `_trigger_sql`'s below-max INSERT predicate `SELECT 1 FROM {table}` and
+    # `trigger_lookup_queries`' `EXPLAIN` twin of it range over the kernel's
+    # `TRACKED_TABLES`, and `child_set_unchanged`'s `SELECT * FROM {table}`
+    # over `CHILD_TABLES` (the two five-hour block child tables), checked
+    # before the query is built. None is a quota projection table, so no
+    # `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_lib_stats_content_revision.py": 3,
     "_lib_subscription_weeks.py": 1,
 }
 
@@ -4674,6 +4682,100 @@ def _first_block_physical_tuple(
         return None
 
 
+def codex_entry_selection_bounds(
+    start_captured_at: dt.datetime, last_captured_at_utc: object,
+) -> tuple[str, str]:
+    """The SQL text bounds of ``codex_quota_breakdown``'s accounting read.
+
+    ``timestamp_utc`` is stored in canonical ``Z`` form, while retained quota
+    observations may have arrived as ``+00:00``.  Keep this SQL bound
+    deliberately one second wider and let the physical-tuple comparison in the
+    breakdown enforce the exact inclusive endpoint.  This preserves same-second
+    path/offset ordering without relying on mixed-spelling text equality.
+
+    One definition (#1050 spec 4.7), because the Codex cycle-detail stamp's
+    per-selection aggregate (``codex_entry_selection_aggregate``) must select
+    exactly the rows the breakdown prices.
+    """
+    query_start = (
+        start_captured_at - dt.timedelta(seconds=1)
+    ).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    query_end = (
+        _parse_utc(str(last_captured_at_utc), "captured_at_utc")
+        + dt.timedelta(seconds=1)
+    ).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return query_start, query_end
+
+
+def codex_entry_models(cache_conn: sqlite3.Connection) -> tuple[str, ...]:
+    """Every distinct ``codex_session_entries.model``, ascending (#1050).
+
+    One ``model > ?`` seek per model through ``idx_codex_entries_model_time``
+    rather than a ``SELECT DISTINCT`` over the table: the population is a few
+    dozen models, the table is history-sized.
+    """
+    models: list[str] = []
+    last = None
+    while True:
+        if last is None:
+            row = cache_conn.execute(
+                "SELECT MIN(model) FROM codex_session_entries").fetchone()
+        else:
+            row = cache_conn.execute(
+                "SELECT MIN(model) FROM codex_session_entries WHERE model > ?",
+                (last,)).fetchone()
+        if row is None or row[0] is None:
+            return tuple(models)
+        last = str(row[0])
+        models.append(last)
+
+
+def codex_entry_selection_aggregate(
+    cache_conn: sqlite3.Connection, *, source_root_key: str,
+    query_start: str, query_end: str, account_key: str | None,
+    models: tuple[str, ...],
+) -> tuple:
+    """The aggregate twin of ``codex_quota_breakdown``'s accounting read.
+
+    #1050 spec 4.7: the same ``source_root_key``, the same text timestamp
+    bounds (``codex_entry_selection_bounds``) and the same STRICT account
+    predicate, returning ``(COUNT(*), MAX(rowid), per_model)`` where
+    ``per_model`` is ``(model, count, TOTAL input, TOTAL cached input, TOTAL
+    output, TOTAL reasoning output, TOTAL total)`` for every model with a row,
+    ascending by model. A Codex cycle-detail stamp carries it, so a late entry
+    inside a past milestone interval, a removed one or a re-tokenized one
+    re-stamps the cycle whose dollars it moves.
+
+    One statement per model, so each seeks ``idx_codex_entries_model_time``
+    (``model``, ``timestamp_utc``) and SQLite builds no temp b-tree: a
+    ``GROUP BY model`` over the timestamp range sorts every row it selects. The
+    unary ``+`` keeps the planner off the root-only index, which on a one-root
+    install is a scan of the whole table; it removes the column's affinity,
+    which is equivalent here because the root key is TEXT bound as a string.
+    """
+    entry_predicate, entry_params = _codex_cache_account_predicate(account_key)
+    total_count = 0
+    max_rowid = None
+    per_model: list[tuple] = []
+    for model in models:
+        row = cache_conn.execute(
+            "SELECT COUNT(*), MAX(rowid), TOTAL(input_tokens), "
+            "       TOTAL(cached_input_tokens), TOTAL(output_tokens), "
+            "       TOTAL(reasoning_output_tokens), TOTAL(total_tokens) "
+            "  FROM codex_session_entries "
+            " WHERE model=? AND timestamp_utc>=? AND timestamp_utc<=? "
+            "   AND +source_root_key=? " + entry_predicate,
+            (model, query_start, query_end, source_root_key, *entry_params),
+        ).fetchone()
+        count = int(row[0] or 0)
+        if not count:
+            continue
+        total_count += count
+        max_rowid = row[1] if max_rowid is None else max(max_rowid, row[1])
+        per_model.append((model, count, *(float(v) for v in row[2:])))
+    return (total_count, max_rowid, tuple(per_model))
+
+
 def codex_quota_breakdown(
     identity: QuotaWindowIdentity,
     resets_at: str | dt.datetime,
@@ -4747,18 +4849,8 @@ def codex_quota_breakdown(
         if owns_cache:
             cache.close()
         return ()
-    # ``timestamp_utc`` is stored in canonical ``Z`` form, while retained
-    # quota observations may have arrived as ``+00:00``.  Keep this SQL bound
-    # deliberately one second wider and let the physical-tuple comparison
-    # below enforce the exact inclusive endpoint.  This preserves same-second
-    # path/offset ordering without relying on mixed-spelling text equality.
-    query_start = (
-        start[0] - dt.timedelta(seconds=1)
-    ).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    query_end = (
-        _parse_utc(str(milestones[-1][1]), "captured_at_utc")
-        + dt.timedelta(seconds=1)
-    ).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    query_start, query_end = codex_entry_selection_bounds(
+        start[0], milestones[-1][1])
     try:
         entries = []
         # Cost read: strict, always. See the docstring above.

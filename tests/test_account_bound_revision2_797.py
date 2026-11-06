@@ -371,8 +371,8 @@ def test_render_never_establishes_the_revision(app, monkeypatch):
     _original_cutover_only()
     before = _journal_bytes()
     forks = []
-    monkeypatch.setattr(sl, "_fork_persist", lambda fd, reservation: (
-        forks.append(fd), sl._release_reservation(reservation)))
+    monkeypatch.setattr(sl, "_dispatch_render_worker", lambda reservation: (
+        forks.append(reservation), sl._release_reservation(reservation)))
     parsed = app._lib_statusline.parse_statusline_stdin(json.dumps({
         "session_id": "peer", "rate_limits": {
             "seven_day": {"used_percentage": 25,
@@ -823,9 +823,10 @@ def test_epoch_1020_rejects_1019_completion_and_selector_proofs(
     stamp and the selector proof read through it are not proofs at 1020."""
     import _cctally_core as core
     import _cctally_journal
-    # #943 moved the index epoch on to 1021 and #1015 to 1022 and #948 to 1023; the derivation
-    # frontier epoch stays at the revision-3 fence's 1020.
-    assert core.STATS_INDEX_EPOCH == 1023
+    # The revision-3 fence arrived at index epoch 1020, and the derivation
+    # frontier epoch stays there; the later index history is the comment above
+    # `STATS_INDEX_EPOCH` in `bin/_cctally_core.py`.
+    assert core.STATS_INDEX_EPOCH >= 1020
     assert _cctally_journal.DERIVATION_FRONTIER_EPOCH == 1020
     T.current(app, monkeypatch, at="2026-10-08T10:00:00Z", weekly=5,
               week_end=WEEK_END)
@@ -1023,7 +1024,7 @@ def test_revision3_boundary_precedes_every_authoritative_decision(
     assert _revision3_ops() == []
     rendered = _journal_bytes()
     with monkeypatch.context() as render:
-        render.setattr(sl, "_fork_persist", lambda fd, reservation:
+        render.setattr(sl, "_dispatch_render_worker", lambda reservation:
                        sl._release_reservation(reservation))
         sl._statusline_persist(app._lib_statusline.parse_statusline_stdin(
             json.dumps({"session_id": "peer", "rate_limits": {"seven_day": {

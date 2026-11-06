@@ -8083,3 +8083,162 @@ def test_1040_milestone_moved_to_an_open_block_keeps_todays_path(
     assert {k: _1040_target_value(v) for k, v in plan.targets.items()} == \
         {_884_ONE: (3.0, None)}, summary
     assert [d.block for d in plan.decisions] == [(_875_ACCOUNT, _875_WINDOW)]
+
+
+# --------------------------------------------------------------------------
+# #1004 T7 (rederive part) and T5 (`_reconcile_snapshot_identities`)
+# --------------------------------------------------------------------------
+
+
+def _legacy_journal(mod):
+    """A cutover naming `acct-a`, then legacy unstamped Claude readings and
+    legacy unstamped Codex quota observations (one shared stub shape)."""
+    import _cctally_core
+    import _cctally_journal as runtime
+    import _lib_journal as journal
+
+    cutover = journal.make_op(
+        at="2026-07-25T11:00:00Z", src="accounts-cutover",
+        payload={"kind": "accounts_cutover",
+                 "claude_legacy_account": "acct-a"})
+    cutover["id"] = runtime.CUTOVER_OP_ID
+    records = [cutover]
+    for n in range(6):
+        captured = f"2026-07-25T12:{n:02d}:00Z"
+        obs = _raw_obs(journal)
+        obs.pop("account")
+        obs = journal.make_obs(
+            at=captured, src="record-usage", provider="claude",
+            payload={**obs["payload"], "captured_at": captured,
+                     "weekly_percent": 10.0 + n})
+        records.append(journal.unstamped_record(obs))
+        records.append(journal.unstamped_record(journal.make_obs(
+            at=captured, src="codex-quota", provider="codex",
+            payload={"kind": "quota_window_snapshot", "source": "codex",
+                     "line_offset": n, "used_percent": 5.0 + n})))
+    _cctally_core.JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    path = _cctally_core.JOURNAL_DIR / "observations-2026-07.jsonl"
+    path.write_bytes(b"".join(journal.encode_line(r) for r in records))
+    return records
+
+
+def test_planning_view_normalizes_streamed_records_at_decode(
+    tmp_path, monkeypatch
+):
+    """#1004 T7: legacy unattributed records under an `accounts_cutover`
+    normalize identically through the planning view whether the reader
+    streams them or lists them; the shared Codex stubs normalize once (one
+    normalized object for every position, the stub itself untouched); and a
+    streamed slot's decode never goes through the `id()` memo, which a freed
+    decode's reused address would otherwise hit with another position's
+    record. Mis-normalized, the legacy readings fold under `unattributed`."""
+    monkeypatch.setenv("CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER", "1")
+    mod = _isolated(tmp_path, monkeypatch)
+    import _cctally_rederive as command
+    import _lib_retained_records as RR
+
+    _legacy_journal(mod)
+    records = command.read_rederive_journal_prefix()[0]
+    with monkeypatch.context() as patch:
+        patch.setattr(RR, "MATERIALIZE_FOR_TESTS", True)
+        listed = command.read_rederive_journal_prefix()[0]
+    view = command._normalized_planning_view(records)
+    expected = command._normalized_planning_view(listed)
+    assert not isinstance(view, list)
+    assert list(view) == expected and list(view) == list(view)
+    claude = [i for i, r in enumerate(expected) if r.get("provider") == "claude"]
+    codex = [i for i, r in enumerate(expected) if r.get("provider") == "codex"]
+    assert len(claude) == len(codex) == 6
+    assert {expected[i]["account"] for i in claude} == {"acct-a"}
+    assert {expected[i]["account"] for i in codex} == {"unattributed"}
+    # Shared stubs: one normalized object for every position.
+    shared = {id(view[i]) for i in codex} | {id(r) for i, r in
+                                             enumerate(view) if i in codex}
+    assert len(shared) == 1
+    assert all("account" not in records.slot(i) for i in codex)
+    assert all(records.is_streamed(i) for i in claude)
+    # Streamed decodes: alternating access never returns another position.
+    for _round in range(3):
+        for i in claude:
+            got = view[i]
+            assert got == expected[i] and got is not view[i]
+
+
+class _Changed(Exception):
+    pass
+
+
+def test_reconcile_snapshot_identities_keeps_positions_not_records(tmp_path):
+    """#1004 T5: after its collection pass `_reconcile_snapshot_identities`
+    holds positions, not decoded observations, for its unmatched snapshot
+    identities: under 64 bytes per streamed raw observation at the first
+    transition check. It used to convert a lazy sequence to a tuple and keep
+    `(index, record)` per identity, re-materializing the journal."""
+    import gc
+    import tracemalloc
+
+    import _lib_rederive as rederive
+    import _lib_retained_records as RR
+
+    count = 2000
+    lines = []
+    for n in range(count):
+        lines.append(json.dumps({
+            "t": "obs", "provider": "claude", "id": f"o:{n:06d}",
+            "at": "2026-07-25T12:00:00Z", "account": "acct-a",
+            "payload": {"weekly_percent": 10.0, "resets_at": 1785542400,
+                        "source": "statusline", "pad": "p" * 400}},
+            separators=(",", ":")).encode())
+    path = tmp_path / "seg.jsonl"
+    path.write_bytes(b"".join(line + b"\n" for line in lines))
+
+    class Reader:
+        def __init__(self):
+            self._fh = open(path, "rb")
+
+        def read(self, segment, start, length):
+            self._fh.seek(start)
+            return self._fh.read(length)
+
+        def close(self):
+            self._fh.close()
+
+    seq = RR.RetainedRecords(RR.LineCoordinates(), Reader, json.loads,
+                             error=_Changed)
+    offset = 0
+    for line in lines:
+        seq.append_streamed(line, "seg.jsonl", offset, len(line))
+        offset += len(line) + 1
+    # One unmatched desired identity at the front, and an unmatched current
+    # identity for every tenth later observation.
+    current = {f"sa:o:{n:06d}": {"payload": {"kind": "snapshot_accept"}}
+               for n in range(10, count, 10)}
+    desired = {"sa:o:000000": {"payload": {"kind": "snapshot_accept"}}}
+
+    class Selection:
+        by_id: dict = {}
+
+    seen = {}
+    real = rederive._same_acceptance_transition
+
+    def transition(*args, **kwargs):
+        if "first" not in seen:
+            gc.collect()
+            seen["first"] = tracemalloc.get_traced_memory()[0] - base
+        return False
+
+    rederive._same_acceptance_transition = transition
+    tracemalloc.start()
+    try:
+        gc.collect()
+        base = tracemalloc.get_traced_memory()[0]
+        rederive._reconcile_snapshot_identities(
+            current, desired, Selection(), seq)
+    finally:
+        tracemalloc.stop()
+        rederive._same_acceptance_transition = real
+        seq.close()
+    assert "first" in seen, "non-vacuity: the transition check ran"
+    per = seen["first"] / count
+    print(f"T5 reconcile after collection: {per:.1f} bytes per record")
+    assert per < 64, per

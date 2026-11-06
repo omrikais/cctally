@@ -5,6 +5,36 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.118.0] - 2026-11-06
+
+### Added
+- Codex cost reports price `gpt-6.1-terra`, `gpt-6-rosalind` and `gpt-6-astra-law` from their published rate cards, and `gpt-5.5-cyber-preview` as `gpt-5.5-cyber`, instead of falling back to `gpt-5` rates.
+
+### Changed
+- `cctally doctor` checks an unchanged journal about three times faster. It keeps a small cache of its journal scan in the journal folder and verifies the journal against it by hash, so every check still sees every byte.
+- Repairing or fully re-reading Codex history (`cctally cache-sync --source codex` or the background worker) no longer locks the cache for the whole run, so Codex hooks keep recording usage during a history repair, and repairs re-read less.
+- While a Codex history repair runs (`cctally cache-sync --source codex` or the background worker), a Claude Code hook that arrives mid-step now waits briefly for its turn, so your Claude usage is recorded right away, not minutes later.
+- Upgrade rebuilds of `stats.db` and `cctally db rederive` finish much faster on large journals, and `cctally db rederive` uses less memory. Upgrade rebuilds, `db rebuild --db stats` and `db rederive --yes` write far less to disk.
+
+### Fixed
+- Sessions from a removed git worktree now show and group under their repository in `project`, the `dashboard` and the Conversation Viewer instead of `.worktrees`; a `.git` folder counts only when it holds a repository.
+- Codex conversation project labels in the `dashboard` Conversation Viewer now stay current: a label left on an earlier folder or `(unassigned)` is corrected on the next full refresh.
+- Anonymized Codex `transcript export` output now scrubs both the repository name and the session folder's own name, as Claude exports already do.
+- The `dashboard` no longer rescans every Claude transcript on every refresh when its cache still tracks transcripts that were deleted from disk.
+- Compressed Codex history that fails conversation verification no longer keeps the `dashboard` rescanning every Claude and Codex transcript on each refresh; that history keeps its last verified view until it changes.
+- Upgrading from a cctally older than 1.74.0 on a Python without a zstd decoder keeps cached Codex history in `codex-*` reports; it is fully refreshed once Python 3.14+ or `backports.zstd` is available.
+- The dashboard's Doctor modal and `cctally doctor` now wait at most half a second in total for stats.db maintenance, instead of about 5 seconds per database read (40 to 60 seconds per report), and report the maintenance.
+- `cctally doctor`'s Latest snapshot check no longer fails with "Hooks may be broken" when usage stays flat for over an hour; it now counts every accepted reading, and says when stats.db cannot be read.
+- The Current Week freshness chip in `cctally dashboard` and `cctally tui` no longer turns stale while usage stays flat; it now ages from the newest reading that confirms the shown percentage.
+- An interrupted `cctally cache-sync --source codex --rebuild` no longer gives Codex usage from before account tracking to the account logged in at the retry; it stays unattributed. A rebuild with an unreadable rollout now stays pending.
+- A running `dashboard` now shows corrected usage, milestone and block figures after a stored correction (`db rederive`, a rebuild or an in-place fix) without a new sample, and a reopened Claude or Codex cycle detail shows current figures.
+- `explain`'s short-conversations-with-large-context class no longer measures prior-generation Claude requests above 200K tokens against a 200K window, and reports a request it cannot place as undecided instead of guessing.
+- `cctally dashboard --no-sync` started while stats.db is being rebuilt after an upgrade or repaired after corruption now shows your data once that finishes, instead of staying empty until a restart.
+- Conversation Viewer search results in the `dashboard` now keep a transcript's own square brackets, such as `[WARN]`, as text and highlight only the words your search matched.
+- The `dashboard` Conversation Viewer header now shows a Codex conversation's project and git branch, or `no branch recorded` when Codex saved none, instead of `—`, as it does for a Claude conversation opened from All.
+- The `statusline` no longer runs at full CPU for minutes after recording a reading on macOS, and Claude Code hooks no longer pile up behind it: a `hook-tick` that finds another usage refresh already in progress skips its own.
+- Removing cached Codex history for deleted rollout files (`cctally cache-sync` and the background cleanup) and recording Codex conversation updates no longer slow down as history grows; a 20-minute cleanup now takes a few minutes.
+
 ## [1.117.2] - 2026-11-03
 
 ### Fixed

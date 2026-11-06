@@ -2450,6 +2450,108 @@ def _dashboard_sync_loop(
             sleep(min(0.1, max(0.0, deadline - now)))
 
 
+def _frozen_deferral_settle_loop(
+    *,
+    stop,
+    interval: float,
+    ref,
+    sync_lock,
+    run_locked,
+    mark_rebuilding,
+    is_deferred,
+    monotonic=time.monotonic,
+    wait=None,
+) -> None:
+    """Retry a frozen dashboard's no-ingest build until recovery permits it (#932).
+
+    `--no-sync` starts no sync thread, so a frozen dashboard whose first build
+    DEFERRED (an older-epoch index, or a corruption heal running detached) would
+    otherwise hold that data-less deferral frame for its whole life. This loop
+    retries the dashboard's existing locked publisher with ``skip_sync=True``
+    (the same no-ingest build a manual ``POST /api/sync`` runs: no ingest, no
+    OAuth refresh, no derivations) only while the held frame is an EXPLICIT
+    stats deferral (``is_deferred``, the `SyncFailureAttribution.deferred`
+    predicate), and exits for good on any other outcome — a populated or empty
+    success, a crash, an exhausted corruption retry.
+
+    Cadence: one ``interval`` before the first attempt, then
+    ``_next_deadline(t0, interval, work)``, the #313 cooldown that bounds duty
+    to 50 %. The ``sync_lock`` acquire is NON-blocking; contention skips that
+    cadence. Every attempt does all of its work under the lock and rechecks
+    ``stop`` right after acquiring it, which is what makes
+    `_retire_frozen_deferral_settle`'s lock fence exact. ``wait(seconds)``
+    returns True when stopped (``stop.wait`` in production).
+    """
+    if wait is None:
+        wait = stop.wait
+    deadline = monotonic() + interval
+    while True:
+        if wait(max(0.0, deadline - monotonic())) or stop.is_set():
+            return
+        if not is_deferred(ref.get()):
+            return   # settled elsewhere (a manual sync): no extra build
+        if not sync_lock.acquire(blocking=False):
+            deadline = monotonic() + interval
+            continue
+        try:
+            if stop.is_set() or not is_deferred(ref.get()):
+                return
+            t0 = monotonic()
+            try:
+                with _rebuilding_claim(mark_rebuilding):
+                    run_locked(skip_sync=True)
+            except Exception:  # noqa: BLE001 — logged; the loop is done
+                _log_sync_iteration_failure()
+                return
+            work = monotonic() - t0
+            still_deferred = is_deferred(ref.get())
+        finally:
+            sync_lock.release()
+        if not still_deferred:
+            return
+        deadline = _next_deadline(t0, interval, work)
+
+
+def _make_frozen_deferral_settle_thread(
+    *, stop, interval, ref, hub, sync_lock, run_sync_now_locked,
+) -> threading.Thread:
+    """The daemon thread running `_frozen_deferral_settle_loop` (#932)."""
+    collaborators = _make_sync_loop_collaborators(ref=ref, hub=hub)
+    tui = _cctally()._cctally_tui
+    return threading.Thread(
+        target=lambda: _frozen_deferral_settle_loop(
+            stop=stop,
+            interval=float(interval),
+            ref=ref,
+            sync_lock=sync_lock,
+            run_locked=run_sync_now_locked,
+            mark_rebuilding=collaborators["mark_rebuilding"],
+            is_deferred=tui._tui_snapshot_is_stats_deferral,
+        ),
+        daemon=True,
+        name="dashboard-frozen-deferral-settle",
+    )
+
+
+def _retire_frozen_deferral_settle(*, stop, sync_lock, thread) -> None:
+    """Retire the settle thread before the resources its attempts use (#932).
+
+    A lock fence, not a timed join: set ``stop``, then acquire and release
+    ``sync_lock`` (blocking, no timeout), which waits out any attempt already
+    in flight — its build, verifier submission, ``set_final`` and publish all
+    run under the lock — and no attempt can start after it, because each
+    rechecks ``stop`` right after acquiring. The join that follows only
+    collects a thread that is waiting on ``stop`` or returning. The lock is
+    released before the caller retires the memory verifiers, whose unsafe
+    completion takes the same lock. Intentionally unbounded: it drains
+    whichever holder has the lock.
+    """
+    stop.set()
+    sync_lock.acquire()
+    sync_lock.release()
+    thread.join()
+
+
 def _dashboard_startup_schema_migration(*, run_derivations: bool = True) -> None:
     """Advance both stores to head once, at startup, in EVERY mode (#780).
 
@@ -7135,6 +7237,25 @@ def _projects_week_usage_rows(
     return rows
 
 
+def _projects_content_revision_leg(conn: "sqlite3.Connection") -> str:
+    """The Claude content revision memo leg read on ``conn`` (#1050) for a
+    call without a dispatch leg (tests, the drill-down fallback).
+
+    A ``current`` store's leg is its token. Any other state names itself, so a
+    store with no revision tracking (a bare fixture database) memoizes exactly
+    as it did before #1050 instead of missing on every call; the tick never
+    takes this path, and its own dispatch leg on such a store is a fresh nonce.
+    """
+    import _lib_stats_content_revision as k
+    try:
+        revision = k.read_claude_content_revision(conn)
+    except k.StatsContentRevisionUnreadable:
+        return "?unreadable"
+    if revision.state == k.STATE_CURRENT:
+        return revision.token
+    return f"?{revision.state}"
+
+
 def _build_projects_envelope(
     conn: "sqlite3.Connection",
     *,
@@ -7142,6 +7263,7 @@ def _build_projects_envelope(
     current_week: "Any | None" = None,
     weeks_back: int = 12,
     use_projects_env_cache: bool = False,
+    content_revision_leg: "str | None" = None,
 ) -> dict:
     """Build the ``projects.{current_week, trend}`` envelope block.
 
@@ -7172,6 +7294,12 @@ def _build_projects_envelope(
     ``(max(session_entries.id), max_wus_id, max(mutation_seq), cw_week_start,
     weeks_back)`` — the ``mutation_seq`` leg (#270 §7d) busts the memo on an
     id-stable in-place finalization.
+
+    ``content_revision_leg`` (#1050 spec 4.5 item 7) is the dashboard tick's
+    dispatch leg of the stats.db Claude content revision, read before this
+    lookup; the memo key carries it, so an in-place ``weekly_percent``
+    correction (which moves no ``MAX(id)``) rebuilds the envelope. ``None``
+    reads it here, on ``conn``.
     """
     c = _cctally()
 
@@ -7184,6 +7312,7 @@ def _build_projects_envelope(
     # SELECT uses below).
     cur = conn.execute("SELECT COALESCE(MAX(id), 0) FROM session_entries")
     max_id = cur.fetchone()[0]
+    stats_readable = True
     try:
         cur = conn.execute(
             "SELECT COALESCE(MAX(id), 0) FROM weekly_usage_snapshots"
@@ -7191,6 +7320,15 @@ def _build_projects_envelope(
         max_wus_id = cur.fetchone()[0]
     except sqlite3.OperationalError:
         max_wus_id = 0
+        stats_readable = False
+    # #1050 spec 4.5 item 7: the attributed percentages are functions of the
+    # stored `weekly_percent`, which a correction rewrites in place. The leg is
+    # the dispatch's; a caller without one reads it here, before the lookup.
+    # A connection with no stats tables publishes no stats-derived value, so
+    # it keys on no leg; an untrusted or unreadable identity is a fresh nonce.
+    if content_revision_leg is None:
+        content_revision_leg = (
+            _projects_content_revision_leg(conn) if stats_readable else "")
     # #270 (§7d, Codex-2b): this OUTER whole-envelope memo returns BEFORE the
     # inner per-(project, week) reconcile cache, so an id-stable in-place
     # finalization — which leaves MAX(id)/MAX(wus id) flat — would serve the
@@ -7214,7 +7352,8 @@ def _build_projects_envelope(
     cw_key: "dt.datetime | None" = None
     if current_week is not None:
         cw_key = getattr(current_week, "week_start_at", None)
-    memo_key = (max_id, max_wus_id, entry_mutation_seq, cw_key, weeks_back)
+    memo_key = (max_id, max_wus_id, entry_mutation_seq, cw_key, weeks_back,
+                content_revision_leg)
     cached = _PROJECTS_ENV_MEMO.get("value")
     if cached is not None and _PROJECTS_ENV_MEMO.get("key") == memo_key:
         return cached
@@ -12226,7 +12365,6 @@ def _dashboard_stats_deferred_snapshot(args, *, pinned_now, exc):
     c = _cctally()
     tui = c._cctally_tui
     now_utc = pinned_now or dt.datetime.now(dt.timezone.utc)
-    hydrating = not getattr(args, "no_sync", False)
     errors = [f"stats-open: {exc}"]
     envelope_precompute = None
     try:
@@ -12249,19 +12387,16 @@ def _dashboard_stats_deferred_snapshot(args, *, pinned_now, exc):
         # a fresh success. There is no earlier success to preserve either.
         "last_sync_at": None,
         "last_sync_error": "; ".join(errors),
-        "sync_failures": (
-            tui.SyncFailureAttribution(
-                leg="stats-open",
-                database="stats",
-                corruption=tui._stats_open_failure_is_corruption(exc),
-            ),
-        ),
+        "sync_failures": (tui._tui_deferral_attribution(exc),),
         "doctor_payload": doctor_payload,
         "envelope_precompute": envelope_precompute,
-        "hydrating": hydrating,
+        # #932 §4.2: hydrating in BOTH modes. A frozen dashboard's settle loop
+        # (`_frozen_deferral_settle_loop`) replaces this frame once recovery
+        # permits a build, so it must read as loading, never as "restart the
+        # dashboard".
+        "hydrating": True,
+        "source_bundle": tui._tui_hydrating_source_bundle(),
     }
-    if hydrating:
-        replacements["source_bundle"] = tui._tui_hydrating_source_bundle()
     return dataclasses.replace(tui._tui_empty_snapshot(now_utc), **replacements)
 
 
@@ -12351,14 +12486,29 @@ def _dashboard_initial_snapshot_once(
         )
     if conn is not None:
         try:
+            reading_errors: list[Exception] = []
             try:
-                cw = tui._tui_build_current_week(conn, now_utc, skip_sync=True)
+                cw = tui._tui_build_current_week(
+                    conn, now_utc, skip_sync=True,
+                    reading_errors=reading_errors)
             except Exception as exc:  # noqa: BLE001 — never block the bind
                 tui._tui_capture_sync_failure(
                     conn,
                     errors,
                     sync_failures,
                     leg="current-week",
+                    database="stats_or_cache",
+                    exc=exc,
+                    stats_heal_attempted=stats_heal_attempted,
+                )
+            # #1018 twin review F1: a failed confirming-reading lookup keeps
+            # the card and is recorded like its other reads.
+            for exc in reading_errors:
+                tui._tui_capture_sync_failure(
+                    conn,
+                    errors,
+                    sync_failures,
+                    leg="current-week-reading",
                     database="stats_or_cache",
                     exc=exc,
                     stats_heal_attempted=stats_heal_attempted,
@@ -12810,6 +12960,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     update_check_stop = threading.Event()
     update_check_thread = _DashboardUpdateCheckThread(
         update_check_stop, hub=hub, snapshot_ref=ref, runtime_bind=args.host,
+        # #932 §4.2: serialize its republish with every snapshot publisher.
+        sync_lock=sync_lock,
     )
     update_check_thread.start()
 
@@ -12909,6 +13061,23 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # #932: a frozen dashboard whose first build DEFERRED (an older-epoch
+    # index or a detached heal) has no sync thread to replace that frame, so a
+    # one-shot settle loop retries the no-ingest build until recovery permits
+    # it. Started after the server objects exist and immediately before the
+    # shutdown-managed region below.
+    frozen_settle_stop = threading.Event()
+    frozen_settle_thread = None
+    if args.no_sync and _cctally()._cctally_tui._tui_snapshot_is_stats_deferral(
+            initial):
+        frozen_settle_thread = _make_frozen_deferral_settle_thread(
+            stop=frozen_settle_stop,
+            interval=float(args.sync_interval),
+            ref=ref, hub=hub, sync_lock=sync_lock,
+            run_sync_now_locked=_run_sync_now_locked,
+        )
+        frozen_settle_thread.start()
+
     # Block the main thread until SIGINT/SIGTERM. The wait is driven by a
     # self-pipe wakeup fd (signal.set_wakeup_fd) rather than a
     # threading.Event, so a single signal unblocks it unconditionally — the
@@ -12929,6 +13098,12 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         _lib_write_io.clear_local_instance()
         if sync_thread is not None:
             sync_thread.stop()
+        # #932: fence the settle thread through `sync_lock` BEFORE the memory
+        # verifiers, their completion locks, the server and the hub retire.
+        if frozen_settle_thread is not None:
+            _retire_frozen_deferral_settle(
+                stop=frozen_settle_stop, sync_lock=sync_lock,
+                thread=frozen_settle_thread)
         conversation_sync_stop.set()
         if conversation_sync_thread is not None:
             conversation_sync_thread.join(timeout=2)

@@ -655,7 +655,19 @@ def test_new_unread_conversation_container_never_certifies(
         assert stats.files_total == (3 if mode == "full" else 1)
         assert stats.files_failed == stats.container_pending == 0
         reason = "decoder-unavailable" if failure == "no-decoder" else "decode-error"
-        assert stats.container_skipped == {reason: 1}
+        if failure == "corrupt-after-validation":
+            # #1052: the census is phase 1's. A unit-phase decode failure is
+            # counted apart from it, once, and still holds the unread identity.
+            assert stats.container_skipped == {}
+            assert stats.barrier_container_skipped == {reason: 1}
+            assert stats.all_container_skipped() == {reason: 1}
+            # The stored status reports the unit-phase skip too.
+            status = json.loads(conv.execute(
+                "SELECT value FROM cache_meta WHERE key=?",
+                (_cache_mod.CODEX_CONTAINER_STATUS_KEY,)).fetchone()[0])
+            assert status["skipped"][reason] == 1
+        else:
+            assert stats.container_skipped == {reason: 1}
         assert conv.execute(
             "SELECT 1 FROM codex_conversation_source_files WHERE path=?",
             (str(fresh),)).fetchone() is None
@@ -842,7 +854,9 @@ def test_between_phase_unreadability_keeps_seal_debt_and_retries(
                            (barrier.PUBLISHED_SEQ_KEY,)).fetchone()
         decisions = _certification_decisions(mode, stats)
         print("BETWEEN_PHASE_UNREAD", mode, decisions, vars(stats), "seal", seal, "ack", ack)
-        assert stats.container_skipped == {"decoder-unavailable": 1}
+        # #1052: a phase-2 skip is counted apart from phase 1's census, once.
+        assert stats.container_skipped == {}
+        assert stats.barrier_container_skipped == {"decoder-unavailable": 1}
         assert stats.container_reads_held == 1
         assert stats.barrier_retry and stats.barrier_keys_published == 0
         assert decisions == (False, False, False)

@@ -679,15 +679,16 @@ RESIDUAL_COUNT_KEYS = ("failed", "unpublishedDeferred", "obligations",
                        "containerPending", "keysDeferred")
 #: The Codex conversation counts that are part of a pass's residual.
 _RESIDUAL_COUNT_FIELDS = ("container_pending", "container_reads_held",
-                          "barrier_keys_deferred", "files_deferred_torn",
-                          "prune_refused")
+                          "barrier_keys_deferred", "barrier_keys_terminal",
+                          "files_deferred_torn", "prune_refused")
 
 
 def conversation_residual(stats) -> tuple:
     """One provider pass's residual as canonical ``(name, value)`` pairs.
 
     The failed paths, the deferrals no unit of the same pass published (with
-    the keys each named), the causes of ``barrier_retry``, the existing
+    the keys each named), the causes of ``barrier_retry``, the terminal
+    deferrals (each terminal file with its keys, #1052), the existing
     leftover counts, and the pass's deferred reason and maintenance failure
     (a refusal that repeats identically settles; one that changes restarts the
     chain). ``()`` when the pass left nothing unfinished."""
@@ -703,8 +704,14 @@ def conversation_residual(stats) -> tuple:
         (str(path), tuple(sorted(keys))) for path, keys in deferred.items()
         if str(path) not in published))
     causes = tuple(sorted(getattr(stats, "barrier_retry_causes", None) or ()))
+    # #1052: each terminal file with the keys it holds back. No certificate
+    # revision: a re-seal that leaves the same file terminal for the same keys
+    # is the same residual, and a changed key is a different one.
+    terminal = tuple(sorted(
+        (str(path), tuple(sorted(keys))) for path, keys in
+        (getattr(stats, "barrier_terminal_keys", None) or {}).items()))
     items = [("failed_paths", failed), ("unpublished_deferred", unpublished),
-             ("barrier_retry_causes", causes)]
+             ("barrier_retry_causes", causes), ("barrier_terminal", terminal)]
     items += [(name, getattr(stats, name, 0) or 0)
               for name in _RESIDUAL_COUNT_FIELDS]
     items += [("deferred_reason", str(reason) if reason else None),

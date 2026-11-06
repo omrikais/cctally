@@ -223,3 +223,121 @@ def test_pricing_coverage_and_drift_scope_accept_sol_61_as_directly_priced():
     assert SOL_61 in pricing_check.scope_litellm({
         SOL_61: {"litellm_provider": "openai", "input_cost_per_token": 2e-06},
     })
+
+
+# ── #989: GPT-6.1 Terra, GPT-6 Rosalind and GPT-6 Astra for Law ─────────────
+# Each card is written from OpenAI's published per-MTok rates on
+# https://developers.openai.com/api/docs/pricing (read 2026-11-05), not copied
+# from the table, so a mistyped card fails here. Without a card each model
+# priced at the `gpt-5` fallback ($0.18 for the standard vector below) with
+# isFallback=true, under-reporting Rosalind about ninefold.
+TERRA_61 = "gpt-6.1-terra"
+ROSALIND = "gpt-6-rosalind"
+ASTRA_LAW = "gpt-6-astra-law"
+_MTOK = 1e6
+
+NEW_GPT6_CARDS = {
+    TERRA_61: {
+        "input_cost_per_token": 1.00 / _MTOK,
+        "cache_read_input_token_cost": 0.05 / _MTOK,
+        "output_cost_per_token": 5.00 / _MTOK,
+        "input_cost_per_token_above_272k_tokens": 2.00 / _MTOK,
+        "cache_read_input_token_cost_above_272k_tokens": 0.10 / _MTOK,
+        "output_cost_per_token_above_272k_tokens": 7.50 / _MTOK,
+    },
+    ROSALIND: {
+        "input_cost_per_token": 15.00 / _MTOK,
+        "cache_read_input_token_cost": 1.50 / _MTOK,
+        "output_cost_per_token": 75.00 / _MTOK,
+        "input_cost_per_token_above_272k_tokens": 30.00 / _MTOK,
+        "cache_read_input_token_cost_above_272k_tokens": 3.00 / _MTOK,
+        "output_cost_per_token_above_272k_tokens": 112.50 / _MTOK,
+    },
+    # Promotional "at least through December 31, 2026"; no long-context
+    # column is published, so no tier is inferred.
+    ASTRA_LAW: {
+        "input_cost_per_token": 10.00 / _MTOK,
+        "cache_read_input_token_cost": 1.00 / _MTOK,
+        "output_cost_per_token": 50.00 / _MTOK,
+    },
+}
+
+
+@pytest.mark.parametrize("model", sorted(NEW_GPT6_CARDS))
+def test_new_gpt6_cards_are_direct_vendor_cards(model, capsys):
+    pricing._unknown_codex_model_warnings.discard(model)
+
+    resolved, is_fallback = pricing._resolve_codex_pricing(model)
+
+    card = pricing.CODEX_MODEL_PRICING[model]
+    assert card.keys() == NEW_GPT6_CARDS[model].keys()
+    for field, rate in NEW_GPT6_CARDS[model].items():
+        assert card[field] == pytest.approx(rate), field
+    assert resolved is card
+    assert is_fallback is False
+    assert pricing._is_codex_fallback(model) is False
+    assert pricing._codex_fast_multiplier(model) == 2.0
+    assert "unknown model" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("model", "speed", "expected"),
+    [
+        # 60,000 noncached input + 40,000 cached + 10,000 output (reasoning is
+        # a subset of output, billed once).
+        (TERRA_61, "standard", 0.112),
+        (TERRA_61, "fast", 0.224),       # vendor: Fast is 2x Standard
+        (ROSALIND, "standard", 1.71),
+        (ROSALIND, "fast", 3.42),        # fallback-contract: no vendor fast tier
+        (ASTRA_LAW, "standard", 1.14),
+        (ASTRA_LAW, "fast", 2.28),       # fallback-contract: no vendor fast tier
+    ],
+)
+def test_new_gpt6_standard_and_fast_costs(model, speed, expected, capsys):
+    pricing._unknown_codex_model_warnings.discard(model)
+
+    cost = pricing._calculate_codex_entry_cost(
+        model, 100_000, 40_000, 10_000, 2_000, speed=speed,
+    )
+
+    assert cost == pytest.approx(expected)
+    assert "unknown model" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("model", "input_tokens", "cached_tokens", "output_tokens", "expected"),
+    [
+        # Exactly 272,000 inclusive input keeps the short card; one more token
+        # reprices the whole request, output included.
+        (TERRA_61, 272_000, 0, 10_000, 0.322),
+        (TERRA_61, 272_001, 0, 10_000, 0.619002),
+        (ROSALIND, 272_000, 0, 10_000, 4.83),
+        (ROSALIND, 272_001, 0, 10_000, 9.28503),
+        # No published long-context tier: base rates throughout.
+        (ASTRA_LAW, 400_000, 100_000, 20_000, 4.1),
+        # Terra's cached input is 5% of input, not the usual 10% (0.01).
+        (TERRA_61, 100_000, 100_000, 0, 0.005),
+    ],
+)
+def test_new_gpt6_long_context_and_cached_rates(
+    model, input_tokens, cached_tokens, output_tokens, expected,
+):
+    cost = pricing._calculate_codex_entry_cost(
+        model, input_tokens, cached_tokens, output_tokens, 0,
+    )
+
+    assert cost == pytest.approx(expected)
+
+
+def test_coverage_and_drift_scope_accept_the_new_gpt6_cards():
+    gaps = pricing_check.classify_coverage(
+        [("codex", model, 3, 123_456) for model in NEW_GPT6_CARDS],
+        lambda _model: None,
+        pricing._is_codex_fallback,
+    )
+
+    assert gaps == []
+    assert set(pricing_check.scope_litellm({
+        model: {"litellm_provider": "openai", "input_cost_per_token": 1e-06}
+        for model in NEW_GPT6_CARDS
+    })) == set(NEW_GPT6_CARDS)

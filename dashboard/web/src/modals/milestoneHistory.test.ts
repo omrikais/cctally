@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   clearMilestoneHistoryCacheForTests,
   fetchWeekDetail,
+  milestoneHistoryCacheSizeForTests,
   stepWeek,
 } from './milestoneHistory';
 import type { WeekIndexEntry } from '../types/envelope';
@@ -169,5 +170,59 @@ describe('fetchWeekDetail', () => {
       code: 'unknown_key',
       reason: 'pruned',
     });
+  });
+});
+
+// #1050 spec 4.6 (G2): an untrusted store re-stamps every cycle on every
+// index, and a busy current cycle re-stamps on every crossing, so a cache
+// keyed by stamp grew without bound in a long-lived tab. It is a 32-entry
+// least-recently-used cache.
+describe('fetchWeekDetail cache bound (#1050)', () => {
+  const ok = () =>
+    vi.fn(async (url: string) => ({ ok: true, json: async () => ({ url }) }));
+
+  it('keeps 32 entries and evicts the least recently used on the 33rd', async () => {
+    const spy = ok();
+    global.fetch = spy as unknown as typeof fetch;
+    for (let i = 0; i < 33; i += 1) {
+      await fetchWeekDetail('claude', entry(`cycle:${i}`, { detail_stamp: `s${i}` }));
+    }
+    expect(milestoneHistoryCacheSizeForTests()).toBe(32);
+    expect(spy).toHaveBeenCalledTimes(33);
+    // The newest 32 are still cached; the first one was evicted.
+    await fetchWeekDetail('claude', entry('cycle:32', { detail_stamp: 's32' }));
+    await fetchWeekDetail('claude', entry('cycle:1', { detail_stamp: 's1' }));
+    expect(spy).toHaveBeenCalledTimes(33);
+    await fetchWeekDetail('claude', entry('cycle:0', { detail_stamp: 's0' }));
+    expect(spy).toHaveBeenCalledTimes(34);
+    expect(milestoneHistoryCacheSizeForTests()).toBe(32);
+  });
+
+  it('a hit refreshes recency, so the entry outlives older ones', async () => {
+    const spy = ok();
+    global.fetch = spy as unknown as typeof fetch;
+    for (let i = 0; i < 32; i += 1) {
+      await fetchWeekDetail('claude', entry(`cycle:${i}`, { detail_stamp: `s${i}` }));
+    }
+    // Touch the oldest, then insert one more: cycle:1 is now the LRU.
+    await fetchWeekDetail('claude', entry('cycle:0', { detail_stamp: 's0' }));
+    await fetchWeekDetail('claude', entry('cycle:32', { detail_stamp: 's32' }));
+    expect(spy).toHaveBeenCalledTimes(33);
+    await fetchWeekDetail('claude', entry('cycle:0', { detail_stamp: 's0' }));
+    expect(spy).toHaveBeenCalledTimes(33);
+    await fetchWeekDetail('claude', entry('cycle:1', { detail_stamp: 's1' }));
+    expect(spy).toHaveBeenCalledTimes(34);
+  });
+
+  it('never refetches a repeated key while it is cached', async () => {
+    const spy = ok();
+    global.fetch = spy as unknown as typeof fetch;
+    const e = entry('cycle:repeat', { detail_stamp: 'same' });
+    const first = await fetchWeekDetail('codex', e);
+    for (let i = 0; i < 40; i += 1) {
+      expect(await fetchWeekDetail('codex', e)).toBe(first);
+    }
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(milestoneHistoryCacheSizeForTests()).toBe(1);
   });
 });

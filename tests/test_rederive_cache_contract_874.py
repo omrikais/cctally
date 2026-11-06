@@ -59,8 +59,11 @@ PLAN_FIELDS = (
     "actionCountsByEventKind", "preservedEventCount", "noOp", "dataGaps",
     "conflicts", "errors", "uncertainCostFactCount",
 )
+#: `BlockTotalsEngine._fetch` is the scratch replay's session-entry reader
+#: since #1003 D1: inside `_scratch_read_adapters` the engine answers block
+#: totals from its own full and delta fetches, not `_joined_entries`.
 READERS = ("_validate_cache_rows", "_cache_fingerprint", "_joined_entries",
-           "iter_entries", "iter_codex_entries")
+           "BlockTotalsEngine._fetch", "iter_entries", "iter_codex_entries")
 
 
 def _args(*, yes=False, as_json=True):
@@ -278,16 +281,21 @@ class _Readers:
         import _cctally_rederive as rederive_cmd
 
         self.calls: dict[str, int] = {}
-        for owner, name in (
-            (rederive_cmd, "_validate_cache_rows"),
-            (rederive_cmd, "_cache_fingerprint"),
-            (rederive_cmd, "_joined_entries"),
-            (cache, "iter_entries"),
-            (cache, "iter_codex_entries"),
+        for owner, name, label in (
+            (rederive_cmd, "_validate_cache_rows", None),
+            (rederive_cmd, "_cache_fingerprint", None),
+            (rederive_cmd, "_joined_entries", None),
+            # #1003 D1: the engine's full fetch (``through`` None) and its
+            # delta fetch both run through this one method.
+            (rederive_cmd.BlockTotalsEngine, "_fetch",
+             "BlockTotalsEngine._fetch"),
+            (cache, "iter_entries", None),
+            (cache, "iter_codex_entries", None),
         ):
             original = getattr(owner, name)
 
-            def counted(*args, _name=name, _original=original, **kwargs):
+            def counted(*args, _name=label or name, _original=original,
+                        **kwargs):
                 self.calls[_name] = self.calls.get(_name, 0) + 1
                 return _original(*args, **kwargs)
 
@@ -409,12 +417,15 @@ def test_every_claude_cache_column_is_contracted_or_unread(
     readers = _Readers(monkeypatch)
 
     # Non-vacuity: the intact cache plans normally and reaches every Claude
-    # reader, and (no Codex provenance) never the Codex one.
+    # reader, and (no Codex provenance) never the Codex one. The scratch
+    # replay reads session entries through the #1003 engine's fetch, so that
+    # is the reader required here; `_joined_entries` stays monitored (the
+    # engine's uncached path and the live readers call it).
     baseline = _run(mod, capsys, readers)
     assert baseline["exit"] == 0, baseline
     assert baseline["plan"]["status"] in ("preview", "no-op"), baseline
     for name in ("_validate_cache_rows", "_cache_fingerprint",
-                 "_joined_entries", "iter_entries"):
+                 "BlockTotalsEngine._fetch", "iter_entries"):
         assert baseline["calls"].get(name, 0) >= 1, baseline
     assert baseline["calls"].get("iter_codex_entries", 0) == 0, baseline
 

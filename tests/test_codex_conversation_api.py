@@ -1385,6 +1385,35 @@ def test_codex_export_golden_and_no_staling_trigger_leak(tmp_path, monkeypatch):
     assert _mask_export(md) == _EXPORT_GOLDEN.read_text(encoding="utf-8")
 
 
+def test_1037_export_bytes_ignore_the_header_fields(tmp_path, monkeypatch):
+    """Detects the #1037 header fields (`project_label`, `git_branch`,
+    `git_branch_status`) leaking into Codex export Markdown. Unmasked: the
+    export rendered from the produced envelope (with a recorded branch) equals,
+    byte for byte, the export of the same envelope without the three keys."""
+    ns = load_script()
+    srv, _root, keys, _r = _boot(ns, tmp_path, monkeypatch, claude_sids=())
+    try:
+        conn = ns["open_conversations_db"]()
+        try:
+            cq = ns["_load_sibling"]("_lib_codex_conversation_query")
+            detail = cq.get_codex_conversation(
+                conn, keys["modern-full"], effective_speed="standard", limit=0,
+                legacy_export=True)
+            exported = cq.get_codex_conversation_export(
+                conn, keys["modern-full"], effective_speed="standard")
+        finally:
+            conn.close()
+    finally:
+        stop(srv, srv._test_thread)
+    assert (detail["git_branch"], detail["git_branch_status"]) == (
+        "fixture-branch", "recorded")
+    render = ns["_load_sibling"](
+        "_lib_codex_conversation_export").render_codex_conversation_markdown
+    stripped = {k: v for k, v in detail.items()
+                if k not in ("project_label", "git_branch", "git_branch_status")}
+    assert render(detail) == render(stripped) == exported["markdown"]
+
+
 # ── #463 S1 — Phase C hydration is a hard failure, and the route reports it ───
 
 

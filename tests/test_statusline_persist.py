@@ -302,31 +302,320 @@ def test_the_statusline_persist_nudge_fires_outside_the_persist_lock(
     )
 
 
-def test_the_forked_persist_child_nudges_outside_its_own_lock(
-        app, monkeypatch, tmp_path):
-    """The same property on the path production actually takes.
+#: #1064 spec section 7 test 4: the probe a real `cctally statusline` render and
+#: every process it starts import at interpreter start. The spec names a
+#: `sitecustomize` on `PYTHONPATH`, but under pytest the isolation interceptor
+#: prepends its own `tests/isolation_bootstrap/sitecustomize.py` to every
+#: child's `PYTHONPATH` (it does not chain-load, so it shadows any other), the
+#: runner's venv disables `usercustomize`, and a launch that bypasses the
+#: bootstrap is refused. A `PYTHONWARNINGS` category filter naming this module
+#: makes CPython import it while it processes the warning options, before
+#: `site` runs, in every interpreter that inherits the environment, and leaves
+#: the isolation bootstrap untouched. It notes whether this process image has
+#: forked since it started and records, as JSON lines in
+#: `$CCTALLY_TEST_REDUCER_PROBE/records.jsonl`: its own load, every
+#: `_statusline-continue` spawn (with `…_FAIL_SPAWN`, the render's spawn
+#: raises), the process that runs `_run_reducer_pass` (pid, ppid, argv, the
+#: fork flag, the selected-state descriptors open there, the reservation's
+#: state), the pass's dashboard nudge and the pass's end. The statusline
+#: module is loaded through `spec_from_file_location`, which bypasses
+#: `sys.meta_path`, so the probe wraps `SourceFileLoader.exec_module`.
+_REDUCER_PROBE = r"""
+import fcntl, importlib.machinery, os, sys
 
-    `sync_for_test=True` is the test hatch; a real statusline render forks, and
-    the child takes the persist lock BLOCKING for the whole reduce-and-publish.
-    """
-    probe = tmp_path / "fork-nudge-probe"
+_OUT = os.environ.get("CCTALLY_TEST_REDUCER_PROBE")
+_FORKED = [False]
 
-    def _fake_nudge(*args, **kwargs):
-        fd = app._try_acquire_persist_lock()
-        probe.write_text("free" if fd is not None else "held")
-        app._release_persist_lock(fd)
 
-    monkeypatch.setitem(app.__dict__, "_nudge_dashboard_repaint", _fake_nudge)
-    parsed = _status_input(
-        app, session_id="fork", seven_pct=42, seven_resets_epoch=_future_week()
-    )
-    app._statusline_persist(parsed)          # the real, forking path
+class ProbeWarning(Warning):
+    "The category the PYTHONWARNINGS filter names; never raised."
 
-    deadline = time.time() + 20.0
-    while time.time() < deadline and not probe.exists():
+
+def _record(role, **fields):
+    import json
+
+    fields.update(role=role, pid=os.getpid(), ppid=os.getppid(),
+                  argv=list(sys.argv), forked=_FORKED[0])
+    fd = os.open(os.path.join(_OUT, "records.jsonl"),
+                 os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, (json.dumps(fields) + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def _held(path):
+    "Whether another open file description holds an exclusive flock on path."
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def _open_descriptors_of(path):
+    try:
+        target = os.stat(str(path))
+    except FileNotFoundError:
+        return []
+    found = []
+    for name in os.listdir("/dev/fd"):
+        try:
+            st = os.fstat(int(name))
+        except (OSError, ValueError):
+            continue
+        if (st.st_dev, st.st_ino) == (target.st_dev, target.st_ino):
+            found.append(int(name))
+    return found
+
+
+def _install(sl):
+    import subprocess
+
+    real_pass = sl._run_reducer_pass
+
+    def probed_pass(*args, **kwargs):
+        def nudge(*a, **k):
+            _record("nudge", selected_held=_held(sl._selected_lock_path()))
+
+        sl._cctally()._nudge_dashboard_repaint = nudge
+        reservation_fd = None
+        if "--reservation-fd" in sys.argv:
+            reservation_fd = int(sys.argv[sys.argv.index("--reservation-fd") + 1])
+        _record("pass-start",
+                selected_fds=_open_descriptors_of(sl._selected_lock_path()),
+                reservation_held=_held(sl._reducer_reservation_path()),
+                reservation_fd_is_the_reservation=(
+                    reservation_fd is not None and reservation_fd in
+                    _open_descriptors_of(sl._reducer_reservation_path())))
+        try:
+            return real_pass(*args, **kwargs)
+        finally:
+            _record("pass-end",
+                    reservation_held=_held(sl._reducer_reservation_path()))
+
+    sl._run_reducer_pass = probed_pass
+
+    class ProbePopen(subprocess.Popen):
+        def __init__(self, args, *a, **k):
+            command = [str(x) for x in args]
+            if "_statusline-continue" in command:
+                fail = (os.environ.get("CCTALLY_TEST_REDUCER_PROBE_FAIL_SPAWN")
+                        and "_statusline-continue" not in sys.argv)
+                _record("spawn", command=command,
+                        pass_fds=list(k.get("pass_fds", ())),
+                        close_fds=k.get("close_fds"),
+                        reservation_held=_held(sl._reducer_reservation_path()),
+                        selected_held=_held(sl._selected_lock_path()),
+                        failed=bool(fail))
+                if fail:
+                    raise OSError("probe: forced spawn failure")
+            super().__init__(args, *a, **k)
+
+    subprocess.Popen = ProbePopen
+
+
+if _OUT:
+    _record("probe-loaded")
+    os.register_at_fork(after_in_child=lambda: _FORKED.__setitem__(0, True))
+    _real_exec_module = importlib.machinery.SourceFileLoader.exec_module
+
+    def _exec_module(self, module):
+        _real_exec_module(self, module)
+        if module.__name__ == "_cctally_statusline":
+            _install(module)
+
+    importlib.machinery.SourceFileLoader.exec_module = _exec_module
+"""
+
+
+def _probe_records(out):
+    path = out / "records.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def _flock_held(path):
+    import fcntl
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_until(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
         time.sleep(0.05)
-    assert probe.exists(), "the forked child never reached its nudge"
-    assert probe.read_text() == "free"
+    return predicate()
+
+
+def test_the_reducer_runs_in_the_execd_worker(tmp_path):
+    """#1064 spec section 7 test 4. Detects a reducer pass that runs in an
+    inherited process image — a bare-fork child of the render, or an exec'd
+    worker that then forks — where macOS reloads the zone file on every
+    local-time conversion (50-340x slower) and a pass held the selected state
+    for up to an hour. Runs the real `cctally statusline` CLI against a
+    sandbox store (bypassing the in-process continuation seam of
+    `tests/_script_loader.py`) with the probe above imported at start-up.
+
+    The pass must run in a process other than the render whose argv is
+    `_statusline-continue --reservation-fd <fd>` and which has not forked
+    since exec; the render hands the reservation over while it is held and
+    after releasing the selected state; the worker inherits only the
+    reservation (no selected-state descriptor), holds the reservation through
+    the pass, nudges with the selected state free, publishes durably and
+    releases the reservation at the end. A forced spawn failure leaves the
+    arrival durable and the reservation free, and the next render answers
+    it. A missing probe record fails the test."""
+    home = tmp_path / "home"
+    data = tmp_path / "data"
+    probe_dir = tmp_path / "probe"
+    out = tmp_path / "probe-out"
+    for path in (home / ".claude" / "projects", data, probe_dir, out):
+        path.mkdir(parents=True, exist_ok=True)
+    (probe_dir / "_reducer_probe.py").write_text(_REDUCER_PROBE)
+    # A fresh hook-tick throttle marker keeps the render's statusline OAuth
+    # timer from forking its own refresh child (it has nothing to fetch with).
+    (data / "hook-tick.last-fetch").touch()
+    bound = data / "statusline-account-bound-v3"
+    selected_lock = bound / "selected.lock"
+    reservation_lock = bound / "continuation.reducer.lock"
+    db_path = data / "stats.db"
+
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["CCTALLY_DATA_DIR"] = str(data)
+    env["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
+    env["CCTALLY_TEST_REDUCER_PROBE"] = str(out)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(probe_dir), env.get("PYTHONPATH")) if p)
+    env.pop("CCTALLY_AS_OF", None)
+    env["PYTHONWARNINGS"] = ",".join(
+        w for w in (env.get("PYTHONWARNINGS"), "ignore::_reducer_probe.ProbeWarning") if w)
+    now = int(time.time())
+
+    def payload(percent):
+        return json.dumps(_rate_limits_payload(
+            seven_pct=percent, seven_resets_epoch=now + 3 * 86400,
+            five_pct=12.0, five_resets_epoch=now + 2 * 3600)).encode()
+
+    def render(percent, *, fail_spawn=False):
+        render_env = dict(env)
+        if fail_spawn:
+            render_env["CCTALLY_TEST_REDUCER_PROBE_FAIL_SPAWN"] = "1"
+        proc = subprocess.Popen(
+            [sys.executable, str(_CCTALLY_BIN), "statusline"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, env=render_env)
+        _, err = proc.communicate(payload(percent), timeout=60)
+        loaded = [r for r in _probe_records(out)
+                  if r["role"] == "probe-loaded" and r["pid"] == proc.pid]
+        assert loaded, (
+            "the probe did not load in the render, so nothing it records can "
+            f"be trusted; render stderr: {err.decode(errors='replace')}")
+        return proc.pid
+
+    def pass_ended():
+        return any(r["role"] == "pass-end" for r in _probe_records(out))
+
+    def intake_bytes():
+        return sum(s.stat().st_size for s in bound.glob("accounts/*/intake/*.jsonl"))
+
+    def settled(worker):
+        # timing-budget: the worker's final release check and WAL finalizer
+        assert _wait_until(lambda: not _pid_alive(worker), 30.0), (
+            "the worker never exited")
+        assert not _flock_held(reservation_lock), "the reservation outlived the worker"
+        assert not _flock_held(selected_lock)
+
+    # -- A dispatching render: the pass runs in the exec'd worker.
+    render_pid = render(57.0)
+    # timing-budget: interpreter start-up plus one first-reading pass on an empty store
+    assert _wait_until(pass_ended, 30.0), (
+        f"no probe record of a completed reducer pass: {_probe_records(out)}")
+    records = _probe_records(out)
+    starts = [r for r in records if r["role"] == "pass-start"]
+    assert starts, records
+    for start in starts:
+        assert start["pid"] != render_pid, (
+            f"the reducer ran in the render process: {start}")
+        assert start["argv"][1:3] == ["_statusline-continue", "--reservation-fd"], (
+            f"the reducer ran in an inherited process image: {start}")
+        assert start["forked"] is False, (
+            f"the reducer ran in a process image that forked after exec: {start}")
+        assert start["selected_fds"] == [], (
+            f"the worker inherited a selected-state descriptor: {start}")
+        assert start["reservation_held"] and start["reservation_fd_is_the_reservation"], (
+            f"the worker ran without holding the reservation: {start}")
+    spawns = [r for r in records if r["role"] == "spawn"]
+    assert len(spawns) == 1 and spawns[0]["pid"] == render_pid, records
+    spawn = spawns[0]
+    assert not spawn["failed"]
+    assert spawn["reservation_held"], (
+        "the reservation was free at the hand-off while the work was pending")
+    assert not spawn["selected_held"], (
+        "the render dispatched while it still held the selected state")
+    assert spawn["close_fds"] is True and len(spawn["pass_fds"]) == 1
+    assert starts[0]["argv"][1:] == [
+        "_statusline-continue", "--reservation-fd", str(spawn["pass_fds"][0])]
+    worker = starts[0]["pid"]
+    nudges = [r for r in records if r["role"] == "nudge"]
+    assert nudges, "the first reading emitted events, so the pass must nudge"
+    assert all(r["pid"] == worker and not r["selected_held"] for r in nudges), nudges
+    settled(worker)
+    assert _count_snapshots(db_path) == 1, "the pass did not publish durably"
+
+    # -- A forced spawn failure: the arrival stays durable, nothing is held.
+    (out / "records.jsonl").unlink()
+    before = intake_bytes()
+    failed_render = render(58.0, fail_spawn=True)
+    records = _probe_records(out)
+    spawns = [r for r in records if r["role"] == "spawn"]
+    assert [r["pid"] for r in spawns] == [failed_render] and spawns[0]["failed"], (
+        f"the render made no exec'd worker spawn to fail: {records}")
+    # timing-budget: a stray pass (a fallback reducer) would publish within this
+    _wait_until(pass_ended, 3.0)
+    assert not [r for r in _probe_records(out) if r["role"].startswith("pass")], (
+        "a failed worker spawn must leave the pass to the next event, not run it")
+    assert not _flock_held(reservation_lock), "the failed spawn kept the reservation"
+    assert not _flock_held(selected_lock)
+    assert intake_bytes() > before, (
+        "the arrival of the render whose spawn failed is not durable in the intake")
+    assert _count_snapshots(db_path) == 1
+
+    # -- The next activating event reclaims the reservation and answers it.
+    render(58.0)
+    # timing-budget: interpreter start-up plus one pass
+    assert _wait_until(pass_ended, 30.0), _probe_records(out)
+    settled([r for r in _probe_records(out) if r["role"] == "pass-start"][0]["pid"])
+    assert _count_snapshots(db_path) == 2, "the retained arrival was never answered"
 
 
 def test_reducer_ignores_incomplete_candidate_temp(app):
@@ -637,6 +926,47 @@ def test_projection_normalizes_weekly_jitter_and_uses_capture_order_not_row_id(a
         dt.datetime.fromtimestamp(reset + 40, tz=dt.timezone.utc)
     ).timestamp())
     assert projection.seven_day.canonical_key == expected
+
+
+@pytest.mark.parametrize("value", [
+    "2026-11-06T06:24:00Z", "2026-11-06T06:24:00.999999+00:00",
+    "2026-11-06T08:24:00+02:00", "2026-11-05T22:24:00-08:00",
+    " 2026-11-06 06:24:00Z ", "2026-11-06T06:24:00",
+    "2026-11-06T12:09:00+05:45", "2026-11-06T11:54:15+05:30:15",
+    "1969-12-31T23:59:59.250000Z", "1969-12-31T23:59:59.25",
+    "20261106T062400Z", "2026-11-06T06:24Z", "2026-11-06T06:24:00z",
+    "2026-W45-5T06:24:00Z",
+    "0001-01-01T00:00:00+00:00", "9999-12-31T23:59:59+00:00",
+    "", "not-a-date", None, 1762410240,
+    dt.datetime(2026, 11, 6, 6, 24, tzinfo=dt.timezone.utc),
+])
+def test_projection_epoch_equals_the_shared_parser(app, value):
+    """#1064 (accuracy: a projection timestamp read as another instant
+    reorders the snapshot rows and moves the selected reset and freshness).
+    The fast path for aware values gives the epoch, or the error, that
+    `parse_iso_datetime` gives, under a host zone with a non-zero offset so
+    the naive value keeps its host-local reading."""
+    saved = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Jerusalem"
+    time.tzset()
+    try:
+        sl = sys.modules["_cctally_statusline"]
+        core = sys.modules["_cctally_core"]
+
+        def outcome(fn):
+            try:
+                return ("value", fn())
+            except Exception as exc:  # the error class is part of the contract
+                return ("raises", type(exc))
+
+        assert outcome(lambda: sl._epoch_from_iso(value)) == outcome(
+            lambda: int(core.parse_iso_datetime(str(value), "x").timestamp()))
+    finally:
+        if saved is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = saved
+        time.tzset()
 
 
 def test_projection_selects_latest_post_credit_weekly_and_five_hour_segments(app):

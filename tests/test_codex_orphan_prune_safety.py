@@ -197,6 +197,12 @@ def test_invalid_codex_home_refuses_both_pruners_and_preserves_rows(
         )
         assert cache_rebuild.prune_refused is True
         assert conversation_rebuild.prune_refused is True
+        # #1051 A8: the #485 refusal returns before the clear, so it arms no
+        # byte-zero replay and writes no replay record.
+        assert cache.execute(
+            "SELECT COUNT(*) FROM cache_meta WHERE key IN (?, ?)",
+            (_cctally_cache.CODEX_REPLAY_FROM_ZERO_KEY,
+             _cctally_cache.CODEX_HEAL_WALK_KEY)).fetchone()[0] == 0
         assert _cache_counts(cache) == after_cache
         assert _conversation_counts(conversations) == after_conversations
     finally:

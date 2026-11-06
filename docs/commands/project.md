@@ -234,12 +234,7 @@ Model rows under `--breakdown` leave `Cost Share` blank, for the same reason the
 
 ## Claude grouping
 
-`git-root` (default) walks from each entry's `cwd` upward looking for a
-`.git` (file or dir) and buckets by that path. Non-git directories
-(`~/tmp/scratch`, `~`) fall back with a dimmed `(no-git)` suffix.
-Entries whose `project_path` hasn't been captured yet (lazy-backfill
-race) bucket as `(unknown)` and produce a stderr warning pointing to
-`cache-sync`.
+`git-root` (default) walks from each entry's `cwd` upward looking for a repository marker and buckets by that path. A `.git` file (a worktree or submodule) counts by its presence; a `.git` folder counts only when it holds `HEAD`, `objects/` and `refs/`, so a stray `.git` folder that is not a repository (for example one left in a worktree container) is skipped and the walk continues upward. A removed worktree's sessions therefore group with the repository that held it. Non-git directories (`~/tmp/scratch`, `~`) fall back with a dimmed `(no-git)` suffix. Entries whose `project_path` hasn't been captured yet (lazy-backfill race) bucket as `(unknown)` and produce a stderr warning pointing to `cache-sync`.
 
 When two distinct git-roots share a basename (e.g. `~/repos/foo` and
 `~/forks/foo`), the display label is disambiguated by appending the

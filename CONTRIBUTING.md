@@ -20,7 +20,7 @@ is the primary way to contribute. A good report includes:
 
 - `cctally --version`
 - Your OS / platform (e.g. macOS 15, Ubuntu 24.04)
-- Relevant output from `cctally doctor` (a read-only health report)
+- Relevant output from `cctally doctor` (a health report, read-only except its disposable journal-scan cache)
 - Steps to reproduce, and what you expected vs. what happened
 
 **Please don't paste raw session data or credentials.** Your Claude session

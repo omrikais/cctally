@@ -687,6 +687,180 @@ def test_bind_precedes_the_full_build_and_hydration_clears(
             name_contains="dashboard-conversations-sync")
 
 
+def test_no_sync_over_an_older_epoch_index_fills_once_the_rebuild_completes(
+    monkeypatch, tmp_path, small_corpus
+):
+    """#932: a frozen dashboard leaves its deferred empty frame once the
+    older-epoch stats rebuild completes.
+
+    Failure it detects: `cctally dashboard --no-sync` over a stats index one
+    epoch behind binds with the deferred, data-less frame ("no successful
+    snapshot yet", a permanent "rebuilding" chip, "Projects data unavailable")
+    and, because frozen mode starts no sync thread, never publishes the real
+    snapshot after the detached rebuild publishes the current index.
+
+    The rebuild is the real resolver, run in-process at a point this test
+    chooses, so "once the rebuild completes" is an event, not a sleep. The
+    detached launch is replaced by a recorder: a real worker would race the
+    first frame this test reads.
+
+    It also detects: a deferral classification set only at startup (the
+    resolver runs only after a settle ATTEMPT has deferred again, so a retry
+    the publisher does not mark as a deferral ends the loop before recovery);
+    ingest or OAuth refresh leaking into frozen mode; a settle loop that
+    keeps rebuilding after the frame settled; and a shutdown that retires the
+    snapshot memory verifier or closes the hub BEFORE fencing the settle
+    thread, which would let an in-flight attempt submit to a retired verifier
+    or publish into a closed hub.
+    """
+    ns = _load_with_corpus(monkeypatch, tmp_path, small_corpus)
+    dash = _dash_mod()
+    import sys as _sys
+    from types import SimpleNamespace
+    core = _sys.modules["_cctally_core"]
+    store = _sys.modules["_cctally_store"]
+    before_handlers = set(threading.enumerate())
+    deadline = time.monotonic() + _WHOLE_TEST_BUDGET_S
+
+    # The copied corpus index is current; put it one epoch behind.
+    conn = sqlite3.connect(core.DB_PATH)
+    try:
+        conn.execute(f"PRAGMA user_version = {core.STATS_INDEX_EPOCH - 1}")
+        conn.commit()
+    finally:
+        conn.close()
+    assert store.stats_epoch_rebuild_pending() is True
+
+    launches = []
+    monkeypatch.setattr(
+        store, "defer_stats_epoch_rebuild",
+        lambda: launches.append("defer") or "spawned")
+
+    # Frozen mode's real-path seams: the publisher and builder resolve each of
+    # these through the `cctally` namespace, so a call from either lands here.
+    real_path_calls = []
+    for seam in ("sync_cache", "sync_codex_cache", "_refresh_usage_inproc"):
+        real_fn = ns[seam]
+        monkeypatch.setitem(
+            ns, seam,
+            lambda *a, _seam=seam, _real=real_fn, **k: (
+                real_path_calls.append(_seam) or _real(*a, **k)))
+    builds = []
+    real_build = ns["_tui_build_snapshot"]
+
+    def counting_build(*a, **k):
+        builds.append(time.monotonic())
+        return real_build(*a, **k)
+
+    monkeypatch.setitem(ns, "_tui_build_snapshot", counting_build)
+
+    # Shutdown order: recorders that still delegate to the real retirements.
+    shutdown_order = []
+    snapshot_cache = ns["_load_sibling"]("_lib_snapshot_cache")
+    for owner, name, label in (
+        (dash, "_retire_frozen_deferral_settle", "settle"),
+        (snapshot_cache, "shutdown_snapshot_memory_worker", "memory"),
+        (dash.SSEHub, "close", "hub"),
+    ):
+        real_fn = getattr(owner, name)
+        monkeypatch.setattr(
+            owner, name,
+            lambda *a, _label=label, _real=real_fn, **k: (
+                shutdown_order.append(_label) or _real(*a, **k)))
+
+    bound = {}
+    real_server_cls = dash._QuietThreadingHTTPServer
+
+    class _RecordingServer(real_server_cls):
+        def __init__(self, address, handler):
+            super().__init__(address, handler)
+            bound["srv"] = self
+
+    monkeypatch.setattr(dash, "_QuietThreadingHTTPServer", _RecordingServer)
+    stop = threading.Event()
+    monkeypatch.setattr(
+        dash, "_dashboard_wait_for_signal",
+        lambda *a, **k: stop.wait(timeout=_remaining(deadline)))
+
+    interval = 1.0
+    args = ns["build_parser"]().parse_args(
+        ["dashboard", "--port", "0", "--no-browser", "--host", "127.0.0.1",
+         "--no-sync", "--sync-interval", str(int(interval))])
+    outcome = []
+    server_thread = threading.Thread(
+        target=lambda: outcome.append(dash.cmd_dashboard(args)),
+        daemon=True, name="932-frozen-dashboard-under-test")
+    server_thread.start()
+    frames = None
+    try:
+        while "srv" not in bound and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "srv" in bound, "the server never bound"
+        port = bound["srv"].server_address[1]
+        assert launches, "the frozen first build never deferred to a rebuild"
+
+        frames = _sse_frames(port, deadline)
+        first = next(frames, None)
+        assert first is not None, "no SSE frame arrived"
+        assert not first.get("sessions", {}).get("rows"), (
+            "the deferred first frame unexpectedly carried sessions")
+
+        # A settle ATTEMPT must defer again (a second recorded admission)
+        # before recovery, so a classification only the startup frame carries
+        # cannot pass.
+        while len(launches) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(launches) >= 2, (
+            "no settle attempt re-entered the deferred rebuild admission")
+
+        (core.APP_DIR / "stats-epoch-rebuild.pending").touch()
+        assert store.cmd_stats_epoch_rebuild_internal(SimpleNamespace()) == 0
+        assert store.stats_epoch_rebuild_pending() is False
+
+        filled = None
+        for frame in frames:
+            if (frame.get("hydrating") is False
+                    and frame.get("sessions", {}).get("rows")):
+                filled = frame
+                break
+        assert filled is not None, (
+            "the frozen dashboard never published a populated frame after the "
+            "older-epoch rebuild completed")
+        failure = filled.get("sync_failure") or {}
+        assert failure.get("kind") != "maintenance_active", (
+            f"the filled frame still reports a rebuild: {failure!r}")
+        assert filled.get("sync_age_s") is None, "a frozen frame is sync paused"
+        assert filled["sources"]["claude"]["data"] is not None
+
+        # Settled: over two further intervals no build runs, and the settle
+        # thread has gone — before shutdown, so the loop stopped by itself.
+        settled_builds = len(builds)
+        time.sleep(2 * interval + 0.5)
+        assert len(builds) == settled_builds, (
+            "the frozen dashboard kept rebuilding after its frame settled")
+        assert not [t for t in threading.enumerate()
+                    if t.name == "dashboard-frozen-deferral-settle"
+                    and t.is_alive()], "the settle thread outlived its result"
+        assert real_path_calls == [], (
+            f"frozen mode ran ingest or refresh: {real_path_calls!r}")
+    finally:
+        stop.set()
+        if frames is not None:
+            frames.close()
+        teardown_deadline = time.monotonic() + _TEARDOWN_BUDGET_S
+        server_thread.join(timeout=_remaining(teardown_deadline))
+        _await_handler_exit(before_handlers, deadline=teardown_deadline)
+        _await_handler_exit(
+            before_handlers, deadline=teardown_deadline,
+            name_contains="dashboard-frozen-deferral-settle")
+    assert not server_thread.is_alive(), "the dashboard never shut down"
+    assert "settle" in shutdown_order, "shutdown never fenced the settle thread"
+    for later in ("memory", "hub"):
+        assert later in shutdown_order, f"shutdown never ran {later!r}"
+        assert shutdown_order.index("settle") < shutdown_order.index(later), (
+            f"the settle thread was fenced after {later!r}: {shutdown_order!r}")
+
+
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
 def test_server_bind_does_not_wait_on_reverse_dns(monkeypatch, tmp_path, host):
     """Binding the dashboard server must not wait on a reverse-DNS lookup.

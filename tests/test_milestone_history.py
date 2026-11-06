@@ -2191,7 +2191,8 @@ def test_836_the_stamp_moves_when_a_crossings_weekly_join_becomes_unavailable(
     the crossing's join to the `0` sentinel, leaving every count, max id and
     capture of the stamp unchanged, so the client keeps rendering the cached
     detail's retired value as a percentage. A genuine held WRITE (marker in
-    the payload) keeps its value and must not move the stamp."""
+    the payload) keeps its value; since #1050 it re-stamps through the
+    revision component, as every in-place rewrite does."""
     import _cctally_milestone_history as mh
     conn = ns["open_db"]()
     try:
@@ -2215,10 +2216,12 @@ def test_836_the_stamp_moves_when_a_crossings_weekly_join_becomes_unavailable(
         after = mh.build_claude_week_index(conn)[0]["detail_stamp"]
     finally:
         conn.close()
-    if transition == "held_write":
-        assert after == before
-    else:
-        assert after != before
+    # #1050 spec 4.2/4.6: the held write is an in-place rewrite of a row the
+    # cycle reads (held state is a compared column), so the revision
+    # component re-stamps it as well; only its unavailable-join component is
+    # unchanged, which `test_836_unavailable_join_stamps_match_the_per_cycle_
+    # oracle` pins for held writes.
+    assert after != before
 
 
 def test_836_a_count_preserving_retirement_swap_still_moves_the_stamp(ns):
@@ -2249,14 +2252,22 @@ def test_836_a_clean_single_account_stamp_is_byte_stable(ns):
     try:
         _836_single_account_join_store(ns, conn)
         entry = mh.build_claude_week_index(conn)[0]
-        rows = mh._claude_cycle_rows(conn, ns["make_week_ref"](
+        ref = ns["make_week_ref"](
             week_start_date="2026-05-15", week_end_date="2026-05-22",
-            week_start_at=WK_A_START, week_end_at=WK_A_END))
+            week_start_at=WK_A_START, week_end_at=WK_A_END)
+        rows = mh._claude_cycle_rows(conn, ref)
+        # #1050: the seeded rows are tracked writes, so the stamp carries
+        # their revision component; this test is about the unavailable-join
+        # component, which must still be absent.
+        revision_part = mh._ClaudeRevisionScopes(conn).component(
+            conn, ref, 0, entry["start_at_utc"], entry["end_at_utc"])
     finally:
         conn.close()
+    assert revision_part, "non-vacuity: the seeded store is revision-scoped"
     assert entry["detail_stamp"] == mh._mh.compute_detail_stamp(
         entry["key"], len(rows), 1, 1 if rows else 0,
-        max((r["captured_at_utc"] for r in rows), default=None))
+        max((r["captured_at_utc"] for r in rows), default=None),
+        *revision_part)
 
 
 def _836_oracle_unavailable_ids(conn, start_iso, end_iso, account_key):
@@ -2646,9 +2657,13 @@ def test_836_the_route_rejects_a_claude_qualifier_on_an_undecorated_store(
 
 # The serialized undecorated history (index + every detail, labels removed:
 # they follow the host's display zone) on the pre-#836 code, `main` 1d959f1fe.
+# #1050 re-pinned: the revision component is the one deliberate stamp change
+# (the seed's rows are tracked writes). With every `detail_stamp` removed too,
+# the payload digests are identical before and after #1050
+# (b59508e5…f292 and 54c5b6bd…ab6d on 4524115b4 and on the #1050 change).
 _836_UNDECORATED_BASELINE = {
-    0: "8ca6ac196c0a5143b1bcaf73fd262778766de57cf6141c3dd648b12ec9b18746",
-    1: "4c7da9e47c46b206501b6e2f660427c4426f602d1bb1956dced894b455703ea0",
+    0: "d85c36b87a42d24c8a2c2fe0a19fc4b11081e797c109886f613164aea1cdd41a",
+    1: "141743e500e6d62c00102c778806b8de3d12aef2bd0adc9c7a3688d995c09c01",
 }
 
 
@@ -2694,3 +2709,207 @@ def test_836_undecorated_history_matches_the_pre_change_baseline(
                            "details": unlabeled(details)}, sort_keys=True)
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     assert digest == _836_UNDECORATED_BASELINE[real_accounts], (digest, payload)
+
+
+# ── #1050: revision-scoped Claude cycle stamps (spec 4.6) ──────────────
+
+
+def _1050_stamps(index):
+    return {(e["start_at_utc"], e["end_at_utc"]): e["detail_stamp"]
+            for e in index}
+
+
+_1050_A = ("2026-05-15T00:00:00Z", "2026-05-22T00:00:00Z")
+_1050_B = ("2026-05-08T00:00:00Z", "2026-05-15T00:00:00Z")
+_1050_C_PRE = ("2026-05-01T00:00:00Z", "2026-05-04T12:00:00Z")
+_1050_C_POST = ("2026-05-04T12:00:00Z", "2026-05-08T00:00:00Z")
+
+# Each in-place rewrite of a Claude-published row, and the cycles whose
+# stamps it must move; every other cycle keeps its stamp.
+_1050_STAMP_SCOPES = {
+    # A weekly milestone's cohort (and its bucket): only its own cycle.
+    "cohort": (
+        "UPDATE percent_milestones SET cumulative_cost_usd = 9.0 "
+        "WHERE week_start_date = '2026-05-15' AND percent_threshold = 2",
+        {_1050_A}),
+    # A weekly usage sample's bucket, referenced by no five-hour milestone.
+    "bucket": (
+        "UPDATE weekly_usage_snapshots SET weekly_percent = 6.0 "
+        "WHERE week_start_date = '2026-05-08'",
+        {_1050_B}),
+    # A block straddling the B/A boundary belongs to both cycles.
+    "straddling_block": (
+        "UPDATE five_hour_blocks SET total_cost_usd = 7.0 "
+        "WHERE five_hour_window_key = 5149",
+        {_1050_A, _1050_B}),
+    # A week-C sample is the weekly join of week A's five-hour milestones:
+    # its own bucket (both C cycles) and the referencing block (A) move.
+    "out_of_days_snapshot": (
+        "UPDATE weekly_usage_snapshots SET weekly_percent = 41.0 "
+        "WHERE id = 1",
+        {_1050_A, _1050_C_PRE, _1050_C_POST}),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_1050_STAMP_SCOPES))
+def test_1050_claude_stamp_scopes(ns, case):
+    """#1050 spec 4.6. Detects: an in-place correction of a stored row that
+    leaves the cycle-detail stamp unchanged, so a reopened Current Week
+    history serves the pre-correction detail from the client cache — and a
+    correction that re-stamps cycles it does not touch (a refetch storm)."""
+    import _cctally_milestone_history as mh
+    sql, affected = _1050_STAMP_SCOPES[case]
+    conn = ns["open_db"]()
+    try:
+        _seed_full(conn)
+        before = _1050_stamps(mh.build_claude_week_index(conn))
+        assert conn.execute(sql).rowcount >= 1, "non-vacuity: a row rewritten"
+        conn.commit()
+        after = _1050_stamps(mh.build_claude_week_index(conn))
+    finally:
+        conn.close()
+    assert set(before) == set(after) == {
+        _1050_A, _1050_B, _1050_C_PRE, _1050_C_POST}
+    moved = {bounds for bounds in before if before[bounds] != after[bounds]}
+    assert moved == affected
+
+
+def test_1050_claude_stamp_reset_moved_twice_then_deleted(ns):
+    """#1050 spec 4.6 reset points. Detects: a reset moved away and back,
+    which restores the cycles' bounds and counts exactly, keeping their old
+    stamps (so the pre-move detail is served again); and a deleted reset that
+    leaves the neighbouring cycle it bounded unstamped."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        event_id = _seed_full(conn)
+        initial = _1050_stamps(mh.build_claude_week_index(conn))
+
+        def move(effective):
+            conn.execute(
+                "UPDATE week_reset_events SET effective_reset_at_utc = ?, "
+                "old_week_end_at = ? WHERE id = ?",
+                (effective, effective, event_id))
+            conn.commit()
+            return _1050_stamps(mh.build_claude_week_index(conn))
+
+        moved = move("2026-05-05T12:00:00+00:00")
+        assert ("2026-05-05T12:00:00Z", "2026-05-08T00:00:00Z") in moved
+        back = move(WK_C_EFFECTIVE)
+        conn.execute("DELETE FROM week_reset_events WHERE id = ?", (event_id,))
+        conn.commit()
+        deleted = _1050_stamps(mh.build_claude_week_index(conn))
+    finally:
+        conn.close()
+    assert set(back) == set(initial), "the move back restores every cycle"
+    # The C cycles are bounded by the reset; B starts at its new week end.
+    for bounds in (_1050_C_PRE, _1050_C_POST, _1050_B):
+        assert back[bounds] != initial[bounds], bounds
+    assert back[_1050_A] == initial[_1050_A] == moved[_1050_A]
+    assert _1050_C_PRE not in deleted and _1050_C_POST not in deleted
+    assert deleted[_1050_B] != back[_1050_B]
+    assert deleted[_1050_A] == back[_1050_A]
+
+
+def test_1050_claude_stamp_account_move_restamps_merged_only(ns):
+    """#1050 spec 4.6 account predicate. Detects: a weekly milestone moved
+    from one account to another (its merged count unchanged) leaving the
+    merged history's stamp unchanged, and a scoped history of a third account
+    re-stamped by rows it never reads."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        _seed_836_two_accounts(ns, conn)
+
+        def read():
+            lone = mh.build_claude_week_index(
+                conn, account_key=UNATTRIBUTED_836, now_utc=_836_NOW)
+            return mh.build_claude_week_index(conn), lone
+
+        merged_before, lone_before = read()
+        assert conn.execute(
+            "UPDATE percent_milestones SET account_key = ? "
+            "WHERE account_key = ? AND percent_threshold = 4",
+            (ACCT_836_A, ACCT_836_B)).rowcount == 1
+        conn.commit()
+        merged_after, lone_after = read()
+    finally:
+        conn.close()
+    assert ([e["milestone_count"] for e in merged_before]
+            == [e["milestone_count"] for e in merged_after]), (
+                "non-vacuity: the merged counts do not see the move")
+    before, after = _1050_stamps(merged_before), _1050_stamps(merged_after)
+    assert set(before) == set(after)
+    moved = {b for b in before if before[b] != after[b]}
+    # The moved milestone's bucket is week A's storage week, which both of
+    # the merged cycles Bob's credit cuts it into share; week B is untouched.
+    assert moved == {("2026-05-15T00:00:00Z", "2026-05-18T00:00:00Z"),
+                     ("2026-05-18T00:00:00Z", "2026-05-22T00:00:00Z")}
+    assert _1050_stamps(lone_before) == _1050_stamps(lone_after)
+
+
+def test_1050_fresh_store_stamps_byte_identical(ns):
+    """#1050 spec 4.6 empty rule. Detects: a store with no tracked write
+    (usage appends only) whose stamps change bytes, which would refetch every
+    cached detail on upgrade; and, on a store that has tracked writes, a cycle
+    no write touched gaining the component."""
+    import _cctally_milestone_history as mh
+    import _lib_milestone_history as lmh
+    conn = ns["open_db"]()
+    try:
+        for start_date, start, end, pct in (
+                ("2026-05-08", WK_B_START, WK_B_END, 5.0),
+                ("2026-05-15", WK_A_START, WK_A_END, 10.0)):
+            _seed_usage(conn, captured_at_utc=start[:10] + "T09:00:00Z",
+                        week_start_date=start_date, week_start_at=start,
+                        week_end_at=end, weekly_percent=pct)
+        conn.commit()
+        assert tuple(conn.execute(
+            "SELECT seq, domain_generation FROM stats_content_revision"
+        ).fetchone()) == (0, 0), "setup: no tracked write"
+        fresh = mh.build_claude_week_index(conn)
+        for t in (1, 2):
+            _seed_percent_milestone(
+                conn, week_start_date="2026-05-15", week_end_date="2026-05-22",
+                percent_threshold=t,
+                captured_at_utc=f"2026-05-16T1{t}:00:00+00:00",
+                cumulative_cost_usd=float(t))
+        conn.commit()
+        touched = mh.build_claude_week_index(conn)
+    finally:
+        conn.close()
+
+    def base(entry):
+        return lmh.compute_detail_stamp(
+            entry["key"], entry["milestone_count"], entry["block_count"],
+            entry["segment_count"],
+            "2026-05-16T12:00:00+00:00" if entry["milestone_count"] else None)
+
+    assert [e["detail_stamp"] for e in fresh] == [base(e) for e in fresh]
+    by_start = {e["start_at_utc"]: e for e in touched}
+    untouched = by_start["2026-05-08T00:00:00Z"]
+    assert untouched["detail_stamp"] == base(untouched)
+    assert by_start["2026-05-15T00:00:00Z"]["detail_stamp"] != base(
+        by_start["2026-05-15T00:00:00Z"])
+
+
+def test_1050_untrusted_store_stamps_carry_a_fresh_u_nonce_per_build(ns):
+    """#1050 spec 4.6 untrusted store. Detects: a store whose tracking is
+    missing (a kernel trigger dropped) keeping stable stamps, so a correction
+    the kernel cannot see is served stale from the client cache forever."""
+    import _cctally_milestone_history as mh
+    import _lib_stats_content_revision as k
+    conn = ns["open_db"]()
+    try:
+        _seed_full(conn)
+        trusted = _1050_stamps(mh.build_claude_week_index(conn))
+        conn.execute(f"DROP TRIGGER {k.KERNEL_TRIGGERS[0]}")
+        conn.commit()
+        assert k.classify(conn) == k.STATE_PARTIAL, "setup: untrusted"
+        first = _1050_stamps(mh.build_claude_week_index(conn))
+        second = _1050_stamps(mh.build_claude_week_index(conn))
+    finally:
+        conn.close()
+    assert set(trusted) == set(first) == set(second)
+    for bounds in trusted:
+        assert len({trusted[bounds], first[bounds], second[bounds]}) == 3

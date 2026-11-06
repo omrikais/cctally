@@ -678,7 +678,7 @@ def _seed_correction_facts(conn, *, account_key="acct-a",
     detected, materialized by a later completed batch touching its account.
     A null-lineage transition is assessed over `(-inf, detected_at]`, so this
     correction supersedes it with no explicit event (derived)."""
-    conn.execute("INSERT INTO claude_weekly_observation_index VALUES (?,?,?)",
+    conn.execute("INSERT INTO claude_weekly_observation_index (observation_id, account_key, captured_at_utc) VALUES (?,?,?)",
                  ("obs-1", account_key, captured_at))
     conn.execute("INSERT INTO claude_weekly_correction_history VALUES (?,?,?)",
                  ("op-1", "obs-1", "hold"))

@@ -22,6 +22,7 @@ implementation of the rule without an import cycle.
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
 import threading
 from collections import OrderedDict
@@ -100,6 +101,44 @@ def decode_codex_project_metadata(
     return DecodedCodexProjectMetadata(
         cwd=cwd, git_json=git_json, undecodable_fields=frozenset(undecodable),
     )
+
+
+#: The reader header's branch statuses (#1037). ``not_recorded`` is a readable
+#: record that names no branch; ``unreadable`` is metadata the store holds but
+#: cannot read (or no thread row at all).
+GIT_BRANCH_RECORDED = "recorded"
+GIT_BRANCH_NOT_RECORDED = "not_recorded"
+GIT_BRANCH_UNREADABLE = "unreadable"
+
+
+def derive_codex_git_branch(
+    decoded: "DecodedCodexProjectMetadata | None",
+) -> "tuple[str | None, str]":
+    """``(git_branch, git_branch_status)`` for one thread row's OWN ``git_json``
+    (#1037), first match wins: no thread row (``None``) or undecodable
+    ``git_json`` bytes → unreadable; NULL or empty → not recorded; invalid JSON
+    or not an object → unreadable; a string ``branch`` with a non-empty
+    ``strip()`` → that string, unmodified; anything else → not recorded.
+
+    ``cwd`` is never consulted, and neither is a parent's or root's metadata:
+    the project attribution exclusion governs the project label only, so a
+    corrupt ``cwd`` beside a readable branch still shows the branch (R-P1).
+    """
+    if decoded is None or "git_json" in decoded.undecodable_fields:
+        return None, GIT_BRANCH_UNREADABLE
+    raw = decoded.git_json
+    if raw is None or raw == "":
+        return None, GIT_BRANCH_NOT_RECORDED
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None, GIT_BRANCH_UNREADABLE
+    if not isinstance(value, dict):
+        return None, GIT_BRANCH_UNREADABLE
+    branch = value.get("branch")
+    if isinstance(branch, str) and branch.strip():
+        return branch, GIT_BRANCH_RECORDED
+    return None, GIT_BRANCH_NOT_RECORDED
 
 
 def _absent(metadata: "DecodedCodexProjectMetadata | None", field: str) -> bool:

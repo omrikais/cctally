@@ -1409,6 +1409,68 @@ def test_frontier_can_certificate_a_stably_missing_tracked_directory(
             conn.close()
 
 
+def test_an_orphan_residual_store_seeds_and_plans_caught_up(
+    small_corpus, tmp_path,
+):
+    """#916 A3(a). Detects: a store still tracking a deleted transcript that
+    the prune gates refuse can never certify, so every dashboard tick plans
+    ``full`` (``unseeded``) and rescans every Claude transcript until a
+    ``cache-sync --rebuild``."""
+    import _lib_ingest_frontier as frontier
+
+    bbf = _load_build_bench()
+    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    with _corpus_env(corpus, bbf) as cctally:
+        projects = cctally._get_claude_data_dirs()[0] / "projects"
+        orphan_dir = projects / "-proj-916-residual"
+        orphan_dir.mkdir()
+        orphan = orphan_dir / "gone.jsonl"
+        # No ``uuid``: gate B cannot prove conversation coverage, so the prune
+        # must leave this path as a residual (the production copy's shape).
+        orphan.write_text(json.dumps({
+            "type": "assistant", "timestamp": "2026-07-01T00:00:00Z",
+            "requestId": "r916", "sessionId": "S916",
+            "message": {"id": "m916", "model": "claude-opus-4-7",
+                        "usage": {"input_tokens": 0, "output_tokens": 10,
+                                  "cache_creation_input_tokens": 0,
+                                  "cache_read_input_tokens": 0}},
+        }) + "\n")
+        conn = cctally.open_cache_db()
+        try:
+            ingest = cctally.sync_cache(conn)
+            assert ingest.full_walk_complete and conn.execute(
+                "SELECT COUNT(*) FROM session_entries WHERE source_path=?",
+                (str(orphan),),
+            ).fetchone()[0] == 1, (
+                f"guard: the store must be clean, with the transcript ingested, "
+                f"before the deletion: {ingest}")
+            shutil.rmtree(orphan_dir)
+            pruned = cctally._prune_orphaned_cache_entries(conn, lock_timeout=None)
+            assert pruned.pruned_files == 0 and str(orphan) in pruned.residual_paths, (
+                f"guard: the orphan must stay a residual: {pruned}")
+
+            app_dir = pathlib.Path(corpus)
+            roots = (projects,)
+            state = frontier.DashboardIngestFrontier(app_dir)
+            cutoff = state.capture_cutoff()
+            walk = cctally.sync_cache(conn)
+            certifiable = frontier.provider_sync_certifiable("full", walk)
+            seeded = state.seed_provider(
+                "claude", conn, roots=roots, cutoff=cutoff)
+            assert seeded, _seed_detail(
+                state, f"certifiable={certifiable} walk={walk}")
+            assert certifiable, walk
+            _assert_plan(state.plan_provider(
+                "claude", conn, roots=roots,
+            ), mode="caught_up")
+            assert conn.execute(
+                "SELECT COUNT(*) FROM session_entries WHERE source_path=?",
+                (str(orphan),),
+            ).fetchone()[0] == 1, "certifying must not touch the residual rows"
+        finally:
+            conn.close()
+
+
 def test_ingest_frontier_database_replacement_and_bad_marker_fail_full(
     small_corpus, tmp_path,
 ):
@@ -1624,6 +1686,11 @@ def test_missing_full_walk_sentinel_invalidates_a_same_inode_store(
     {"files_deferred_torn": 1},
     {"maintenance_failed": True},
     {"full_walk_complete": False},
+    # #916: a residual-only walk with any per-file defect still refuses. A
+    # stats object without the flag (Codex, ``_DebtCleared``) is the
+    # ``{"full_walk_complete": False}`` case above, read through ``getattr``.
+    {"full_walk_complete": False, "full_walk_residual_only": True,
+     "files_failed": 1},
 ])
 def test_a_dirty_full_provider_result_can_never_mint_a_certificate(dirty):
     import _lib_ingest_frontier as frontier
@@ -1642,6 +1709,15 @@ def test_a_dirty_full_provider_result_can_never_mint_a_certificate(dirty):
     assert not frontier.provider_sync_certifiable(
         "full", types.SimpleNamespace(**values)
     )
+
+
+def test_a_clean_residual_only_full_result_is_certifiable():
+    """#916. Detects: the full leg refusing a walk whose only defect was
+    orphan rows, which keeps an orphan store re-walking on every tick."""
+    import _lib_ingest_frontier as frontier
+
+    assert frontier.provider_sync_certifiable("full", types.SimpleNamespace(
+        full_walk_complete=False, full_walk_residual_only=True))
 
 
 @pytest.mark.parametrize("invalid_kind", [

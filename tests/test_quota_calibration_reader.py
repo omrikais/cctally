@@ -994,7 +994,7 @@ def _seed_r6(db: pathlib.Path) -> None:
     conn = sqlite3.connect(db)
     try:
         conn.executemany(
-            "INSERT INTO claude_weekly_observation_index VALUES (?,?,?)",
+            "INSERT INTO claude_weekly_observation_index (observation_id, account_key, captured_at_utc) VALUES (?,?,?)",
             _R6_INDEX)
         conn.executemany(
             "INSERT INTO claude_weekly_correction_ops VALUES (?,?,?)",

@@ -1484,3 +1484,42 @@ def test_the_human_render_caps_refused_rows_and_names_the_blocking_count(capsys)
     assert len(reset_rows) == account_mod._ATTRIBUTE_REFUSED_ROW_CAP, len(reset_rows)
     assert f"{len(groups) - len(reset_rows)} more" in out, out
     assert "1 blocking" in out, out
+
+
+def test_a_heal_fence_defers_the_apply_as_recorded_pending(store, capsys):
+    """#982 R3 (c): while a Codex heal holds its population, the apply's
+    strict reconciliation refuses with ``deferred_heal`` and the command ends
+    `recordedPending` with no spend stamped; a rerun after the heal finishes
+    it. Detects: an operator apply stamping window spend over a store the
+    heal has not finished ingesting (a one-way stamp nothing revisits)."""
+    since, until = _selector()
+    conn = store._cache()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key, value) VALUES (?, ?)",
+            ("codex_heal_walk", json.dumps({
+                "v": 1, "mode": "history", "phase": "units",
+                "population": ["/heal/elsewhere/rollout.jsonl"]})))
+        conn.commit()
+    finally:
+        conn.close()
+    argv = ["account", "attribute", "work", "--since", since, "--until",
+            until, "--yes", "--json"]
+    store.ns["main"](argv)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "recordedPending", payload
+    assert "deferred_heal" in payload["errors"][0]["message"], payload
+    assert store.account not in {
+        account for _ts, account in store.entry_accounts()}, (
+        "spend moved while the heal fence held")
+    conn = store._cache()
+    try:
+        conn.execute("DELETE FROM cache_meta WHERE key='codex_heal_walk'")
+        conn.commit()
+    finally:
+        conn.close()
+    store.ns["main"](argv)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] in ("applied", "recovered"), payload
+    assert store.account in {
+        account for _ts, account in store.entry_accounts()}

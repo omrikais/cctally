@@ -452,6 +452,52 @@ def test_trigger_repairs_seek_the_partition_index(db, conn, image):
         marker in detail for detail in plan for marker in guard.TEMP_MARKERS), plan
 
 
+def _partition_delete_steps(db, tmp_path, *, rows, which):
+    connection = sqlite3.connect(tmp_path / f"partition-{rows}-{which}.db")
+    try:
+        db._apply_cache_schema(connection)
+        for i in range(rows):
+            _insert(connection, line_offset=i, logical_limit_key="limit-big",
+                    captured_at_utc=f"2026-07-{1 + i // 86400:02d}T"
+                    f"{(i // 3600) % 24:02d}:{(i // 60) % 60:02d}:"
+                    f"{i % 60:02d}Z")
+        connection.commit()
+        ids = [row[0] for row in connection.execute(
+            "SELECT id FROM quota_window_snapshots ORDER BY id")]
+        victim = ids[-1] if which == "latest" else ids[0]
+        before = _summary_rows(connection)
+        counter = [0]
+
+        def tick():
+            counter[0] += 1
+            return 0
+
+        connection.set_progress_handler(tick, 1)
+        connection.execute(
+            "DELETE FROM quota_window_snapshots WHERE id=?", (victim,))
+        connection.set_progress_handler(None, 0)
+        connection.commit()
+        assert (_summary_rows(connection) != before) == (which == "latest"), (
+            "non-vacuity: only a latest-row delete moves the summary")
+        _assert_exact(db, connection)
+        return counter[0]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("which", ["non-latest", "latest"])
+def test_partition_latest_delete_work_is_bounded_by_the_partition(
+    db, tmp_path, which,
+):
+    """#971 T3 (failure: every deleted quota row re-reads its whole partition
+    to recompute a maximum that is discarded whenever the summary row
+    survives, about 0.7 ms per row on a real store). One delete's VM steps do
+    not grow with the partition's size, whether or not it held the maximum."""
+    small = _partition_delete_steps(db, tmp_path, rows=20, which=which)
+    big = _partition_delete_steps(db, tmp_path, rows=2000, which=which)
+    assert big <= small + 64, (which, small, big)
+
+
 def test_the_conversations_store_carries_no_summary(db):
     connection = sqlite3.connect(":memory:")
     try:

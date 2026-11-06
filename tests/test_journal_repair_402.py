@@ -382,7 +382,12 @@ def test_doctor_repair_and_rebuild_share_sequence_bearing_fingerprints(
     before_doctor = _tree(app_dir)
     doctor = _run_cli(app_dir, "doctor", "--json")
     assert doctor.returncode == 2
-    assert _tree(app_dir) == before_doctor
+    # #1054: a deep doctor's only write is its disposable journal-scan
+    # checkpoint; every other path stays byte- and mode-identical.
+    after_doctor_tree = _tree(app_dir)
+    assert "journal/.doctor-scan-index" not in before_doctor
+    assert after_doctor_tree.pop("journal/.doctor-scan-index")[0] == "file"
+    assert after_doctor_tree == before_doctor
     doctor_leg = _doctor_check(json.loads(doctor.stdout), "journal.protocol")
 
     expected_unacknowledged = preview_payload["unacknowledgedViolations"]
@@ -1999,3 +2004,68 @@ def test_the_whole_recovery_command_takes_no_extra_prefix_traversal(
     # preview under the repair lock, and the final preview after the rebuild,
     # each with its one mid-segment evidence re-read (#997 D12).
     assert opened == list(S5.TAINTED_EVIDENCE_PASS_OPENS) * 3, opened
+
+
+def test_doctor_admits_an_acknowledgement_appended_at_its_checkpoint(
+    monkeypatch, tmp_path,
+):
+    """T3 (#1054): detects a checkpointed scan whose prior high-water at the
+    cached boundary is wrong. The audit is appended exactly at the covered
+    end of a prefix whose tail is an observation, a blank line and a
+    malformed line; its evidence is the raw-prefix hash at that point, so a
+    high-water taken from the last cached hit fails selection closed. The
+    stats-preloaded shallow gather still shows the violation unacknowledged.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core
+    import _cctally_journal as jr
+
+    journal_dir = _cctally_core.JOURNAL_DIR
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    segment = journal_dir / "observations-2026-07.jsonl"
+    records = [
+        *(_irrelevant_obs(1.0 + index / 1_000) for index in range(20)),
+        *_invalid_batch("commit_without_begin", index=1),
+        _irrelevant_obs(2.0),
+    ]
+    segment.write_bytes(
+        b"".join(journal.encode_line(record) for record in records)
+        + b"\n" + b"{malformed\n"
+    )
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    first = ns["doctor_gather_state"](deep=True)
+    assert [item["kind"] for item in first.journal_protocol_violations] == [
+        "commit_without_begin"
+    ]
+    assert (journal_dir / ".doctor-scan-index").exists()
+
+    (violation,) = journal.resolve_effective_events(records).protocol_violations
+    high_water = (segment.name, segment.stat().st_size)
+    audit = journal.make_protocol_resolution(
+        at=AT,
+        violations=[violation],
+        journal_high_water=high_water,
+        journal_prefix_hash=S5._prefix_digest(journal_dir, high_water),
+    )
+    with segment.open("ab") as handle:
+        handle.write(journal.encode_line(audit))
+
+    warm = ns["doctor_gather_state"](deep=True)
+    # The second warm run reads the audit itself as a cached hit at an
+    # offset past zero, so its evidence check needs the hit's own
+    # high-water, not the segment's running one.
+    rewarm = ns["doctor_gather_state"](deep=True)
+    shallow = ns["doctor_gather_state"](deep=False)
+    (journal_dir / ".doctor-scan-index").unlink()
+    cold = ns["doctor_gather_state"](deep=True)
+    for state in (warm, rewarm, cold):
+        assert state.journal_protocol_error is None
+        assert state.journal_protocol_violations == []
+        assert [
+            item["fingerprint"] for item in state.journal_protocol_acknowledged
+        ] == [violation.fingerprint]
+    assert shallow.journal_protocol_acknowledged == []
+    assert [item["kind"] for item in shallow.journal_protocol_violations] == [
+        "commit_without_begin"
+    ]

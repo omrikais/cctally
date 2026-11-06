@@ -1,30 +1,29 @@
 import { Fragment, type ReactNode } from 'react';
+import type { SnippetPart } from '../types/conversation';
 
-// Convert a search snippet into React nodes. FTS snippets delimit hits
-// with literal '[' / ']' (the SQLite snippet() markers we configured);
-// LIKE snippets carry no markers. We split on balanced [..] pairs and
-// wrap the inside in <mark>. Everything is rendered as React TEXT nodes
-// (never innerHTML), so raw HTML in the prose is inert. An unbalanced
-// '[' with no closing ']' renders verbatim (defensive — a literal
-// bracket in user content must not eat the rest of the snippet).
-export function renderSnippet(snippet: string): ReactNode {
-  const out: ReactNode[] = [];
-  let i = 0;
-  let key = 0;
-  while (i < snippet.length) {
-    const open = snippet.indexOf('[', i);
-    if (open === -1) {
-      out.push(<Fragment key={key++}>{snippet.slice(i)}</Fragment>);
-      break;
-    }
-    const close = snippet.indexOf(']', open + 1);
-    if (close === -1) {
-      out.push(<Fragment key={key++}>{snippet.slice(i)}</Fragment>);
-      break;
-    }
-    if (open > i) out.push(<Fragment key={key++}>{snippet.slice(i, open)}</Fragment>);
-    out.push(<mark key={key++}>{snippet.slice(open + 1, close)}</mark>);
-    i = close + 1;
+// #1036 — a search snippet is rendered from the server's structured
+// `snippet_parts` (literal transcript text plus the FTS match flag of each
+// part), never by parsing brackets: the transcript's own `[` / `]` are text,
+// and the legacy bracket `snippet` string is the CLI's form. Without valid
+// parts (an old server, a LIKE or Codex excerpt with none, a malformed list)
+// the snippet renders as ONE literal text node with no highlight. Everything
+// is rendered as React TEXT nodes (never innerHTML), so raw HTML is inert.
+export function isSnippetParts(value: unknown): value is SnippetPart[] {
+  return Array.isArray(value) && value.every((part) =>
+    typeof part === 'object' && part !== null
+    && typeof (part as { text?: unknown }).text === 'string'
+    && typeof (part as { match?: unknown }).match === 'boolean');
+}
+
+export function renderSnippet(snippet: string | null | undefined, parts?: unknown): ReactNode {
+  if (isSnippetParts(parts) && parts.length > 0) {
+    return (
+      <>
+        {parts.map((part, i) => (part.match
+          ? <mark key={i}>{part.text}</mark>
+          : <Fragment key={i}>{part.text}</Fragment>))}
+      </>
+    );
   }
-  return <>{out}</>;
+  return <>{snippet ?? ''}</>;
 }

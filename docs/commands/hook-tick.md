@@ -33,6 +33,7 @@ On every assistant-message boundary (`PostToolBatch`, `Stop`, `SubagentStop`):
 
 - `ok(7d=N,5h=M)` / `ok(7d=N)` — fetched successfully (5h optional)
 - `throttled(age=Ns)` — last fetch was less than the throttle threshold ago
+- `throttled(inflight)` — another usage refresh (a hook-tick or the statusline's OAuth check) holds the fetch lock; this one skipped its OAuth refresh
 - `skipped-no-oauth` — `--no-oauth` flag set
 - `skipped-no-token` — no Claude OAuth token found in keychain or credentials file
 - `err(network)` / `err(parse)` — fetch or parse failed

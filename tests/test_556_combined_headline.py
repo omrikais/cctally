@@ -380,7 +380,10 @@ def test_the_claude_idle_clock_advances_quota_but_not_hero(tmp_path, monkeypatch
         domain_freshness={"hero": "fresh", "quota": "fresh", "sessions": "fresh"},
     )
     current_week = SimpleNamespace(
-        latest_snapshot_at=NOW - dt.timedelta(seconds=600),
+        # #1018 twin: the quota axis ages from the confirming reading, never
+        # from the stored row (deliberately fresher here).
+        latest_snapshot_at=NOW - dt.timedelta(seconds=5),
+        latest_weekly_reading_at=NOW - dt.timedelta(seconds=600),
         week_start_at=WEEK_START,
         week_end_at=WEEK_END,
     )
@@ -392,6 +395,81 @@ def test_the_claude_idle_clock_advances_quota_but_not_hero(tmp_path, monkeypatch
     assert dict(refreshed.domain_freshness) == {
         "hero": "fresh", "quota": "stale", "sessions": "fresh",
     }
+
+
+def _stale_claude_state(tui):
+    return SourceDashboardState(
+        source="claude",
+        availability="ok",
+        freshness="fresh",
+        warnings=(),
+        data_version="claude-v1",
+        last_success_at=NOW,
+        capabilities={"hero": CapabilityRecord("supported", "subscription-week")},
+        data={**_claude_source_data(
+            week_end="2026-04-20T14:00:00Z", freshness_label="stale"),
+            "quota": {"current_week": {"freshness": {
+                "label": "stale", "age_seconds": 900,
+                "captured_at": "2026-04-16T13:45:00Z"}}}},
+        domain_freshness={"hero": "fresh", "quota": "stale", "sessions": "fresh"},
+    )
+
+
+@pytest.mark.parametrize("reading_age, quota, copy", [
+    (10, "fresh", {"label": "fresh", "age_seconds": 10,
+                   "captured_at": "2026-04-16T13:59:50Z"}),
+    (None, "fresh", None),
+], ids=["confirmed", "no-confirmation"])
+def test_the_claude_idle_clock_follows_the_confirming_reading(
+    tmp_path, monkeypatch, reading_age, quota, copy,
+):
+    """#1018 twin spec 5.4 (failure: the idle quota axis stays `stale` from a
+    prior tick while flat readings confirm the value, or keeps a retained
+    `stale` when the confirmation disappears; or the source copies of the
+    current-week freshness freeze at the build instant). Only `quota`
+    follows the reading; `hero` keeps its accounting meaning; None maps to
+    `fresh`, asserted from a prior `stale`."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    tui = ns["_cctally_tui"]
+    state = _stale_claude_state(tui)
+    current_week = SimpleNamespace(
+        latest_snapshot_at=NOW - dt.timedelta(hours=2),
+        latest_weekly_reading_at=(
+            None if reading_age is None
+            else NOW - dt.timedelta(seconds=reading_age)),
+        week_start_at=WEEK_START,
+        week_end_at=WEEK_END,
+    )
+
+    refreshed = tui._refresh_claude_source_clock(
+        state, current_week=current_week, now_utc=NOW, raw_config={},
+    )
+
+    assert dict(refreshed.domain_freshness) == {
+        "hero": "fresh", "quota": quota, "sessions": "fresh",
+    }
+    assert refreshed.data["hero"]["current_week"]["freshness"] == copy
+    assert refreshed.data["quota"]["current_week"]["freshness"] == copy
+    assert state.domain_freshness["quota"] == "stale"
+    assert state.data["hero"]["current_week"]["freshness"]["label"] == "stale"
+
+
+def test_a_claude_week_without_a_confirmation_keeps_quota_fresh(
+    tmp_path, monkeypatch,
+):
+    """#1018 twin spec 5.4, full-build helper (failure: a null current-week
+    freshness reads as stale on the quota axis)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    data = _claude_source_data(
+        week_end="2026-04-20T14:00:00Z", freshness_label="stale")
+    data["hero"]["current_week"]["freshness"] = None
+
+    domains = ns["_cctally_tui"]._tui_claude_domain_freshness(
+        data, now_utc=NOW)
+
+    assert domains == {"hero": "fresh", "quota": "fresh", "sessions": "fresh"}
 
 
 def test_the_claude_idle_clock_stales_the_hero_axis_past_the_week_end(
@@ -672,6 +750,7 @@ def test_a_decorated_provider_whose_account_read_failed_still_withholds(
 
         monkeypatch.setattr(_cctally_account, "real_account_count", _raise)
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             stats_conn=stats,
             now_utc=NOW,
             display_tz_name="UTC",

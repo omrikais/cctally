@@ -863,7 +863,20 @@ export interface ConversationDetail {
     unattributed_cost_usd?: number;
     parent?: { conversation_key: string; title: string | null } | null;
     children?: { conversation_key: string; title: string | null; cost_usd: number }[];
+    // #1037 — Codex only: why `git_branch` is null. `not_recorded` (the
+    // retained git metadata names no branch) renders `no branch recorded`;
+    // `unreadable` (stored but unreadable, or no thread row) renders `—`.
+    git_branch_status?: GitBranchStatus;
   };
+}
+
+export type GitBranchStatus = 'recorded' | 'not_recorded' | 'unreadable';
+
+// #1036 — one part of a search excerpt: literal transcript text, and whether
+// SQLite FTS matched it. The viewer highlights only `match: true` parts.
+export interface SnippetPart {
+  text: string;
+  match: boolean;
 }
 
 // #177 S6 — kind facet for the rail search chips. Maps 1:1 to the backend
@@ -884,6 +897,9 @@ export interface SearchHit {
   title: string; // derived conversation title for the hit's session (#165 Q4)
   ts: string;
   snippet: string;
+  // #1036 — the structured excerpt (absent from a server that predates it, in
+  // which case the snippet renders literally with no highlight).
+  snippet_parts?: SnippetPart[];
   cost_usd: number;
   // #177 S6 — non-prose match badges (sorted lowercase; server omits prose).
   // Always present on the wire (defaults to []); optional here for back-compat

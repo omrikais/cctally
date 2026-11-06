@@ -348,18 +348,6 @@ ALLOWLIST: "tuple[TempStructureRule, ...]" = (
         detail_pattern=r"USE TEMP B-TREE FOR ORDER BY",
         reason="top-1: LIMIT 1, so the sorter keeps one row",
     ),
-    TempStructureRule(
-        rule_id="codex-cycle-milestone-count",
-        call_site="_cctally_milestone_history._codex_milestone_count",
-        sql_pattern=(r"^SELECT COUNT\(DISTINCT percent_threshold\), "
-                     r"MAX\(captured_at_utc\) FROM quota_percent_milestones "
-                     r"WHERE source='codex' AND source_root_key=\?"),
-        detail_pattern=r"USE TEMP B-TREE FOR count\(DISTINCT\)",
-        reason=("schema bound: a count(DISTINCT) b-tree holds distinct keys "
-                "only, and percent_threshold is an INTEGER the writer derives "
-                "from an integer crossing under CHECK(percent_threshold "
-                "BETWEEN 1 AND 100): at most 100 entries"),
-    ),
     *(
         TempStructureRule(
             rule_id=f"panel-row-cap-{call_site.rsplit('.', 1)[1].strip('_')}",

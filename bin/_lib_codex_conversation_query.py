@@ -52,12 +52,14 @@ from _lib_codex_find_projection import (
 from _lib_codex_metadata import (
     codex_metadata_is_malformed,
     decode_codex_project_metadata,
+    derive_codex_git_branch,
     resolve_codex_threads_table,
 )
 from _lib_codex_title_clean import clean_codex_title
 from _lib_conversation import _strip_ansi
 from _lib_conversation_query import (
-    _FULL_PAYLOAD_CEILING, _first_nonblank_line, _parse_outline_ts)
+    _FULL_PAYLOAD_CEILING, _first_nonblank_line, _parse_outline_ts,
+    plain_snippet_parts)
 from _lib_pricing import _calculate_codex_entry_cost
 from _lib_retained_size import retained_size_bytes
 
@@ -1648,15 +1650,38 @@ def _display_chain(fields: dict) -> str:
             or _short_native(fields.get("native_thread_id")) or "")
 
 
+def _conversation_header_fields(
+    conn: sqlite3.Connection, conversation_key: str, rows: list | None = None,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+) -> "tuple[str, str | None]":
+    """``(display title, project_label)`` from ONE ``_rollup_fields`` resolution
+    (#1037): the project label is the value the rail shows (stored rollup or the
+    identical live recompute, under the request's undecodable-key exclusion)."""
+    fields = _rollup_fields(
+        conn, conversation_key, rows=rows, undecodable_keys=undecodable_keys)
+    if fields is None:
+        return "", None
+    return _display_chain(fields), fields.get("project_label")
+
+
 def _conversation_display_title(
     conn: sqlite3.Connection, conversation_key: str, rows: list | None = None,
     *, undecodable_keys: "frozenset[str]" = frozenset(),
 ) -> str:
-    fields = _rollup_fields(
-        conn, conversation_key, rows=rows, undecodable_keys=undecodable_keys)
-    if fields is None:
-        return ""
-    return _display_chain(fields)
+    return _conversation_header_fields(
+        conn, conversation_key, rows=rows, undecodable_keys=undecodable_keys)[0]
+
+
+def _conversation_branch(
+    conn: sqlite3.Connection, conversation_key: str,
+) -> "tuple[str | None, str]":
+    """``(git_branch, git_branch_status)`` from the conversation's own thread row
+    in the request's thread view (scoped, last-good), decoded field by field.
+    Independent of the project attribution exclusion (#1037 R-P1)."""
+    row = conn.execute(_THREAD_FACTS_SQL, (conversation_key,)).fetchone()
+    if row is None:
+        return derive_codex_git_branch(None)
+    return derive_codex_git_branch(decode_codex_project_metadata(row[4], row[5]))
 
 
 def _conversation_hit_fields(
@@ -2491,15 +2516,22 @@ def get_codex_conversation(
         built.append(item)
     _attach_spawn_child_links(conn, conversation_key, built)
     page_items = built
+    # NOT the Phase A rows: those carry no ``text``, and the live-recompute
+    # fallback inside _rollup_fields derives the title from it. Passing None
+    # keeps the stored fast path unchanged and lets the rare no-rollup case
+    # do its own wide read rather than titling the conversation "".
+    title, project_label = _conversation_header_fields(
+        conn, conversation_key, undecodable_keys=undecodable_keys)
+    git_branch, git_branch_status = _conversation_branch(conn, conversation_key)
     return {
         "status": "ok",
         "conversation_key": conversation_key,
-        # NOT the Phase A rows: those carry no ``text``, and the live-recompute
-        # fallback inside _rollup_fields derives the title from it. Passing None
-        # keeps the stored fast path unchanged and lets the rare no-rollup case
-        # do its own wide read rather than titling the conversation "".
-        "title": _conversation_display_title(
-            conn, conversation_key, undecodable_keys=undecodable_keys),
+        "title": title,
+        # #1037: the reader header's project slot (the rail's label) and branch
+        # slot (the thread's own retained git_json, with its status).
+        "project_label": project_label,
+        "git_branch": git_branch,
+        "git_branch_status": git_branch_status,
         "items": page_items,
         "page": page,
         "session_index": session_index,
@@ -4354,7 +4386,9 @@ def _collapse_message_hits(
                 hit["snippet"] = _search_excerpt(disp, query)
     return [
         {"conversation_key": h["conversation_key"], "item_key": h["item_key"],
-         "title": h["title"], "snippet": h["snippet"], "badges": sorted(h["_badges"]),
+         "title": h["title"], "snippet": h["snippet"],
+         "snippet_parts": plain_snippet_parts(h["snippet"]),
+         "badges": sorted(h["_badges"]),
          "last_activity_utc": h["last_activity_utc"], "project_label": h["project_label"]}
         for h in collapsed.values()
     ]
@@ -4379,9 +4413,11 @@ def _search_title(
             "SELECT conversation_key, title, last_activity_utc, project_label "
             "FROM codex_conversation_rollups WHERE title LIKE ?", (like,)):
         cleaned = clean_codex_title(title)
+        snippet = _excerpt(cleaned)
         hits.append(
             {"conversation_key": ck, "item_key": None, "title": cleaned,
-             "snippet": _excerpt(cleaned), "badges": ["title"],
+             "snippet": snippet, "snippet_parts": plain_snippet_parts(snippet),
+             "badges": ["title"],
              "last_activity_utc": last_act,
              "project_label": (
                  None if ck in undecodable_keys else project_label)})
@@ -4414,10 +4450,12 @@ def _search_files(
                 conn, ck, undecodable_keys=undecodable_keys)
         item_key = pos_cache[ck].get((member[0], member[1]))
         title, last_act, project_label = fields_cache[ck]
+        snippet = _excerpt(file_path)
         hit = collapsed.setdefault(
             (ck, item_key),
             {"conversation_key": ck, "item_key": item_key, "title": title,
-             "snippet": _excerpt(file_path), "badges": ["files"],
+             "snippet": snippet, "snippet_parts": plain_snippet_parts(snippet),
+             "badges": ["files"],
              "last_activity_utc": last_act, "project_label": project_label})
     return list(collapsed.values())
 

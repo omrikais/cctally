@@ -527,17 +527,27 @@ def _seed_excluded(ns):
     return seg
 
 
+@pytest.mark.parametrize("from_checkpoint", [False, True],
+                         ids=["cold", "from-checkpoint"])
 @pytest.mark.parametrize("failure", ["boundary-lookup", "segment-read"])
 def test_a_failing_deep_scan_reports_its_checks_unavailable(
-        ns, monkeypatch, capsys, failure):
+        ns, monkeypatch, capsys, failure, from_checkpoint):
     """K9K10-R6: when the deep scan's boundary lookup raised, the scan set
     the boundary to None: `excluded_population(None)` reported zero excluded
     records and the conflict scan ran with admission disabled. A segment the
     scan could not read was skipped. Each must render the affected checks
-    unavailable, with the cause — never zero, never an unfiltered scan."""
+    unavailable, with the cause — never zero, never an unfiltered scan.
+
+    #1054 (T8): the same holds when the run starts from a reusable deep-scan
+    checkpoint, and a failing run publishes no checkpoint of its own — a
+    scan error never becomes a cache hit."""
     import pathlib
     import _cctally_journal as jr
     seg = _seed_excluded(ns)
+    index_before = None
+    if from_checkpoint:
+        _legs(capsys, True)
+        index_before = _scan_index().read_bytes()
     if failure == "boundary-lookup":
         def unreadable(self, high_water):
             raise jr.AccountBoundCutoverUnavailable(
@@ -564,6 +574,10 @@ def test_a_failing_deep_scan_reports_its_checks_unavailable(
     assert conflicts["severity"] == "warn", conflicts
     assert conflicts["details"]["available"] is False, conflicts
     assert "injected" in conflicts["summary"], conflicts
+    if from_checkpoint:
+        assert _scan_index().read_bytes() == index_before
+    else:
+        assert not _scan_index().exists()
 
 
 def test_an_unlistable_journal_is_never_an_empty_one(ns, monkeypatch, capsys):
@@ -649,3 +663,225 @@ def test_the_unreadable_journal_remediation_names_the_resolved_data_dir():
         "Check the permissions of /data/cctally-dev/journal/ and the disk, "
         "then run `cctally doctor --deep` again")
     assert "~/.local/share/cctally" not in result.remediation
+
+
+# --------------------------------------------------------------------------
+# #1054: the deep scan's checkpoint — excluded population and cutover value
+# --------------------------------------------------------------------------
+
+def _scan_index():
+    return _cctally_core.JOURNAL_DIR / ".doctor-scan-index"
+
+
+def _published_entries():
+    import _lib_doctor_scan_index as dsi
+    raw = _scan_index().read_bytes()
+    return dsi.decode(raw, json.loads(raw)["version"])
+
+
+def _exclusion_decodes(monkeypatch):
+    """Counts `decode_line` calls made inside the deep scan's exclusion."""
+    import _cctally_doctor
+    import _lib_journal as J
+    counter = {"inside": False, "n": 0}
+    real_population = _cctally_doctor._deep_excluded_population
+    real_decode = J.decode_line
+
+    def population(*args, **kwargs):
+        counter["inside"] = True
+        try:
+            return real_population(*args, **kwargs)
+        finally:
+            counter["inside"] = False
+
+    def decode(raw):
+        if counter["inside"]:
+            counter["n"] += 1
+        return real_decode(raw)
+
+    monkeypatch.setattr(_cctally_doctor, "_deep_excluded_population",
+                        population)
+    monkeypatch.setattr(J, "decode_line", decode)
+    return counter
+
+
+@pytest.mark.parametrize("where", ["earlier-segment",
+                                   "new-segment-after-the-main-pass"])
+def test_deep_doctor_finds_an_excluded_record_appended_after_its_checkpoint(
+        ns, monkeypatch, where):
+    """T3 (#1054): detects a cached excluded population trusted past its
+    verified range, or a re-listing lost to the checkpoint. The legacy
+    record is appended after a published checkpoint, into an earlier
+    segment or into a segment created between the main pass and the
+    exclusion; the immediate deep run counts it while the stats summary
+    still describes the earlier journal."""
+    import _cctally_doctor
+    import _cctally_journal as jr
+    import _lib_journal as J
+    earlier = "observations-2026-01.jsonl"
+    _raw_append(earlier, [_legacy_obs(J, "2026-01-04T00:00:00Z", 2.0)])
+    _seed_excluded(ns)
+    first = ns["doctor_gather_state"](deep=True).legacy_writer
+    assert first["excludedCount"] == 1
+    assert _scan_index().exists()
+    with monkeypatch.context() as m:
+        if where == "earlier-segment":
+            _raw_append(earlier, [_legacy_obs(J, "2026-01-05T00:00:00Z",
+                                              72.0)])
+        else:
+            real_resolve = jr._PassBoundary.resolve
+
+            def resolve_then_create(self, high_water):
+                _raw_append("observations-2099-01.jsonl", [
+                    _legacy_obs(J, "2026-10-09T11:00:00Z", 73.0)])
+                return real_resolve(self, high_water)
+
+            m.setattr(jr._PassBoundary, "resolve", resolve_then_create)
+        warm = ns["doctor_gather_state"](deep=True).legacy_writer
+    assert warm["excludedCount"] == 2
+    assert _cctally_doctor._gather_legacy_writer(None, None)[
+        "excludedCount"] == 1
+    _scan_index().unlink()
+    cold = ns["doctor_gather_state"](deep=True).legacy_writer
+    assert (warm["excludedCount"], warm["coordinateDigest"]) == (
+        cold["excludedCount"], cold["coordinateDigest"])
+
+
+def test_deep_doctor_finds_a_cutover_candidate_appended_after_its_checkpoint(
+        ns, monkeypatch):
+    """T3 (#1054): detects a warm run that misses a legacy cutover op in the
+    fresh suffix. The fallback is pinned to a sentinel account because the
+    real one re-reads the same op and would mask the miss: only the
+    candidate's account makes the legacy event a duplicate, not a conflict."""
+    import _cctally_journal as jr
+    import _lib_journal as J
+    monkeypatch.setattr(jr, "resolve_cutover_claude_account",
+                        lambda: "acct-sentinel")
+    payload = {"captured_at_utc": "2026-10-09T09:00:00Z",
+               "weekly_percent": 5.0, "account_key": "acct-a"}
+    stamped = J.make_evt(kind="snapshot_accept", id="sa:x",
+                         at="2026-10-09T09:00:00Z", payload=payload)
+    legacy = J.unstamped_record(J.make_evt(
+        kind="snapshot_accept", id="sa:x", at="2026-10-09T09:00:00Z",
+        payload={k: v for k, v in payload.items() if k != "account_key"}))
+    segment = "observations-2026-10.jsonl"
+    _raw_append(segment, [stamped, legacy])
+    before = ns["doctor_gather_state"](deep=True)
+    assert [c["eventId"] for c in before.journal_conflicts] == ["sa:x"]
+    assert _scan_index().exists()
+    cutover = J.make_op(at="2026-10-09T10:00:00Z", src="accounts-cutover",
+                        payload={"kind": "accounts_cutover",
+                                 "claude_legacy_account": "acct-a"})
+    cutover["id"] = jr.CUTOVER_OP_ID
+    _raw_append(segment, [cutover])
+    warm = ns["doctor_gather_state"](deep=True)
+    assert warm.journal_conflicts == []
+    _scan_index().unlink()
+    cold = ns["doctor_gather_state"](deep=True)
+    assert (warm.journal_conflicts, warm.journal_protocol_violations) == (
+        cold.journal_conflicts, cold.journal_protocol_violations)
+
+
+def test_deep_doctor_reuses_its_cached_excluded_population(ns, monkeypatch):
+    """T8 (#1054): detects an exclusion that re-decodes its verified range
+    on every run (the second exclusion decode the cache removes)."""
+    _seed_excluded(ns)
+    ns["doctor_gather_state"](deep=True)
+    counter = _exclusion_decodes(monkeypatch)
+    warm = ns["doctor_gather_state"](deep=True).legacy_writer
+    assert counter["n"] == 0
+    _scan_index().unlink()
+    cold = ns["doctor_gather_state"](deep=True).legacy_writer
+    assert counter["n"] > 0
+    assert warm == cold
+    assert warm["excludedCount"] == 1
+
+
+def test_deep_doctor_recomputes_exclusion_under_an_attached_revision(
+        ns, monkeypatch):
+    """T8 (#1054): detects a cached excluded population reused across a
+    boundary change with unchanged bytes (dataclass equality ignores an
+    attached revision). The first run sees the cutover alone, which admits
+    a revision-1 record; the second sees the same journal with its revision
+    fences attached, which exclude it, and must recompute and equal the
+    oracle under that boundary."""
+    import _cctally_journal as jr
+    import _lib_account_protocol as ap
+    import _lib_journal as J
+    seg = _seed_excluded(ns)
+    _raw_append(seg, [J.prerevision_record(J.make_obs(
+        at="2026-10-09T11:00:00Z", src="statusline", provider="claude",
+        payload={"weekly_percent": 2.0}))])
+    real_resolve = jr._PassBoundary.resolve
+    captured = {}
+
+    def cutover_only(self, high_water):
+        boundary = real_resolve(self, high_water)
+        assert boundary.revision is not None
+        return ap.original_boundary(boundary)
+
+    with monkeypatch.context() as m:
+        m.setattr(jr._PassBoundary, "resolve", cutover_only)
+        first = ns["doctor_gather_state"](deep=True).legacy_writer
+    assert first["excludedCount"] == 1
+
+    def capturing(self, high_water):
+        captured["boundary"] = real_resolve(self, high_water)
+        return captured["boundary"]
+
+    monkeypatch.setattr(jr._PassBoundary, "resolve", capturing)
+    counter = _exclusion_decodes(monkeypatch)
+    warm = ns["doctor_gather_state"](deep=True).legacy_writer
+    assert counter["n"] > 0
+    oracle = jr.excluded_population(captured["boundary"])
+    assert len(oracle) == 2
+    assert warm["excludedCount"] == 2
+    assert warm["coordinateDigest"] == ap.coordinate_population_digest(
+        item.coordinate for item in oracle)
+
+
+@pytest.mark.parametrize("ends", ["after-covered", "before-covered"])
+def test_a_short_exclusion_read_publishes_nothing_for_its_bytes(
+        ns, monkeypatch, ends):
+    """T8 (#1054): detects a contribution published for bytes the run did
+    not classify, and an unverified prefix trusted when the stream ended
+    before reaching it. The reuse read is cut short: past the cached range
+    it keeps the cached list plus the suffix it classified; before it, the
+    segment is recomputed cold by a second read."""
+    import _cctally_journal as jr
+    import _lib_doctor_scan_index as dsi
+    import _lib_journal as J
+    seg = _seed_excluded(ns)
+    ns["doctor_gather_state"](deep=True)
+    cached = _published_entries()[seg].exclusion
+    assert cached is not None and cached.excluded
+    later = [_legacy_obs(J, "2026-10-09T12:00:00Z", 80.0),
+             _legacy_obs(J, "2026-10-09T13:00:00Z", 81.0)]
+    _raw_append(seg, later)
+    hi = (_cctally_core.JOURNAL_DIR / seg).stat().st_size
+    if ends == "after-covered":
+        cut = cached.covered + len(J.encode_line(later[0]))
+    else:
+        data = (_cctally_core.JOURNAL_DIR / seg).read_bytes()
+        cut = data.index(b"\n", cached.lo) + 1
+        assert cut < cached.covered
+    real_iter = jr._iter_segment_lines
+    reads = []
+
+    def short_reuse_read(seg_path, lo, hi_, *, on_bytes=None):
+        reuse = (isinstance(on_bytes, dsi.RangeHasher)
+                 and on_bytes.prefix_state != "none")
+        reads.append("reuse" if reuse else "plain")
+        return real_iter(seg_path, lo, cut if reuse else hi_,
+                         on_bytes=on_bytes)
+
+    monkeypatch.setattr(jr, "_iter_segment_lines", short_reuse_read)
+    warm = ns["doctor_gather_state"](deep=True).legacy_writer
+    published = _published_entries()[seg].exclusion
+    assert "reuse" in reads
+    if ends == "after-covered":
+        assert warm["excludedCount"] == 2
+        assert published is None
+    else:
+        assert warm["excludedCount"] == 3
+        assert published is not None and published.covered == hi

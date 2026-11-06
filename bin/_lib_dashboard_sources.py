@@ -124,7 +124,15 @@ CapabilityStatus = Literal[
 # reconnects over its existing EventSource, so an old client demonstrably does
 # meet a new server, and `docs/cli-contract.md` calls a changed meaning
 # breaking. That is why this is a bump and not a silent addition.
-SOURCE_SCHEMA_VERSION = 12
+# 12 -> 13 (#1018 twin): the MEANING of the Claude current-week freshness
+# changed. `hero.current_week.freshness` and `quota.current_week.freshness`
+# (and the legacy `current_week.freshness` they copy) used to age from the
+# stored weekly row, which a flat stream of equal readings never replaces;
+# `captured_at` now names the newest genuine reading that confirms the
+# displayed weekly value, and the member is null when no reading confirms it.
+# `last_snapshot_age_sec` keeps the stored row's age. Same shape, new value,
+# which `docs/cli-contract.md` counts as a changed meaning.
+SOURCE_SCHEMA_VERSION = 13
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
 SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")
@@ -1953,6 +1961,34 @@ _CODEX_STATS_DIGEST_RELATIONS: tuple[tuple[str, str], ...] = (
     ),
     _meter_rate_change_relation("codex"),
     _meter_rate_change_supersession_relation("codex"),
+    # #1050 spec 4.7 (G3): the complete canonical tuple of every row the Codex
+    # cycle detail reads, each bound to its account. The two relations above
+    # for these tables omit `account_key` (and the milestones' physical
+    # `source_path`/`line_offset`), so a boundary-only rewrite, an account-only
+    # rewrite or two accounts' values swapped in place moved neither the
+    # digest nor `codex_version`, and `_codex_quota_reuse_identity` reused the
+    # old read. Appended, so the relations above keep their bytes; each is the
+    # account-qualified unique key followed by every other column the helper
+    # reads, ordered by the UNIQUE autoindex's own column order, which is total
+    # over NOT NULL columns and streams from that index with no sorter.
+    (
+        "quota_percent_milestones",
+        "SELECT source, source_root_key, account_key, logical_limit_key, "
+        "observed_slot, window_minutes, resets_at_utc, percent_threshold, "
+        "captured_at_utc, source_path, line_offset, high_water_percent, "
+        "orphaned_at FROM quota_percent_milestones WHERE source='codex' "
+        "ORDER BY source, source_root_key, account_key, logical_limit_key, "
+        "observed_slot, window_minutes, resets_at_utc, percent_threshold",
+    ),
+    (
+        "quota_window_blocks",
+        "SELECT source, source_root_key, account_key, logical_limit_key, "
+        "observed_slot, window_minutes, resets_at_utc, limit_id, limit_name, "
+        "nominal_start_at_utc, current_percent, orphaned_at "
+        "FROM quota_window_blocks WHERE source='codex' "
+        "ORDER BY source, source_root_key, account_key, logical_limit_key, "
+        "observed_slot, window_minutes, resets_at_utc",
+    ),
 )
 
 

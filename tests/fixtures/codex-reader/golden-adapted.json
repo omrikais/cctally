@@ -1,8 +1,8 @@
 {
   "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
   "title": "Synthetic first meaningful user prompt",
-  "project_label": "—",
-  "git_branch": null,
+  "project_label": "project-red",
+  "git_branch": "fixture-branch",
   "started_utc": "2026-07-14T12:03:00Z",
   "last_activity_utc": "2026-07-14T12:13:00Z",
   "cost_usd": 0.0051625,
@@ -417,6 +417,7 @@
     },
     "unattributed_cost_usd": 0,
     "parent": null,
-    "children": []
+    "children": [],
+    "git_branch_status": "recorded"
   }
 }

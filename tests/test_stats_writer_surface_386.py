@@ -569,11 +569,20 @@ FROZEN_WRITE_SITES = {
 # (any other table raises before SQL);
 # test_location_adoption_writes_only_its_cursor_table observes it on both
 # stores with an SQLite authorizer and proves zero stats-main writes.
+# #1050 adds `_lib_stats_content_revision.py`'s five: the three `CREATE
+# TRIGGER {TRIGGER_PREFIX}{table}_<op>` builders of `_trigger_sql` (the trigger
+# names come from the kernel's fixed `TRACKED_TABLES`, never a caller) and the
+# two `_install` drops, of the kernel's own prefixed triggers and of its one
+# named index. They run only inside `ensure_stats_content_revision`, under
+# `stats_open_time_guard` (the sanctioned open-time write scope), and
+# `tests/test_stats_content_revision.py` reaches each through a real install
+# and repair.
 FROZEN_DYNAMIC_SITES = {
     "_cctally_cache.py": 17,
     "_cctally_db.py": 9,
     "_cctally_journal.py": 11,
     "_cctally_store.py": 1,
+    "_lib_stats_content_revision.py": 5,
 }
 
 

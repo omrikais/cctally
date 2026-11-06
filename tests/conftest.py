@@ -698,6 +698,14 @@ def _reset_snapshot_dispatch_state():
         _sources.reset_codex_quota_observation_cache()
     except Exception:
         pass
+    # #1050: the Codex cycle index's process memo. Only an already-loaded
+    # module is reset; importing it here would load the CLI's siblings early.
+    _mh = sys.modules.get("_cctally_milestone_history")
+    if _mh is not None:
+        try:
+            _mh.reset_codex_cycle_inputs_memo()
+        except Exception:
+            pass
     yield
 
 

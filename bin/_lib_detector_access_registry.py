@@ -34,8 +34,11 @@ only through this review:
 
 1. Print the before/after shape-line delta of every affected site with
    `bin/cctally-test-remote python3 tests/_detector_access_callgraph.py
-   --base <rev>`, where `<rev>` is the tree the current pins were reviewed on
-   (`HEAD` for an uncommitted sync; the merge base for a committed branch).
+   --base <rev>`, where `<rev>` is the full SHA of the commit the current
+   pins were reviewed on (the merge base for a committed branch, the
+   checkout's commit for an uncommitted change). Never pass `HEAD`: the runner
+   snapshots the working tree into its own commit, so its `HEAD` already
+   contains the change and the delta comes out empty.
    Read it beside the source diff (`git diff <rev> -- bin/`).
 2. Explain every added (`+`), removed (`-`) and changed (`~`) dependency.
    "Only additions" is not an explanation.
@@ -691,9 +694,23 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton',),
         inert_rule=MAINT,
     ),
+    # #1018 twin epoch 1024 (spec 5.1): the observation index gains its four
+    # enriched columns and the partial freshness index. Schema-only, MAINT.
     AccessContract(
         function='_cctally_core:open_db',
-        sql_fingerprint='CREATE TABLE IF NOT EXISTS claude_weekly_observation_index ( observation_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, captured_at_utc TEXT NOT NULL )',
+        sql_fingerprint='CREATE INDEX IF NOT EXISTS idx_claude_weekly_observation_index_freshness ON claude_weekly_observation_index (account_key, weekly_resets_at_utc, weekly_percent, captured_at_utc DESC) WHERE weekly_freshness_eligible = 1',
+        table='claude_weekly_observation_index',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS claude_weekly_observation_index ( observation_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, captured_at_utc TEXT NOT NULL, weekly_percent REAL, weekly_resets_at_utc TEXT, weekly_reading_genuine INTEGER NOT NULL DEFAULT 0, weekly_freshness_eligible INTEGER NOT NULL DEFAULT 0 )',
         table='claude_weekly_observation_index',
         keys=(),
         predicate='',
@@ -1269,10 +1286,31 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # registered as their own MAINT contracts. No SQL, table selection,
     # predicate, ordering, selected column, execution condition or effect of
     # these sites changed, so each contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1018 twin T1, base d94a83792), for open_db #1.
+    # Changed: the binding `STATS_INDEX_EPOCH` 1023 -> 1024 (spec 5.1) and the
+    # producer `open_db` itself, whose epoch-1024 schema block creates
+    # `claude_weekly_observation_index` with the four enriched columns
+    # (`weekly_percent`, `weekly_resets_at_utc`, `weekly_reading_genuine`,
+    # `weekly_freshness_eligible`) and the partial index
+    # `idx_claude_weekly_observation_index_freshness`; those are literal
+    # statements, registered as their own MAINT contracts. No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its MAINT inert rule
+    # stand.
+    # Reviewed re-pin (#1050 T2, base a858a87ab), for open_db #1. Changed:
+    # only the producer `open_db` itself, which now calls the new helper
+    # `_ensure_stats_content_revision` before both current-epoch `return
+    # conn` paths and after the epoch stamp of the fresh, scratch and cutover
+    # schema apply (spec 4.3). That helper installs the content-revision
+    # kernel's tables, triggers and index; its statements are registered as
+    # their own MAINT contracts under `_lib_stats_content_revision`. No SQL,
+    # table selection, predicate, ordering, selected column, execution
+    # condition or effect of this site changed, so the contract and its MAINT
+    # inert rule stand.
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#1',
-        sql_shape='sha256:61bf241458c1f433',
+        sql_shape='sha256:89c6c21da1b99cc6',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1308,10 +1346,31 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # as their own MAINT contracts. No SQL, table selection, predicate,
     # ordering, selected column, execution condition or effect of this site
     # changed, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1018 twin T1, base d94a83792), for open_db #2.
+    # Changed: the binding `STATS_INDEX_EPOCH` 1023 -> 1024 (spec 5.1) and the
+    # producer `open_db` itself, whose epoch-1024 schema block creates
+    # `claude_weekly_observation_index` with the four enriched columns
+    # (`weekly_percent`, `weekly_resets_at_utc`, `weekly_reading_genuine`,
+    # `weekly_freshness_eligible`) and the partial index
+    # `idx_claude_weekly_observation_index_freshness`; those are literal
+    # statements, registered as their own MAINT contracts. No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its MAINT inert rule
+    # stand.
+    # Reviewed re-pin (#1050 T2, base a858a87ab), for open_db #2. Changed:
+    # only the producer `open_db` itself, which now calls the new helper
+    # `_ensure_stats_content_revision` before both current-epoch `return
+    # conn` paths and after the epoch stamp of the fresh, scratch and cutover
+    # schema apply (spec 4.3). That helper installs the content-revision
+    # kernel's tables, triggers and index; its statements are registered as
+    # their own MAINT contracts under `_lib_stats_content_revision`. No SQL,
+    # table selection, predicate, ordering, selected column, execution
+    # condition or effect of this site changed, so the contract and its MAINT
+    # inert rule stand.
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#2',
-        sql_shape='sha256:7d7365dfd8acf5d3',
+        sql_shape='sha256:da7e324fa4e6c968',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1347,10 +1406,31 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # as their own MAINT contracts. No SQL, table selection, predicate,
     # ordering, selected column, execution condition or effect of this site
     # changed, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1018 twin T1, base d94a83792), for open_db #3.
+    # Changed: the binding `STATS_INDEX_EPOCH` 1023 -> 1024 (spec 5.1) and the
+    # producer `open_db` itself, whose epoch-1024 schema block creates
+    # `claude_weekly_observation_index` with the four enriched columns
+    # (`weekly_percent`, `weekly_resets_at_utc`, `weekly_reading_genuine`,
+    # `weekly_freshness_eligible`) and the partial index
+    # `idx_claude_weekly_observation_index_freshness`; those are literal
+    # statements, registered as their own MAINT contracts. No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its MAINT inert rule
+    # stand.
+    # Reviewed re-pin (#1050 T2, base a858a87ab), for open_db #3. Changed:
+    # only the producer `open_db` itself, which now calls the new helper
+    # `_ensure_stats_content_revision` before both current-epoch `return
+    # conn` paths and after the epoch stamp of the fresh, scratch and cutover
+    # schema apply (spec 4.3). That helper installs the content-revision
+    # kernel's tables, triggers and index; its statements are registered as
+    # their own MAINT contracts under `_lib_stats_content_revision`. No SQL,
+    # table selection, predicate, ordering, selected column, execution
+    # condition or effect of this site changed, so the contract and its MAINT
+    # inert rule stand.
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#3',
-        sql_shape='sha256:d3d6289b75b86c2f',
+        sql_shape='sha256:c3f6f15f3c9914f7',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1387,7 +1467,12 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_forecast:_fetch_current_week_snapshots',
         sql_fingerprint='dynamic:_cctally_forecast:_fetch_current_week_snapshots#1',
-        sql_shape='sha256:bc82aa15fa1aa9ed',
+        # Reviewed re-pin (#1018 twin T3, base 90dc7562c): the opt-in
+        # `include_journal_id` binding appends `, journal_id` to the selected
+        # columns (after the optional account, before the trailing row id).
+        # Read-only; no predicate, ordering or account scope changed, and
+        # every existing caller's selected columns are unchanged.
+        sql_shape='sha256:9e126e751be4da6b',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1400,7 +1485,12 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_forecast:_fetch_current_week_snapshots',
         sql_fingerprint='dynamic:_cctally_forecast:_fetch_current_week_snapshots#2',
-        sql_shape='sha256:372400419fad0c9e',
+        # Reviewed re-pin (#1018 twin T3, base 90dc7562c): the opt-in
+        # `include_journal_id` binding appends `, journal_id` to the selected
+        # columns (after the optional account, before the trailing row id).
+        # Read-only; no predicate, ordering or account scope changed, and
+        # every existing caller's selected columns are unchanged.
+        sql_shape='sha256:144e218d4af90f27',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1413,7 +1503,12 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_forecast:_fetch_current_week_snapshots',
         sql_fingerprint='dynamic:_cctally_forecast:_fetch_current_week_snapshots#3',
-        sql_shape='sha256:4f8ce3420819f7e2',
+        # Reviewed re-pin (#1018 twin T3, base 90dc7562c): the opt-in
+        # `include_journal_id` binding appends `, journal_id` to the selected
+        # columns (after the optional account, before the trailing row id).
+        # Read-only; no predicate, ordering or account scope changed, and
+        # every existing caller's selected columns are unchanged.
+        sql_shape='sha256:210baccc777fcd1e',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1426,7 +1521,12 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_forecast:_fetch_current_week_snapshots',
         sql_fingerprint='dynamic:_cctally_forecast:_fetch_current_week_snapshots#4',
-        sql_shape='sha256:61d729e93a7eeffe',
+        # Reviewed re-pin (#1018 twin T3, base 90dc7562c): the opt-in
+        # `include_journal_id` binding appends `, journal_id` to the selected
+        # columns (after the optional account, before the trailing row id).
+        # Read-only; no predicate, ordering or account scope changed, and
+        # every existing caller's selected columns are unchanged.
+        sql_shape='sha256:fe11d3e5ad616f9f',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1461,10 +1561,24 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # covers keep their table selection, predicate, ordering, selected
     # columns, parameter construction, execution conditions and effects, so
     # the contract and its inert rule stand.
+    #
+    # Reviewed re-pin (#982 #975 T1, base 3d3e759da), for #1 and #2.
+    # Changed (`~ producer`): only the producer's choice of reset-anchor
+    # resolver. It gains an optional `anchors=` argument; when given, it is
+    # used in place of the per-call `_codex_anchor_resolver(cache)` (the
+    # history provenance drain passes a resolver seeded from copies of its
+    # committed-evidence base), and it is ignored when the cache lacks the
+    # anchor column, exactly as the per-call resolver was. Every other caller
+    # omits it and is unchanged. The resolver only computes the
+    # `canonical_resets_at_utc` value the INSERT/UPSERT binds, as before; the
+    # natural-key read and the INSERT/UPSERT keep their table selection,
+    # predicate, ordering, selected columns, parameter construction,
+    # execution conditions and effects, so the contract and its inert rule
+    # stand.
     AccessContract(
         function='_cctally_journal:_apply_quota_records',
         sql_fingerprint='dynamic:_cctally_journal:_apply_quota_records#1',
-        sql_shape='sha256:265c580d51dc9ea0',
+        sql_shape='sha256:6163599100a812de',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1477,7 +1591,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_journal:_apply_quota_records',
         sql_fingerprint='dynamic:_cctally_journal:_apply_quota_records#2',
-        sql_shape='sha256:b1a8eedf9a7f98c9',
+        sql_shape='sha256:c04f34a3783ade13',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2053,10 +2167,15 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # SQL, table selection, predicate, ordering, selected column, execution
     # condition or effect of these sites changed, so each contract and its
     # inert rule stand.
+    # Reviewed re-pin (#1018 twin T1, base d94a83792), for _publish_generation_in_place #1. Changed:
+    # only the binding `STATS_INDEX_EPOCH` 1023 -> 1024 (spec 5.1). No SQL,
+    # table selection, predicate, ordering, selected column, execution
+    # condition or effect of this site changed, so the contract and its
+    # inert rule stand.
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#1',
-        sql_shape='sha256:3dbfedf9486acbb9',
+        sql_shape='sha256:dc539be3e0b79518',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2075,10 +2194,15 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # the binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1). No SQL, table
     # selection, predicate, ordering, selected column, execution condition or
     # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1018 twin T1, base d94a83792), for _publish_generation_in_place #2. Changed:
+    # only the binding `STATS_INDEX_EPOCH` 1023 -> 1024 (spec 5.1). No SQL,
+    # table selection, predicate, ordering, selected column, execution
+    # condition or effect of this site changed, so the contract and its
+    # inert rule stand.
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#2',
-        sql_shape='sha256:cde6ffe8c29bd1a7',
+        sql_shape='sha256:a997bd74615a0821',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2097,10 +2221,15 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # the binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1). No SQL, table
     # selection, predicate, ordering, selected column, execution condition or
     # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1018 twin T1, base d94a83792), for _publish_generation_in_place #3. Changed:
+    # only the binding `STATS_INDEX_EPOCH` 1023 -> 1024 (spec 5.1). No SQL,
+    # table selection, predicate, ordering, selected column, execution
+    # condition or effect of this site changed, so the contract and its
+    # inert rule stand.
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#3',
-        sql_shape='sha256:cde6ffe8c29bd1a7',
+        sql_shape='sha256:a997bd74615a0821',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2119,10 +2248,15 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # the binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1). No SQL, table
     # selection, predicate, ordering, selected column, execution condition or
     # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1018 twin T1, base d94a83792), for _publish_generation_in_place #4. Changed:
+    # only the binding `STATS_INDEX_EPOCH` 1023 -> 1024 (spec 5.1). No SQL,
+    # table selection, predicate, ordering, selected column, execution
+    # condition or effect of this site changed, so the contract and its
+    # inert rule stand.
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#4',
-        sql_shape='sha256:e42670f9ea1e0bc2',
+        sql_shape='sha256:e2a4af53267f96f7',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2141,10 +2275,15 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # the binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1). No SQL, table
     # selection, predicate, ordering, selected column, execution condition or
     # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1018 twin T1, base d94a83792), for _publish_generation_in_place #5. Changed:
+    # only the binding `STATS_INDEX_EPOCH` 1023 -> 1024 (spec 5.1). No SQL,
+    # table selection, predicate, ordering, selected column, execution
+    # condition or effect of this site changed, so the contract and its
+    # inert rule stand.
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#5',
-        sql_shape='sha256:cde6ffe8c29bd1a7',
+        sql_shape='sha256:a997bd74615a0821',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2388,10 +2527,127 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # `_REBUILD_COUNT_TABLES`, its table selection, predicate, ordering,
     # selected column, parameters, execution condition and read-only effect
     # are unchanged, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1003/#1004, base bfc595fe9), for
+    # _rebuild_stats_index_locked #1. Added: `binding` and `assigned`
+    # `_cctally_record._BLOCK_TOTALS_ENGINE` (#1003 D1's engine slot, which
+    # `_compute_block_totals` consults; only `_scratch_read_adapters` sets it,
+    # never this rebuild), `computed-by _cctally_record._block_totals_reprice`
+    # (today's full re-price body, moved unchanged out of
+    # `_compute_block_totals`) and `binding
+    # _lib_retained_records.MATERIALIZE_FOR_TESTS` (#1004 D4's test switch).
+    # Changed: `BlockTotals` (gains `add_priced`, the one per-entry fold step
+    # `fold_block_totals` and the engine share), `_compute_block_totals` and
+    # `fold_block_totals` (the seam and the shared step, same additions in the
+    # same order), and the producer, whose read pass keeps its retained
+    # records as a coordinate-backed `RetainedRecords` and installs the legacy
+    # account normalization as a decode-time hook instead of an in-place loop.
+    # All of it is Python state, never SQL: this site's `SELECT COUNT(*) FROM
+    # {tbl}` over the unchanged `_REBUILD_COUNT_TABLES`, its table selection,
+    # predicate, ordering, selected column, parameters, execution condition
+    # and read-only effect are unchanged, so the contract and its MAINT inert
+    # rule stand.
+    # Reviewed re-pin (#916, base 6807e4052), for
+    # _rebuild_stats_index_locked #1. The closure reaches
+    # `_cctally_cache.sync_cache`. Added: `binding _cctally_cache._ingest_frontier`
+    # (the module's existing frontier handle, which sync_cache now reads for
+    # the `claude_ingest_walk_orphan_residual` key) and `computed-by
+    # _cctally_cache._clear_claude_walk_verdicts` (the rebuild and truncation
+    # wipes' single DELETE of the walk-complete marker and that token).
+    # Changed: `sync_cache` (an orphan-only walk now ends residual-only and
+    # writes the token instead of the marker, the re-walk UPSERT is chosen per
+    # file from its own -1 cursor, and `finally` withdraws both verdicts),
+    # `IngestStats` (gains `full_walk_residual_only` and
+    # `orphan_residual_count`), and `assigned _LAST_WARNED_ORPHAN_SET`, whose
+    # assigning body is sync_cache; the warning throttle itself is unchanged.
+    # All of it is cache.db Python state, never SQL: this site's
+    # `SELECT COUNT(*) FROM {tbl}` over the unchanged `_REBUILD_COUNT_TABLES`,
+    # its table selection, predicate, ordering, selected column, parameters,
+    # execution condition and read-only effect are unchanged, so the contract
+    # and its MAINT inert rule stand.
+    # Reviewed re-pin (#1018 twin T1, base d94a83792), for
+    # _rebuild_stats_index_locked #1. Added: the bindings
+    # `_cctally_oauth_samples._HOLD_ELIGIBILITY`, `_READ_ELIGIBILITY_FACTS`
+    # and `_SET_ELIGIBILITY` and `_lib_oauth_samples._CANONICAL_FORMAT`, and
+    # `computed-by` `_cctally_oauth_samples._maintain_freshness_eligibility`,
+    # `_before_reset`, `_lib_oauth_samples.canonical_instant`, `_parse_aware`
+    # and `format_request_started`. Changed: `STATS_INDEX_EPOCH` 1023 -> 1024,
+    # the helper `open_db` (see the open_db re-pin) and the fold applier
+    # `apply_weekly_observation_decision_op` (`~ computed-by`), which beside
+    # its unchanged decision upsert and history insert now keeps the decided
+    # observation's `claude_weekly_observation_index.weekly_freshness_eligible`
+    # current by primary key: a `hold` clears it, an `accept` reads that row's
+    # stored genuine flag, weekly value, reset and capture and recomputes it
+    # with the parsed pre-reset test (spec 5.1). Those are keyed writes to a
+    # projection no detector decision reads. This site's `SELECT COUNT(*)
+    # FROM {tbl}` over the unchanged `_REBUILD_COUNT_TABLES`, its execution
+    # condition and its read-only effect are unchanged, so the contract and
+    # its MAINT inert rule stand.
+    # Reviewed re-pin (#1050 T2, base a858a87ab), for
+    # _rebuild_stats_index_locked #1. Added: `helper
+    # _cctally_core:_ensure_stats_content_revision` and the
+    # `_lib_stats_content_revision` installer it calls (`helper`
+    # `ensure_stats_content_revision`, `classify`, `_inspect`, `_install`,
+    # `_default_guard`, `_contention_errors`, `_is_busy`), with every binding
+    # and `computed-by` they read: the kernel's table/index/trigger SQL
+    # (`REVISION_TABLE_SQL`, `SCOPE_TABLE_SQL`, `USAGE_SNAPSHOT_INDEX_SQL`,
+    # `TRIGGER_SQL` built by `_trigger_sql`/`_body`/`_upsert`/`_owner`/
+    # `_render`/`_scope_selects` over `TRACKED_TABLES`), its names, states
+    # and `_SCHEMA_READ`. Changed: the helper `open_db` (see the open_db
+    # re-pin). The rebuild reaches them only through the scratch's
+    # `open_db(_target_path=...)` schema apply, which now installs the
+    # kernel objects into the scratch (spec 4.3); each installer statement
+    # is registered as its own MAINT contract. This site's `SELECT COUNT(*)
+    # FROM {tbl}` over the unchanged `_REBUILD_COUNT_TABLES`, its execution
+    # condition and its read-only effect are unchanged, so the contract and
+    # its MAINT inert rule stand.
+    # Reviewed re-pin (#1050 T3, base 737379aab), for
+    # _rebuild_stats_index_locked #1. Added: `computed-by
+    # _lib_stats_content_revision.child_set_unchanged` with its helper
+    # `_default_value` and bindings `CHILD_TABLES`, `_CHILD_SELECTS`,
+    # `_CHILD_COLUMNS` and `_UNDECIDABLE`, and `computed-by
+    # _cctally_five_hour._open_block_child_rows`. Changed: `computed-by
+    # _cctally_five_hour.project_open_block_end`, reached through
+    # `_refresh_every_open_block` in the scratch rebuild: it now builds its
+    # model and project rows with `_open_block_child_rows` and skips its
+    # unchanged DELETE and INSERT statements when
+    # `child_set_unchanged` finds the stored set equal to them (an
+    # exact-key read of the same window and account the DELETE names). The
+    # rows the projection leaves are identical either way. This site's
+    # `SELECT COUNT(*) FROM {tbl}` over the unchanged `_REBUILD_COUNT_TABLES`,
+    # its execution condition and its read-only effect are unchanged, so the
+    # contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1050 T3 fix, base 7602973ef), for
+    # _rebuild_stats_index_locked #1. Changed: only the binding
+    # `_lib_stats_content_revision._CHILD_COLUMNS`, which drops its
+    # `ORDER BY cid` (the column order only has to agree between the two
+    # tuple sets built from that one read, and the sort cost a temp B-tree on
+    # the live record path). The column set it returns is unchanged, so the
+    # contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1055, base a2b64a5fb; the same delta on a merge
+    # candidate over d2da6cd94), for _rebuild_stats_index_locked #1, reached
+    # through `sync_cache`. Added: `computed-by
+    # _cctally_cache._wait_behind_drain_unit` and the
+    # `_lib_codex_drain_admission` helpers it calls (`ClaudeWaiter`,
+    # `_waiter_path`, `lock_busy`), their bindings
+    # (`CLAUDE_HOOK_DRAIN_POLL_SECONDS`, `CLAUDE_WAITER_FILE_NAME`,
+    # `CLAUDE_WAITER_HOLD_ALLOWANCE_SECONDS`, `GATE_FILE_NAME`,
+    # `_WAITER_MAGIC`, `_WAITER_VERSION`, `_monotonic_ns`) and `assigned
+    # _cctally_core.CACHE_LOCK_CODEX_PATH`, the lock the wait probes.
+    # Changed: `sync_cache` (its `drain_wait_seconds` keyword, the bounded
+    # wait after a refused first attempt, and the nested cleanup that
+    # unlocks before it releases the waiter), `_acquire_cache_flock` (its
+    # `poll` and absolute `deadline` keywords; a `timeout`-only call keeps
+    # the old loop) and `assigned _LAST_WARNED_ORPHAN_SET`, whose assigning
+    # body is sync_cache. All of it is lock-file and waiter-record Python
+    # state, never SQL, and only the hook-tick Claude leg passes
+    # `drain_wait_seconds`, so the wait never runs on the rebuild path. This
+    # site's `SELECT COUNT(*) FROM {tbl}` over the unchanged
+    # `_REBUILD_COUNT_TABLES`, its execution condition and its read-only
+    # effect are unchanged, so the contract and its MAINT inert rule stand.
     AccessContract(
         function='_cctally_journal:_rebuild_stats_index_locked',
         sql_fingerprint='dynamic:_cctally_journal:_rebuild_stats_index_locked#1',
-        sql_shape='sha256:d9d1dae4e1f35d58',
+        sql_shape='sha256:2c06127369fd4dad',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2485,10 +2741,18 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('period-keyed',),
         inert_rule=JOURNAL,
     ),
+    # Reviewed re-pin (#1003 D1, base bfc595fe9), for _joined_entries #1.
+    # Changed: only the producer. The row-to-entry construction moved
+    # unchanged into `_joined_entry_from_row`, which `BlockTotalsEngine`
+    # shares so an engine entry equals a fresh query's field for field. The
+    # SQL text, its cache.db `session_entries`/`session_files` tables,
+    # predicate, ordering, selected columns, parameters and read-only effect
+    # are unchanged, and it never reads stats.db, so the contract and its
+    # MAINT inert rule stand.
     AccessContract(
         function='_cctally_rederive:_joined_entries',
         sql_fingerprint='dynamic:_cctally_rederive:_joined_entries#1',
-        sql_shape='sha256:2956a402028d910d',
+        sql_shape='sha256:019898f4526da0c8',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL over cache.db session entries only (the scratch derivation cost read); never stats.db',
@@ -2542,10 +2806,21 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # Reviewed re-pin (#1050 T3, base 737379aab), for
+    # _replace_block_children #1. Changed: only the producer itself. It
+    # builds each child set's rows first and calls
+    # `_lib_stats_content_revision.child_set_unchanged` (its own contract
+    # below) with the same window and account as this DELETE's predicate,
+    # skipping the DELETE and the strict INSERTs when the stored set equals
+    # them. The `DELETE FROM {child_table} WHERE {predicate}` over the
+    # unchanged `_BLOCK_CHILDREN`, its predicate and parameter construction
+    # and its effect are unchanged; it now runs only when the set differs,
+    # and the rows left behind are identical either way, so the contract and
+    # its JOURNAL inert rule stand.
     AccessContract(
         function='_cctally_journal:_replace_block_children',
         sql_fingerprint='dynamic:_cctally_journal:_replace_block_children#1',
-        sql_shape='sha256:98c56d859553c085',
+        sql_shape='sha256:d8dee0c16168bf40',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -3148,10 +3423,15 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # name with the same statement shape. No SQL, table selection,
     # predicate, ordering, selected column, execution condition or effect of
     # this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1018 twin T1, base d94a83792), for stats_index_matches_journal_prefix #1. Changed:
+    # only the binding `STATS_INDEX_EPOCH` 1023 -> 1024 (spec 5.1). No SQL,
+    # table selection, predicate, ordering, selected column, execution
+    # condition or effect of this site changed, so the contract and its
+    # inert rule stand.
     AccessContract(
         function='_cctally_journal:stats_index_matches_journal_prefix',
         sql_fingerprint='dynamic:_cctally_journal:stats_index_matches_journal_prefix#1',
-        sql_shape='sha256:b27ac2227f9613cb',
+        sql_shape='sha256:ee1cf10e54836826',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -3323,6 +3603,12 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # completion step, else INSERT OR IGNORE) and its footprint. All are
     # keyed writes that a replay repeats to the same rows, and no detector
     # decision reads them.
+    # #1018 twin (spec 5.1): the two index writes also carry the enriched
+    # columns, and their freshness eligibility consults the effective
+    # reviewed decision of the same observation id (a decision folded before
+    # its observation still applies). The read is keyed and feeds only the
+    # written eligibility, which the current-week freshness reader alone
+    # consumes; no detector decision reads it.
     AccessContract(
         function='_cctally_journal:write_batch_lineage',
         sql_fingerprint='INSERT INTO correction_batch_lineage (batch_id, commit_segment, commit_offset) VALUES (?, ?, ?) ON CONFLICT(batch_id) DO UPDATE SET commit_segment = excluded.commit_segment, commit_offset = excluded.commit_offset',
@@ -3361,10 +3647,10 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_oauth_samples:attribute_staged_observations',
-        sql_fingerprint='INSERT OR IGNORE INTO claude_weekly_observation_index (observation_id, account_key, captured_at_utc) SELECT observation_id, ?, captured_at_utc FROM rebuild_weekly_observation_unstamped',
+        sql_fingerprint="INSERT OR IGNORE INTO claude_weekly_observation_index (observation_id, account_key, captured_at_utc, weekly_percent, weekly_resets_at_utc, weekly_reading_genuine, weekly_freshness_eligible) SELECT s.observation_id, ?, s.captured_at_utc, s.weekly_percent, s.weekly_resets_at_utc, s.base_genuine AND (s.required_account IS NULL OR s.required_account = ?), s.base_genuine AND (s.required_account IS NULL OR s.required_account = ?) AND s.pre_reset AND NOT EXISTS (SELECT 1 FROM claude_weekly_observation_decisions AS d WHERE d.observation_id = s.observation_id AND d.disposition = 'hold') FROM rebuild_weekly_observation_unstamped AS s",
         table='claude_weekly_observation_index',
         keys=('observation_id',),
-        predicate='',
+        predicate="eligibility reads claude_weekly_observation_decisions by observation_id (disposition = 'hold')",
         ordering='',
         selected=(),
         effects='write',
@@ -3373,10 +3659,10 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_oauth_samples:project_observation',
-        sql_fingerprint='INSERT OR IGNORE INTO claude_weekly_observation_index (observation_id, account_key, captured_at_utc) VALUES (?, ?, ?)',
+        sql_fingerprint="INSERT OR IGNORE INTO claude_weekly_observation_index (observation_id, account_key, captured_at_utc, weekly_percent, weekly_resets_at_utc, weekly_reading_genuine, weekly_freshness_eligible) VALUES (?, ?, ?, ?, ?, ?, ? AND NOT EXISTS (SELECT 1 FROM claude_weekly_observation_decisions AS d WHERE d.observation_id = ? AND d.disposition = 'hold'))",
         table='claude_weekly_observation_index',
         keys=('observation_id',),
-        predicate='',
+        predicate="eligibility reads claude_weekly_observation_decisions by observation_id (disposition = 'hold')",
         ordering='',
         selected=(),
         effects='write',
@@ -5109,10 +5395,32 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # #1003 D2 (base bfc595fe9): the policy's own page-cache pragma,
+    # `PRAGMA cache_size=-{DISPOSABLE_SCRATCH_CACHE_SIZE_KIB}` (64 MiB), is
+    # now the first dynamic site, so the replay-index loop moved to #2 with
+    # its contract and shape unchanged apart from the producer (and the
+    # constant the producer now names). The pragma sets the private scratch
+    # connection's cache, before its replay, beside the static
+    # `journal_mode=MEMORY` and `synchronous=OFF` pragmas of the same policy;
+    # it reads and writes no table and changes no result set, and it never
+    # runs on a published index or inside a live automatic decision.
     AccessContract(
         function='_cctally_store:apply_disposable_scratch_policy',
         sql_fingerprint='dynamic:_cctally_store:apply_disposable_scratch_policy#1',
-        sql_shape='sha256:fe12cdb5583c26fc',
+        sql_shape='sha256:2260b6be0f086524',
+        table='dynamic',
+        keys=(),
+        predicate='dynamic PRAGMA cache_size on the disposable scratch connection; no table',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_store:apply_disposable_scratch_policy',
+        sql_fingerprint='dynamic:_cctally_store:apply_disposable_scratch_policy#2',
+        sql_shape='sha256:94c0a37bd46dce8c',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -5195,6 +5503,169 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         effects='read',
         classes=('period-keyed',),
         inert_rule=None,
+    ),
+    # #1050 T2: the content-revision kernel's installer (spec 4.3), reached
+    # from every `open_db` path. Each statement creates, seeds or repairs the
+    # kernel's own objects under the open-time maintenance guard; none is read
+    # by a detector decision.
+    AccessContract(
+        function='_lib_stats_content_revision:_inspect',
+        sql_fingerprint='SELECT singleton, format_version, domain_generation, seq FROM stats_content_revision LIMIT 2',
+        table='stats_content_revision',
+        keys=('singleton',),
+        predicate='',
+        ordering='',
+        selected=('singleton', 'format_version', 'domain_generation', 'seq'),
+        effects='read',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_lib_stats_content_revision:_install',
+        sql_fingerprint='CREATE INDEX idx_five_hour_milestones_usage_snapshot_id ON five_hour_milestones(usage_snapshot_id)',
+        table='five_hour_milestones',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_lib_stats_content_revision:_install',
+        sql_fingerprint='CREATE TABLE stats_content_revision (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), format_version INTEGER NOT NULL CHECK (format_version >= 1), domain_generation INTEGER NOT NULL DEFAULT 0 CHECK (domain_generation >= 0), seq INTEGER NOT NULL DEFAULT 0 CHECK (seq >= 0))',
+        table='stats_content_revision',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_lib_stats_content_revision:_install',
+        sql_fingerprint="CREATE TABLE stats_content_revision_scopes (kind TEXT NOT NULL CHECK (kind IN ('cohort', 'bucket', 'block', 'reset_point')), account_key TEXT NOT NULL, scope_key TEXT NOT NULL, start_epoch INTEGER, end_epoch INTEGER, revision INTEGER NOT NULL, PRIMARY KEY (kind, account_key, scope_key))",
+        table='stats_content_revision_scopes',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_lib_stats_content_revision:_install',
+        sql_fingerprint='INSERT INTO stats_content_revision (singleton, format_version, domain_generation, seq) VALUES (1, ?, 0, 0)',
+        table='stats_content_revision',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_lib_stats_content_revision:_install',
+        sql_fingerprint='UPDATE stats_content_revision SET format_version = ?, domain_generation = ?, seq = ? WHERE singleton = 1',
+        table='stats_content_revision',
+        keys=('singleton',),
+        predicate='singleton = 1',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_lib_stats_content_revision:_install',
+        sql_fingerprint='dynamic:_lib_stats_content_revision:_install#1',
+        sql_shape='sha256:15b28df089bc0407',
+        table='dynamic',
+        keys=(),
+        predicate='dynamic SQL',
+        ordering='',
+        selected=(),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_lib_stats_content_revision:_install',
+        sql_fingerprint='dynamic:_lib_stats_content_revision:_install#2',
+        sql_shape='sha256:96968b8250f530b2',
+        table='dynamic',
+        keys=(),
+        predicate='dynamic SQL',
+        ordering='',
+        selected=(),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_lib_stats_content_revision:_install',
+        sql_fingerprint='dynamic:_lib_stats_content_revision:_install#3',
+        sql_shape='sha256:2e1fd5db25812db9',
+        table='dynamic',
+        keys=(),
+        predicate='dynamic SQL',
+        ordering='',
+        selected=(),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_lib_stats_content_revision:ensure_stats_content_revision',
+        sql_fingerprint='dynamic:_lib_stats_content_revision:ensure_stats_content_revision#1',
+        sql_shape='sha256:7451a814fc141b51',
+        table='dynamic',
+        keys=(),
+        predicate='dynamic SQL',
+        ordering='',
+        selected=(),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_lib_stats_content_revision:ensure_stats_content_revision',
+        sql_fingerprint='dynamic:_lib_stats_content_revision:ensure_stats_content_revision#2',
+        sql_shape='sha256:b312dbf76e573326',
+        table='dynamic',
+        keys=(),
+        predicate='dynamic SQL',
+        ordering='',
+        selected=(),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=MAINT,
+    ),
+    # #1050 T3: the identical child-set check of the open-block projection
+    # and the block-close fold/convergence. `SELECT * FROM {table}` over
+    # `CHILD_TABLES` (the two five-hour block child tables) by the exact
+    # window, and account when the caller's DELETE names one: the same
+    # period-keyed rows the caller would replace, read only to skip a
+    # rewrite that would store identical rows (BLOCKS).
+    # Reviewed re-pin (#1050 T3 fix, base 7602973ef): only the binding
+    # `_CHILD_COLUMNS` changed, dropping its `ORDER BY cid` as above; this
+    # site's table set, keys, predicate and read-only effect are unchanged.
+    AccessContract(
+        function='_lib_stats_content_revision:child_set_unchanged',
+        sql_fingerprint='dynamic:_lib_stats_content_revision:child_set_unchanged#1',
+        sql_shape='sha256:2ff8bd5b011e00b5',
+        table='dynamic',
+        keys=('five_hour_window_key', 'account_key'),
+        predicate='dynamic SQL',
+        ordering='',
+        selected=(),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
     ),
 )
 

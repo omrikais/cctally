@@ -505,3 +505,27 @@ def test_trie_perf_smoke_large_plan_under_5s():
     # timing-budget: retained beside the edge count, which bounds compiling the pattern and not the scrub_text pass over a megabyte
     assert dt < 30.0, f"scrub_text took {dt:.2f}s — trie regression?"
     assert "project-" in out                                    # matches actually fired
+
+
+def test_string_only_labels_plan_is_unchanged():
+    """#972 O6: per-root labels may be a collection, but a plan built from one
+    string label per root keeps today's bytes (the committed parity fixture's
+    plan), and a singleton collection builds the identical plan."""
+    fixture = json.loads(_PARITY_FIXTURE.read_text(encoding="utf-8"))
+    string_wire = anon.plan_to_wire(make_plan())
+    assert string_wire == fixture["plan"]
+    roots = {"/Users/alice/repos/cctally-dev": {"cctally-dev"},
+             "/Volumes/EXT/repos/project": ("project",)}
+    assert anon.plan_to_wire(make_plan(project_roots=roots)) == string_wire
+    # #972 §5.8 rule 7: a None or empty label is skipped, alone or inside a
+    # collection, exactly as a falsy string label is (a TypeError here failed
+    # the whole anonymized export).
+    padded = {"/Users/alice/repos/cctally-dev": {"cctally-dev", None, ""},
+              "/Volumes/EXT/repos/project": ["project", None]}
+    assert anon.plan_to_wire(make_plan(project_roots=padded)) == string_wire
+    bare = {"/Users/alice/repos/cctally-dev": None,
+            "/Volumes/EXT/repos/project": ""}
+    wire = anon.plan_to_wire(make_plan(project_roots=bare))
+    assert not any(t["bounded"] and t["replacement"].startswith("project-")
+                   for t in wire["tokens"])
+    assert any(t["replacement"] == "project-1" for t in wire["tokens"])

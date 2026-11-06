@@ -930,9 +930,10 @@ function SearchRow({ hit, ctx, kind, selectedId, pickAnchor }: { hit: SearchHit;
       {/* #217 S4 QA fix — suppress the bottom snippet row for a file hit: its
           `snippet` IS the path, already shown prominently on the filepath line
           above, so rendering it here too duplicates the path (and would wrap a
-          plain path in renderSnippet's [bracket] highlighting). Every other kind
-          (prose/title/tool/thinking) keeps its snippet row. */}
-      {!isFileHit && <div className="conv-rail-row-snippet">{renderSnippet(hit.snippet)}</div>}
+          plain path in a snippet highlight). Every other kind
+          (prose/title/tool/thinking) keeps its snippet row; #1036 — the
+          highlight comes only from the server's structured parts. */}
+      {!isFileHit && <div className="conv-rail-row-snippet">{renderSnippet(hit.snippet, hit.snippet_parts)}</div>}
     </button>
   );
 }

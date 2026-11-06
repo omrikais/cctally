@@ -2155,6 +2155,9 @@ def build_cache_report_qa(as_of: dt.datetime) -> None:
     Read-heavy and creation-heavy rows make the mini net bars mixed-sign.
     """
     build_ok(as_of)
+    # Rebuilding `ok` here rewrites its committed store, so finish it the way
+    # the scenario loop does, or the `ok` golden would lose its confirmation.
+    cut_over_with_weekly_confirmation("ok", as_of)
     source_app = FIXTURES_DIR / "ok" / ".local" / "share" / "cctally"
     scenario_dir, app_dir = _scenario_dirs("cache-report-qa")
     create_stats_db(app_dir / "stats.db")
@@ -2507,19 +2510,32 @@ def _reconcile_fixture_quota_projection(
     `codex_projection_coherence` returns `missing_projection_state`, and the
     Codex hero publishes as `codex_projection_incoherent` — which is what every
     pre-existing Codex dashboard fixture does, and which would withhold the
-    very combined figure this scenario exists to pin.
+    very combined figure this scenario exists to pin. The path pinning and the
+    pruning are `_real_store_pass`'s.
+    """
+    def _project(_cctally_core) -> None:
+        import _cctally_quota
 
-    The projector reads its databases through the process-wide path constants,
-    so pin `CCTALLY_DATA_DIR` and re-run `_init_paths_from_env` before calling
-    it. This mirrors `bin/build-bench-fixtures.py::_pin_env`; the re-init is
+        _cctally_quota.reconcile_codex_quota_projection(
+            source_root_keys=(root_key,), now=now,
+        )
+
+    _real_store_pass(app_dir, now=now, action=_project)
+
+
+def _real_store_pass(app_dir: Path, *, now: dt.datetime, action) -> None:
+    """Run ``action`` against one scenario's databases through the real
+    modules, then seed the Current Week confirmation and prune the pass's
+    runtime side artifacts.
+
+    The real modules read their databases through the process-wide path
+    constants, so pin `CCTALLY_DATA_DIR` and re-run `_init_paths_from_env`
+    first. This mirrors `bin/build-bench-fixtures.py::_pin_env`; the re-init is
     what lets a second scenario in the same process target its own directory.
 
     The pin is UNDONE on the way out. The path constants are process-wide, so
     leaving `CCTALLY_DATA_DIR` pointed at this scenario would make any later
-    builder that reaches the real modules write into the wrong directory. That
-    is latent rather than live only because the two scenarios that call this
-    are currently last in `SCENARIOS`, which is not a property a builder added
-    later can rely on.
+    builder that reaches the real modules write into the wrong directory.
     """
     import importlib.util
 
@@ -2538,13 +2554,11 @@ def _reconcile_fixture_quota_projection(
         sys.modules["cctally"] = module
         spec.loader.exec_module(module)
     import _cctally_core
-    import _cctally_quota
 
     _cctally_core._init_paths_from_env()
     try:
-        _cctally_quota.reconcile_codex_quota_projection(
-            source_root_keys=(root_key,), now=now,
-        )
+        action(_cctally_core)
+        _seed_fixture_weekly_confirmation(app_dir, now=now)
     finally:
         _pin_reconcile_nondeterminism(app_dir)
         _prune_reconcile_side_artifacts(app_dir)
@@ -2553,6 +2567,114 @@ def _reconcile_fixture_quota_projection(
         else:
             os.environ["CCTALLY_DATA_DIR"] = previous_data_dir
         _cctally_core._init_paths_from_env()
+
+
+def cut_over_with_weekly_confirmation(name: str, now: dt.datetime) -> None:
+    """Cut a legacy-head scenario store over and seed its Current Week
+    confirmation (#1018 twin spec 5.3, 8.9).
+
+    A store left at the legacy head is cut over when the harness first opens
+    it, and the cutover stamps every exported row `b:<table>:<rowid>` with no
+    originating observation, so its card would publish no freshness. Running
+    that same real open here, then seeding the displayed row, keeps every
+    golden's freshness. A store with no displayed Claude week, or one a
+    scenario builder already moved to the epoch, is left as built.
+    """
+    app_dir = FIXTURES_DIR / name / ".local" / "share" / "cctally"
+    stats_path = app_dir / "stats.db"
+    if not stats_path.exists():
+        return
+    conn = sqlite3.connect(stats_path)
+    try:
+        (user_version,) = conn.execute("PRAGMA user_version").fetchone()
+        displayed = conn.execute(
+            "SELECT 1 FROM weekly_usage_snapshots WHERE weekly_observation_held = 0 "
+            "AND unixepoch(captured_at_utc) <= unixepoch(?) "
+            "AND unixepoch(week_start_at) <= unixepoch(?) "
+            "AND unixepoch(?) < unixepoch(week_end_at) LIMIT 1",
+            (_iso(now), _iso(now), _iso(now)),
+        ).fetchone()
+    finally:
+        conn.close()
+    from _cctally_db import _STATS_MIGRATIONS
+
+    if user_version != len(_STATS_MIGRATIONS) or displayed is None:
+        return
+
+    def _cut_over(_cctally_core) -> None:
+        _cctally_core.open_db().close()
+
+    # The pass prunes `config.json` as runtime state, but here it is scenario
+    # input (alert and notifier settings), written by the builder before it.
+    config_path = app_dir / "config.json"
+    config_bytes = config_path.read_bytes() if config_path.exists() else None
+    pass_started = _iso(dt.datetime.now(dt.timezone.utc).replace(microsecond=0))
+    _real_store_pass(app_dir, now=now, action=_cut_over)
+    if config_bytes is not None:
+        config_path.write_bytes(config_bytes)
+    # The open's legacy migrations stamp the 5-hour blocks they backfill with
+    # the wall clock. Pin those stamps to the scenario's instant so the store
+    # is the same on every build (`tests/test_fixture_builder_contract.py`).
+    conn = sqlite3.connect(stats_path)
+    try:
+        for column in ("created_at_utc", "last_updated_at_utc"):
+            conn.execute(
+                f"UPDATE five_hour_blocks SET {column} = ? WHERE {column} >= ?",
+                (_iso(now), pass_started))
+        conn.commit()
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+
+def _seed_fixture_weekly_confirmation(app_dir: Path, *, now: dt.datetime) -> None:
+    """Give the Current Week card's displayed row an originating observation
+    (#1018 twin spec 5.3).
+
+    The card's freshness ages from the newest genuine reading confirming the
+    displayed weekly value, resolved through the displayed row's `journal_id`
+    (`sa:<observation-id>`) to its `claude_weekly_observation_index` row. The
+    real open above has just cut this store over, which stamps every exported
+    row `b:<table>:<rowid>`, and the store carries no `obs` records, so without
+    this the card would publish no freshness. The displayed row is the newest
+    non-held weekly row of the window containing ``now`` (what both card
+    builders display); it gets a stable `sa:` id and ONE eligible index row of
+    its own reading, captured with it, in its provider window. A store with no
+    such row (no Claude week) is left unchanged.
+    """
+    import _lib_oauth_samples
+
+    conn = sqlite3.connect(app_dir / "stats.db")
+    try:
+        row = conn.execute(
+            "SELECT id, account_key, captured_at_utc, weekly_percent, week_end_at "
+            "FROM weekly_usage_snapshots WHERE weekly_observation_held = 0 "
+            "AND unixepoch(captured_at_utc) <= unixepoch(?) "
+            "AND unixepoch(week_start_at) <= unixepoch(?) "
+            "AND unixepoch(?) < unixepoch(week_end_at) "
+            "ORDER BY unixepoch(captured_at_utc) DESC, id DESC LIMIT 1",
+            (_iso(now), _iso(now), _iso(now)),
+        ).fetchone()
+        if row is None:
+            return
+        rowid, account, captured, percent, week_end = row
+        observation_id = f"fixture-confirmation-{rowid}"
+        week_end_epoch = int(dt.datetime.fromisoformat(
+            week_end.replace("Z", "+00:00")).timestamp())
+        conn.execute(
+            "UPDATE weekly_usage_snapshots SET journal_id = ? WHERE id = ?",
+            (f"sa:{observation_id}", rowid))
+        conn.execute(
+            "INSERT OR REPLACE INTO claude_weekly_observation_index "
+            "(observation_id, account_key, captured_at_utc, weekly_percent, "
+            " weekly_resets_at_utc, weekly_reading_genuine, "
+            " weekly_freshness_eligible) VALUES (?, ?, ?, ?, ?, 1, 1)",
+            (observation_id, account,
+             _lib_oauth_samples.canonical_instant(captured), percent,
+             _lib_oauth_samples.normalize_weekly_reset(week_end_epoch)))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # One literal in place of the projector's per-pass random token. The token is a
@@ -2621,6 +2743,9 @@ _RECONCILE_KEEP: frozenset[str] = frozenset({"stats.db", "cache.db"})
 _RECONCILE_SIDE_ARTIFACTS: frozenset[str] = frozenset({
     "cache.db-shm",
     "cache.db-wal",
+    # A legacy cutover pass (`cut_over_with_weekly_confirmation`) over a store
+    # whose stats open consults cache.db takes the cache maintenance lock.
+    "cache.db.maintenance.lock",
     "config.json",
     "config.json.lock",
     "journal",
@@ -3769,5 +3894,6 @@ if __name__ == "__main__":
     for name in _selected:
         as_of, fn = SCENARIOS[name]
         fn(as_of)
+        cut_over_with_weekly_confirmation(name, as_of)
         print(f"built: {name}")
     print(f"Built fixtures under {FIXTURES_DIR}")

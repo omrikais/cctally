@@ -3135,7 +3135,8 @@ def _reconcile_snapshot_identities(
     decision only when exact retained origins prove their causal order, axes,
     and dependency graph; otherwise leave the ordinary correction diff intact.
     """
-    if not isinstance(raw_observations, (list, tuple)):
+    # #1004 D4: any sequence (a coordinate-backed one is read, never listed).
+    if not isinstance(raw_observations, Sequence):
         raw_observations = tuple(raw_observations)
     reviewed_pairs = tuple(snapshot_identity_decisions or ())
     if not raw_observations and not reviewed_pairs:
@@ -3170,6 +3171,8 @@ def _reconcile_snapshot_identities(
     }
     if not needed_raw_ids:
         return
+    # #1004 D4: positions only; a record is decoded again where it is read,
+    # so the collection pass keeps no observation alive.
     raw_positions = {}
     repeated_raw_ids = set()
     for index, record in enumerate(raw_observations):
@@ -3183,7 +3186,7 @@ def _reconcile_snapshot_identities(
         if raw_id in raw_positions:
             repeated_raw_ids.add(raw_id)
         else:
-            raw_positions[raw_id] = (index, record)
+            raw_positions[raw_id] = index
     # A repeated physical raw id has no unique order position. Leave its
     # accepted decision to the normal diff instead of choosing an occurrence.
     for raw_id in repeated_raw_ids:
@@ -3205,14 +3208,15 @@ def _reconcile_snapshot_identities(
     }
     candidates: dict[str, list[str]] = {}
     for old_id, old in unmatched_current.items():
-        old_index, old_raw = raw_positions[old_id[3:]]
+        old_index = raw_positions[old_id[3:]]
+        old_raw = raw_observations[old_index]
         candidates[old_id] = []
         for new_id, new in unmatched_desired.items():
-            new_index, new_raw = raw_positions[new_id[3:]]
+            new_index = raw_positions[new_id[3:]]
             if (
                 new_index < old_index
                 and _same_acceptance_transition(
-                    old, new, old_raw, new_raw,
+                    old, new, old_raw, raw_observations[new_index],
                     raw_observations[new_index + 1:old_index],
                     allow_intervening_same_account_observations=(
                         (old_id[3:], new_id[3:]) in reviewed_set
@@ -3880,7 +3884,8 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
         and selected.record is not None
         and _is_owned_event(selected.record)
     }
-    if not isinstance(raw_observations, (list, tuple)):
+    # #1004 D4: any sequence; a coordinate-backed one is never listed.
+    if not isinstance(raw_observations, Sequence):
         raw_observations = tuple(raw_observations)
     _reconcile_snapshot_identities(
         current, desired, selection, raw_observations,

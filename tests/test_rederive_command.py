@@ -9,6 +9,7 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 import time
 
 import pytest
@@ -2127,6 +2128,21 @@ S5_TAINTED_BASELINE = {
 }
 
 
+class _Opens(list):
+    """Segment opens through the read seam. The list itself holds the
+    prefix traversals; `rereads` holds #1004 D4's coordinate re-reads (a
+    streamed record decoded again on a later planning pass), which are by
+    design one open per segment per pass and never a prefix re-hash."""
+
+    def __init__(self):
+        super().__init__()
+        self.rereads: list = []
+
+    def clear(self):
+        super().clear()
+        self.rereads.clear()
+
+
 def _s5_module(tmp_path, monkeypatch, builder):
     """The isolated CLI module over one S5 fixture, plus an open recorder."""
     import journal_fixture_496_s5 as S5
@@ -2134,13 +2150,18 @@ def _s5_module(tmp_path, monkeypatch, builder):
     mod = _isolated(tmp_path, monkeypatch)
     import _cctally_core
     import _cctally_journal as jr
+    import _cctally_rederive as rederive
 
     built = builder(_cctally_core.APP_DIR)
     real = jr._open_segment_for_read
-    opened: list[str] = []
+    opened = _Opens()
 
     def record(seg_path):
-        opened.append(pathlib.Path(seg_path).name)
+        caller = sys._getframe(1).f_locals.get("self")
+        target = (opened.rereads
+                  if isinstance(caller, rederive._RederiveLineReader)
+                  else opened)
+        target.append(pathlib.Path(seg_path).name)
         return real(seg_path)
 
     monkeypatch.setattr(jr, "_open_segment_for_read", record)
@@ -2214,7 +2235,7 @@ def test_a_rederive_preview_opens_each_segment_exactly_once(
     the seam; nothing else is reopened."""
     import journal_fixture_496_s5 as S5
 
-    mod, opened, _built, _S5 = _s5_module(
+    mod, opened, built, _S5 = _s5_module(
         tmp_path, monkeypatch, S5.build_tainted)
     opened.clear()
     assert mod.cmd_db_rederive(_args()) == 2
@@ -2223,6 +2244,7 @@ def test_a_rederive_preview_opens_each_segment_exactly_once(
         "a rederive preview must open each segment through the seam exactly "
         "once, in canonical order, plus the one mid-segment evidence re-read"
     )
+    _assert_rereads_are_passes(opened, built)
 
 
 def test_rederive_keeps_every_decoded_record(tmp_path, monkeypatch):
@@ -2272,7 +2294,16 @@ def test_a_rederive_preview_that_produces_a_plan_opens_each_segment_once(
     assert payload["status"] == "preview"
     assert payload["actionCounts"]["add"] == 6, payload
     assert opened == list(built["segments"]), opened
+    _assert_rereads_are_passes(opened, built)
+    assert opened.rereads, "non-vacuity: the planner re-read streamed records"
 
+
+def _assert_rereads_are_passes(opened, built):
+    """#1004 D4: coordinate re-reads touch only the prefix's own segments
+    (one open per segment per pass is pinned by
+    `tests/test_1004_retained_records.py`), so the prefix traversal count
+    above stays exact."""
+    assert set(opened.rereads) <= set(built["segments"]), opened.rereads
 
 def test_the_whole_rederive_apply_takes_one_prefix_traversal(
     tmp_path, monkeypatch, capsys
@@ -2308,6 +2339,7 @@ def test_the_whole_rederive_apply_takes_one_prefix_traversal(
     # One snapshot: the apply path's own. The correction append writes through
     # the leaf lock's read-write handle, which is deliberately not this seam.
     assert opened == list(built["segments"]), opened
+    _assert_rereads_are_passes(opened, built)
 
 
 # ==========================================================================

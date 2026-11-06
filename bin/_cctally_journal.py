@@ -55,6 +55,7 @@ import _lib_rebuild_progress
 import _lib_record
 import _lib_segment_summary
 import _lib_selector_state
+import _lib_stats_content_revision
 
 
 # Torn-tail scan window (spec §4.3). A single line must fit inside it — a
@@ -1972,6 +1973,67 @@ def _read_framed_line(fh, segment, offset, length) -> bytes:
             f"{segment}@{offset}: the line the read pass saw is no longer "
             "there")
     return data[lead:lead + length]
+
+
+class _RetainedLineReader:
+    """`_lib_retained_records.LineReader` for the final rebuild's and
+    derivation completion's streamed records (#1004 D4): the framed read
+    `QuotaLineSource` uses, through the one physical segment read boundary,
+    with one open handle (the current segment's), so an in-order pass opens
+    each segment once. A line that is gone or no longer framed raises
+    `JournalError`, the error those readers already raise for a journal
+    that changed under them."""
+
+    __slots__ = ("_segment", "_fh", "__weakref__")
+
+    def __init__(self) -> None:
+        self._segment = None
+        self._fh = None
+
+    def read(self, segment: str, start: int, length: int) -> bytes:
+        if segment != self._segment:
+            self.close()
+            try:
+                self._fh = _open_segment_for_read(
+                    _cctally_core.JOURNAL_DIR / segment)
+            except OSError as exc:
+                raise _retained_line_changed(
+                    f"{segment}: {type(exc).__name__}: {exc}") from exc
+            self._segment = segment
+        try:
+            return _read_framed_line(self._fh, segment, start, length)
+        except (QuotaLineSourceError, OSError) as exc:
+            raise _retained_line_changed(str(exc)) from exc
+
+    def close(self) -> None:
+        fh, self._fh = self._fh, None
+        self._segment = None
+        if fh is not None:
+            fh.close()
+
+
+def _retained_line_changed(message: str) -> Exception:
+    """The integrity error of a streamed record whose line changed after
+    the read pass (framing or digest): a `JournalError`."""
+    return JournalError(f"journal changed since it was read: {message}")
+
+
+def _decode_retained_line(line: bytes):
+    """#1004 D4: a streamed slot's record exactly as the rebuild and
+    completion retained it before: the strict decode, then #997 D15's
+    compaction."""
+    record = _lib_journal.decode_line(line)
+    if record is None:
+        return None
+    return _lib_journal.compact_retained(record)
+
+
+def _new_retained_records():
+    """An empty coordinate-backed `RetainedRecords` over this journal."""
+    import _lib_retained_records
+    return _lib_retained_records.RetainedRecords(
+        _lib_retained_records.LineCoordinates(), _RetainedLineReader,
+        _decode_retained_line, error=_retained_line_changed)
 
 
 def _quota_line_sizes(quota_raw):
@@ -4303,7 +4365,7 @@ def _resolve_obs_anchor(resolver, rec: dict) -> "str | None":
 
 
 def _apply_quota_records(
-    cache, records, *, reported_conflicts=None, quiet=False,
+    cache, records, *, reported_conflicts=None, quiet=False, anchors=None,
 ) -> None:
     """Materialize Codex quota obs into an OPEN cache.db transaction, applying
     the §3.5 precedence rule. Callers must apply the batch's file-account
@@ -4322,7 +4384,13 @@ def _apply_quota_records(
     reachable from the open-time reconciliation, so `cache-sync` and the
     dashboard would emit a line they never emitted before, and acceptance
     criterion 10 requires no new stderr on an ordinary command. Its sibling was
-    guarded and this one was not."""
+    guarded and this one was not.
+
+    ``anchors`` (#975, spec 4.7) replaces the per-call reset-anchor resolver
+    when given. The history provenance drain passes one built from its
+    committed-evidence seed, so a pass seeds each anchor group once instead of
+    once per identity; every other caller omits it and gets a new resolver per
+    call, as before."""
     oracle = _CodexAttributionOracle(cache)
     # One line per FILE PER BATCH, not per record. A mid-file account switch
     # legitimately produces a run of observations whose first-stamp-wins account
@@ -4342,7 +4410,10 @@ def _apply_quota_records(
     # NULL anchor, a later walk's `INSERT OR IGNORE` cannot correct it, and that
     # window stays fragmented forever.
     has_anchor = _cache_has_anchor_column(cache)
-    anchors = _codex_anchor_resolver(cache) if has_anchor else None
+    if not has_anchor:
+        anchors = None
+    elif anchors is None:
+        anchors = _codex_anchor_resolver(cache)
     insert_sql = _QUOTA_SNAPSHOT_INSERT if has_anchor else _QUOTA_SNAPSHOT_INSERT_LEGACY
     upsert_sql = _QUOTA_SNAPSHOT_UPSERT if has_anchor else _QUOTA_SNAPSHOT_UPSERT_LEGACY
     # #980 D3: a span per root covering every quota record this call wrote
@@ -6325,6 +6396,10 @@ def _replace_block_children(
     convergence replace both sets rather than relying on natural-key
     ``INSERT OR IGNORE``. This removes stale children and restores missing
     children while preserving the parent rowid used by milestone FKs.
+
+    A stored set that already equals the replacement is left in place
+    (#1050): a DELETE and re-INSERT of identical rows would advance the
+    content revision on every repeated fold or convergence.
     """
     for payload_key, child_table in _BLOCK_CHILDREN:
         if parent_account is None:
@@ -6333,14 +6408,21 @@ def _replace_block_children(
         else:
             predicate = "account_key = ? AND five_hour_window_key = ?"
             params = (parent_account, int(parent_window))
-        conn.execute(
-            f"DELETE FROM {child_table} WHERE {predicate}", params
-        )
+        rows = []
         for child in children.get(payload_key, []):
             cols = dict(child)
             cols["block_id"] = int(block_id)
             if parent_account is not None:
                 cols["account_key"] = parent_account
+            rows.append(cols)
+        if _lib_stats_content_revision.child_set_unchanged(
+                conn, child_table, five_hour_window_key=int(parent_window),
+                account_key=parent_account, replacement=rows):
+            continue
+        conn.execute(
+            f"DELETE FROM {child_table} WHERE {predicate}", params
+        )
+        for cols in rows:
             _insert_or_ignore(conn, child_table, cols, strict=True)
 
 
@@ -11706,6 +11788,10 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "schema_migrations",
         "schema_migrations_skipped",
         "stats_open_fixups",
+        # #1050 §4.3: the content-revision singleton and its scope table
+        # (`_lib_stats_content_revision.KERNEL_TABLES`).
+        "stats_content_revision",
+        "stats_content_revision_scopes",
         "stats_publication_stamp",
         "stats_quota_projection_state",
         "usage_snapshot_suppressions",
@@ -11716,11 +11802,54 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "weekly_usage_snapshots",
     }
 )
-#: #825/#832 Task 4.0. The one stats trigger. A scratch index without it would
+#: #825/#832 Task 4.0. The suppression trigger. A scratch index without it would
 #: publish a store whose live stale-replica removals leave dangling milestone
 #: references a rebuild cannot reproduce, so its absence fails validation like a
-#: missing table does.
-_REBUILD_REQUIRED_TRIGGERS = frozenset({"trg_usage_snapshot_suppression"})
+#: missing table does. #1050 §4.3 adds the content-revision kernel's triggers:
+#: a generation published without them would leave every in-place rewrite
+#: invisible to the dashboard until the next open reinstalled them.
+_REBUILD_REQUIRED_TRIGGERS = frozenset(
+    {
+        # `_lib_stats_content_revision.KERNEL_TRIGGERS`
+        "trg_content_revision_budget_milestones_delete",
+        "trg_content_revision_budget_milestones_update",
+        "trg_content_revision_claude_weekly_observation_index_delete",
+        "trg_content_revision_claude_weekly_observation_index_update",
+        "trg_content_revision_five_hour_block_models_delete",
+        "trg_content_revision_five_hour_block_models_insert",
+        "trg_content_revision_five_hour_block_models_update",
+        "trg_content_revision_five_hour_block_projects_delete",
+        "trg_content_revision_five_hour_block_projects_insert",
+        "trg_content_revision_five_hour_block_projects_update",
+        "trg_content_revision_five_hour_blocks_delete",
+        "trg_content_revision_five_hour_blocks_insert",
+        "trg_content_revision_five_hour_blocks_update",
+        "trg_content_revision_five_hour_milestones_delete",
+        "trg_content_revision_five_hour_milestones_insert",
+        "trg_content_revision_five_hour_milestones_update",
+        "trg_content_revision_five_hour_reset_events_delete",
+        "trg_content_revision_five_hour_reset_events_insert",
+        "trg_content_revision_five_hour_reset_events_update",
+        "trg_content_revision_percent_milestones_delete",
+        "trg_content_revision_percent_milestones_insert",
+        "trg_content_revision_percent_milestones_update",
+        "trg_content_revision_project_budget_milestones_delete",
+        "trg_content_revision_project_budget_milestones_update",
+        "trg_content_revision_projected_milestones_delete",
+        "trg_content_revision_projected_milestones_update",
+        "trg_content_revision_week_reset_events_delete",
+        "trg_content_revision_week_reset_events_update",
+        "trg_content_revision_weekly_cost_snapshots_delete",
+        "trg_content_revision_weekly_cost_snapshots_insert",
+        "trg_content_revision_weekly_cost_snapshots_update",
+        "trg_content_revision_weekly_credit_floors_delete",
+        "trg_content_revision_weekly_credit_floors_update",
+        "trg_content_revision_weekly_usage_snapshots_delete",
+        "trg_content_revision_weekly_usage_snapshots_insert",
+        "trg_content_revision_weekly_usage_snapshots_update",
+        "trg_usage_snapshot_suppression",
+    }
+)
 _REBUILD_REQUIRED_INDEXES = frozenset(
     {
         "idx_budget_milestones_alert_digest",
@@ -11729,6 +11858,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
         "idx_budget_milestones_journal_id_null",
         "idx_claude_oauth_samples_five_hour",
         "idx_claude_oauth_samples_weekly",
+        "idx_claude_weekly_observation_index_freshness",
         "idx_claude_weekly_observation_index_window",
         "idx_cost_week_start_at_time",
         "idx_cost_week_time",
@@ -11747,6 +11877,9 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
         "idx_five_hour_milestones_block",
         "idx_five_hour_milestones_journal_id",
         "idx_five_hour_milestones_journal_id_null",
+        # #1050 §4.2: the snapshot trigger's block lookup
+        # (`_lib_stats_content_revision.USAGE_SNAPSHOT_INDEX`).
+        "idx_five_hour_milestones_usage_snapshot_id",
         "idx_five_hour_reset_events_journal_id",
         "idx_five_hour_reset_events_journal_id_null",
         "idx_journal_protocol_violations_batch",
@@ -11807,8 +11940,12 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # #948 epoch 1023: `outcome_quarantine_envelope` and
 # `outcome_quarantine_certificates` dropped; `outcome_quarantine_episodes`,
 # `outcome_quarantine_bounds` and `outcome_quarantine_axis_state` added.
+# #1018 twin epoch 1024: the four enriched columns of
+# `claude_weekly_observation_index` and its partial freshness index.
+# #1050 (same epoch, no bump): the content-revision kernel's two tables, its
+# triggers and `idx_five_hour_milestones_usage_snapshot_id`.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "b7fab856ea97a64c43b3d24669212925d21348c92948f57fba50787aa966995a"
+    "1cc565ce0908c80a72884d5e76d815776f57a297fc4d928d0735ba179da4a6f8"
 )
 
 
@@ -15038,7 +15175,17 @@ def _rebuild_stats_index_locked(
         # dropped as soon as it has contributed (#496 S4 §4). #997 D7: the
         # quota observations are now retained as COORDINATES (16 bytes each)
         # and the cache leg re-reads them one chunk at a time.
-        decoded: list = []
+        #
+        # #1004 D4: `decoded` is a `RetainedRecords`. A retained record is a
+        # streamed slot (its coordinates and the digest of its line), re-read,
+        # digest-checked and decoded on each access, so every pass sees a
+        # fresh record equal to the one retained before; every other position
+        # keeps its `None` slot. With `MATERIALIZE_FOR_TESTS` set the pass
+        # retains the decoded records and hands on today's list (a test
+        # switch).
+        import _lib_retained_records
+        materialize = _lib_retained_records.MATERIALIZE_FOR_TESTS
+        decoded = _new_retained_records()
         quota_raw = QuotaLineSource()
         protocol_evidence = []
         prior_high_water = None
@@ -15100,7 +15247,10 @@ def _rebuild_stats_index_locked(
             # fingerprint that `journal_protocol_resolution` ops reference by
             # name, so contributing the wrong count makes an acknowledged
             # violation unresolvable (#496 S5b §5.4).
-            decoded.extend([None] * int(summary.decoded_entry_count))
+            for _ in range(int(summary.decoded_entry_count)):
+                # An elided line is never read back; its coordinate is a
+                # zero-length stand-in in its segment.
+                decoded.append_retained(None, name, 0, 0)
             last_seen.merge(
                 summary.last_seen_stamped,
                 summary.last_seen_legacy_claude_at,
@@ -15162,7 +15312,7 @@ def _rebuild_stats_index_locked(
                             {"t": rec.get("t"), "id": rec.get("id"),
                              "rev": rec.get("rev", 0)})
                     summaries.decoded(False)
-                    decoded.append(None)
+                    decoded.append_retained(None, segment, offset, len(raw))
                     prior_high_water = (segment, offset + len(raw) + 1)
                     continue
                 rebuild_quarantine.on_record(
@@ -15231,7 +15381,12 @@ def _rebuild_stats_index_locked(
                     rec.get("t") in _lib_journal_router.RETAINED_RECORD_TYPES)
                 summaries.decoded(retained, _is_codex_quota_obs(rec))
                 if retained:
-                    decoded.append(rec)
+                    if materialize:
+                        decoded.append_retained(
+                            rec, segment, offset, len(raw))
+                    else:
+                        decoded.append_streamed(
+                            raw, segment, offset, len(raw))
                 else:
                     if update_quota_cache and _is_codex_quota_obs(rec):
                         quota_raw.append(segment, offset, len(raw))
@@ -15247,7 +15402,7 @@ def _rebuild_stats_index_locked(
                     # and raise on every later rebuild. The selector skips a non-dict
                     # element, so this costs one pointer and keeps every sequence
                     # identical to the pre-change numbering (#496 S4; corrects §4.7).
-                    decoded.append(None)
+                    decoded.append_retained(None, segment, offset, len(raw))
                 prior_high_water = (
                     segment,
                     offset + len(raw) + 1,
@@ -15295,9 +15450,22 @@ def _rebuild_stats_index_locked(
         # is dropped before the inventory check and publication.
         _cctally_oauth_samples.attribute_staged_observations(
             conn, cutover_claude)
-        for rec in decoded:
-            if rec is not None:
-                _normalize_legacy_account_stamp(rec, cutover_claude)
+        if materialize:
+            # Every slot is a retained object here, so this decodes nothing.
+            listed = list(decoded)
+            decoded.close()
+            decoded = listed
+            for rec in decoded:
+                if rec is not None:
+                    _normalize_legacy_account_stamp(rec, cutover_claude)
+        else:
+            # #1004 D4: normalization moves to decode time. The hook is
+            # installed before the first consumer reads a record (the staged
+            # attribution above reads only projected tables), so every pass
+            # below sees each record normalized, as the in-place loop left it.
+            decoded.set_normalizer(
+                lambda rec: _normalize_legacy_account_stamp(
+                    rec, cutover_claude))
 
         # Resolve corrections BEFORE either disposable index is mutated. A
         # malformed revision, divergent same-revision candidate, or invalid

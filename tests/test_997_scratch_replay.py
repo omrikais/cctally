@@ -50,7 +50,26 @@ def _policy_of(conn) -> dict:
         "indexes": {str(row[0]) for row in sqlite3.Connection.execute(
             conn, "SELECT name FROM sqlite_schema WHERE type = 'index' "
             "AND name LIKE 'replay_usage_%'")},
+        # #1003 D2: the page cache that keeps a replay batch's dirty pages
+        # from spilling (and being re-written) before the commit.
+        "cache_size": int(sqlite3.Connection.execute(
+            conn, "PRAGMA cache_size").fetchone()[0]),
     }
+
+
+#: #1003 T8: SQLite's compiled default page cache, which every connection
+#: the disposable policy does not govern keeps.
+def _compiled_default_cache_size() -> int:
+    conn = sqlite3.connect(":memory:")
+    try:
+        return int(conn.execute("PRAGMA cache_size").fetchone()[0])
+    finally:
+        conn.close()
+
+
+_DEFAULT_CACHE_SIZE = _compiled_default_cache_size()
+#: #1003 D2: `PRAGMA cache_size=-65536` (64 MiB) on disposable scratches.
+_SCRATCH_CACHE_SIZE = -65536
 
 
 def _db_path(conn) -> str:
@@ -236,7 +255,8 @@ def test_replay_scratch_connections_use_disposable_policy(
     capsys.readouterr()
 
     expected = {"journal_mode": "memory", "synchronous": 0,
-                "indexes": _REPLAY_INDEXES}
+                "indexes": _REPLAY_INDEXES,
+                "cache_size": _SCRATCH_CACHE_SIZE}
     assert seen.get("base") == expected, seen
     assert seen.get("all-0.db") == expected, seen
     assert seen.get("stats.rederive.db") == expected, seen
@@ -270,7 +290,8 @@ def test_live_rebuild_scratch_keeps_store_policy_and_fingerprint(
     assert seen, "the fixture never folded into a rebuild scratch"
     for policy in seen:
         assert policy == {"journal_mode": "delete", "synchronous": 2,
-                          "indexes": set()}, policy
+                          "indexes": set(),
+                          "cache_size": _DEFAULT_CACHE_SIZE}, policy
     conn = core.open_db()
     try:
         assert _policy_of(conn)["indexes"] == set()
@@ -288,7 +309,8 @@ def test_scratch_policy_without_usage_table_sets_pragmas_only(tmp_path):
     try:
         _cctally_store.apply_disposable_scratch_policy(conn)
         assert _policy_of(conn) == {
-            "journal_mode": "memory", "synchronous": 0, "indexes": set()}
+            "journal_mode": "memory", "synchronous": 0, "indexes": set(),
+            "cache_size": _SCRATCH_CACHE_SIZE}
         assert not conn.in_transaction
     finally:
         conn.close()
@@ -544,12 +566,14 @@ def test_prefix_window_unchanged_after_replays(ns, monkeypatch, capsys):
     real = _cctally_completion._replay
 
     def checking(base, tmp, name, prefix, *args, **kwargs):
-        before = json.dumps(prefix.window, sort_keys=True)
+        # #1004 D4: `window` is a `RetainedRecords` (each access of a
+        # streamed position is a fresh decode; placeholders are retained).
+        before = json.dumps(list(prefix.window), sort_keys=True)
         try:
             return real(base, tmp, name, prefix, *args, **kwargs)
         finally:
             checked.append(
-                json.dumps(prefix.window, sort_keys=True) == before)
+                json.dumps(list(prefix.window), sort_keys=True) == before)
 
     monkeypatch.setattr(_cctally_completion, "_replay", checking)
     jr.append_record(_legacy_claude(J, "2026-07-26T08:00:00Z", 50.0))
@@ -763,3 +787,478 @@ def test_plan_view_shared_stub_normalized_once(ns, monkeypatch):
     assert view[1] is not stub and "account" not in stub
     assert view[1]["account"]
     assert view[2] is current and view[0] is records[0]
+
+
+# --------------------------------------------------------------------------
+# #1003 T2/T3 — the incremental block-totals engine's scope and equality
+# --------------------------------------------------------------------------
+
+def _seed_block_cache(mod, account="acct-a"):
+    """Claude cache rows every 20 minutes from five hours before ``W1`` to
+    seven hours after it, two projects, a raw-cost row, a fast row and a
+    model with no card: the five-hour blocks of `_readings` own a growing
+    population, so each tick's totals differ from the last."""
+    paths = ("/tmp/claude/projects/repo-a/s-a.jsonl",
+             "/tmp/claude/projects/repo-b/s-b.jsonl")
+    conn = mod.open_cache_db()
+    for path, session, project in zip(paths, ("sa", "sb"),
+                                      ("/repo-a", "/repo-b")):
+        conn.execute(
+            "INSERT INTO session_files (path, size_bytes, mtime_ns, "
+            "last_byte_offset, last_ingested_at, session_id, project_path) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (path, 100, 1, 100, "2026-07-25T12:00:00Z", session, project))
+    start = W1 - 5 * 3600
+    for index in range(36):
+        moment = dt.datetime.fromtimestamp(start + index * 1200, UTC)
+        model = ("claude-zz-1003-unpriced" if index % 11 == 5
+                 else "claude-opus-4-6" if index % 5 == 0
+                 else "claude-3-5-sonnet-20241022")
+        conn.execute(
+            "INSERT INTO session_entries (source_path, line_offset, "
+            "timestamp_utc, model, input_tokens, output_tokens, "
+            "cache_create_tokens, cache_read_tokens, cache_create_1h_tokens, "
+            "account_key, cost_usd_raw, speed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (paths[index % 2], index * 10,
+             moment.isoformat() if index % 3 else
+             moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
+             model, 1000 + index, 200 + index, 300, 400 + index,
+             100 if index % 2 else 0, account,
+             0.25 if index % 7 == 3 else None,
+             "fast" if index % 5 == 0 else None))
+    conn.commit()
+    return conn
+
+
+def _block_readings(J):
+    """`_readings` (a weekly reset, a five-hour block spanning several K=4
+    batches) plus a week-2 in-place drop of more than 25 points (a credit)."""
+    readings = _readings(J)
+    for offset, pct in ((W1 + 4 * 3600, 60.0), (W1 + 4 * 3600 + 900, 20.0)):
+        captured = offset
+        readings.append(J.make_obs(
+            at=_iso(captured), src="record-usage", provider="claude",
+            account="acct-a", payload={
+                "captured_at": _iso(captured), "source": "statusline",
+                "weekly_percent": pct, "resets_at": W2,
+                "five_hour_percent": 40.0,
+                "five_hour_resets_at": _iso(W1 + 6 * 3600)}))
+    return readings
+
+
+@pytest.fixture
+def engine_off(monkeypatch):
+    """Force the engine slot empty inside every scratch replay: the
+    engine-free reference path."""
+    import _cctally_rederive
+
+    def apply():
+        monkeypatch.setattr(_cctally_rederive, "BlockTotalsEngine",
+                            lambda cache_conn: None)
+    return apply
+
+
+def test_engine_slot_is_scoped_to_scratch_read_adapters(ns, tmp_path):
+    """#1003 T2: `_scratch_read_adapters` installs a fresh engine for its
+    context and restores the previous slot on normal exit and on an
+    exception; `_no_cache_read_adapters` installs none. Detects an engine
+    that leaks past a replay into live recording (which would cache a
+    `cache.db` that live ingest keeps changing)."""
+    import _cctally_completion
+    import _cctally_record as rec
+    import _cctally_rederive
+
+    cache = ns["open_cache_db"]()
+    sentinel = object()
+    previous = rec.swap_block_totals_engine(sentinel)
+    try:
+        with _cctally_rederive._scratch_read_adapters(cache):
+            first = rec._BLOCK_TOTALS_ENGINE
+            assert isinstance(first, _cctally_rederive.BlockTotalsEngine)
+        assert rec._BLOCK_TOTALS_ENGINE is sentinel
+        with pytest.raises(RuntimeError, match="replay failed"):
+            with _cctally_rederive._scratch_read_adapters(cache):
+                second = rec._BLOCK_TOTALS_ENGINE
+                assert isinstance(second, _cctally_rederive.BlockTotalsEngine)
+                assert second is not first
+                raise RuntimeError("replay failed")
+        assert rec._BLOCK_TOTALS_ENGINE is sentinel
+        with _cctally_completion._no_cache_read_adapters():
+            assert rec._BLOCK_TOTALS_ENGINE is sentinel
+    finally:
+        rec.swap_block_totals_engine(previous)
+        cache.close()
+    assert _cctally_rederive.BlockTotalsEngine.verify is False
+
+
+def test_live_and_final_rebuild_paths_never_see_an_engine(
+        ns, monkeypatch, capsys):
+    """#1003 T2: live ingest (`maybe_update_five_hour_block`) and the final
+    rebuild's open-block projection run with an empty slot; only a
+    completion replay over a readable cache uses the engine. Detects a live
+    or published path answered from a replay's cache snapshot."""
+    import argparse
+    import _cctally_journal as jr
+    import _cctally_record as rec
+    import _cctally_rederive
+    import _lib_journal as J
+
+    mod = __import__("sys").modules["cctally"]
+    _seed_block_cache(mod).close()
+    calls: list = []
+    depth = [0]
+    real_replay = _cctally_rederive.replay_scratch_records
+    real_body = rec._block_totals_reprice
+    real_totals = _cctally_rederive.BlockTotalsEngine.totals
+
+    def spy_replay(*args, **kwargs):
+        depth[0] += 1
+        try:
+            return real_replay(*args, **kwargs)
+        finally:
+            depth[0] -= 1
+
+    def spy_body(*args, **kwargs):
+        calls.append(("body", depth[0] > 0, rec._BLOCK_TOTALS_ENGINE))
+        return real_body(*args, **kwargs)
+
+    def spy_totals(self, *args, **kwargs):
+        calls.append(("engine", depth[0] > 0, self))
+        return real_totals(self, *args, **kwargs)
+
+    monkeypatch.setattr(_cctally_rederive, "replay_scratch_records",
+                        spy_replay)
+    monkeypatch.setattr(rec, "_block_totals_reprice", spy_body)
+    monkeypatch.setattr(_cctally_rederive.BlockTotalsEngine, "totals",
+                        spy_totals)
+
+    readings = _readings(J, 10)
+    for record in readings[:6]:
+        jr.append_record(record)
+    jr.run_stats_ingest(mode="authoritative")
+    live = list(calls)
+    for record in readings[6:]:
+        jr.append_record(record)
+    calls.clear()
+    assert ns["cmd_db_rebuild"](argparse.Namespace(db="stats", json=True)) == 0
+    capsys.readouterr()
+
+    assert live and all(kind == "body" and not in_replay and slot is None
+                        for kind, in_replay, slot in live), live
+    outside = [c for c in calls if not c[1]]
+    inside = [c for c in calls if c[1]]
+    assert outside, "non-vacuity: the final rebuild projected an open block"
+    assert all(kind == "body" and slot is None
+               for kind, _, slot in outside), outside
+    assert inside and all(kind == "engine" for kind, _, _ in inside), inside
+
+
+class _RecordingSink(dict):
+    """A `block_source_evidence` sink that asks for every block and records
+    each stored population with its by-value snapshot at storage time."""
+
+    def __init__(self):
+        super().__init__()
+        self.log: list = []
+
+    def __contains__(self, key):
+        return True
+
+    def __setitem__(self, key, value):
+        self.log.append((key, value, tuple(_entry_value(e) for e in value)))
+        super().__setitem__(key, value)
+
+
+def _entry_value(entry) -> tuple:
+    return tuple((name, value.isoformat() if isinstance(value, dt.datetime)
+                  else value) for name, value in vars(entry).items())
+
+
+def test_shared_owned_entries_are_never_mutated(
+        ns, tmp_path, monkeypatch, engine_off):
+    """#1003 T2: the engine shares one entry object between calls where the
+    full re-price built fresh ones, and `block_source_evidence` retains the
+    owned entries of every tick. Each stored population must still equal,
+    by value, its snapshot at storage time after the whole replay, and the
+    populations must equal the engine-free replay's. Detects a later tick
+    mutating an entry an earlier tick's evidence holds."""
+    import _cctally_rederive
+    import _lib_journal as J
+
+    monkeypatch.setattr(_cctally_rederive, "_SCRATCH_REPLAY_COMMIT_EVERY", 4)
+    mod = __import__("sys").modules["cctally"]
+    cache = _seed_block_cache(mod)
+    records = _block_readings(J)
+    logs = {}
+    try:
+        for mode in ("engine", "off"):
+            if mode == "off":
+                engine_off()
+            sink = _RecordingSink()
+            scratch_dir = tmp_path / mode
+            scratch_dir.mkdir()
+            _cctally_rederive._derive_desired_events(
+                records, cache, scratch_dir, block_sources=sink)
+            for key, value, snapshot in sink.log:
+                assert tuple(_entry_value(e) for e in value) == snapshot, key
+            logs[mode] = [(key, snapshot) for key, _, snapshot in sink.log]
+    finally:
+        cache.close()
+    assert any(snapshot for _, snapshot in logs["engine"]), (
+        "non-vacuity: a tick retained owned entries")
+    assert logs["engine"] == logs["off"]
+
+
+def _replay_with_cache(conn, records, cache, *, held_ids, retention):
+    import _cctally_quarantine
+    import _cctally_rederive
+    fold = _cctally_quarantine.QuarantineFold.empty(held_ids=held_ids)
+    return _cctally_rederive.replay_scratch_records(
+        conn, records, cache, fold=fold, held_ids=held_ids,
+        retention=retention, prepare=copy.deepcopy)
+
+
+def test_scratch_replay_equal_with_and_without_engine(
+        ns, tmp_path, monkeypatch, engine_off):
+    """#1003 T3: a scratch replay over a five-hour block spanning several
+    commit batches, a weekly reset, an in-place credit, a reviewed hold and
+    a retained decision offered mid-batch derives byte-identical candidates
+    and scratch tables with the engine (shadow verification on) and with the
+    slot forced empty. Detects any engine answer that changes a derived
+    row, milestone or candidate."""
+    import _cctally_rederive
+    import _lib_journal as J
+
+    monkeypatch.setattr(_cctally_rederive, "_SCRATCH_REPLAY_COMMIT_EVERY", 4)
+    mod = __import__("sys").modules["cctally"]
+    cache = _seed_block_cache(mod)
+    readings = _block_readings(J)
+    held = frozenset({readings[3]["id"]})
+    try:
+        probe = _scratch(tmp_path, "probe.db")
+        try:
+            derived = _replay_with_cache(probe, readings, cache,
+                                         held_ids=held, retention=None)
+        finally:
+            probe.close()
+        records, effective = _with_retained_offer(J, readings, derived)
+        results = {}
+        engines: list = []
+        real_engine = _cctally_rederive.BlockTotalsEngine
+
+        def tracking(cache_conn):
+            engines.append(real_engine(cache_conn))
+            return engines[-1]
+
+        for mode in ("engine", "off"):
+            if mode == "engine":
+                monkeypatch.setattr(real_engine, "verify", True)
+                monkeypatch.setattr(_cctally_rederive, "BlockTotalsEngine",
+                                    tracking)
+            else:
+                engine_off()
+            conn = _scratch(tmp_path, f"{mode}.db")
+            try:
+                events = _replay_with_cache(
+                    conn, records, cache, held_ids=held,
+                    retention=_retention(effective))
+                results[mode] = (json.dumps(events, sort_keys=True),
+                                 _dump(conn))
+            finally:
+                conn.close()
+    finally:
+        cache.close()
+    assert results["engine"][0] == results["off"][0]
+    assert results["engine"][1] == results["off"][1]
+    assert json.loads(results["engine"][0]), "the fixture derived nothing"
+    assert results["engine"][1]["five_hour_blocks"], "no five-hour block"
+    assert any(row for row in results["engine"][1]["five_hour_block_models"])
+    [engine] = engines
+    assert engine.counts["extended"] + engine.counts["cached"] > 0
+
+
+def _snapshot_dir(share, dest):
+    import shutil
+    shutil.copytree(share, dest)
+
+
+def _restore_dir(share, src):
+    import shutil
+    shutil.rmtree(share)
+    shutil.copytree(src, share)
+
+
+def _journal_bytes_of(share) -> dict:
+    return {path.name: path.read_bytes()
+            for path in sorted((share / "journal").glob("*.jsonl"))}
+
+
+#: Published tables whose differing columns are the rebuild's own volatile
+#: stamps (spec T10's frozen allowlist), not derived output.
+_PUBLISHED_VOLATILE = frozenset({
+    "schema_migrations", "journal_selector_state", "quota_percent_milestones",
+    "quota_projection_ledger_state", "quota_projection_state",
+    "quota_window_blocks", "stats_publication_stamp",
+})
+
+
+def _published(path) -> dict:
+    conn = sqlite3.connect(str(path))
+    try:
+        out = {}
+        for (table,) in conn.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall():
+            if table in _PUBLISHED_VOLATILE:
+                continue
+            out[table] = sorted((tuple(r) for r in conn.execute(
+                f"SELECT * FROM {table}")), key=repr)
+        return out
+    finally:
+        conn.close()
+
+
+def _pin_wall_clocks(monkeypatch):
+    """Pin every wall clock that reaches journal bytes, so the engine and
+    engine-free runs (seconds apart) append identical lines. The correction
+    batch's begin and commit `at` is `_cctally_rederive._iso_now()` for
+    `db rederive` and `_cctally_completion._iso_now()` for completion, at
+    one-second resolution: unpinned, the two runs differed whenever they
+    straddled a second boundary (observed: `12:46:28Z` against `12:46:29Z`)."""
+    import _cctally_claude_attribution
+    import _cctally_completion
+    import _cctally_journal as jr
+    import _cctally_rederive
+    monkeypatch.setattr(jr, "_now_iso", lambda: "2026-07-30T00:00:00Z")
+    monkeypatch.setattr(_cctally_claude_attribution, "_now_iso",
+                        lambda: "2026-07-30T00:00:00Z")
+    monkeypatch.setattr(_cctally_rederive, "_iso_now",
+                        lambda: "2026-07-30T00:00:00Z")
+    monkeypatch.setattr(_cctally_completion, "_iso_now",
+                        lambda: "2026-07-30T00:00:00Z")
+
+
+def test_completion_equal_with_and_without_engine(
+        ns, tmp_path, monkeypatch, capsys, engine_off):
+    """#1003 T3: a completing `db rebuild` (the predecessor owes the inputs
+    appended after its ingest) over a readable cache appends identical
+    journal bytes, publishes an identical index and derives identical
+    replay candidates with the engine (verification on) and with the slot
+    forced empty. Detects a completion correction batch that the engine
+    changes."""
+    import argparse
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_rederive
+    import _lib_journal as J
+
+    _pin_wall_clocks(monkeypatch)
+    monkeypatch.setattr(_cctally_rederive, "_SCRATCH_REPLAY_COMMIT_EVERY", 4)
+    mod = __import__("sys").modules["cctally"]
+    _seed_block_cache(mod).close()
+    readings = _block_readings(J)
+    for record in readings[:5]:
+        jr.append_record(record)
+    jr.run_stats_ingest(mode="authoritative")
+    for record in readings[5:]:
+        jr.append_record(record)
+    share = _cctally_core.APP_DIR
+    saved = tmp_path / "saved-share"
+    _snapshot_dir(share, saved)
+    real_replay = _cctally_rederive.replay_scratch_records
+    real_engine = _cctally_rederive.BlockTotalsEngine
+    outcomes = {}
+    for mode in ("engine", "off"):
+        replays: list = []
+        engines: list = []
+
+        def spy(*args, **kwargs):
+            events = real_replay(*args, **kwargs)
+            replays.append(json.dumps(events, sort_keys=True))
+            return events
+
+        monkeypatch.setattr(_cctally_rederive, "replay_scratch_records", spy)
+        if mode == "engine":
+            monkeypatch.setattr(real_engine, "verify", True)
+
+            def tracking(cache_conn):
+                engines.append(real_engine(cache_conn))
+                return engines[-1]
+
+            monkeypatch.setattr(_cctally_rederive, "BlockTotalsEngine",
+                                tracking)
+        else:
+            _restore_dir(share, saved)
+            engine_off()
+        before = _journal_bytes_of(share)
+        assert ns["cmd_db_rebuild"](
+            argparse.Namespace(db="stats", json=True)) == 0
+        capsys.readouterr()
+        outcomes[mode] = (replays, _journal_bytes_of(share),
+                          _published(_cctally_core.DB_PATH))
+        if mode == "engine":
+            assert replays, "non-vacuity: no completion replay ran"
+            assert engines and any(
+                e.counts["extended"] + e.counts["cached"] for e in engines)
+            assert _journal_bytes_of(share) != before, (
+                "non-vacuity: completion appended nothing")
+    assert outcomes["engine"][0] == outcomes["off"][0]
+    assert outcomes["engine"][1] == outcomes["off"][1]
+    assert outcomes["engine"][2] == outcomes["off"][2]
+
+
+def test_historical_close_rederive_equal_with_and_without_engine(
+        tmp_path, monkeypatch, capsys, engine_off):
+    """#1003 T3: `db rederive` over #869's historical unpriced close (158
+    retained entries, a card shipped after the close) previews the same
+    plan and appends the same bytes with the engine (verification on) and
+    with the slot forced empty. Detects an engine answer that changes a
+    historical-close correction or its source hash."""
+    import test_cost_repricing_869 as R
+
+    mod = R.load_isolated_cctally_module(tmp_path, monkeypatch)
+    # Imported after the isolated load, which re-executes the siblings.
+    import _cctally_core
+    import _cctally_rederive
+    import _lib_pricing as pricing
+    _pin_wall_clocks(monkeypatch)
+    present = pricing.current_pricing_snapshot()
+    R._record_unmarked_close(mod, monkeypatch, pricing, R._block_508_rows())
+    carded = R._pricing_revision(
+        pricing, claude_prices=present.claude_pricing, date="2026-09-24")
+    monkeypatch.setattr(pricing, "current_pricing_snapshot", lambda: carded)
+    share = _cctally_core.APP_DIR
+    saved = tmp_path / "saved-869"
+    _snapshot_dir(share, saved)
+    real_engine = _cctally_rederive.BlockTotalsEngine
+    outcomes = {}
+    for mode in ("engine", "off"):
+        engines: list = []
+        if mode == "engine":
+            monkeypatch.setattr(real_engine, "verify", True)
+
+            def tracking(cache_conn):
+                engines.append(real_engine(cache_conn))
+                return engines[-1]
+
+            monkeypatch.setattr(_cctally_rederive, "BlockTotalsEngine",
+                                tracking)
+        else:
+            _restore_dir(share, saved)
+            engine_off()
+        preview = R._rederive(mod, capsys, apply=False)
+        preview.pop("generatedAt", None)
+        applied = R._rederive(mod, capsys, apply=True)
+        for key in ("generatedAt", "durationSeconds"):
+            applied.pop(key, None)
+        (applied.get("rebuild") or {}).pop("durationSeconds", None)
+        outcomes[mode] = (preview, applied, _journal_bytes_of(share))
+        if mode == "engine":
+            assert engines and any(
+                e.counts["extended"] + e.counts["cached"] for e in engines)
+            assert R._kind_counts(
+                preview, "five_hour_block_close")["supersede"] == 1
+    engine, off = outcomes["engine"], outcomes["off"]
+    assert engine[0] == off[0], "preview differs"
+    assert {k for k in engine[1] if engine[1][k] != off[1].get(k)} == set()
+    assert engine[2] == off[2], "appended journal bytes differ"

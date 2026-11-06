@@ -1962,3 +1962,2501 @@ def test_journal_first_recovery_without_dated_parent_precedes_publication(env):
     # BASE: protected for the missing dated parent, never ingested.
     assert _entry_accounts(ns, rollout) == control     # journaled A replayed
     assert _conversation_rows(ns, rollout) > 0
+
+
+# ── #982 / #975 T2: the admitted history heal (spec 4.1, 4.3, 4.4, 4.6) ──────
+#
+# Every test below drives the real executor (`run_codex_admitted_heal`) or the
+# real worker body over held history: cursorless compressed rollouts that a
+# settled provenance census hands to the heal. The heal record is armed through
+# raw SQL where a test needs the fence on its own, so the base binary reaches
+# the behavioural assertion rather than a missing helper.
+
+import argparse as _argparse  # noqa: E402
+import fcntl as _fcntl  # noqa: E402
+
+HEAL_WALK_KEY = "codex_heal_walk"
+#: The record's history-sized half (population, D1 set), bound to the
+#: fence key by its `gen` (#982 implementation review).
+HEAL_PAYLOAD_KEY = "codex_heal_walk_payload"
+WEEK_RESET = 1784937600                         # 2026-07-25T00:00Z
+WEEKLY_LIMITS = {
+    "primary": {"resets_at": 1784559600, "used_percent": 13.0,
+                "window_minutes": 330},
+    "secondary": {"resets_at": WEEK_RESET, "used_percent": 20.0,
+                  "window_minutes": 10080},
+}
+
+
+class _Killed(BaseException):
+    """An injected worker death (never an ordinary exception a worker logs)."""
+
+
+def _with_weekly_quota(records: list[dict]) -> list[dict]:
+    """The rollout with an account-level WEEKLY reading on every token count,
+    so window-scoped spend adoption has a window to decide from."""
+    out = []
+    for rec in json.loads(json.dumps(records)):
+        payload = rec.get("payload") or {}
+        if rec.get("type") == "event_msg" and payload.get("type") == "token_count":
+            payload["info"]["rate_limits"] = WEEKLY_LIMITS
+        out.append(rec)
+    return out
+
+
+def _heal_record(ns):
+    """The fence key with its payload's population and D1 set merged in."""
+    row = _one(ns, "SELECT value FROM cache_meta WHERE key=?", (HEAL_WALK_KEY,))
+    if row is None:
+        return None
+    record = json.loads(row[0])
+    payload = _one(ns, "SELECT value FROM cache_meta WHERE key=?",
+                   (HEAL_PAYLOAD_KEY,))
+    if payload is not None:
+        for key, value in json.loads(payload[0]).items():
+            if key in ("population", "known"):
+                record[key] = value
+    return record
+
+
+def _write_heal_record(ns, fence, payload) -> None:
+    """Write both keys of a heal record as raw text or JSON (``None`` leaves
+    a key absent)."""
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("DELETE FROM cache_meta WHERE key IN (?, ?)",
+                     (HEAL_WALK_KEY, HEAL_PAYLOAD_KEY))
+        for key, value in ((HEAL_WALK_KEY, fence), (HEAL_PAYLOAD_KEY, payload)):
+            if value is None:
+                continue
+            conn.execute(
+                "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+                (key, value if isinstance(value, str) else json.dumps(value)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _arm_heal_record(ns, population) -> None:
+    """The fence a start unit writes, armed directly (spec 4.3 shape)."""
+    _write_heal_record(
+        ns, {"v": 1, "mode": "history", "phase": "units", "gen": "armed"},
+        {"v": 1, "gen": "armed",
+         "population": sorted(str(p) for p in population)})
+
+
+def _drop_heal_record(ns) -> None:
+    _write_heal_record(ns, None, None)
+
+
+def _clear_marker(ns, key) -> None:
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("DELETE FROM cache_meta WHERE key=?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _full_walk_marker(ns) -> bool:
+    cc = _cache()
+    return _one(ns, "SELECT COUNT(*) FROM cache_meta WHERE key=?", (
+        cc._ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY,)) == (1,)
+
+
+class _HealProbe:
+    """Observe population commits (the W11 commit trace) and every admission
+    finish (``adm._after_finish``), probing both store locks at each finish
+    with a non-blocking exclusive flock."""
+
+    def __init__(self, ns, monkeypatch, population, *, on_commit=None,
+                 on_finish=None, claude_holder=None):
+        import _lib_codex_drain_admission as adm
+        core = ns["_cctally_core"]
+        self.population = {str(p) for p in population}
+        self.events: list = []
+        self._locks = (core.CACHE_LOCK_PATH, core.CACHE_LOCK_CODEX_PATH)
+        # #1055: a predicate naming the T1 Claude hook as the holder of
+        # ``cache.db.lock``. Only that hook may hold the Claude writer lock at
+        # a finish; ``cache.db.codex.lock`` must always be free.
+        self._claude_holder = claude_holder
+
+        def trace(kind, *args):
+            if kind != "commit":
+                return
+            for path in args[0]:
+                self.events.append(("commit", path))
+                if on_commit is not None and path in self.population:
+                    on_commit(path)
+
+        def after_finish():
+            self.events.append(("finish", self.locks_free()))
+            if on_finish is not None:
+                on_finish()
+
+        monkeypatch.setattr(_cache(), "_CODEX_W11_TRACE", trace)
+        monkeypatch.setattr(adm, "_after_finish", after_finish)
+
+    def locks_free(self) -> bool:
+        fds = []
+        try:
+            for path in self._locks:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+                fds.append(fd)
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                except OSError:
+                    if (path == self._locks[0]
+                            and self._claude_holder is not None
+                            and self._claude_holder()):
+                        continue
+                    return False
+            return True
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+    def commits(self) -> list:
+        return [i for i, event in enumerate(self.events)
+                if event[0] == "commit" and event[1] in self.population]
+
+    def committed(self, path) -> bool:
+        return ("commit", str(path)) in self.events
+
+    def assert_admitted_per_file(self) -> None:
+        commits = self.commits()
+        assert sorted(self.events[i][1] for i in commits) == sorted(
+            self.population), ("each population file commits exactly once",
+                               self.events)
+        for start, end in zip(commits, commits[1:] + [len(self.events)]):
+            assert ("finish", True) in self.events[start + 1:end], (
+                "no admission finish with both store locks free followed a "
+                "population commit: the heal held the writer locks across "
+                "files", self.events)
+
+
+def _settle_and_heal(ns, *, wait_for_requests=True):
+    cc = _cache()
+    result = cc.run_codex_history_provenance_drain(wait_for_requests=False)
+    assert result.outcome == "settled", result
+    return cc.run_codex_admitted_heal(
+        wait_for_requests=wait_for_requests,
+        population=cc._codex_history_candidates())
+
+
+def _split_attribution_rollout(ns, provider, path, session_id) -> None:
+    """A rollout whose first range was decided unattributed (an API-key
+    login) and whose append was decided for acct-a: unattributed spend plus
+    weekly window evidence naming acct-a, in one file."""
+    (provider / "auth.json").write_text('{"OPENAI_API_KEY":"fixture-key"}')
+    write_rollout(path, _with_weekly_quota(conversation_records(
+        2, session_id=session_id, label="split")))
+    _sync(ns)
+    (provider / "auth.json").write_text(_auth_json("acct-a", "a@example.com"))
+    with path.open("a", encoding="utf-8") as fh:
+        for record in _with_weekly_quota(conversation_records(
+                3, session_id=session_id, label="split"))[-4:]:
+            fh.write(json.dumps(record) + "\n")
+    _sync(ns)
+
+
+def _seed_split_heal(ns, provider, day):
+    """P1 (split attribution) as held compressed history after `rm cache.db`;
+    the journal is its only surviving trace."""
+    cc = _cache()
+    p1 = day / _name(11, 31)
+    keeper = day / _name(20, 39)
+    write_rollout(keeper, token_records(1, session_id="keeper-0039",
+                                        start_minute=50))
+    _split_attribution_rollout(ns, provider, p1, "split-0031")
+    accounts = _entry_accounts(ns, p1)
+    assert len(accounts) == 3 and accounts[2] is not None
+    _compress(p1)
+    _drop_stores(ns)
+    _sync(ns)
+    cc.run_codex_inventory_bootstrap(wait_for_requests=False)
+    assert _entry_accounts(ns, p1) == [], "the census holds P1"
+    return p1, keeper
+
+
+def _hook_log(ns) -> list:
+    path = ns["APP_DIR"] / "logs" / "hook-tick.log"
+    if not path.exists():
+        return []
+    return [dict(tok.split("=", 1) for tok in line.split()[1:] if "=" in tok)
+            for line in path.read_text().splitlines()]
+
+
+def _hook_tick(ns) -> None:
+    args = _argparse.Namespace(
+        explain=False, foreground=True, no_oauth=True, throttle_seconds=None,
+        event=None, mock_oauth_response=None, source="codex")
+    assert ns["cmd_hook_tick"](args) == 0
+
+
+@pytest.mark.parametrize("case", ["plain", "yield", "recheck", "hook",
+                                  "hook-budget"])
+def test_heal_executor_admits_each_population_file(env, monkeypatch, case):
+    """R1 (#982): the worker's history heal is admitted per file.
+
+    Detects: one unadmitted walk holding both cache writer flocks across every
+    held rollout (the 932 s production hold), a heal unit admitted while a
+    hook request is fresh, a unit that skips the after-store-locks recheck,
+    and a hook in the yield interval that cannot ingest or report."""
+    import _lib_codex_drain_admission as adm
+    ns, provider, day, _ = env
+    cc = _cache()
+    control, _ = _seed_production_heal(ns, provider, day, monkeypatch)
+    cc.run_codex_inventory_bootstrap(wait_for_requests=False)
+    population = [day / _name(h, s) for h, s in ((11, 2), (12, 1), (13, 4))]
+    live = day / _name(21, 41)
+    if case == "hook-budget":
+        core = ns["_cctally_core"]
+        monkeypatch.setenv("CCTALLY_AS_OF", "2026-07-25T12:00:00Z")
+        core.CONFIG_PATH.write_text(json.dumps({
+            "display": {"tz": "utc"}, "budget": {"codex": {
+                "amount_usd": 1000.0, "period": "calendar-month",
+                "alerts_enabled": True, "alert_thresholds": [90]}}}) + "\n")
+    clock = {"now": int(adm._monotonic_ns())}
+    published: list = []
+    commit_times: dict = {}
+    hooked: list = []
+    projections: list = []
+    monkeypatch.setattr(adm, "_monotonic_ns", lambda: clock["now"])
+    real_projection = ns["reconcile_codex_quota_projection"]
+
+    def projection(**kwargs):
+        projections.append(kwargs)
+        return real_projection(**kwargs)
+
+    def sleep(seconds):
+        if case.startswith("hook") and published and not hooked:
+            write_rollout(live, token_records(2, session_id="live-0041"))
+            with monkeypatch.context() as m:
+                m.setitem(ns, "reconcile_codex_quota_projection", projection)
+                _hook_tick(ns)
+            hooked.append([f for f in _hook_log(ns) if "sync" in f][-1])
+        clock["now"] += int(seconds * 1_000_000_000)
+
+    monkeypatch.setattr(adm, "_sleep", sleep)
+
+    def publish():
+        assert adm.publish_waiting_request(ns["APP_DIR"], root_keys=()) is not None
+        published.append(clock["now"])
+        published.append(len(commit_times))     # commits before the request
+
+    def on_commit(path):
+        commit_times[path] = clock["now"]
+
+    def on_finish():
+        if case in ("yield", "hook", "hook-budget") and probe.commits() and not published:
+            publish()
+
+    def pre_store_locks():
+        if case == "recheck" and probe.commits() and not published:
+            publish()
+
+    monkeypatch.setattr(cc, "_CODEX_PRE_STORE_LOCK_HOOK", pre_store_locks,
+                        raising=False)
+    probe = _HealProbe(ns, monkeypatch, population, on_commit=on_commit,
+                       on_finish=on_finish)
+    assert cc.cmd_codex_replay_drain_internal(_argparse.Namespace()) == 0
+    probe.assert_admitted_per_file()
+    worker = [f for f in _hook_log(ns) if f.get("op") == "replay-drain"][-1]
+    assert worker["result"] == "success", worker
+    assert worker.get("heal") == "done" and int(worker["heal_units"]) >= 3, worker
+    assert _heal_record(ns) is None
+    if case == "plain":
+        assert _heal_oracle(ns) == control
+        assert _full_walk_marker(ns), "an uninterrupted heal certifies the walk"
+        # The worker's log line reports the heal's own counts, summed over
+        # its units, not the zeroes of a sync that never ran.
+        assert int(worker["files"]) >= 3, worker
+        return
+    assert published, "the request was never published"
+    # The fake clock advances only in the backoff sleep, so order (not time)
+    # tells the commits after the request from the one that preceded it.
+    later = list(commit_times.values())[published[1]:]
+    first = min(commit_times.values())
+    assert later, "no population unit committed after the request"
+    assert len(commit_times) == 3 and first <= published[0]
+    assert all(t >= published[0] + adm.REQUEST_TTL_NS for t in later), (
+        "a population unit committed while a hook request was fresh",
+        published, commit_times)
+    if case.startswith("hook"):
+        assert hooked, "no hook ran in the yield interval"
+        assert _entry_accounts(ns, live), "the hook did not ingest the live rollout"
+        assert projections, "the hook in the yield interval skipped its projection"
+        if case == "hook":
+            assert hooked[0]["result"] == "success", hooked
+        else:
+            assert (hooked[0]["sync"], hooked[0]["result"],
+                    hooked[0].get("reason")) == (
+                "deferred", "noop", "budget_ingest_incomplete"), hooked
+
+
+def test_heal_fence_holds_population(env, monkeypatch):
+    """R3 (a): while the fence holds, only the executor ingests population
+    files. Detects: a hook's budgeted sync, an ordinary unbudgeted sync or a
+    targeted call ingesting held population out of the single walk's order."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    p1, _keeper = _seed_split_heal(ns, provider, day)
+    p2 = day / _name(12, 33)
+    write_rollout(p2, token_records(2, session_id="held-0033"))
+    _compress(p2)
+    assert cc.run_codex_history_provenance_drain(
+        wait_for_requests=False).outcome == "settled"
+    _arm_heal_record(ns, (p1, p2))
+    live = day / _name(21, 34)
+    write_rollout(live, token_records(2, session_id="live-0034"))
+    for kwargs in ({"budget_seconds": 60.0}, {}, {"only_paths": {str(p1)}}):
+        stats = _sync(ns, maintenance="caller", **kwargs)
+        assert _entry_accounts(ns, p1) == [] and _entry_accounts(ns, p2) == [], (
+            "a non-executor sync ingested held population", kwargs)
+        assert stats.container_reads_held >= 1, kwargs
+        assert cc.CODEX_REPLAY_DRAIN_COMMAND in stats.drain_requested, kwargs
+        assert not stats.full_walk_complete
+        if "only_paths" in kwargs:
+            assert not stats.targeted_clean
+    assert _entry_accounts(ns, live), "non-population rollouts keep ingesting"
+    assert _heal_record(ns)["phase"] == "units"
+
+
+@pytest.mark.parametrize("driver", ["single-walk", "heal-with-hook"])
+def test_heal_fence_defers_adoption_two_accounts(env, monkeypatch, driver):
+    """R3 (b): one-way adoption waits for the whole population. P1 holds
+    unattributed spend plus weekly evidence for acct-a; P2, later in the walk,
+    claims the same window for acct-b. Detects: a per-file unit's own
+    settlement, or a hook between the units, stamping P1's spend for acct-a
+    before acct-b's claim exists (the single-walk oracle leaves it NULL)."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    p1, _keeper = _seed_split_heal(ns, provider, day)
+    (provider / "auth.json").write_text(_auth_json("acct-b", "b@example.com"))
+    p2 = day / _name(12, 32)
+    write_rollout(p2, _with_weekly_quota(conversation_records(
+        2, session_id="claim-0032", label="b")))
+    _compress(p2)
+    if driver == "single-walk":
+        assert cc.run_codex_history_provenance_drain(
+            wait_for_requests=False).outcome == "settled"
+        _sync(ns)                     # today's single unadmitted heal walk
+    else:
+        hooked: list = []
+
+        def on_finish():
+            if probe.committed(p1) and not probe.committed(p2) and not hooked:
+                hooked.append(_sync(ns, budget_seconds=60.0))
+
+        probe = _HealProbe(ns, monkeypatch, (p1, p2), on_finish=on_finish)
+        assert _settle_and_heal(ns).outcome == "done"
+        assert hooked, "no hook ran between the population units"
+        probe.assert_admitted_per_file()
+    claims = set(_entry_accounts(ns, p2))
+    assert len(claims) == 1 and None not in claims
+    accounts = _entry_accounts(ns, p1)
+    assert accounts[:2] == [None, None], (
+        "adoption stamped P1's unattributed spend before acct-b's claim "
+        "was ingested", accounts)
+    assert accounts[2] is not None and accounts[2] not in claims
+
+
+def test_heal_fence_blocks_direct_settlement(env, monkeypatch):
+    """R3 (c): every one-way stamping path checks the fence. Detects: the #980
+    executor unit, the unbudgeted settlement or a direct kernel call stamping
+    window-derived attribution while a heal holds population."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    p1, _keeper = _seed_split_heal(ns, provider, day)
+
+    def on_finish():
+        if probe.committed(p1):
+            raise _Killed()
+
+    probe = _HealProbe(ns, monkeypatch, (p1,), on_finish=on_finish)
+    with pytest.raises(_Killed):
+        _settle_and_heal(ns)
+    import _lib_codex_drain_admission as adm
+    monkeypatch.setattr(adm, "_after_finish", None)
+    assert _heal_record(ns)["phase"] == "units"
+    accounts = _entry_accounts(ns, p1)
+    assert accounts[:2] == [None, None] and accounts[2] is not None
+    conn = ns["open_cache_db"]()
+    try:
+        assert not cc.load_codex_finalization_debt(conn).empty, (
+            "the unit left its adoption owed")
+    finally:
+        conn.close()
+    conn = ns["open_cache_db"]()
+    locks = cc._cache_store_locks()
+    try:
+        outcome = cc._codex_settle_finalization(conn, deadline=None)
+        assert outcome.fenced and not outcome.adopted
+        conn.rollback()
+        cc._run_codex_executor_unit(conn, "finalization")
+        assert cc.apply_codex_window_spend_adoption(conn) == 0
+        with pytest.raises(cc.CodexHealFenced, match="deferred_heal"):
+            cc.apply_codex_window_spend_adoption(conn, strict=True)
+        with pytest.raises(cc.CodexHealFenced, match="deferred_heal"):
+            cc.reconcile_codex_window_attribution_spend(conn, strict=True)
+        assert cc.reconcile_codex_window_attribution_spend(conn) == (0, 0)
+        conn.rollback()
+    finally:
+        cc._release_cache_store_locks(locks)
+        conn.close()
+    cc.settle_codex_finalization_unbudgeted()
+    assert _entry_accounts(ns, p1)[:2] == [None, None], "a fenced path stamped"
+    # The heal resumes from its record and completes; then the stamp lands.
+    assert cc.run_codex_admitted_heal(wait_for_requests=True).outcome == "done"
+    assert _heal_record(ns) is None
+    assert set(_entry_accounts(ns, p1)) == {accounts[2]}
+
+
+def test_heal_fence_suspends_change_log_prune(env, monkeypatch):
+    """R3 (d): the change-log prune deletes nothing while the fence holds and
+    stays owed. Detects: a prune that removes ledger rows the heal's shared
+    ledger path set has already read, or a due prune silently dropped."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    for n in range(3):
+        write_rollout(day / _name(10, 50 + n),
+                      token_records(2, session_id=f"prune-{n:04d}"))
+    _sync(ns)
+    count_sql = "SELECT COUNT(*) FROM codex_accounting_change_log"
+    before = _one(ns, count_sql)[0]
+    _arm_heal_record(ns, ())
+    conn = ns["open_cache_db"]()
+    try:
+        assert cc._codex_change_log_prune_due(conn, retain_sequences=1)
+        assert cc._prune_codex_accounting_change_log(
+            conn, retain_sequences=1) == 0
+        conn.commit()
+    finally:
+        conn.close()
+    assert _one(ns, count_sql)[0] == before
+    monkeypatch.setattr(cc, "_codex_change_log_prune_due",
+                        lambda conn, **kwargs: True)
+    _sync(ns, maintenance="caller")
+    assert _one(ns, count_sql)[0] >= before
+    conn = ns["open_cache_db"]()
+    try:
+        assert cc.load_codex_owed_maintenance(conn)["change_log_prune"], (
+            "a due prune during the fence was not left owed")
+        conn.execute("DELETE FROM cache_meta WHERE key IN (?, ?)",
+                     (HEAL_WALK_KEY, HEAL_PAYLOAD_KEY))
+        conn.commit()
+        assert cc._prune_codex_accounting_change_log(
+            conn, retain_sequences=1) > 0
+    finally:
+        conn.close()
+
+
+def test_heal_thread_rows_joint_timeline(env, monkeypatch):
+    """R3 (e): with one hook writing live contributors of conversations X and
+    Y between the population units of X and Y, both thread rows end as the
+    population rows (the timeline in which the hook ran before the walk).
+    Detects: a live contributor replacing a population file's thread row."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    session_x = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0a61"
+    session_y = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0a63"
+    write_rollout(day / _name(20, 69), token_records(
+        1, session_id="keeper-0069", start_minute=50))
+    _sync(ns)
+    px, py = day / _name(11, 61), day / _name(13, 63)
+    write_rollout(px, conversation_records(2, session_id=session_x,
+                                           cwd="/tmp/pop-x", label="x"))
+    write_rollout(py, conversation_records(2, session_id=session_y,
+                                           cwd="/tmp/pop-y", label="y"))
+    _compress(px)
+    _compress(py)
+    _clear_marker(ns, "codex_history_provenance")
+    _sync(ns)
+    cc.run_codex_inventory_bootstrap(wait_for_requests=False)
+    assert _entry_accounts(ns, px) == [] and _entry_accounts(ns, py) == []
+    hooked: list = []
+
+    def on_finish():
+        if probe.committed(px) and not probe.committed(py) and not hooked:
+            write_rollout(day / _name(14, 64), _meta_only(session_x, "/tmp/live-x"))
+            write_rollout(day / _name(15, 65), _meta_only(session_y, "/tmp/live-y"))
+            hooked.append(_sync(ns, budget_seconds=60.0))
+
+    probe = _HealProbe(ns, monkeypatch, (px, py), on_finish=on_finish)
+    assert _settle_and_heal(ns).outcome == "done"
+    assert hooked and hooked[0].files_processed >= 2, "the hook wrote nothing"
+    assert _thread(ns, _key(ns, px)) == ("/tmp/pop-x", str(px)), (
+        "a live contributor replaced a population file's thread row")
+    assert _thread(ns, _key(ns, py)) == ("/tmp/pop-y", str(py))
+
+
+def test_heal_fence_ends_with_unreadable_population_file(env, monkeypatch):
+    """R3 (f): an unreadable population container cannot keep the fence. The
+    first clean complete fenced round deletes the record, adoption settles for
+    every other row, and the file stays degraded (U6). Detects: a fence that
+    waits forever on a file no walk can read."""
+    ns, provider, day, _ = env
+    p1, _keeper = _seed_split_heal(ns, provider, day)
+    bad = day / _name(12, 35)
+    (bad.with_name(bad.name + ".zst")).write_bytes(
+        b"\x28\xb5\x2f\xfd" + b"not a zstd frame" * 8)
+    result = _settle_and_heal(ns)
+    assert result.outcome == "done", result
+    assert result.degraded >= 1, result
+    assert _heal_record(ns) is None, "the fence outlived its pass"
+    accounts = _entry_accounts(ns, p1)
+    assert len(accounts) == 3 and len(set(accounts)) == 1 and None not in accounts, (
+        "adoption did not settle for the readable population", accounts)
+    assert _one(ns, "SELECT COUNT(*) FROM codex_session_files WHERE path=?",
+                (str(bad),)) == (0,)
+
+
+def test_heal_same_size_replacement_reset_before_adoption(env, monkeypatch):
+    """R3 (g): a cursored plain file replaced at the same size after the owed
+    pass, whose re-read claims P1's window for acct-b, is reset by a fenced
+    certification round before any adoption. Detects: settlement that runs
+    before the fenced rounds and stamps P1 from stale evidence."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    p1, _keeper = _seed_split_heal(ns, provider, day)
+    q = day / _name(19, 37)
+    write_rollout(q, _with_weekly_quota(conversation_records(
+        2, session_id="claim-0037", label="q")))
+    _sync(ns)
+    acct_a = _entry_accounts(ns, q)
+    assert len(set(acct_a)) == 1 and None not in acct_a
+    (provider / "auth.json").write_text(_auth_json("acct-b", "b@example.com"))
+    real_sync = cc.sync_codex_cache
+    replaced: list = []
+
+    def sync(conn, **kwargs):
+        if kwargs.get("_ingest_limit") is not None and not replaced:
+            data = q.read_bytes()
+            tmp = q.with_name("replacement.tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, q)           # same size, new identity
+            replaced.append(True)
+        return real_sync(conn, **kwargs)
+
+    monkeypatch.setattr(cc, "sync_codex_cache", sync)
+    assert _settle_and_heal(ns).outcome == "done"
+    assert replaced, "the replacement never ran before a certification round"
+    claims = set(_entry_accounts(ns, q))
+    assert len(claims) == 1 and claims != set(acct_a), (
+        "the fenced round did not reset the replaced file", claims)
+    accounts = _entry_accounts(ns, p1)
+    assert accounts[:2] == [None, None], (
+        "adoption ran before the replaced file's evidence was read", accounts)
+
+
+@pytest.mark.parametrize("kill", ["history-units", "history-transition",
+                                  "replay-units",
+                                  "replay-start-before-rehydration"])
+def test_heal_resume_after_kill(env, monkeypatch, kill):
+    """R4: a worker killed mid-heal leaves its record; hooks hold the
+    population (history) or decline (replay) and request the worker; a new
+    worker resumes and the stores equal an uninterrupted run. In replay, the
+    resume never clears again (surviving rows keep their ids), a crash
+    between the clear and the rehydration completes the rehydration first,
+    and a pre-mechanism rollout stays unattributed after `auth.json`
+    switches (D1, I7). Detects: a crash that strands the fence, releases
+    held population to out-of-order writers, re-clears a replay or
+    recaptures its D1 snapshot from a partial store, or diverges."""
+    if kill.startswith("replay"):
+        return _replay_resume_after_kill(env, monkeypatch, kill)
+    import _lib_codex_drain_admission as adm
+    ns, provider, day, _ = env
+    cc = _cache()
+    control, _ = _seed_production_heal(ns, provider, day, monkeypatch)
+    cc.run_codex_inventory_bootstrap(wait_for_requests=False)
+    population = [day / _name(h, s) for h, s in ((11, 2), (12, 1), (13, 4))]
+
+    def on_finish():
+        done = len(probe.commits())
+        if kill == "history-units" and done == 1:
+            raise _Killed()
+        if (kill == "history-transition" and done == 3
+                and _heal_record(ns) is None):
+            raise _Killed()
+
+    probe = _HealProbe(ns, monkeypatch, population, on_finish=on_finish)
+    with pytest.raises(_Killed):
+        cc.cmd_codex_replay_drain_internal(_argparse.Namespace())
+    monkeypatch.setattr(adm, "_after_finish", None)
+    if kill == "history-units":
+        assert _heal_record(ns)["phase"] == "units"
+        stats = _sync(ns, budget_seconds=60.0, maintenance="caller")
+        assert cc.CODEX_REPLAY_DRAIN_COMMAND in stats.drain_requested
+        assert [_entry_accounts(ns, p) == [] for p in population[1:]] == [
+            True, True], "a hook ingested held population after the crash"
+    else:
+        assert _heal_record(ns) is None
+    assert cc.cmd_codex_replay_drain_internal(_argparse.Namespace()) == 0
+    cc.run_codex_prune_drain(wait_for_requests=False)
+    assert _heal_record(ns) is None
+    actual = _heal_oracle(ns)
+    if actual != control:
+        _dump_heal_differences(ns, control, actual)
+    assert actual == control
+
+
+@pytest.mark.parametrize("arrival", ["two-late", "growing", "new-files"])
+def test_heal_walk_piece_ingests_one_file(env, monkeypatch, arrival):
+    """R8 (#982 spec 4.1 steps 4 and 7): each piece of the fenced and the
+    closing walk ingests or resets at most one file, and a walk ends within
+    one piece more than its census has files, whatever arrives meanwhile.
+    Detects: a piece that re-creates a whole-walk hold over late files, a
+    piece that ingests a visited file's appends beside the next file (two
+    reads in one hold), and files created after the census that keep a walk
+    open forever."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    p1, _keeper = _seed_split_heal(ns, provider, day)
+    grows = [day / _name(15, 45), day / _name(15, 48)]
+    lates = [day / _name(16, 46), day / _name(17, 47)]
+    arrived: list = []
+    if arrival == "growing":
+        for n, path in enumerate(grows):
+            write_rollout(path, token_records(2, session_id=f"grow-{n:04d}"))
+        _sync(ns)
+    initial = {path: _cursor_row(ns, path)["last_byte_offset"]
+               for path in grows if arrival == "growing"}
+    real_sync = cc.sync_codex_cache
+    pieces: list = []
+
+    def sync(conn, **kwargs):
+        piece = kwargs.get("_ingest_limit") is not None
+        if piece:
+            assert len(pieces) < 40, ("a heal walk never ended", pieces)
+            if arrival == "two-late" and not pieces:
+                for n, path in enumerate(lates):
+                    write_rollout(path, token_records(
+                        2, session_id=f"late-{n:04d}"))
+            elif arrival == "growing":
+                for n, path in enumerate(grows):
+                    with path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(token_records(
+                            1, session_id=f"grow-{n:04d}",
+                            start_minute=10 + len(pieces))[-1]) + "\n")
+            elif arrival == "new-files":
+                for n in range(2):
+                    path = day / _name(18, 200 + len(arrived))
+                    write_rollout(path, token_records(
+                        2, session_id=f"new-{len(arrived):04d}"))
+                    arrived.append(path)
+        stats = real_sync(conn, **kwargs)
+        if piece:
+            pieces.append({
+                "fenced": bool(kwargs.get("_defer_finalization")),
+                "processed": stats.files_processed,
+                "total": stats.files_total,
+                "complete": getattr(stats, "heal_walk_complete", None)})
+        return stats
+
+    monkeypatch.setattr(cc, "sync_codex_cache", sync)
+    result = _settle_and_heal(ns)
+    assert result.outcome == "done", (result, pieces)
+    assert _heal_record(ns) is None
+    assert all(p["processed"] <= 1 for p in pieces), (
+        "a walk piece ingested or reset more than one file", pieces)
+    fenced = [p for p in pieces if p["fenced"]]
+    closing = [p for p in pieces if not p["fenced"]]
+    for walk in (fenced, closing):
+        # The census is the first piece's discovery set.
+        assert walk and len(walk) <= walk[0]["total"] + 1, (
+            "a walk took more pieces than its census allows", pieces)
+        assert walk[-1]["complete"] and not any(
+            p["complete"] for p in walk[:-1]), pieces
+    if arrival == "two-late":
+        assert [p["processed"] for p in fenced] == [1, 1], pieces
+        assert [p["processed"] for p in closing] == [0], pieces
+        assert _full_walk_marker(ns), "the heal ended without its certificate"
+        for path in lates:
+            assert _entry_accounts(ns, path)
+    elif arrival == "growing":
+        for path in grows:
+            assert _cursor_row(ns, path)["last_byte_offset"] > initial[path], (
+                "a growing file was never read", pieces)
+    else:
+        # Files created after the closing walk's census are left to later
+        # syncs: cursorless after the heal, ingested by the next ordinary one.
+        cursorless = [path for path in arrived if _one(
+            ns, "SELECT 1 FROM codex_session_files WHERE path=?",
+            (str(path),)) is None]
+        assert cursorless, ("every arrival was read inside the heal", pieces)
+        monkeypatch.setattr(cc, "sync_codex_cache", real_sync)
+        _sync(ns)
+        for path in arrived:
+            assert _entry_accounts(ns, path), path
+
+
+def test_heal_publication_between_units_waits_for_both_files(env, monkeypatch):
+    """R10 (intermediate publication): a conversation pass between the two
+    population units of one two-file conversation publishes nothing for it,
+    and publishes once both files are accounted. Detects: a per-file heal
+    exposing a half-ingested conversation to readers."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    session = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0a81"
+    write_rollout(day / _name(20, 89), token_records(
+        1, session_id="keeper-0089", start_minute=50))
+    pa, pb = day / _name(11, 81), day / _name(13, 83)
+    write_rollout(pa, conversation_records(2, session_id=session, label="a"))
+    write_rollout(pb, conversation_records(1, session_id=session, label="b"))
+    _sync(ns)
+    _sync_conversations(ns)
+    assert _conversation_rows(ns, pa) > 0 and _conversation_rows(ns, pb) > 0
+    _compress(pa)
+    _compress(pb)
+    _drop_stores(ns)
+    _sync(ns)
+    cc.run_codex_inventory_bootstrap(wait_for_requests=False)
+    seen: list = []
+
+    def on_finish():
+        if probe.committed(pa) and not probe.committed(pb) and not seen:
+            _sync_conversations(ns)
+            seen.append((_conversation_rows(ns, pa), _conversation_rows(ns, pb)))
+
+    probe = _HealProbe(ns, monkeypatch, (pa, pb), on_finish=on_finish)
+    assert _settle_and_heal(ns).outcome == "done"
+    assert seen == [(0, 0)], (
+        "a conversation published before every contributor was accounted", seen)
+    _sync_conversations(ns)
+    assert _conversation_rows(ns, pa) > 0 and _conversation_rows(ns, pb) > 0
+
+
+def _fail_container(cc, monkeypatch, path):
+    """``path`` fails persistently through the cache walk's file-failure
+    path: every write of its batch raises a (non-corruption) database error,
+    so its one retry fails too and the walk counts it in `files_failed`
+    (never a U6 skip). Discovery, provenance and the barrier scan still see
+    the file. Returns the undo."""
+    real = cc._write_codex_file_batch
+
+    def write(conn, *args, **kwargs):
+        if str(kwargs.get("path_str")) == str(path):
+            raise sqlite3.OperationalError("injected write failure")
+        return real(conn, *args, **kwargs)
+
+    monkeypatch.setattr(cc, "_write_codex_file_batch", write)
+    return lambda: monkeypatch.setattr(cc, "_write_codex_file_batch", real)
+
+
+def test_heal_fence_seals_nothing(env, monkeypatch):
+    """R3 (h): no sync seals barrier keys while the fence holds, and after a
+    transition over a failed contributor the census blocks new seals. P1 and
+    P2 are the two population contributors of one conversation; P1's unit
+    commits and P2 then fails persistently. Detects: a per-file unit sealing
+    the conversation from P1 alone under a census set before the fence, which
+    a pass already past its entry check would publish half, and which P2's
+    later failure would never withdraw."""
+    import _lib_codex_drain_admission as adm
+    ns, provider, day, _ = env
+    cc = _cache()
+    session = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0a91"
+    write_rollout(day / _name(20, 99), token_records(
+        1, session_id="keeper-0099", start_minute=50))
+    pa, pb = day / _name(11, 91), day / _name(13, 93)
+    write_rollout(pa, conversation_records(2, session_id=session, label="a"))
+    write_rollout(pb, conversation_records(1, session_id=session, label="b"))
+    _sync(ns)
+    _sync_conversations(ns)
+    _compress(pa)
+    _compress(pb)
+    _drop_stores(ns)
+    _sync(ns)
+    cc.run_codex_inventory_bootstrap(wait_for_requests=False)
+    assert cc.run_codex_history_provenance_drain(
+        wait_for_requests=False).outcome == "settled"
+    population = cc._codex_history_candidates()
+    assert {str(pa), str(pb)} <= set(population)
+    restore = _fail_container(cc, monkeypatch, pb)
+    seen: list = []
+
+    def on_finish():
+        if seen or not probe.committed(pa) or _heal_record(ns) is None:
+            return
+        key = _key(ns, pa)
+        # A pass that entered before the fence: its entry check has passed.
+        real_pending = cc._cache_side_history_heal_pending
+        cc._cache_side_history_heal_pending = lambda conn: False
+        try:
+            stats = _sync_conversations(ns)
+        finally:
+            cc._cache_side_history_heal_pending = real_pending
+        seen.append((key, _certificate(ns, key) is not None,
+                     _conversation_rows(ns, pa), stats.deferred_reason))
+
+    probe = _HealProbe(ns, monkeypatch, (pa, pb), on_finish=on_finish)
+    result = cc.run_codex_admitted_heal(wait_for_requests=True,
+                                        population=population)
+    monkeypatch.setattr(adm, "_after_finish", None)
+    assert seen, "no conversation pass ran inside the fence"
+    key, sealed, published, _reason = seen[0]
+    assert not sealed, ("a unit sealed a conversation under the fence", seen)
+    assert published == 0, (
+        "a pass past its entry check published from one contributor", seen)
+    assert result.outcome == "done", result
+    assert _heal_record(ns) is None
+    assert _certificate(ns, key) is None, (
+        "a conversation with a failed contributor was sealed after the "
+        "transition")
+    _sync_conversations(ns)
+    assert _conversation_rows(ns, pa) == 0
+    # Control: once P2 reads, the conversation seals and publishes whole.
+    restore()
+    _sync(ns)
+    assert _certificate(ns, key) is not None
+    _sync_conversations(ns)
+    assert _conversation_rows(ns, pa) > 0 and _conversation_rows(ns, pb) > 0
+
+
+def test_heal_history_transition_with_failed_file(env, monkeypatch):
+    """#982 spec 4.1 step 5: a persistently failing population file cannot
+    hold the fence. The fenced walk's last piece deletes the history record,
+    adoption settles for the readable rows, and the failed file stays owed
+    exactly as the single walk leaves it (census 0, no full-walk
+    certificate). Detects: a fence that waits forever on a failed file."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    p1, _keeper = _seed_split_heal(ns, provider, day)
+    bad = day / _name(12, 36)
+    write_rollout(bad, token_records(2, session_id="bad-0036"))
+    _compress(bad)
+    assert cc.run_codex_history_provenance_drain(
+        wait_for_requests=False).outcome == "settled"
+    population = cc._codex_history_candidates()
+    assert str(bad) in population
+    _fail_container(cc, monkeypatch, bad)
+    result = cc.run_codex_admitted_heal(wait_for_requests=True,
+                                        population=population)
+    assert _heal_record(ns) is None, ("the fence outlived a failed file", result)
+    assert result.outcome == "done", result
+    accounts = _entry_accounts(ns, p1)
+    assert len(accounts) == 3 and len(set(accounts)) == 1 and None not in accounts, (
+        "adoption did not settle for the readable population", accounts)
+    assert _entry_accounts(ns, bad) == []
+    assert _one(ns, "SELECT COUNT(*) FROM codex_session_files WHERE path=?",
+                (str(bad),)) == (0,), "the failed file is no longer owed"
+    assert _one(ns, "SELECT value FROM cache_meta WHERE key=?",
+                (cc.CODEX_BARRIER_CENSUS_KEY,)) == ("0",)
+    assert not _full_walk_marker(ns)
+
+
+# ── #982 / #975 T3: the byte-zero replay through the executor (spec 4.5) ─────
+#
+# An armed replay (`codex_replay_from_zero_pending`) is cleared and refilled
+# by the heal executor: a start unit (D1 snapshot, preflight, the clear that
+# writes the replay record, the authoritative rehydration), then the same
+# admitted population units, fenced walk, transition, finalization units and
+# closing walk as a history heal. The marker is armed through raw SQL, as the
+# migrations arm it.
+
+
+def _arm_replay(ns) -> None:
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("INSERT OR REPLACE INTO cache_meta(key, value) VALUES (?, '1')",
+                     (_cache().CODEX_REPLAY_FROM_ZERO_KEY,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _replay_armed(ns) -> bool:
+    return _one(ns, "SELECT COUNT(*) FROM cache_meta WHERE key=?",
+                (_cache().CODEX_REPLAY_FROM_ZERO_KEY,)) == (1,)
+
+
+def _meta_value(ns, key):
+    row = _one(ns, "SELECT value FROM cache_meta WHERE key=?", (key,))
+    return None if row is None else row[0]
+
+
+def _entry_rowids(ns, path) -> list:
+    conn = ns["open_cache_db"]()
+    try:
+        return [row[0] for row in conn.execute(
+            "SELECT rowid FROM codex_session_entries WHERE source_path=? "
+            "ORDER BY rowid", (str(path),))]
+    finally:
+        conn.close()
+
+
+def _seed_replay(ns, day, count=3):
+    """``count`` ingested plain rollouts, then an armed replay over them."""
+    paths = [day / _name(11 + n, 71 + n) for n in range(count)]
+    for n, path in enumerate(paths):
+        write_rollout(path, conversation_records(
+            2, session_id=f"replay-{n:04d}", label=f"r{n}"))
+    _sync(ns)
+    control = _heal_oracle(ns)
+    _arm_replay(ns)
+    return paths, control
+
+
+def _replay_hook(ns, monkeypatch):
+    """One real Codex hook tick, observing its projection, budget and
+    worker-request legs; returns its lifecycle line, the calls and the
+    replay-deferral record it left."""
+    cc = _cache()
+    journal = sys.modules["_cctally_journal"]
+    calls = {"projection": 0, "budget": 0, "drain": 0}
+    real_projection = ns["reconcile_codex_quota_projection"]
+    real_ingest = journal.run_stats_ingest
+
+    def projection(**kwargs):
+        calls["projection"] += 1
+        return real_projection(**kwargs)
+
+    def ingest(*args, **kwargs):
+        if kwargs.get("codex_apply") is not None:
+            calls["budget"] += 1
+        return real_ingest(*args, **kwargs)
+
+    def defer():
+        calls["drain"] += 1
+        return "throttled"
+
+    with monkeypatch.context() as m:
+        m.setitem(ns, "reconcile_codex_quota_projection", projection)
+        m.setattr(journal, "run_stats_ingest", ingest)
+        m.setattr(cc, "_defer_codex_replay_drain", defer)
+        _hook_tick(ns)
+    line = [f for f in _hook_log(ns) if "sync" in f][-1]
+    return line, calls, _meta_value(ns, cc.CODEX_REPLAY_DEFERRED_KEY)
+
+
+@pytest.mark.parametrize("case", ["plain", "yield", "recheck", "hook",
+                                  "contended"])
+def test_replay_refill_admits_each_file(env, monkeypatch, case):
+    """R2 (#982): the worker's byte-zero replay is a start unit followed by
+    one admitted commit per refilled file, each followed by a finish with both
+    store locks free.
+
+    Detects: the replay's single unadmitted clear-and-walk holding both cache
+    writer flocks across every rollout, a refill unit admitted while a hook
+    request is fresh or skipping the after-store-locks recheck, a hook during
+    the refill that ingests out of order, projects or evaluates a budget over
+    the cleared, partly refilled store, or reports success, and a hook that
+    meets a refill unit's locks and publishes a waiting request: every tick
+    declines during the refill, so the request only made the worker idle for
+    its 60 s lifetime (measured: 71 such waits, 4,265 s of a 6,045 s replay)."""
+    import _lib_codex_drain_admission as adm
+    ns, provider, day, _ = env
+    cc = _cache()
+    population, control = _seed_replay(ns, day)
+    clock = {"now": int(adm._monotonic_ns())}
+    published: list = []
+    commit_times: dict = {}
+    hooked: list = []
+    at_first_commit: list = []
+    slept: list = []
+    requests_after_hook: list = []
+    monkeypatch.setattr(adm, "_monotonic_ns", lambda: clock["now"])
+
+    def sleep(seconds):
+        slept.append(seconds)
+        if case == "hook" and published and not hooked:
+            hooked.append(_replay_hook(ns, monkeypatch))
+        clock["now"] += int(seconds * 1_000_000_000)
+
+    monkeypatch.setattr(adm, "_sleep", sleep)
+
+    def publish():
+        assert adm.publish_waiting_request(ns["APP_DIR"], root_keys=()) is not None
+        published.append(clock["now"])
+        published.append(len(commit_times))
+
+    def on_commit(path):
+        if not at_first_commit:
+            at_first_commit.append(_heal_record(ns))
+        commit_times[path] = clock["now"]
+        if case == "contended" and not hooked:
+            # The unit still holds both store locks here, so the hook's
+            # non-blocking acquisition meets them.
+            hooked.append(_replay_hook(ns, monkeypatch))
+            requests_after_hook.append(len(adm.fresh_requests(ns["APP_DIR"])))
+
+    def on_finish():
+        if case in ("yield", "hook") and probe.commits() and not published:
+            publish()
+
+    def pre_store_locks():
+        if case == "recheck" and probe.commits() and not published:
+            publish()
+
+    monkeypatch.setattr(cc, "_CODEX_PRE_STORE_LOCK_HOOK", pre_store_locks,
+                        raising=False)
+    probe = _HealProbe(ns, monkeypatch, population, on_commit=on_commit,
+                       on_finish=on_finish)
+    assert cc.cmd_codex_replay_drain_internal(_argparse.Namespace()) == 0
+    probe.assert_admitted_per_file()
+    record = at_first_commit[0]
+    assert record is not None and (record["mode"], record["phase"],
+                                   record["rehydrated"]) == (
+        "replay", "units", True), ("the refill began before the start unit "
+                                   "committed its clear and rehydration", record)
+    assert set(record["population"]) == {str(p) for p in population}
+    worker = [f for f in _hook_log(ns) if f.get("op") == "replay-drain"][-1]
+    assert worker["result"] == "success" and worker.get("heal") == "done", worker
+    assert not _replay_armed(ns) and _heal_record(ns) is None
+    if case == "contended":
+        assert hooked, "no hook ran while a refill unit held the store locks"
+        line, calls, _deferral = hooked[0]
+        assert (line["sync"], line["result"], line.get("reason")) == (
+            "contended", "noop", "replay_pending"), line
+        assert line.get("drain_request") is None, line
+        assert requests_after_hook == [0], (
+            "the contended hook published a waiting request that the refill "
+            "could only wait out", requests_after_hook)
+        assert calls["projection"] == 0 and calls["budget"] == 0, calls
+        assert calls["drain"] >= 1, "the hook did not request the worker"
+        assert not slept, ("the refill waited for a request no tick could use",
+                           slept)
+    if case in ("plain", "contended"):
+        assert _heal_oracle(ns) == control
+        assert _full_walk_marker(ns), "an uninterrupted replay certifies the walk"
+        return
+    assert published, "the request was never published"
+    later = list(commit_times.values())[published[1]:]
+    assert later, "no refill unit committed after the request"
+    assert len(commit_times) == 3 and min(commit_times.values()) <= published[0]
+    assert all(t >= published[0] + adm.REQUEST_TTL_NS for t in later), (
+        "a refill unit committed while a hook request was fresh",
+        published, commit_times)
+    if case == "hook":
+        assert hooked, "no hook ran during the refill"
+        line, calls, deferral = hooked[0]
+        assert (line["sync"], line["result"], line.get("reason")) == (
+            "deferred", "noop", "replay_pending"), line
+        assert calls["projection"] == 0 and calls["budget"] == 0, (
+            "the hook read the cleared, partly refilled store", calls)
+        assert calls["drain"] >= 1, "the hook did not request the worker"
+        assert deferral is not None, "the declining hook recorded no deferral"
+
+
+def _claude_assistant_line(n: int) -> str:
+    """One priced Claude assistant line for the #1055 hook transcript."""
+    return json.dumps({
+        "type": "assistant", "sessionId": "claude-1055",
+        "timestamp": f"2026-07-20T12:{n:02d}:00.000Z",
+        "requestId": f"req_1055_{n}", "cwd": "/work/claude-1055",
+        "message": {"id": f"msg_1055_{n}", "model": "claude-opus-5-5",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 0}},
+    })
+
+
+def _claude_rows(ns, path) -> tuple:
+    """(session_entries rows, cursor offset) for one Claude transcript."""
+    conn = ns["open_cache_db"]()
+    try:
+        rows = conn.execute("SELECT COUNT(*) FROM session_entries "
+                            "WHERE source_path=?", (str(path),)).fetchone()[0]
+        cursor = conn.execute("SELECT last_byte_offset FROM session_files "
+                              "WHERE path=?", (str(path),)).fetchone()
+    finally:
+        conn.close()
+    return rows, None if cursor is None else cursor[0]
+
+
+def _exclusive_free(path) -> bool:
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("mode", ["history", "replay"])
+def test_contended_claude_hook_ingests_between_admitted_units(
+        env, monkeypatch, mode):
+    """A1 (#1055): a routine Claude hook that meets an admitted Codex drain
+    unit's writer lock registers as the Claude waiter, the executor yields its
+    next admission to it, and the hook ingests its new line within its bound.
+
+    Detects: a Claude hook that only makes one non-blocking attempt and so
+    ends ``lock_contended`` behind back-to-back heal or refill units (Claude
+    spend reaching cache.db late, #1055); a drain that admits a unit past a
+    registered waiter; a waiter released before the Claude writer unlock; and
+    a yield that changes the heal's or the replay's Codex end state."""
+    import threading
+    import time as _time
+    import _lib_codex_drain_admission as adm
+    ns, provider, day, _ = env
+    cc = _cache()
+    core = ns["_cctally_core"]
+    record = sys.modules["_cctally_record"]
+    transcript = (ns["_get_claude_data_dirs"]()[0] / "projects" / "p1055"
+                  / "claude-1055.jsonl")
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(_claude_assistant_line(0) + "\n")
+    conn = ns["open_cache_db"]()
+    try:
+        assert not ns["sync_cache"](conn).lock_contended
+    finally:
+        conn.close()
+    assert _claude_rows(ns, transcript)[0] == 1, "the seed line was not ingested"
+    if mode == "history":
+        control, _ = _seed_production_heal(ns, provider, day, monkeypatch)
+        cc.run_codex_inventory_bootstrap(wait_for_requests=False)
+        population = [day / _name(h, s) for h, s in ((11, 2), (12, 1), (13, 4))]
+    else:
+        population, control = _seed_replay(ns, day)
+
+    hook: dict = {"ident": None, "refused_at": None, "first_free": False,
+                  "acquired_at": None, "holding": False, "registered": False,
+                  "released": False, "stats": [], "exc": None, "rc": None}
+    refused, registered = threading.Event(), threading.Event()
+    events: list = []                   # one ordered trace; append is atomic
+    schedule = {"started": False, "registration": None}
+
+    def on_hook_thread() -> bool:
+        return threading.get_ident() == hook["ident"]
+
+    real_acquire = cc._acquire_cache_flock
+
+    def admitted_after_release() -> bool:
+        trace = list(events)
+        if ("unit-released",) not in trace:
+            return False
+        later = trace[trace.index(("unit-released",)) + 1:]
+        return any(e[0] == "admit" for e in later)
+
+    def acquire(lock_fh, **kwargs):
+        got = real_acquire(lock_fh, **kwargs)
+        if on_hook_thread() and getattr(lock_fh, "name", None) == str(
+                core.CACHE_LOCK_PATH):
+            now = _time.monotonic()
+            if hook["refused_at"] is None and not hook["first_free"]:
+                if got:
+                    hook["first_free"] = True
+                else:
+                    hook["refused_at"] = now
+                refused.set()
+            if got:
+                hook["acquired_at"] = now
+                hook["holding"] = True
+                events.append(("hook-acquired",))
+                # Hold the acquired lock until the executor has attempted its
+                # next admission, so that attempt certainly meets the
+                # registered waiter (bounded; the hook's sync is only later).
+                end = _time.monotonic() + 2.0
+                while _time.monotonic() < end and not admitted_after_release():
+                    _time.sleep(0.01)
+        return got
+
+    monkeypatch.setattr(cc, "_acquire_cache_flock", acquire)
+    waiter_cls = getattr(adm, "ClaudeWaiter", None)
+    if waiter_cls is not None:          # the base tree has no waiter at all
+        real_register = waiter_cls.register.__func__
+        real_release = waiter_cls.release
+
+        def register(cls, app_dir, **kwargs):
+            waiter = real_register(cls, app_dir, **kwargs)
+            if waiter is not None and on_hook_thread():
+                hook["registered"] = True
+                events.append(("registered",))
+                registered.set()
+            return waiter
+
+        def release(self):
+            if on_hook_thread() and hook["registered"] and not hook["released"]:
+                hook["released"] = True
+                events.append(("waiter-release",
+                               _exclusive_free(core.CACHE_LOCK_PATH)))
+            hook["holding"] = False
+            return real_release(self)
+
+        monkeypatch.setattr(waiter_cls, "register", classmethod(register))
+        monkeypatch.setattr(waiter_cls, "release", release)
+    real_admit = adm.admit
+
+    def admit(*args, **kwargs):
+        result = real_admit(*args, **kwargs)
+        events.append(("admit", result.admitted))
+        return result
+
+    monkeypatch.setattr(adm, "admit", admit)
+    real_sync = ns["sync_cache"]
+
+    def sync(conn, **kwargs):
+        stats = real_sync(conn, **kwargs)
+        if on_hook_thread():
+            hook["stats"].append(stats)
+            events.append(("hook-synced", stats.lock_contended))
+        return stats
+
+    monkeypatch.setitem(ns, "sync_cache", sync)
+    monkeypatch.setattr(record, "_hook_tick_read_stdin_event",
+                        lambda *a, **k: {
+                            "event": "Stop", "session_id": "claude-1055",
+                            "transcript_path": str(transcript),
+                            "cwd": "/work/claude-1055"})
+
+    def run_hook():
+        hook["ident"] = threading.get_ident()
+        try:
+            hook["rc"] = ns["cmd_hook_tick"](_argparse.Namespace(
+                explain=False, foreground=True, no_oauth=True,
+                throttle_seconds=None, event=None, mock_oauth_response=None,
+                source=None))
+        except BaseException as exc:  # reported as its own failure below
+            hook["exc"] = exc
+
+    thread = threading.Thread(target=run_hook, name="claude-hook-1055",
+                              daemon=True)
+
+    def on_commit(path):
+        events.append(("commit", path))
+        if schedule["started"]:
+            return
+        schedule["started"] = True
+        # The unit still holds both store locks and the gate here.
+        with transcript.open("a", encoding="utf-8") as fh:
+            fh.write(_claude_assistant_line(1) + "\n")
+        thread.start()
+        if not refused.wait(20):
+            schedule["registration"] = "no-first-attempt"
+            return
+        end = _time.monotonic() + 20
+        while (not registered.is_set() and thread.is_alive()
+               and _time.monotonic() < end):
+            registered.wait(0.01)
+        schedule["registration"] = (
+            "registered" if registered.is_set()
+            else "hook-ended" if not thread.is_alive() else "timeout")
+        events.append(("unit-released",))
+
+    probe = _HealProbe(ns, monkeypatch, population, on_commit=on_commit,
+                       claude_holder=lambda: hook["holding"])
+    assert cc.cmd_codex_replay_drain_internal(_argparse.Namespace()) == 0
+    if schedule["started"]:
+        thread.join(30)
+    assert schedule["started"], "no population unit committed: nothing paused"
+    assert not thread.is_alive(), "the Claude hook thread never finished"
+    assert hook["exc"] is None, ("the Claude hook thread raised", hook["exc"])
+    assert hook["rc"] == 0, hook["rc"]
+    assert schedule["registration"] != "no-first-attempt", (
+        "the hook never attempted cache.db.lock while the unit held it")
+    assert not hook["first_free"], (
+        "the hook's first cache.db.lock attempt was not refused: the paused "
+        "unit did not hold the Claude writer lock")
+    assert schedule["registration"] != "timeout", (
+        "timed out waiting for the hook's waiter registration")
+    assert hook["stats"], "the hook never returned from sync_cache"
+    rows, offset = _claude_rows(ns, transcript)
+    assert not hook["stats"][0].lock_contended and rows == 2, (
+        "the contended Claude hook ended lock_contended and its new line was "
+        "not ingested between admitted units",
+        hook["stats"][0].lock_contended, rows)
+    # GREEN: acquired inside its bound, ingested once, cursor advanced.
+    assert offset == transcript.stat().st_size, "the hook's cursor did not advance"
+    assert len(hook["stats"]) == 1, "the hook synced more than once"
+    assert schedule["registration"] == "registered", schedule
+    assert (hook["acquired_at"] - hook["refused_at"]
+            < adm.CLAUDE_HOOK_DRAIN_WAIT_SECONDS), hook
+    reg = events.index(("registered",))
+    acquired = events.index(("hook-acquired",))
+    release = next(i for i, e in enumerate(events) if e[0] == "waiter-release")
+    assert reg < events.index(("unit-released",)) < acquired < release, events
+    assert events[release][1] is True, (
+        "the waiter was released while the hook still held cache.db.lock",
+        events)
+    during = events[reg:release]
+    admits = [e for e in during if e[0] == "admit"]
+    assert admits and not any(e[1] for e in admits), (
+        "the executor admitted a unit while the Claude waiter was registered",
+        events)
+    assert not [e for e in during if e[0] == "commit"], (
+        "a population unit committed before the waiting hook ingested", events)
+    assert [e for e in events[release:] if e[0] == "commit"], (
+        "the executor never resumed its units after the hook", events)
+    # The executor resumed and completed with an unchanged Codex end state.
+    probe.assert_admitted_per_file()
+    worker = [f for f in _hook_log(ns) if f.get("op") == "replay-drain"][-1]
+    assert worker["result"] == "success" and worker.get("heal") == "done", worker
+    assert _heal_record(ns) is None
+    if mode == "replay":
+        assert not _replay_armed(ns)
+    assert _heal_oracle(ns) == control
+    assert _claude_rows(ns, transcript)[0] == 2
+
+
+class _ClockedTime:
+    """The cache module's ``time`` with an injected ``monotonic``."""
+
+    def __init__(self, real, clock):
+        self._real, self._clock = real, clock
+
+    def monotonic(self):
+        return self._clock["now"]
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@pytest.mark.parametrize("case", ["waiter", "sustained", "no-wait"])
+def test_heal_raw_contention_resets_on_a_fresh_waiter(env, monkeypatch, case):
+    """F6 (#1055): a raw store-lock refusal seen while a request is fresh (here
+    the Claude waiter, registered after the admission checks) is a deliberate
+    wait, not continuous contention, so it resets the 120 s bound.
+
+    Detects: an executor that ends the pass ``contended`` (keeping the fence
+    and requesting another worker) because Claude hooks took their turns just
+    before the bound; a reset that masks a hung ordinary writer; and a
+    ``wait_for_requests=False`` pass that waits instead of yielding."""
+    import _lib_codex_drain_admission as adm
+    ns, provider, day, _ = env
+    cc = _cache()
+    _seed_split_heal(ns, provider, day)
+    assert cc.run_codex_history_provenance_drain(
+        wait_for_requests=False).outcome == "settled"
+    population = cc._codex_history_candidates()
+    assert population
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(cc, "time", _ClockedTime(cc.time, clock))
+    monkeypatch.setattr(cc, "_spawn_codex_worker", lambda command: True)
+    codex_lock = ns["_cctally_core"].CACHE_LOCK_CODEX_PATH
+    state = {"calls": 0, "holder": None, "waiter": None, "contend": True,
+             "first": None, "registered": False}
+
+    def pre_store_locks():
+        state["calls"] += 1
+        if state["contend"] and state["holder"] is None:
+            fd = os.open(codex_lock, os.O_RDWR | os.O_CREAT, 0o600)
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            state["holder"] = fd
+        elif not state["contend"] and state["holder"] is not None:
+            os.close(state["holder"])
+            state["holder"] = None
+        if state["first"] is None:
+            state["first"] = clock["now"]
+        if (case == "waiter" and not state["registered"]
+                and clock["now"] - state["first"]
+                >= cc.CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS):
+            # The first attempt whose raw refusal would end the pass without
+            # the reset; registered after admission's checks, so the raw
+            # branch is what sees it fresh.
+            state["registered"] = True
+            state["waiter"] = adm.ClaudeWaiter.register(
+                ns["APP_DIR"], deadline_ns=adm._monotonic_ns() + 5_000_000_000)
+            assert state["waiter"] is not None
+
+    backoffs: list = []
+
+    def backoff(_adm):
+        backoffs.append(clock["now"])
+        if len(backoffs) > 40:
+            raise AssertionError("the heal waited on the store locks unbounded")
+        if state["waiter"] is not None:
+            state["waiter"].release()
+            state["waiter"] = None
+            state["contend"] = False
+        clock["now"] += 7.0
+
+    monkeypatch.setattr(cc, "_CODEX_PRE_STORE_LOCK_HOOK", pre_store_locks,
+                        raising=False)
+    monkeypatch.setattr(cc, "_drain_backoff", backoff)
+    try:
+        result = cc.run_codex_admitted_heal(
+            wait_for_requests=case != "no-wait", population=population)
+    finally:
+        if state["waiter"] is not None:
+            state["waiter"].release()
+        if state["holder"] is not None:
+            os.close(state["holder"])
+    if case == "no-wait":
+        assert result.outcome == "yielded" and backoffs == [], (result, backoffs)
+        return
+    # The refusals spanned the bound: without the reset this pass gives up.
+    assert clock["now"] - backoffs[0] >= cc.CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS
+    if case == "sustained":
+        assert result.outcome == "contended", result
+        assert _heal_record(ns) is not None, "the contended pass kept its fence"
+        return
+    assert result.outcome == "done", (
+        "a raw refusal met while the Claude waiter was fresh counted as "
+        "continuous contention", result)
+    assert _heal_record(ns) is None
+
+
+@pytest.mark.parametrize("case", ["codex-hook", "refill-hook", "gate"])
+def test_a_probe_collision_loses_no_work(env, monkeypatch, case):
+    """F5 (#1055): a Claude hook's momentary shared probe that coincides with
+    another writer's non-blocking attempt. The probe is reproduced exactly (a
+    read-only descriptor holding ``LOCK_SH | LOCK_NB``) at that instant.
+
+    Detects: an ordinary Codex hook refused by the provider-lock probe that
+    loses its rollout or leaves a request the drain never outlives (it must
+    publish one 60 s request and the worker must then finish unchanged); a
+    replay-refill hook that publishes a request the refill could only wait
+    out; and a worker refused by a gate probe that busy-spins or loses work
+    instead of taking one ordinary 5 s step."""
+    import _lib_codex_drain_admission as adm
+    ns, provider, day, _ = env
+    cc = _cache()
+    core = ns["_cctally_core"]
+    if case == "codex-hook":
+        control, _ = _seed_production_heal(ns, provider, day, monkeypatch)
+        cc.run_codex_inventory_bootstrap(wait_for_requests=False)
+        population = [day / _name(h, s) for h, s in ((11, 2), (12, 1), (13, 4))]
+    else:
+        population, control = _seed_replay(ns, day)
+    clock = {"now": int(adm._monotonic_ns())}
+    monkeypatch.setattr(adm, "_monotonic_ns", lambda: clock["now"])
+    slept: list = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        clock["now"] += int(seconds * 1_000_000_000)
+
+    monkeypatch.setattr(adm, "_sleep", sleep)
+    collided: list = []
+    commit_times: dict = {}
+
+    def shared_probe(path):
+        fd = os.open(path, os.O_RDONLY)
+        _fcntl.flock(fd, _fcntl.LOCK_SH | _fcntl.LOCK_NB)
+        return fd
+
+    real_admit = adm.admit
+
+    def admit(*args, **kwargs):
+        if collided == ["armed"]:
+            fd = shared_probe(core.APP_DIR / adm.GATE_FILE_NAME)
+            try:
+                result = real_admit(*args, **kwargs)
+            finally:
+                os.close(fd)
+            collided.append(("gate", result.admitted))
+            return result
+        return real_admit(*args, **kwargs)
+
+    monkeypatch.setattr(adm, "admit", admit)
+
+    def on_commit(path):
+        commit_times[path] = clock["now"]
+
+    def on_finish():
+        if collided or not probe.commits():
+            return
+        if case == "gate":
+            collided.append("armed")
+            return
+        fd = shared_probe(core.CACHE_LOCK_CODEX_PATH)
+        try:
+            if case == "codex-hook":
+                _hook_tick(ns)
+                collided.append(([f for f in _hook_log(ns) if "sync" in f][-1],
+                                 adm.fresh_requests(core.APP_DIR), clock["now"]))
+            else:
+                collided.append(_replay_hook(ns, monkeypatch)
+                                + (adm.fresh_requests(core.APP_DIR),))
+        finally:
+            os.close(fd)
+
+    probe = _HealProbe(ns, monkeypatch, population, on_commit=on_commit,
+                       on_finish=on_finish)
+    assert cc.cmd_codex_replay_drain_internal(_argparse.Namespace()) == 0
+    probe.assert_admitted_per_file()
+    worker = [f for f in _hook_log(ns) if f.get("op") == "replay-drain"][-1]
+    assert worker["result"] == "success" and worker.get("heal") == "done", worker
+    assert _heal_record(ns) is None
+    assert _heal_oracle(ns) == control, "the collision lost or changed work"
+    assert collided, "the collision never happened"
+    if case == "codex-hook":
+        line, requests, published_at = collided[0]
+        assert (line["sync"], line.get("drain_request")) == (
+            "contended", "published"), line
+        assert len(requests) == 1 and adm.CLAUDE_WAITER_SENTINEL not in requests
+        later = [t for t in commit_times.values() if t > published_at]
+        assert later and all(t >= published_at + adm.REQUEST_TTL_NS
+                             for t in later), (published_at, commit_times)
+        assert set(slept) == {adm.POLL_SECONDS}
+    elif case == "refill-hook":
+        line, _calls, _deferral, requests = collided[0]
+        assert (line["sync"], line.get("reason")) == (
+            "contended", "replay_pending"), line
+        assert line.get("drain_request") is None and requests == []
+        assert slept == []
+    else:
+        assert collided[1] == ("gate", False), collided
+        assert slept == [adm.POLL_SECONDS], slept
+
+
+def test_replay_corrupt_zst_still_consumes_marker(env, monkeypatch):
+    """R2 (#982): a corrupt cursorless `.zst` that reaches the refill degrades
+    under U6 and does not block consumption, as a container that turns
+    unreadable after the single replay's preflight does today. One already
+    unreadable at the start unit is refused by today's preflight (I5): the
+    start clears nothing and leaves every marker. Detects: a per-file replay
+    whose unreadable container keeps the marker (and every Codex hook
+    declining) forever, and a start unit that clears past the refusal."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    population, _control = _seed_replay(ns, day, count=2)
+    bad = (day / _name(15, 79)).with_name(_name(15, 79) + ".zst")
+    garbage = b"\x28\xb5\x2f\xfd" + b"not a zstd frame" * 8
+    rows = {path: _entry_rowids(ns, path) for path in population}
+    bad.write_bytes(garbage)
+    refused = cc.run_codex_admitted_heal(wait_for_requests=True)
+    assert (refused.mode, refused.outcome) == ("replay", "refused"), refused
+    assert _replay_armed(ns) and _heal_record(ns) is None
+    assert {path: _entry_rowids(ns, path) for path in population} == rows, (
+        "a refused start unit cleared the store")
+    bad.unlink()
+    # A second rollout readable at the start unit (so in its population)
+    # that turns unreadable before its refill unit; `bad` arrives after the
+    # census. Only the population file counts as degraded (review F8).
+    member = day / _name(15, 78)
+    write_rollout(member, conversation_records(1, session_id="member-0078"))
+    member = _compress(member)
+    real_sync = cc.sync_codex_cache
+
+    def sync(conn, **kwargs):
+        stats = real_sync(conn, **kwargs)
+        if kwargs.get("_replay_stage") == "start":
+            bad.write_bytes(garbage)     # after the start unit's preflight
+            member.write_bytes(garbage)
+        return stats
+
+    monkeypatch.setattr(cc, "sync_codex_cache", sync)
+    result = cc.run_codex_admitted_heal(wait_for_requests=True)
+    assert bad.exists()
+    assert not _replay_armed(ns), ("the unreadable container blocked the "
+                                   "replay", result)
+    assert _heal_record(ns) is None
+    assert _meta_value(ns, cc.CODEX_REPLAY_BLOCKED_KEY) is None
+    assert (result.mode, result.outcome) == ("replay", "done"), result
+    assert result.degraded == 1, ("only the population file still owed is "
+                                  "degraded", result)
+    for path in population:
+        assert _entry_accounts(ns, path), path
+    assert _one(ns, "SELECT COUNT(*) FROM codex_session_files WHERE path=?",
+                (str(bad).removesuffix(".zst"),)) == (0,)
+
+
+def test_replay_blocked_by_failed_file_keeps_certify_record(env, monkeypatch):
+    """R2 (#982): a refill blocked by today's condition (a file that fails)
+    keeps the marker and moves the record to phase `certify`: the fence ends,
+    adoption settles, sealing resumes, and no later sync clears again.
+    Detects: a blocked replay that holds the fence forever, or one whose
+    next unbudgeted sync re-clears and recaptures D1 from a partial store."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    population, _control = _seed_replay(ns, day)
+    bad = population[1]
+    restore = _fail_container(cc, monkeypatch, bad)
+    result = cc.run_codex_admitted_heal(wait_for_requests=True)
+    record = _heal_record(ns)
+    assert _replay_armed(ns), ("a blocked replay consumed its marker", result)
+    assert record is not None and (record["mode"], record["phase"]) == (
+        "replay", "certify"), (record, result)
+    assert _meta_value(ns, cc.CODEX_REPLAY_BLOCKED_KEY) is not None
+    assert result.mode == "replay", result
+    conn = ns["open_cache_db"]()
+    try:
+        assert not cc._codex_heal_fence_active(conn)
+        assert cc.load_codex_finalization_debt(conn).empty, (
+            "adoption did not settle after the blocked replay")
+    finally:
+        conn.close()
+    assert cc.run_codex_barrier_seal_drain(
+        wait_for_requests=False).census != "heal-fenced"
+    # The fence is over, so a hook declines the replay as it does for a
+    # blocked replay today but still runs its projection and budget leg
+    # (spec 4.4: the skip is for a cleared, partly refilled store only).
+    _line, calls, _deferral = _replay_hook(ns, monkeypatch)
+    assert calls["projection"] >= 1 and calls["budget"] >= 1, calls
+    kept = {path: _entry_rowids(ns, path) for path in population if path != bad}
+    assert all(kept.values()), kept
+    _sync(ns, maintenance="caller")
+    assert {path: _entry_rowids(ns, path) for path in kept} == kept, (
+        "the next unbudgeted sync cleared the blocked replay again")
+    assert _replay_armed(ns) and _heal_record(ns)["phase"] == "certify"
+    # Control: once the file reads, an ordinary walk consumes both.
+    restore()
+    _sync(ns, maintenance="caller")
+    assert not _replay_armed(ns) and _heal_record(ns) is None
+    assert _entry_accounts(ns, bad)
+    assert {path: _entry_rowids(ns, path) for path in kept} == kept
+
+
+def _replay_resume_after_kill(env, monkeypatch, kill):
+    """R4 (replay): see ``test_heal_resume_after_kill``."""
+    import _lib_codex_drain_admission as adm
+    ns, provider, day, _ = env
+    cc = _cache()
+    journal = sys.modules["_cctally_journal"]
+    premech = day / _name(10, 70)
+    write_rollout(premech, conversation_records(
+        2, session_id="premech-0070", label="pre"))
+    with monkeypatch.context() as m:
+        m.setattr(cc, "_append_codex_file_account_decision", lambda **_kw: None)
+        m.setattr(cc, "record_codex_file_account", lambda *_a, **_kw: None)
+        _sync(ns)
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("UPDATE codex_session_entries SET account_key=NULL "
+                     "WHERE source_path=?", (str(premech),))
+        conn.commit()
+    finally:
+        conn.close()
+    population, control = _seed_replay(ns, day)
+    population = [premech] + population
+    assert set(_entry_accounts(ns, premech)) == {None}
+    (provider / "auth.json").write_text(_auth_json("acct-b", "b@example.com"))
+    real_rehydrate = journal.rehydrate_codex_journal_families
+    rehydrations: list = []
+
+    def rehydrate(conn, *args, **kwargs):
+        record = cc.load_codex_heal_record(conn)
+        if (kill == "replay-start-before-rehydration" and not rehydrations
+                and record is not None and record.get("mode") == "replay"
+                and not record.get("rehydrated")):
+            rehydrations.append("killed")
+            raise _Killed()
+        rehydrations.append(kwargs.get("authoritative"))
+        return real_rehydrate(conn, *args, **kwargs)
+
+    monkeypatch.setattr(journal, "rehydrate_codex_journal_families", rehydrate)
+
+    def on_finish():
+        if kill == "replay-units" and len(probe.commits()) == 1:
+            raise _Killed()
+
+    probe = _HealProbe(ns, monkeypatch, population, on_finish=on_finish)
+    with pytest.raises(_Killed):
+        cc.cmd_codex_replay_drain_internal(_argparse.Namespace())
+    monkeypatch.setattr(adm, "_after_finish", None)
+    record = _heal_record(ns)
+    assert record is not None and (record["mode"], record["phase"]) == (
+        "replay", "units"), record
+    assert record["rehydrated"] is (kill == "replay-units"), record
+    assert _replay_armed(ns)
+    stats = _sync(ns, budget_seconds=60.0, maintenance="caller")
+    assert stats.deferred_reason == "replay_pending" and stats.replay_refill
+    survivors = {path: _entry_rowids(ns, path) for path in population}
+    if kill == "replay-units":
+        assert survivors[premech], "the first refill unit did not commit"
+    resumed_from = len(rehydrations)
+    assert cc.cmd_codex_replay_drain_internal(_argparse.Namespace()) == 0
+    if kill == "replay-start-before-rehydration":
+        assert rehydrations[resumed_from] is True, (
+            "the resume read rollouts before completing the authoritative "
+            "rehydration", rehydrations)
+    assert not _replay_armed(ns) and _heal_record(ns) is None
+    for path, ids in survivors.items():
+        if ids:
+            assert _entry_rowids(ns, path) == ids, (
+                "the resumed replay cleared again", path)
+    assert set(_entry_accounts(ns, premech)) == {None}, (
+        "pre-mechanism spend took the live login after the resume (D1, I7)")
+    actual = _heal_oracle(ns)
+    if actual != control:
+        _dump_heal_differences(ns, control, actual)
+    assert actual == control
+
+
+def test_cache_sync_replay_runs_before_provenance(env, monkeypatch):
+    """#982 spec 4.6: `cache-sync --source codex` with an armed replay and
+    held history runs the replay executor first, then provenance, then the
+    history executor. Detects: an unadmitted first replay sync, or a replay
+    that runs after provenance settles the census it then clears."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    p1, _keeper = _seed_split_heal(ns, provider, day)
+    _arm_replay(ns)
+    order: list = []
+    real_heal = cc.run_codex_admitted_heal
+    real_provenance = cc.run_codex_history_provenance_drain
+
+    def heal(**kwargs):
+        result = real_heal(**kwargs)
+        order.append(("heal", result.mode, result.outcome))
+        return result
+
+    def provenance(**kwargs):
+        order.append(("provenance", _replay_armed(ns)))
+        return real_provenance(**kwargs)
+
+    monkeypatch.setattr(cc, "run_codex_admitted_heal", heal)
+    monkeypatch.setattr(cc, "run_codex_history_provenance_drain", provenance)
+    assert cc.cmd_cache_sync(_argparse.Namespace(
+        source="codex", rebuild=False, prune_orphans=False,
+        prune_conversations=False)) == 0
+    assert order[:2] == [("heal", "replay", "done"), ("provenance", False)], order
+    assert ("heal", "history", "done") in order[2:], order
+    assert not _replay_armed(ns) and _heal_record(ns) is None
+    accounts = _entry_accounts(ns, p1)
+    assert len(accounts) == 3 and accounts[2] is not None, accounts
+
+
+def _token_events(session_id, first_total, count, minute):
+    """``count`` token events continuing a rollout's cumulative total."""
+    out = []
+    for index in range(count):
+        record = token_records(1, session_id=session_id,
+                               start_minute=minute + index)[-1]
+        record["payload"]["info"]["total_token_usage"]["total_tokens"] = (
+            first_total + 100 * index)
+        out.append(record)
+    return out
+
+
+def _append_records(path, records) -> None:
+    with path.open("a", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record) + "\n")
+
+
+def test_heal_last_piece_revalidates_visited_rows(env, monkeypatch):
+    """R8 (#982 spec 4.1 step 7, revision 7): another writer that partially
+    ingests a visited live file between two pieces of the closing walk leaves
+    it in the backlog; the barrier census is 0 and the full-walk certificate
+    is withheld, as a single walk followed by that partial hook leaves them.
+    Detects: a last piece that trusts the visited set and certifies a store
+    holding an incomplete cursor."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    p1, _keeper = _seed_split_heal(ns, provider, day)
+    live_a, live_b = day / _name(15, 45), day / _name(16, 46)
+    for n, path in enumerate((live_a, live_b)):
+        write_rollout(path, token_records(2, session_id=f"live-{n:04d}"))
+    _sync(ns)
+    real_sync = cc.sync_codex_cache
+    closing: list = []
+    partial: list = []
+
+    def partial_hook():
+        """A budgeted sync whose deadline passes after live_a's first new
+        accounting emission (the parser's own stop-before-line)."""
+        clock = {"now": 0.0}
+        real_iter = cc._iter_codex_fused_records_with_offsets
+
+        def expire_after_entry(stream, source_path, **kwargs):
+            for emission in real_iter(stream, source_path, **kwargs):
+                yield emission
+                if (source_path == str(live_a)
+                        and emission.accounting is not None):
+                    clock["now"] = 10_000.0
+
+        with monkeypatch.context() as m:
+            m.setattr(cc, "_walk_clock", lambda: clock["now"])
+            m.setattr(cc, "_iter_codex_fused_records_with_offsets",
+                      expire_after_entry)
+            return _sync(ns, budget_seconds=100, quota_reconcile="defer")
+
+    def sync(conn, **kwargs):
+        piece = (kwargs.get("_ingest_limit") is not None
+                 and not kwargs.get("_defer_finalization"))
+        if piece and not closing:
+            for n, path in enumerate((live_a, live_b)):
+                _append_records(path, _token_events(f"live-{n:04d}", 300, 1, 20))
+        stats = real_sync(conn, **kwargs)
+        if piece:
+            closing.append(stats)
+            if len(closing) == 1 and not stats.heal_walk_complete:
+                _append_records(live_a, _token_events("live-0000", 400, 2, 30))
+                partial.append(partial_hook())
+                partial.append(_cursor_row(ns, live_a))
+        return stats
+
+    monkeypatch.setattr(cc, "sync_codex_cache", sync)
+    result = _settle_and_heal(ns)
+    monkeypatch.setattr(cc, "sync_codex_cache", real_sync)
+    assert result.outcome == "done", result
+    assert len(closing) >= 2 and partial, ("the closing walk took one piece",
+                                           closing)
+    assert partial[1]["ingest_complete"] == 0, partial[1]
+    assert _cursor_row(ns, live_a)["ingest_complete"] == 0, (
+        "a later piece re-examined the visited file")
+    assert _meta_value(ns, cc.CODEX_BARRIER_CENSUS_KEY) == "0", (
+        "the last piece certified the barrier census over a visited file "
+        "another writer left incomplete")
+    assert not _full_walk_marker(ns), (
+        "the heal certified a store holding an incomplete cursor")
+    conn = ns["open_cache_db"]()
+    try:
+        backlog = cc._load_codex_backlog_record(conn)
+    finally:
+        conn.close()
+    assert backlog is not None and backlog["files"] >= 1, backlog
+    assert closing[-1].heal_visit_changed == {str(live_a)}
+    # Control: the next ordinary sync resumes the file and certifies.
+    _sync(ns)
+    assert _cursor_row(ns, live_a)["ingest_complete"] == 1
+    assert _full_walk_marker(ns)
+
+
+# --- #982 #975 implementation-review corrections (spec 4.5a) ---------------
+
+
+def _premech_rollout(ns, monkeypatch, path, session_id) -> None:
+    """A rollout ingested before the durable-attribution mechanism: no
+    journaled decision and unattributed spend (D1, I7)."""
+    cc = _cache()
+    write_rollout(path, conversation_records(2, session_id=session_id,
+                                             label="pre"))
+    with monkeypatch.context() as m:
+        m.setattr(cc, "_append_codex_file_account_decision", lambda **_kw: None)
+        m.setattr(cc, "record_codex_file_account", lambda *_a, **_kw: None)
+        _sync(ns)
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("UPDATE codex_session_entries SET account_key=NULL "
+                     "WHERE source_path=?", (str(path),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("arm", ["helper", "migration"])
+def test_replay_rearmed_over_blocked_record_clears_again(env, monkeypatch, arm):
+    """Spec 4.5a: a replay marker re-armed (a later arming migration) while a
+    blocked replay's `certify` record exists makes the next unbudgeted sync
+    clear again, with the record's persisted D1 set in its snapshot.
+
+    Detects: a re-armed replay that only refills (the rows the new parser
+    must re-derive are never cleared, so the migration's repair never
+    happens), and a re-clear that recaptures D1 from the partly refilled
+    store, sending a pre-mechanism rollout the refill never reached to the
+    live `auth.json` (I7)."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    premech = day / _name(10, 70)
+    _premech_rollout(ns, monkeypatch, premech, "premech-0070")
+    population, _control = _seed_replay(ns, day)
+    restore = _fail_container(cc, monkeypatch, premech)
+    cc.run_codex_admitted_heal(wait_for_requests=True)
+    assert _heal_record(ns)["phase"] == "certify" and _replay_armed(ns)
+    assert _entry_rowids(ns, premech) == [], "the failing rollout was refilled"
+    kept = {path: _entry_rowids(ns, path) for path in population}
+    assert all(kept.values()), kept
+    # Leave the persisted D1 set as the rollout's only pre-mechanism
+    # evidence: no cursor (the clear erased it and the refill failed), and,
+    # as on a store that predates them, no incarnation and no ledger row.
+    conn = ns["open_cache_db"]()
+    try:
+        identity = next(
+            cc.codex_file_key_for_entry_path(root, path)
+            for root, path in conn.execute(
+                "SELECT DISTINCT source_root_key, source_path "
+                "FROM codex_accounting_change_log WHERE source_path=?",
+                (str(premech),)))
+        assert identity in _heal_record(ns)["known"]
+        conn.execute("DELETE FROM codex_file_incarnations WHERE file_identity=?",
+                     (identity,))
+        conn.execute("DELETE FROM codex_accounting_change_log "
+                     "WHERE source_path=?", (str(premech),))
+        conn.commit()
+    finally:
+        conn.close()
+    restore()
+    (provider / "auth.json").write_text(_auth_json("acct-b", "b@example.com"))
+    conn = ns["open_cache_db"]()
+    try:
+        if arm == "helper":
+            cc.arm_codex_replay_from_zero(conn)
+            conn.commit()
+        else:
+            sys.modules["_cctally_db"]._035_codex_thread_source_inference_replay(
+                conn)
+    finally:
+        conn.close()
+    assert _heal_record(ns).get("reclear") is True, _heal_record(ns)
+    _sync(ns, maintenance="caller")
+    assert all(_entry_rowids(ns, path) != ids for path, ids in kept.items()), (
+        "the re-armed replay did not clear again")
+    assert not _replay_armed(ns) and _heal_record(ns) is None
+    assert _entry_rowids(ns, premech), "the re-clear did not refill the rollout"
+    assert set(_entry_accounts(ns, premech)) == {None}, (
+        "the re-clear lost the persisted D1 set (I7)")
+
+
+@pytest.mark.parametrize("damage", ["known", "rehydrated", "unparseable"])
+def test_malformed_replay_record_fails_closed(env, monkeypatch, damage):
+    """Spec 4.5a: a replay record whose D1 set or rehydration flag is missing
+    or malformed declines every writer without clearing, and the executor
+    ends `degraded`. Detects: a re-clear with a recaptured D1 set (the
+    persisted one is lost) or a refill with a corrupted one."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    population, _control = _seed_replay(ns, day)
+    rows = {path: _entry_rowids(ns, path) for path in population}
+    fence = {"v": 1, "mode": "replay", "phase": "units", "rehydrated": True,
+             "gen": "damaged"}
+    payload = {"v": 1, "gen": "damaged",
+               "population": sorted(str(p) for p in population), "known": []}
+    if damage == "known":
+        payload["known"] = 7
+    elif damage == "rehydrated":
+        fence["rehydrated"] = "yes"
+    else:
+        fence = "{not json"
+    _write_heal_record(ns, fence, payload)
+    stats = _sync(ns, maintenance="caller")
+    assert stats.deferred_reason == "replay_pending", stats
+    assert {path: _entry_rowids(ns, path) for path in population} == rows, (
+        "a writer cleared under a malformed replay record")
+    result = cc.run_codex_admitted_heal(wait_for_requests=False)
+    assert (result.mode, result.outcome) == ("replay", "degraded"), result
+    assert {path: _entry_rowids(ns, path) for path in population} == rows
+    assert _replay_armed(ns)
+
+
+def test_heal_record_shortens_replay_worker_throttle(env, monkeypatch):
+    """Spec 4.5a: while a heal record exists, a worker request is throttled
+    for minutes, not the hourly spawn throttle, and a `contended` pass
+    requests the worker. Detects: a stalled pass leaving the global fence
+    standing until the hourly spawn."""
+    import _lib_codex_drain_admission as adm
+    ns, provider, day, _ = env
+    cc = _cache()
+    core = ns["_cctally_core"]
+    held = day / _name(11, 51)
+    write_rollout(held, conversation_records(1, session_id="held-0051"))
+    keeper = day / _name(20, 52)
+    write_rollout(keeper, token_records(1, session_id="keeper-0052"))
+    _sync(ns)
+    _arm_heal_record(ns, [held])
+    spawns: list = []
+    monkeypatch.setattr(cc, "_spawn_codex_worker",
+                        lambda command: spawns.append(command) or True)
+    monkeypatch.setattr(cc, "CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(adm, "_sleep", lambda _s: None)
+    marker = ns["APP_DIR"] / cc.CODEX_REPLAY_DRAIN_MARKER_NAME
+    if marker.exists():
+        marker.unlink()
+    fd = os.open(core.CACHE_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        result = cc.run_codex_admitted_heal(wait_for_requests=True)
+    finally:
+        os.close(fd)
+    assert result.outcome == "contended", result
+    replay = cc.CODEX_REPLAY_DRAIN_COMMAND
+
+    def requested() -> int:
+        return spawns.count(replay)
+
+    assert requested() == 1, ("the contended pass did not request the worker",
+                              spawns)
+    assert cc.CODEX_HEAL_RETRY_THROTTLE_SECONDS == 300
+    now = __import__("time").time()
+    os.utime(marker, (now - 301, now - 301))
+    _hook_tick(ns)
+    assert requested() == 2, ("a hook 301 s after the request did not spawn "
+                              "the worker while the record exists", spawns)
+    now = __import__("time").time()
+    os.utime(marker, (now - 299, now - 299))
+    _hook_tick(ns)
+    assert requested() == 2, ("a hook 299 s after the request spawned", spawns)
+    # Control: without a record the hourly throttle is unchanged.
+    _drop_heal_record(ns)
+    now = __import__("time").time()
+    os.utime(marker, (now - 301, now - 301))
+    assert cc._defer_codex_replay_drain() == "throttled"
+    assert requested() == 2
+
+
+def test_heal_finalization_units_bound_lock_contention(env, monkeypatch):
+    """Spec 4.1 step 6 (review F10): a finalization unit whose store locks
+    another writer holds continuously ends the pass `contended` after the
+    replay worker's lock wait, as every other heal unit does. Detects: a
+    finalization loop that waits on the store locks without a bound."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    _seed_split_heal(ns, provider, day)
+    assert cc.run_codex_history_provenance_drain(
+        wait_for_requests=False).outcome == "settled"
+    transitioned: list = []
+    real_sync = cc.sync_codex_cache
+
+    def sync(conn, **kwargs):
+        stats = real_sync(conn, **kwargs)
+        if getattr(stats, "heal_transitioned", False):
+            transitioned.append(True)
+        return stats
+
+    real_locks = cc._cache_store_locks
+    real_debt = cc.load_codex_finalization_debt
+    monkeypatch.setattr(cc, "sync_codex_cache", sync)
+    monkeypatch.setattr(cc, "_cache_store_locks",
+                        lambda: None if transitioned else real_locks())
+    monkeypatch.setattr(
+        cc, "load_codex_finalization_debt",
+        lambda conn: (cc._codex_malformed_debt() if transitioned
+                      else real_debt(conn)))
+    monkeypatch.setattr(cc, "CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(cc, "_spawn_codex_worker", lambda command: True)
+    backoffs: list = []
+
+    def backoff(_adm):
+        backoffs.append(1)
+        if len(backoffs) > 50:
+            raise AssertionError("the finalization units waited on the store "
+                                 "locks without a bound")
+
+    monkeypatch.setattr(cc, "_drain_backoff", backoff)
+    result = cc.run_codex_admitted_heal(
+        wait_for_requests=True, population=cc._codex_history_candidates())
+    assert transitioned, result
+    assert result.outcome == "contended", result
+
+
+def test_heal_replay_armed_during_history_heal_ends_pass(env, monkeypatch):
+    """Spec 4.5a: a replay armed while a history heal runs ends the pass
+    before its fenced walk, without a transition, and the next pass runs in
+    replay mode. Detects: a fenced walk whose every piece clears and refills
+    under `_ingest_limit=1` (quadratic in the corpus)."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    p1, _keeper = _seed_split_heal(ns, provider, day)
+    assert cc.run_codex_history_provenance_drain(
+        wait_for_requests=False).outcome == "settled"
+    population = cc._codex_history_candidates()
+    real_owed = cc._codex_heal_owed_files
+
+    def owed(conn, files):
+        if not _replay_armed(ns):
+            _arm_replay(ns)                  # after the population units
+        return real_owed(conn, files)
+
+    current: list = []
+    clears: list = []
+    real_sync = cc.sync_codex_cache
+    real_clear = cc._clear_codex_derived_rows
+
+    def sync(conn, **kwargs):
+        current.append(kwargs)
+        try:
+            return real_sync(conn, **kwargs)
+        finally:
+            current.pop()
+
+    def clear(conn, *args, **kwargs):
+        clears.append(current[-1].get("_ingest_limit") if current else "outside")
+        return real_clear(conn, *args, **kwargs)
+
+    monkeypatch.setattr(cc, "_codex_heal_owed_files", owed)
+    monkeypatch.setattr(cc, "sync_codex_cache", sync)
+    monkeypatch.setattr(cc, "_clear_codex_derived_rows", clear)
+    first = cc.run_codex_admitted_heal(wait_for_requests=False,
+                                       population=population)
+    assert (first.mode, first.outcome) == ("history", "replay_due"), first
+    record = _heal_record(ns)
+    assert record is not None and record["mode"] == "history", (
+        "the ended pass made a transition", record)
+    second = cc.run_codex_admitted_heal(wait_for_requests=False)
+    assert (second.mode, second.outcome) == ("replay", "done"), second
+    assert not _replay_armed(ns) and _heal_record(ns) is None
+    assert clears and 1 not in clears, (
+        "a walk piece cleared the store under `_ingest_limit=1`", clears)
+    accounts = _entry_accounts(ns, p1)
+    assert len(accounts) == 3 and accounts[2] is not None, accounts
+
+
+@pytest.mark.parametrize("mode", ["history", "replay"])
+def test_cache_sync_heal_summary_sums_units(env, monkeypatch, capsys, mode):
+    """Review F7: `cache-sync --source codex` prints the existing "codex
+    done" line once for the heal, with every count summed over the heal's
+    units and walk pieces and each file reported at most once per pass.
+    Detects: a history heal that prints no summary, a replay summary mixing
+    summed and last-piece counts, and a skipped count inflated by the
+    pass's later walks re-finding (or skipping as visited) files it already
+    counted."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    write_rollout(day / _name(20, 99), conversation_records(
+        1, session_id="keeper-0099"))
+    _sync(ns)
+    paths = [day / _name(10, n + 1) for n in range(2)]
+    for n, path in enumerate(paths):
+        write_rollout(path, conversation_records(
+            3, session_id=f"sum-{n:04d}", label=f"s{n}"))
+    _sync(ns)
+    if mode == "history":
+        # Held compressed history whose journal is its only trace (as in
+        # `_seed_split_heal`): the first leg holds it, provenance settles the
+        # census, and the heal ingests it.
+        for path in paths:
+            _compress(path)
+        _drop_stores(ns)
+        _sync(ns)
+        cc.run_codex_inventory_bootstrap(wait_for_requests=False)
+        assert all(_entry_accounts(ns, path) == [] for path in paths)
+    else:
+        _arm_replay(ns)
+    units: list = []
+    real_sync = cc.sync_codex_cache
+
+    def sync(conn, **kwargs):
+        stats = real_sync(conn, **kwargs)
+        if kwargs.get("_walk_share") is not None:
+            units.append(stats)
+        return stats
+
+    monkeypatch.setattr(cc, "sync_codex_cache", sync)
+    capsys.readouterr()
+    assert cc.cmd_cache_sync(_argparse.Namespace(
+        source="codex", rebuild=False, prune_orphans=False,
+        prune_conversations=False)) == 0
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "codex done:" in line]
+    assert units and lines, err
+
+    def total(name):
+        return sum(int(getattr(stats, name) or 0) for stats in units)
+
+    assert total("files_processed") >= 2 and total("rows_changed") > 0
+    # Each file at most once per pass, as the single walk reports it: the
+    # replay re-reads all three files; the history heal reads the two held
+    # files and walks the keeper unchanged. The certification and closing
+    # walks find every file again, and their pieces skip visited files;
+    # neither may count a file twice.
+    processed, skipped = (3, 0) if mode == "replay" else (2, 1)
+    assert total("files_processed") == processed, total("files_processed")
+    expected = (
+        f"codex done: {processed} processed, "
+        f"{skipped} skipped, "
+        f"{total('files_reset_truncated')} reset, "
+        f"{total('rows_changed')} rows changed, "
+        f"{total('lines_malformed')} malformed, "
+        f"{total('token_events_skipped')} drift-skipped")
+    assert lines[-1].endswith(expected), (lines, expected)
+    assert sum(1 for line in lines if line.endswith(expected)) == 1, lines
+
+
+# --- #982 #975 round 7: every heal unit is bound to its pass generation ----
+
+
+def _heal_store_state(ns):
+    """Everything a heal unit could write: cursors, accounting rows (by
+    rowid) and every `cache_meta` key (the record, the replay marker, the
+    finalization debt, the full-walk certificate)."""
+    conn = ns["open_cache_db"]()
+    try:
+        return (
+            [tuple(row) for row in conn.execute(
+                "SELECT * FROM codex_session_files ORDER BY path")],
+            [row[0] for row in conn.execute(
+                "SELECT rowid FROM codex_session_entries ORDER BY rowid")],
+            [tuple(row) for row in conn.execute(
+                "SELECT key, value FROM cache_meta ORDER BY key")],
+        )
+    finally:
+        conn.close()
+
+
+def test_replay_rearm_during_pass_restarts_from_fresh_clear(env, monkeypatch):
+    """Spec 4.5a (Generation, round-7 P1): a replay re-armed between two
+    pieces of an executor pass ends that pass `restart` without another
+    write; the next pass's start unit clears freshly with the union D1 set
+    and refills the pre-mechanism rollout, and only that pass consumes the
+    new marker. Detects: a later piece of the old pass that performs the
+    fresh clear, skips a file it visited before that clear and consumes the
+    marker, leaving that file cursorless with its D1 evidence gone, so a
+    later sync attributes it from the live `auth.json` (I7)."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    x, premech, b = (day / _name(10, 81), day / _name(11, 82),
+                     day / _name(12, 83))
+    for path, sid in ((x, "x-0081"), (b, "b-0083")):
+        write_rollout(path, conversation_records(2, session_id=sid, label=sid))
+    _sync(ns)
+    _premech_rollout(ns, monkeypatch, premech, "premech-0082")
+    assert set(_entry_accounts(ns, premech)) == {None}
+    _arm_replay(ns)
+    (provider / "auth.json").write_text(_auth_json("acct-b", "b@example.com"))
+    monkeypatch.setattr(cc, "_spawn_codex_worker", lambda command: True)
+    real_sync = cc.sync_codex_cache
+    real_clear = cc._clear_codex_derived_rows
+    current: list = []
+    clears: list = []
+    pieces: list = []
+    rearmed: list = []
+
+    def sync(conn, **kwargs):
+        fenced = kwargs.get("_heal_transition")
+        if fenced and not pieces and not rearmed:
+            # Give the fenced walk bytes to stop at around the visited
+            # pre-mechanism rollout: X's tail (ingested) and B's (the stop).
+            _append_records(x, _token_events("x-0081", 900_000, 1, 40))
+            _append_records(b, _token_events("b-0083", 900_000, 1, 40))
+        current.append(kwargs)
+        try:
+            stats = real_sync(conn, **kwargs)
+        finally:
+            current.pop()
+        if fenced and not rearmed:
+            pieces.append(stats)
+            assert str(premech) in stats.heal_examined, stats.heal_examined
+            assert not stats.heal_walk_complete, "the piece did not stop"
+            arm_conn = ns["open_cache_db"]()
+            try:
+                cc.arm_codex_replay_from_zero(arm_conn)
+                arm_conn.commit()
+            finally:
+                arm_conn.close()
+            rearmed.append(_heal_store_state(ns))
+        return stats
+
+    def clear(conn, *args, **kwargs):
+        clears.append(dict(current[-1]) if current else {"outside": True})
+        return real_clear(conn, *args, **kwargs)
+
+    monkeypatch.setattr(cc, "sync_codex_cache", sync)
+    monkeypatch.setattr(cc, "_clear_codex_derived_rows", clear)
+    first = cc.run_codex_admitted_heal(wait_for_requests=False)
+    assert rearmed, "the fenced walk never ran a piece"
+    assert all(c.get("_replay_stage") == "start" for c in clears), (
+        "a unit other than a pass's start unit performed the fresh clear",
+        [sorted(k for k in c if c[k] is not None) for c in clears])
+    assert (first.mode, first.outcome) == ("replay", "restart"), first
+    assert _heal_store_state(ns) == rearmed[0], (
+        "the old pass wrote after the re-arm")
+    assert _replay_armed(ns) and _heal_record(ns).get("reclear") is True
+    before_rows = {path: _entry_rowids(ns, path) for path in (x, b)}
+    clears.clear()
+    second = cc.run_codex_admitted_heal(wait_for_requests=False)
+    assert (second.mode, second.outcome) == ("replay", "done"), second
+    assert [c.get("_replay_stage") for c in clears] == ["start"], clears
+    assert all(_entry_rowids(ns, path) != ids
+               for path, ids in before_rows.items()), "no fresh clear ran"
+    assert not _replay_armed(ns) and _heal_record(ns) is None
+    assert _entry_rowids(ns, premech), "the new pass did not refill A"
+    monkeypatch.setattr(cc, "sync_codex_cache", real_sync)
+    _sync(ns)
+    assert set(_entry_accounts(ns, premech)) == {None}, (
+        "the pre-mechanism rollout was attributed from the live auth.json")
+
+
+@pytest.mark.parametrize("mode", ["history", "replay"])
+@pytest.mark.parametrize("unit", ["population", "piece"])
+def test_heal_unit_with_stale_generation_writes_nothing(env, monkeypatch,
+                                                        mode, unit):
+    """Spec 4.5a (Generation): an executor unit whose pass generation is not
+    the record's commits no row, cursor, record change or settlement and
+    reports `heal_generation_stale`; the same unit with the record's
+    generation ingests (control). Detects: a unit of an ended pass writing
+    over a record a newer pass (or a fresh clear) wrote."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    keeper = day / _name(20, 91)
+    write_rollout(keeper, token_records(1, session_id="keeper-0091"))
+    if mode == "history":
+        _sync(ns)
+        held = day / _name(11, 92)
+        write_rollout(held, conversation_records(2, session_id="held-0092"))
+        _arm_heal_record(ns, [held])
+        target = held
+    else:
+        population, _control = _seed_replay(ns, day, count=2)
+        start = _sync(ns, maintenance="caller", lock_timeout=0,
+                      _walk_share=cc._CodexWalkShare(), _replay_stage="start")
+        assert not start.rebuild_refused and not start.prune_refused, start
+        target = population[0]
+    record = _heal_record(ns)
+    assert record is not None and record["mode"] == mode, record
+    kwargs = ({"only_paths": {str(target)}} if unit == "population" else
+              {"_ingest_limit": 1, "_heal_transition": True,
+               "_defer_finalization": True})
+    before = _heal_store_state(ns)
+    stale = _sync(ns, maintenance="caller", lock_timeout=0,
+                  _walk_share=cc._CodexWalkShare(),
+                  _heal_generation="an-older-pass", **kwargs)
+    assert stale.heal_generation_stale, stale
+    assert _heal_store_state(ns) == before, (
+        "a unit with a stale generation wrote")
+    control = _sync(ns, maintenance="caller", lock_timeout=0,
+                    _walk_share=cc._CodexWalkShare(),
+                    _heal_generation=record["gen"], **kwargs)
+    assert not control.heal_generation_stale, control
+    assert _entry_rowids(ns, target), "the control unit did not ingest"
+
+
+@pytest.mark.parametrize("damage", ["known", "unparseable"])
+def test_rebuild_declines_malformed_replay_record(env, monkeypatch, damage):
+    """Spec 4.5a (Validation, revision 10): an automatic unbudgeted sync and
+    an explicit `cache-sync --rebuild` both decline over a malformed replay
+    record, leaving every row, the marker and the pre-mechanism rollout's
+    D1 protection in place. Detects: any writer that re-clears with a
+    recaptured D1 set, which would attribute a rollout not yet refilled
+    from the live `auth.json` (I7)."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    premech = day / _name(10, 70)
+    _premech_rollout(ns, monkeypatch, premech, "premech-0070")
+    population, _control = _seed_replay(ns, day)
+    rows = {path: _entry_rowids(ns, path) for path in population}
+    fence = {"v": 1, "mode": "replay", "phase": "units", "rehydrated": True,
+             "gen": "damaged"}
+    payload = {"v": 1, "gen": "damaged",
+               "population": sorted(str(p) for p in population),
+               "known": 7 if damage == "known" else []}
+    _write_heal_record(ns, "{not json" if damage == "unparseable" else fence,
+                       payload)
+    (provider / "auth.json").write_text(_auth_json("acct-b", "b@example.com"))
+    stats = _sync(ns, maintenance="caller")
+    assert stats.deferred_reason == "replay_pending", stats
+    assert {path: _entry_rowids(ns, path) for path in population} == rows
+    monkeypatch.setattr(cc, "_spawn_codex_worker", lambda command: True)
+    cc.cmd_cache_sync(_argparse.Namespace(
+        source="codex", rebuild=True, prune_orphans=False,
+        prune_conversations=False))
+    assert {path: _entry_rowids(ns, path) for path in population} == rows, (
+        "an explicit rebuild cleared under a malformed replay record")
+    assert _replay_armed(ns), "the rebuild consumed the marker"
+    assert set(_entry_accounts(ns, premech)) <= {None}, (
+        "a pre-mechanism rollout took the live login (I7)")
+
+
+# --- #982 #975 fix-verification (P3) ---------------------------------------
+
+
+@pytest.mark.parametrize("driver", ["sync", "executor"])
+def test_reclear_record_without_marker_refills_and_retires(env, monkeypatch,
+                                                           driver):
+    """A replay record marked `reclear` whose replay marker is gone (only a
+    damaged `cache_meta` produces it) is a record that no longer asks for a
+    replay: an unbudgeted sync and an executor pass refill with it and retire
+    it, clearing nothing. Detects: the `refill_record` read that raised
+    `AttributeError` on every unbudgeted sync and executor start unit, and a
+    fresh clear no armed marker asked for (the conversation side, which waits
+    only on the marker, would then publish over the cleared store)."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    paths = [day / _name(11 + n, 61 + n) for n in range(2)]
+    for n, path in enumerate(paths):
+        write_rollout(path, conversation_records(
+            2, session_id=f"reclear-{n:04d}", label=f"c{n}"))
+    _sync(ns)
+    rows = {path: _entry_rowids(ns, path) for path in paths}
+    assert all(rows.values()), rows
+    _write_heal_record(
+        ns, {"v": 1, "mode": "replay", "phase": "units", "rehydrated": True,
+             "reclear": True, "gen": "lost-marker"},
+        {"v": 1, "gen": "lost-marker",
+         "population": sorted(str(p) for p in paths), "known": []})
+    assert not _replay_armed(ns)
+    monkeypatch.setattr(cc, "_spawn_codex_worker", lambda command: True)
+    clears: list = []
+    real_clear = cc._clear_codex_derived_rows
+
+    def clear(conn, *args, **kwargs):
+        clears.append(True)
+        return real_clear(conn, *args, **kwargs)
+
+    monkeypatch.setattr(cc, "_clear_codex_derived_rows", clear)
+    if driver == "sync":
+        stats = _sync(ns, maintenance="caller")
+        assert stats.deferred_reason is None, stats
+    else:
+        result = cc.run_codex_admitted_heal(wait_for_requests=False)
+        assert (result.mode, result.outcome) == ("replay", "done"), result
+    assert not clears, "a writer cleared without an armed replay marker"
+    assert {path: _entry_rowids(ns, path) for path in paths} == rows
+    assert _heal_record(ns) is None and not _replay_armed(ns)
+
+
+def test_cache_sync_heal_rerun_refusal_exits_3(env, monkeypatch, capsys):
+    """`cache-sync`'s second Codex leg reports a refused inline re-run (a
+    replay armed during the history heal whose start unit the #485/#968
+    preflight refuses) exactly as the first leg reports a refused replay:
+    the existing refusal message and exit 3. Detects: a refused replay that
+    prints an ordinary "codex done" line and exits 0."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    _seed_split_heal(ns, provider, day)
+    real_owed = cc._codex_heal_owed_files
+
+    def owed(conn, files):
+        if not _replay_armed(ns):
+            _arm_replay(ns)                  # after the population units
+        return real_owed(conn, files)
+
+    monkeypatch.setattr(cc, "_codex_heal_owed_files", owed)
+    monkeypatch.setattr(cc, "_codex_compressed_rebuild_refusal",
+                        lambda files: "decode-error")
+    monkeypatch.setattr(cc, "_spawn_codex_worker", lambda command: True)
+    capsys.readouterr()
+    code = cc.cmd_cache_sync(_argparse.Namespace(
+        source="codex", rebuild=False, prune_orphans=False,
+        prune_conversations=False))
+    err = capsys.readouterr().err
+    assert code == 3, err
+    assert cc.CODEX_REBUILD_REFUSED_MESSAGE in err, err
+    assert _replay_armed(ns), "the refused replay consumed its marker"
+
+
+def test_replay_drain_request_skips_spawn_while_heal_runs(env, monkeypatch):
+    """A worker request while `codex-heal-walk.lock` is held (a heal pass is
+    running) spawns nothing; with the lock free and a heal record present
+    it spawns under the 300 s retry throttle. Detects: a redundant
+    `_codex-replay-drain` every 300 s of a healthy heal, running provenance,
+    verification, reset, membership and seal drains beside the executor."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    held = day / _name(11, 53)
+    write_rollout(held, conversation_records(1, session_id="held-0053"))
+    _sync(ns)
+    _arm_heal_record(ns, [held])
+    spawns: list = []
+    monkeypatch.setattr(cc, "_spawn_codex_worker",
+                        lambda command: spawns.append(command) or True)
+    marker = ns["APP_DIR"] / cc.CODEX_REPLAY_DRAIN_MARKER_NAME
+    marker.touch()
+    now = __import__("time").time()
+    os.utime(marker, (now - 301, now - 301))
+    lock_path = ns["APP_DIR"] / cc.CODEX_HEAL_WALK_LOCK_NAME
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        assert cc._defer_codex_replay_drain() == "throttled"
+        assert cc._defer_codex_replay_drain(short=True) == "throttled"
+        assert spawns == [], ("a request spawned while the heal ran", spawns)
+    finally:
+        os.close(fd)
+    assert cc._defer_codex_replay_drain() == "spawned"
+    assert spawns == [cc.CODEX_REPLAY_DRAIN_COMMAND], spawns
+
+
+def test_heal_history_start_unit_bounds_lock_contention(env, monkeypatch):
+    """The history start unit, like every other heal unit, ends the pass
+    `contended` after the replay worker's lock wait when another writer
+    holds the store locks continuously. Detects: a start unit that waits on
+    the store locks without a bound."""
+    ns, provider, day, _ = env
+    cc = _cache()
+    _seed_split_heal(ns, provider, day)
+    assert cc.run_codex_history_provenance_drain(
+        wait_for_requests=False).outcome == "settled"
+    population = cc._codex_history_candidates()
+    assert population and _heal_record(ns) is None
+    monkeypatch.setattr(cc, "_cache_store_locks", lambda: None)
+    monkeypatch.setattr(cc, "CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(cc, "_spawn_codex_worker", lambda command: True)
+    backoffs: list = []
+
+    def backoff(_adm):
+        backoffs.append(1)
+        if len(backoffs) > 50:
+            raise AssertionError("the history start unit waited on the store "
+                                 "locks without a bound")
+
+    monkeypatch.setattr(cc, "_drain_backoff", backoff)
+    result = cc.run_codex_admitted_heal(wait_for_requests=True,
+                                        population=population)
+    assert result.outcome == "contended", result
+    assert _heal_record(ns) is None, "the contended start unit wrote a record"

@@ -264,6 +264,9 @@ def test_idle_snapshot_stats_corruption_reaches_the_heal_boundary(
         with pytest.raises(tui._StatsSnapshotCorruption):
             tui._tui_build_idle_snapshot(
                 _idle_prior(tui), now_utc=_NOW, precompute_envelope=False,
+                # #1050: a file that is not a database has no readable
+                # dispatch identity.
+                claude_input_identity=None,
                 runtime_bind=None, raw_config={}, errors=errors,
                 source_stats_conn=conn, codex_dependency=None,
             )
@@ -287,6 +290,9 @@ def test_idle_snapshot_stats_corruption_never_emits_the_cache_envelope(
     try:
         idle = tui._tui_build_idle_snapshot(
             _idle_prior(tui), now_utc=_NOW, precompute_envelope=False,
+            # #1050: a file that is not a database has no readable
+            # dispatch identity.
+            claude_input_identity=None,
             runtime_bind=None, raw_config={}, errors=errors,
             source_stats_conn=conn, stats_heal_attempted=True,
             codex_dependency=None,

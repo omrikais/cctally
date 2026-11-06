@@ -179,22 +179,22 @@
                     "details": {
                         "path": "$HOME/.local/share/cctally/stats.db",
                         "registry_size": 13,
-                        "user_version": 1023
+                        "user_version": 1024
                     },
                     "id": "db.stats.file",
                     "severity": "ok",
-                    "summary": "version 1023 / 13 known",
+                    "summary": "version 1024 / 13 known",
                     "title": "stats.db"
                 },
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 51,
-                        "user_version": 51
+                        "registry_size": 52,
+                        "user_version": 52
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 51 / 51 known",
+                    "summary": "version 52 / 52 known",
                     "title": "cache.db"
                 },
                 {
@@ -212,14 +212,14 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 51,
-                            "user_version": 51
+                            "registry_size": 52,
+                            "user_version": 52
                         },
                         "stats.db": {
-                            "epoch": 1023,
+                            "epoch": 1024,
                             "legacy_head": 13,
                             "mismatch": false,
-                            "user_version": 1023
+                            "user_version": 1024
                         }
                     },
                     "id": "db.version_ahead",
@@ -328,7 +328,8 @@
                                     "048_codex_quota_physical_group_order",
                                     "049_codex_rollout_containers",
                                     "050_preserve_claude_cost_attribution",
-                                    "051_codex_retained_identities"
+                                    "051_codex_retained_identities",
+                                    "052_codex_delete_trigger_plans"
                                 ],
                                 "failed": [],
                                 "pending": [],
@@ -358,7 +359,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "64/64 applied",
+                    "summary": "65/65 applied",
                     "title": "Migrations"
                 },
                 {
@@ -405,7 +406,7 @@
                     "details": {
                         "cache_db_free_ratio": 0.0,
                         "cache_db_freelist_count": 0,
-                        "cache_db_page_count": 149,
+                        "cache_db_page_count": 151,
                         "warn_ratio": 0.25
                     },
                     "id": "db.reclaimable",
@@ -571,6 +572,11 @@
             "checks": [
                 {
                     "details": {
+                        "effective_freshness_age_s": 2,
+                        "effective_freshness_at": "2026-05-13T14:22:29+00:00",
+                        "freshness_unavailable_reason": null,
+                        "latest_reading_age_s": 2,
+                        "latest_reading_at": "2026-05-13T14:22:29+00:00",
                         "latest_snapshot_age_s": 2,
                         "latest_snapshot_at": "2026-05-13T14:22:29+00:00"
                     },

@@ -704,8 +704,12 @@ def _published_index_digest(dump) -> str:
     `generation_stamped_at_utc`, its columns 1 and 2) names the previous
     publication's rebuild record and stamp time, so it describes the build,
     not the replayed content, exactly as `selector_state.comparable` clears it.
+    The content-revision tables (#1050) count the tracked mutations the build
+    itself made, so they describe the build too and are left out.
     """
     dump = dict(dump)
+    for table in ("stats_content_revision", "stats_content_revision_scopes"):
+        dump.pop(table, None)
     if "journal_selector_state" in dump:
         dump["journal_selector_state"] = [
             (row[0], None, None, *row[3:])
@@ -755,10 +759,38 @@ def _published_index_digest(dump) -> str:
 #: the episodes and axis-state tables are empty. Both passes publish the same
 #: digest. (The previous pin was
 #: `sha256:9201c404f013935f6d30f02ea2293b7f3da50720cdd9798862c62e0458aaab8a`.)
+#: Re-pinned for #1018 twin (epoch 1024): each `claude_weekly_observation_index`
+#: row gains its raw weekly value, normalized reset, genuine flag and freshness
+#: eligibility (spec 5.1); the population and every other table are
+#: unchanged. Both passes publish the same digest. (The previous pin was
+#: `sha256:baab738b026377fc333e9e5892feedc7549f391ff2fcfa7e91af92aed295f7b1`.)
 RELEASE_FIXTURE_INDEX_DIGESTS = (
-    "sha256:baab738b026377fc333e9e5892feedc7549f391ff2fcfa7e91af92aed295f7b1",
-    "sha256:baab738b026377fc333e9e5892feedc7549f391ff2fcfa7e91af92aed295f7b1",
+    "sha256:5a63a993019f2e9431c16a1e63567aefe19ab2b16bf600030944e64d7e379f09",
+    "sha256:5a63a993019f2e9431c16a1e63567aefe19ab2b16bf600030944e64d7e379f09",
 )
+
+#: The pricing snapshot date the digests above were recorded under (#1065).
+#: The published five-hour block's cost provenance carries the snapshot date,
+#: so the test prices under this fixed date: a pricing sync that only advances
+#: the date (#989 moved it to 2026-11-05) leaves the pin alone, while a rate
+#: change for the fixture's models still moves it.
+_PINNED_PRICING_DATE = "2026-10-14"
+
+
+def _pin_pricing_date(monkeypatch):
+    pricing = importlib.import_module("_lib_pricing")
+    live = pricing.current_pricing_snapshot()
+    pinned = pricing.PricingSnapshot(
+        snapshot_date=_PINNED_PRICING_DATE,
+        claude_pricing=live.claude_pricing,
+        codex_pricing=live.codex_pricing,
+        aliases=live.aliases,
+        tier_thresholds=live.tier_thresholds,
+        fallback_model=live.fallback_model,
+        cache_write_1h_multiplier=live.cache_write_1h_multiplier,
+        fast_multipliers=live.fast_multipliers,
+    )
+    monkeypatch.setattr(pricing, "current_pricing_snapshot", lambda: pinned)
 
 
 def test_rebuild_published_index_unchanged_by_release(
@@ -766,6 +798,7 @@ def test_rebuild_published_index_unchanged_by_release(
     """The published index of both bundle paths equals the one the
     implementation before the release-order change published."""
     jr = importlib.import_module("_cctally_journal")
+    _pin_pricing_date(monkeypatch)
     _release_fixture(ns, quota=True)
     digests = []
     for status in ("recovered", "covered"):
@@ -777,3 +810,92 @@ def test_rebuild_published_index_unchanged_by_release(
         assert dump["weekly_usage_snapshots"], "no snapshot was published"
         digests.append(_published_index_digest(dump))
     assert tuple(digests) == RELEASE_FIXTURE_INDEX_DIGESTS
+
+
+# --------------------------------------------------------------------------
+# #1004 T6 — planner and apply equal over streamed and listed records
+# --------------------------------------------------------------------------
+
+
+def _rederive_run(mod, capsys, *, yes, reviewed_args=None):
+    import argparse
+
+    args = reviewed_args or argparse.Namespace(
+        family="claude-usage", yes=yes, json=True)
+    before = W._journal_bytes()
+    code = mod.cmd_db_rederive(args)
+    output = W._stable_output(capsys.readouterr().out)
+    output.pop("durationSeconds", None)
+    return code, output, W._journal_bytes()[len(before):]
+
+
+@pytest.mark.parametrize("materialize", [False, True],
+                         ids=["streamed", "listed"])
+def test_preview_holds_the_reader_form(tmp_path, monkeypatch, materialize,
+                                       no_append_path_cutover):
+    """#1004 T6 non-vacuity: the streamed preview stores the reader's
+    `RetainedRecords` and `record_ends` view as they are (no `tuple(...)`
+    copy, which would restore today's memory), and the test switch really
+    builds today's tuples, so the equality below compares two forms."""
+    mod, _records = W._store(tmp_path, monkeypatch, stubbed=True)
+    import _lib_retained_records as RR
+    monkeypatch.setattr(RR, "MATERIALIZE_FOR_TESTS", materialize)
+    preview = W._preview(mod)
+    if materialize:
+        assert isinstance(preview.records, tuple)
+        assert isinstance(preview.record_ends, tuple)
+    else:
+        assert isinstance(preview.records, RR.RetainedRecords)
+        assert not isinstance(preview.record_ends, (list, tuple))
+        assert any(preview.records.is_streamed(i)
+                   for i in range(len(preview.records)))
+
+
+def test_rederive_outputs_equal_streamed_and_listed(
+        tmp_path, monkeypatch, capsys, no_append_path_cutover):
+    """#1004 T6: the preview JSON (minus `generatedAt`), the apply's
+    appended bytes and published index, an exact-retry apply, and a reviewed
+    decision's materialization (its apply and its exact retry) are identical
+    with coordinate-backed records and with today's lists. Any difference is
+    a correction the journal would record differently."""
+    results = {}
+    for materialize in (False, True):
+        name = "listed" if materialize else "streamed"
+        with monkeypatch.context() as patch:
+            mod, _records = W._store(tmp_path / name / "plain", patch,
+                                     stubbed=True)
+            import _lib_retained_records as RR
+            patch.setattr(RR, "MATERIALIZE_FOR_TESTS", materialize)
+            plain = {
+                "preview": _rederive_run(mod, capsys, yes=False),
+                "apply": _rederive_run(mod, capsys, yes=True),
+                "index": W._index_dump(),
+                "retry": _rederive_run(mod, capsys, yes=True),
+            }
+        with monkeypatch.context() as patch:
+            mod, records = W._store(tmp_path / name / "reviewed", patch,
+                                    stubbed=True)
+            import _lib_retained_records as RR
+            patch.setattr(RR, "MATERIALIZE_FOR_TESTS", materialize)
+            args = W._reviewed_manifest(
+                mod, records, tmp_path / name / "reviewed", capsys)
+            reviewed = {
+                "apply": _rederive_run(mod, capsys, yes=True,
+                                       reviewed_args=args),
+                "index": W._index_dump(),
+                "retry": _rederive_run(mod, capsys, yes=True,
+                                       reviewed_args=args),
+            }
+        results[materialize] = (plain, reviewed)
+    streamed, listed = results[False], results[True]
+    for part in (0, 1):
+        for key in streamed[part]:
+            assert streamed[part][key] == listed[part][key], (part, key)
+    plain, reviewed = streamed
+    assert plain["preview"][0] == 0
+    assert plain["preview"][1]["status"] == "preview", plain["preview"][1]
+    assert plain["apply"][0] == 0 and plain["apply"][2], "non-vacuity"
+    assert plain["retry"][2] == b"", "the exact retry appends nothing"
+    assert reviewed["apply"][0] == 0 and reviewed["apply"][2], (
+        "non-vacuity: the reviewed decision materialized")
+    assert reviewed["retry"][2] == b""

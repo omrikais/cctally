@@ -882,9 +882,11 @@ def test_source_schema_version_moves_with_the_retired_s2_transition():
     cycle sublegs, and combined token totals may be null when uncertified.
     #834 S2 takes it to 12: Codex metadata availability is a typed three-state
     result rather than one boolean, so a partial now MEANS one of two things.
+    #1018 twin takes it to 13: the Claude Current Week `freshness` now ages from
+    the newest confirming weekly reading and is null without one.
     """
     from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
-    assert SOURCE_SCHEMA_VERSION == 12
+    assert SOURCE_SCHEMA_VERSION == 13
 
 
 # Spec §5 also asked for Codex "field-survival assertions" HERE. They live

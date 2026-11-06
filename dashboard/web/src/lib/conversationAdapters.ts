@@ -26,7 +26,7 @@ import type {
   ToolOutcome,
   CodexLifecycleState,
 } from '../types/conversation';
-import type { ConversationSource } from '../types/conversation';
+import type { ConversationSource, GitBranchStatus } from '../types/conversation';
 import {
   conversationDegradedNotice,
   conversationDegradedReason,
@@ -1058,7 +1058,19 @@ type QualifiedDetailEnvelope = {
   subagent_meta?: ConversationDetail['subagent_meta'];
   // #463 S3 §3.2 — conversation-scoped, re-sent on every page.
   session_index?: unknown;
+  // #1037 — the reader header's project and branch slots. Codex also sends
+  // why a branch is absent; a server that predates the fields omits all three.
+  project_label?: string | null;
+  git_branch?: string | null;
+  git_branch_status?: GitBranchStatus;
 };
+
+const GIT_BRANCH_STATUSES: readonly string[] = ['recorded', 'not_recorded', 'unreadable'];
+
+function gitBranchStatus(value: unknown): GitBranchStatus | undefined {
+  return typeof value === 'string' && GIT_BRANCH_STATUSES.includes(value)
+    ? (value as GitBranchStatus) : undefined;
+}
 
 export function adaptQualifiedDetail(ref: ConversationRef, body: QualifiedDetailEnvelope): ConversationDetail {
   const degradedReason = conversationDegradedReason(body);
@@ -1071,13 +1083,14 @@ export function adaptQualifiedDetail(ref: ConversationRef, body: QualifiedDetail
   const lastTs = [...(body.items ?? [])].reverse().find((item) => item.timestamp_utc)?.timestamp_utc ?? firstTs;
   const page = body.page;
   const index = sessionIndex(body.session_index);
+  const branchStatus = gitBranchStatus(body.git_branch_status);
   return {
     session_id: ref.key,
     title: cleanQualifiedTitle(body.title),
-    // Qualified detail intentionally does not repeat collection-only project
-    // metadata. An em dash is truthful; the provider strip carries source.
-    project_label: '—',
-    git_branch: null,
+    // #1037 — source-agnostic: both providers send the header's project label
+    // and branch; an absent value keeps the truthful em dash / null.
+    project_label: body.project_label || '—',
+    git_branch: body.git_branch ?? null,
     started_utc: firstTs,
     last_activity_utc: lastTs,
     cost_usd: num(body.total_cost_usd),
@@ -1099,6 +1112,7 @@ export function adaptQualifiedDetail(ref: ConversationRef, body: QualifiedDetail
       unattributed_cost_usd: num(body.unattributed_cost_usd),
       parent: body.parent ?? null,
       children: body.children ?? [],
+      ...(branchStatus ? { git_branch_status: branchStatus } : {}),
     },
   };
 }
@@ -1152,6 +1166,7 @@ export function adaptQualifiedSearch(
     title: cleanQualifiedTitle(hit.title) ?? 'Untitled conversation',
     ts: hit.last_activity_utc ?? '',
     snippet: hit.snippet,
+    ...(hit.snippet_parts !== undefined ? { snippet_parts: hit.snippet_parts } : {}),
     cost_usd: 0,
     match_kinds: hit.badges.filter((badge): badge is NonNullable<SearchHit['match_kinds']>[number] =>
       badge === 'tool' || badge === 'thinking' || badge === 'title' || badge === 'file'),

@@ -385,6 +385,56 @@ def test_scoped_codex_anon_uses_only_physically_owned_project_paths(tmp_path):
         conn.close()
 
 
+def test_scoped_codex_anon_label_follows_the_thread_cwd(tmp_path):
+    """#972 §5.8 rule 6. A shared conversation whose thread cwd (and so its
+    rollup label) belongs to another account, while this account's own
+    session_meta for it names an owned path: the label is not registered for
+    that owned path, so another account's project word never enters this
+    account's plan. The owned path itself still does."""
+    from _lib_conversation_anon import plan_to_wire
+
+    conn = _open_scoped_codex_fixture(tmp_path, ACCOUNT_A, scope=False)
+    alice_path = "/Users/alice/account-a-project"
+    bravo_path = "/Users/bravo/foreign-word"
+    try:
+        conn.execute(
+            "UPDATE cache_db.codex_conversation_threads SET cwd=? "
+            "WHERE conversation_key='v1.shared'", (bravo_path,),
+        )
+        conn.execute(
+            "UPDATE main.codex_conversation_rollups SET project_label=? "
+            "WHERE conversation_key='v1.shared'", ("foreign-word",),
+        )
+        for offset, path, account in ((0, alice_path, ACCOUNT_A),
+                                      (1, bravo_path, ACCOUNT_B)):
+            conn.execute(
+                "INSERT INTO main.codex_conversation_events "
+                "(source_path,line_offset,source_root_key,conversation_key,"
+                "native_thread_id,root_thread_id,record_type,payload_json,account_key) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                ("shared-codex.jsonl", offset, "root", "v1.shared",
+                 "shared-thread", "shared-thread", "session_meta",
+                 json.dumps({"type": "session_meta", "payload": {"cwd": path}}),
+                 account),
+            )
+        conn.commit()
+        cache.scope_conversations_db_to_account(conn, ACCOUNT_A)
+        assert conn.execute(
+            "SELECT project_label FROM temp.codex_conversation_rollups "
+            "WHERE conversation_key='v1.shared'").fetchone() == ("foreign-word",)
+        owned, _ambiguous, _undecodable = claude_query._scoped_codex_anon_paths(
+            conn, ACCOUNT_A)
+        assert owned == {alice_path: frozenset()}
+        result = claude_query.build_anon_plan_for_sources(
+            conn, home_dir="/Users/alice", sources={"codex"},
+        )
+        wire = json.dumps(plan_to_wire(result.plan))
+        assert alice_path in wire
+        assert "foreign-word" not in wire
+    finally:
+        conn.close()
+
+
 def test_scoped_codex_anon_refuses_thread_path_from_other_account(tmp_path):
     """The B leaf survives, but its thread CWD came from A's session_meta."""
     conn = _open_scoped_codex_fixture(tmp_path, ACCOUNT_B, scope=False)
@@ -484,7 +534,7 @@ def test_scoped_codex_anon_handles_store_without_raw_threads_table():
     try:
         db._apply_conversations_schema(conn)
         assert claude_query._scoped_codex_anon_paths(conn, ACCOUNT_A) == (
-            set(), 0, 0,
+            {}, 0, 0,
         )
         conn.execute(
             "INSERT INTO codex_conversation_messages "

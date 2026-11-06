@@ -262,19 +262,33 @@ def _assert_everything_kept(ns, retained, before_events, marker_key=None,
         assert _meta(ns, marker_key, store) is not None
 
 
-def test_explicit_rebuild_refuses_with_exit_3(estate, capsys):
+@pytest.mark.parametrize("armed", [True, False])
+def test_explicit_rebuild_refuses_with_exit_3(estate, capsys, armed):
+    """The refusal returns before the clear and keeps every retained row.
+    Armed: the pending replay's marker survives the refusal. Unarmed (#1051
+    A8): the refusal arms no byte-zero replay and writes no replay record.
+    Detects: a refused rebuild losing retained Codex data, dropping a
+    pending replay, or leaving a replay owed over a store it never
+    cleared."""
     ns, retained, _fresh, _mode = estate
     events = _events(ns)
-    conn = ns["open_cache_db"]()
-    try:
-        key = sys.modules["_cctally_cache"].CODEX_REPLAY_FROM_ZERO_KEY
-        conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)", (key, "1"))
-        conn.commit()
-    finally:
-        conn.close()
+    cache_mod = sys.modules["_cctally_cache"]
+    key = cache_mod.CODEX_REPLAY_FROM_ZERO_KEY
+    if armed:
+        conn = ns["open_cache_db"]()
+        try:
+            conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)", (key, "1"))
+            conn.commit()
+        finally:
+            conn.close()
     assert ns["main"](["cache-sync", "--source", "codex", "--rebuild"]) == 3
     assert REFUSAL in capsys.readouterr().err
-    _assert_everything_kept(ns, retained, events, key)
+    if armed:
+        _assert_everything_kept(ns, retained, events, key)
+    else:
+        _assert_everything_kept(ns, retained, events)
+        assert _meta(ns, key) is None
+        assert _meta(ns, cache_mod.CODEX_HEAL_WALK_KEY) is None
 
 
 def test_an_implicit_sync_finding_the_replay_marker_refuses(estate):
@@ -1276,3 +1290,476 @@ def test_review_t6_terminal_unverified_retained_history_warns_once(
             assert snapshot_tables(conn, CACHE_FAMILIES) == before
         finally:
             conn.close()
+
+
+# ── #983: legacy cache migrations on a decoder-less upgrade ─────────────────
+
+def _rewind_cache_below(seq: int) -> None:
+    """Make cache.db look last opened by a binary that predates cache migration
+    ``seq``: that migration and every later one pending, user_version seq-1."""
+    import _cctally_core as core
+    db = sys.modules["_cctally_db"]
+    later = [(m.name,) for m in db._CACHE_MIGRATIONS if m.seq >= seq]
+    conn = sqlite3.connect(core.CACHE_DB_PATH)
+    try:
+        conn.executemany("DELETE FROM schema_migrations WHERE name=?", later)
+        conn.execute(f"PRAGMA user_version = {seq - 1}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _entry_rows(ns):
+    conn = ns["open_cache_db"]()
+    try:
+        return sorted(conn.execute(
+            "SELECT source_path, line_offset, timestamp_utc, model, "
+            "input_tokens, cached_input_tokens, output_tokens, "
+            "reasoning_output_tokens, total_tokens "
+            "FROM codex_session_entries").fetchall())
+    finally:
+        conn.close()
+
+
+def _legacy_estate(tmp_path, monkeypatch, *, below, all_compressed=False):
+    """#983: a plain keeper and a retained rollout ingested at HEAD into both
+    stores, the retained one (and the keeper too when ``all_compressed``)
+    replaced by its ``.jsonl.zst`` twin, the store given the shape an old
+    binary left and rewound below cache migration ``below``.
+
+    Old shape (review F4): no conversation key on any accounting row or cursor
+    (pre-#312), plus one stale copied-preamble style row on the keeper at an
+    offset the parser never emits, which only a real byte-zero replay removes.
+    ``below`` 24 also gets the pre-S1 shaping."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    provider = tmp_path / "codex"
+    day = provider / "sessions" / "2026" / "07" / "20"
+    day.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(provider))
+    keeper, retained = day / _name(9), day / _name(1)
+    write_rollout(keeper, conversation_records(1, session_id="keep", label="k"))
+    write_rollout(retained, conversation_records(3, session_id="ret", label="r"))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    conv = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conv)
+    finally:
+        conv.close()
+    recovered = _entry_rows(ns)
+    assert _entries(ns, retained) == 3 and _entries(ns, keeper) == 1
+    for path in (retained, keeper) if all_compressed else (retained,):
+        path.with_name(path.name + ".zst").write_bytes(zstd_bytes(path.read_bytes()))
+        path.unlink()
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("UPDATE codex_session_entries SET conversation_key = NULL")
+        conn.execute("UPDATE codex_session_files SET last_conversation_key = NULL")
+        columns = [r[1] for r in conn.execute(
+            "PRAGMA table_info(codex_session_entries)") if r[1] != "id"]
+        copied = ", ".join(
+            {"line_offset": "1", "model": "'unknown'"}.get(c, c) for c in columns)
+        conn.execute(
+            f"INSERT INTO codex_session_entries ({', '.join(columns)}) "
+            f"SELECT {copied} FROM codex_session_entries WHERE source_path = ?",
+            (str(keeper),))
+        conn.commit()
+    finally:
+        conn.close()
+    if below == 24:
+        _shape_pre_s1(ns)
+    old = _entry_rows(ns)  # read at HEAD, before the rewind arms the upgrade
+    _rewind_cache_below(below)
+    return ns, keeper, retained, recovered, old
+
+
+def _assert_at_head_with_every_marker(ns):
+    conn = ns["open_cache_db"]()
+    try:
+        registry = sys.modules["_cctally_db"]._CACHE_MIGRATIONS
+        applied = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
+        assert {m.name for m in registry} <= applied
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == len(registry)
+    finally:
+        conn.close()
+
+
+def _conversation_sources(ns):
+    conv = ns["open_conversations_db"]()
+    try:
+        return {r[0] for r in conv.execute(
+            "SELECT DISTINCT source_path FROM codex_conversation_events")}
+    finally:
+        conv.close()
+
+
+def _conversation_keys(ns):
+    conn = ns["open_cache_db"]()
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT conversation_key FROM codex_session_entries")]
+    finally:
+        conn.close()
+
+
+def _codex_project(ns, capsys):
+    capsys.readouterr()
+    rc_ = ns["main"](["project", "--source", "codex", "--since", "2026-07-01",
+                      "--until", "2026-07-31", "--json"])
+    return rc_, json.loads(capsys.readouterr().out)
+
+
+def _append_token_events(path):
+    with open(path, "a") as fh:
+        for minute, cumulative in ((30, 450), (31, 500)):
+            fh.write(json.dumps({
+                "timestamp": f"2026-07-20T10:{minute}:00.000Z",
+                "type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "last_token_usage": {
+                        "input_tokens": 30, "cached_input_tokens": 5,
+                        "output_tokens": 20, "reasoning_output_tokens": 3,
+                        "total_tokens": 50},
+                    "total_token_usage": {"total_tokens": cumulative}}}},
+                separators=(",", ":")) + "\n")
+
+
+@pytest.mark.parametrize(("below", "all_compressed"), (
+    (26, False), (24, False), (26, True)),
+    ids=("below-026", "below-024", "below-026-all-compressed"))
+def test_a_decoder_less_legacy_upgrade_keeps_compressed_only_history(
+        below, all_compressed, tmp_path, monkeypatch, capsys):
+    """#983: an upgrade through the legacy Codex migrations on a Python with
+    neither zstd decoder used to clear every retained Codex accounting row (on
+    main the replay marker 035 arms then froze the walk until a decoder
+    appeared). The legacy migrations now only arm the guarded replay, so the
+    decoder-less upgrade keeps every retained row, the old shape included,
+    reports it through the read commands, and a later decoder restoration
+    replays the history from byte zero. The all-compressed leg is refused by
+    root evidence before the compressed preflight (spec 6, F5)."""
+    import _cctally_cache as cache
+
+    ns, keeper, retained, recovered, old = _legacy_estate(
+        tmp_path, monkeypatch, below=below, all_compressed=all_compressed)
+    stale = [row for row in old if row[3] == "unknown"]
+    assert len(stale) == 1 and stale[0][0] == str(keeper)
+    real_backend = rc.resolve_zstd_backend
+    monkeypatch.setattr(rc, "resolve_zstd_backend", lambda: rc.UNAVAILABLE)
+
+    for attempt in range(2):
+        conn = ns["open_cache_db"]()
+        try:
+            refused = ns["sync_codex_cache"](conn)
+            record = conn.execute(
+                "SELECT value FROM cache_meta WHERE key=?",
+                (cache.CODEX_ORPHAN_PRUNE_REFUSED_KEY,)).fetchone()
+        finally:
+            conn.close()
+        _assert_at_head_with_every_marker(ns)
+        if all_compressed:
+            assert refused.prune_refused
+            assert json.loads(record[0])["reasons"] == ["no_recognizable_roots"]
+        else:
+            assert refused.rebuild_refused == "decoder-unavailable"
+        assert _replay_marker(ns) == "1"
+        assert _entry_rows(ns) == old, f"attempt {attempt}: retained rows changed"
+        if attempt == 0 and not all_compressed:
+            _append_token_events(keeper)  # not ingested while the walk is held
+
+    if not all_compressed:
+        capsys.readouterr()
+        assert ns["main"](["codex", "daily", "--since", "20260701", "--json"]) == 0
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)["totals"]["totalTokens"] == sum(
+            row[-1] for row in old)
+        assert captured.err.splitlines().count(WARNING) == 1
+        status, payload = _codex_project(ns, capsys)
+        assert payload["status"] == "unavailable" and status == 3
+        assert [w["code"] for w in payload["warnings"]] == [
+            "qualified_metadata_unavailable"]
+    conversations = _families(ns)[1]
+    conv = ns["open_conversations_db"]()
+    try:
+        assert ns["sync_codex_conversations"](conv).deferred_reason == (
+            "cache_replay_pending")
+    finally:
+        conv.close()
+    assert _families(ns)[1] == conversations
+
+    monkeypatch.setattr(rc, "resolve_zstd_backend", real_backend)
+    conn = ns["open_cache_db"]()
+    try:
+        restored = ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    assert restored.rebuild_refused is None and not restored.prune_refused
+    assert _replay_marker(ns) is None
+    rows = _entry_rows(ns)
+    assert stale[0] not in rows, "the stale old-shape row survived: no replay ran"
+    appended = [row for row in rows if row not in recovered]
+    assert rows == sorted(recovered + appended)
+    if all_compressed:
+        assert appended == []
+    else:
+        assert [(r[0], r[4:]) for r in appended] == [
+            (str(keeper), (30, 5, 20, 3, 50))] * 2
+    assert None not in _conversation_keys(ns)
+    if not all_compressed:
+        status, payload = _codex_project(ns, capsys)
+        assert (status, payload["status"]) == (0, "ok")
+    conv = ns["open_conversations_db"]()
+    try:
+        assert ns["sync_codex_conversations"](conv).deferred_reason is None
+    finally:
+        conv.close()
+    assert _conversation_sources(ns) == {str(keeper), str(retained)}
+
+
+def test_a_replay_before_a_deferred_later_migration_converges(
+        tmp_path, monkeypatch):
+    """#983 (spec 5.3, F8): the replay checks its marker, not the registry, so
+    it may run while 028 is deferred for its own reason. It runs at the HEAD
+    schema and re-derives every family, so 028 applying afterwards converges."""
+    ns, keeper, retained, recovered, _old = _legacy_estate(
+        tmp_path, monkeypatch, below=26)
+    db = sys.modules["_cctally_db"]
+    lock = open(ns["_cctally_core"].CONVERSATIONS_LOCK_MAINTENANCE_PATH, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        conn = ns["open_cache_db"]()
+        try:
+            assert conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name=?",
+                ("028_split_conversation_store",)).fetchone() is None
+            assert conn.execute("PRAGMA user_version").fetchone()[0] < len(
+                db._CACHE_MIGRATIONS)
+            replayed = ns["sync_codex_cache"](conn)
+        finally:
+            conn.close()
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    assert replayed.rebuild_refused is None and not replayed.prune_refused
+    assert _replay_marker(ns) is None
+    _assert_at_head_with_every_marker(ns)
+    assert _entry_rows(ns) == recovered
+    assert None not in _conversation_keys(ns)
+    conv = ns["open_conversations_db"]()
+    try:
+        assert ns["sync_codex_conversations"](conv).deferred_reason is None
+    finally:
+        conv.close()
+    assert _conversation_sources(ns) == {str(keeper), str(retained)}
+
+
+def _shape_pre_s1(ns) -> None:
+    """Give a HEAD-ingested store the shape a pre-#294 S1, pre-#416 binary
+    left: no provider-root identity on cursors and entries, no quota, thread
+    or root rows, and no durable attribution evidence anywhere (map,
+    incarnations, path ledger, journal)."""
+    import shutil
+
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("UPDATE codex_session_files SET source_root_key = NULL")
+        conn.execute("UPDATE codex_session_entries "
+                     "SET source_root_key = NULL, account_key = NULL")
+        conn.execute("DELETE FROM quota_window_snapshots WHERE source = 'codex'")
+        conn.execute("DELETE FROM codex_conversation_threads")
+        conn.execute("DELETE FROM codex_source_roots")
+        conn.execute("DELETE FROM codex_file_accounts")
+        conn.execute("DELETE FROM codex_file_incarnations")
+        conn.execute(
+            "DELETE FROM codex_accounting_change_log WHERE change_kind = 'path'")
+        conn.commit()
+    finally:
+        conn.close()
+    shutil.rmtree(ns["_cctally_core"].JOURNAL_DIR, ignore_errors=True)
+
+
+def _replay_marker(ns):
+    return _meta(ns, sys.modules["_cctally_cache"].CODEX_REPLAY_FROM_ZERO_KEY)
+
+
+def _cursor_rows(ns):
+    conn = ns["open_cache_db"]()
+    try:
+        return sorted(conn.execute(
+            "SELECT path, source_root_key, last_byte_offset "
+            "FROM codex_session_files").fetchall())
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("spelling", ("configured-spelling", "symlink-spelling"))
+def test_a_pre_s1_null_root_rollout_replays_without_live_attribution(
+        spelling, tmp_path, monkeypatch):
+    """#983 (spec 5.2, D1): a pre-S1 cursor carries no source_root_key, so the
+    rebuild's identity snapshot skipped it and the replay attributed history
+    that was never durably decided from whoever is logged in now. The NULL-root
+    cursor is resolved through discovery, in either stored spelling."""
+    from test_codex_file_attribution import _account_key_for, _auth_json, _map_rows
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    real = tmp_path / "codex"
+    day = real / "sessions" / "2026" / "07" / "20"
+    day.mkdir(parents=True)
+    write_rollout(day / _name(9), token_records(2, session_id="pre-s1"))
+    configured = real
+    if spelling == "symlink-spelling":
+        configured = tmp_path / "codex-link"
+        configured.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("CODEX_HOME", str(configured))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)  # no auth.json: nothing to attribute to
+    finally:
+        conn.close()
+    original = _entry_rows(ns)
+    assert len(original) == 2
+    assert {row[0] for row in _cursor_rows(ns)} == {
+        str(configured / "sessions" / "2026" / "07" / "20" / _name(9))}, (
+        "precondition: the cursor keeps the configured spelling")
+    _shape_pre_s1(ns)
+    _rewind_cache_below(24)
+    monkeypatch.setenv("CODEX_HOME", str(real))
+    (real / "auth.json").write_text(_auth_json("acct-beta", "beta@example.com"))
+
+    conn = ns["open_cache_db"]()
+    try:
+        result = ns["sync_codex_cache"](conn)
+        accounts = {r[0] for r in conn.execute(
+            "SELECT DISTINCT account_key FROM codex_session_entries")}
+        decisions = _map_rows(conn)
+    finally:
+        conn.close()
+    assert result.rebuild_refused is None and not result.prune_refused
+    assert _replay_marker(ns) is None, "the guarded replay must have run"
+    # The re-read spells the source through today's CODEX_HOME.
+    assert sorted(row[1:] for row in _entry_rows(ns)) == sorted(
+        row[1:] for row in original)
+    assert accounts == {None}, (
+        "pre-#416 history was attributed from the live auth.json: "
+        f"{accounts} (D1 forbids inference; expected unattributed)")
+    assert _account_key_for("acct-beta", "beta@example.com") not in accounts
+    assert decisions == [], (
+        "a decision was minted over history that was never durably stamped")
+
+
+@pytest.mark.parametrize("second", (
+    "tier2-unrecognizable-dir", "tier3-missing", "tier2-symlinked",
+    "outside-every-root"))
+def test_a_null_root_row_under_an_unrecognized_root_refuses_the_replay(
+        second, tmp_path, monkeypatch):
+    """#983 (spec 5.2): with any root recognized, a NULL-root identity passed
+    the #485 partition unchecked, so the replay cleared retained rows of a
+    configured root that offers no deletion evidence (unrecognizable, missing,
+    or reached through a symlink). Such a row now refuses exactly as a
+    root-keyed row of that root does; a row under no configured root stays
+    removable."""
+    import shutil
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    root_a = tmp_path / "codex-a"
+    write_rollout(root_a / "sessions" / "2026" / "07" / "20" / _name(9),
+                  token_records(1, session_id="a"))
+    real_b = tmp_path / ("codex-c" if second == "outside-every-root" else "codex-b")
+    real_b.mkdir()
+    configured_b = real_b
+    if second == "tier2-symlinked":
+        configured_b = tmp_path / "codex-b-link"
+        configured_b.symlink_to(real_b, target_is_directory=True)
+    day_b = configured_b / "sessions" / "2026" / "07" / "20"
+    rollout_b = day_b / _name(1)
+    write_rollout(rollout_b, token_records(2, session_id="b"))
+    monkeypatch.setenv("CODEX_HOME", f"{root_a},{configured_b}")
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    assert _entries(ns, rollout_b) == 2, "precondition: stored in configured spelling"
+    _shape_pre_s1(ns)
+    rollout_b.unlink()
+    if second == "tier3-missing":
+        shutil.rmtree(real_b)  # an unmounted volume
+    elif second != "outside-every-root":
+        (day_b / _name(2)).write_text('{"unrelated": true}\n')
+    if second == "outside-every-root":
+        monkeypatch.setenv("CODEX_HOME", str(root_a))
+    retained, cursors = _entry_rows(ns), _cursor_rows(ns)  # at HEAD
+    _rewind_cache_below(24)
+
+    conn = ns["open_cache_db"]()
+    try:
+        result = ns["sync_codex_cache"](conn)
+        record = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
+            (sys.modules["_cctally_cache"].CODEX_ORPHAN_PRUNE_REFUSED_KEY,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if second == "outside-every-root":
+        assert not result.prune_refused
+        assert _replay_marker(ns) is None
+        assert _entries(ns, rollout_b) == 0, "an unconfigured root's row is removable"
+        assert _entries(ns, root_a / "sessions" / "2026" / "07" / "20" / _name(9)) == 1
+        return
+    assert result.prune_refused, "the replay cleared an unrecognized root's history"
+    assert record is not None
+    assert "configured_root_unrecognizable" in json.loads(record[0])["reasons"]
+    assert _replay_marker(ns) == "1"
+    assert _entry_rows(ns) == retained
+    assert _cursor_rows(ns) == cursors
+
+
+def test_a_null_root_row_whose_dated_directory_vanished_holds_the_replay(
+        tmp_path, monkeypatch):
+    """#983 (review F1): once a pre-S1 row resolves to its recognized root, the
+    #485 parent check applies to it. A rollout whose whole dated directory is
+    gone leaves the cache as the only copy of its history, so the replay
+    refuses (``source_parent_unavailable``) and keeps every row and the marker,
+    exactly as it does for a root-keyed row, instead of clearing that history
+    the way the old out-of-band 024 did."""
+    import shutil
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    root = tmp_path / "codex"
+    keeper = root / "sessions" / "2026" / "07" / "20" / _name(9)
+    write_rollout(keeper, token_records(1, session_id="a"))
+    gone_day = root / "sessions" / "2026" / "07" / "21"
+    gone = gone_day / _name(1)
+    write_rollout(gone, token_records(2, session_id="b"))
+    monkeypatch.setenv("CODEX_HOME", str(root))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    assert _entries(ns, gone) == 2, "precondition: the rollout was ingested"
+    _shape_pre_s1(ns)
+    shutil.rmtree(gone_day)  # the user deleted a whole day directory
+    retained, cursors = _entry_rows(ns), _cursor_rows(ns)  # at HEAD
+    _rewind_cache_below(24)
+
+    conn = ns["open_cache_db"]()
+    try:
+        result = ns["sync_codex_cache"](conn)
+        record = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
+            (sys.modules["_cctally_cache"].CODEX_ORPHAN_PRUNE_REFUSED_KEY,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert result.prune_refused, "the replay cleared the only copy of a rollout"
+    assert record is not None
+    assert "source_parent_unavailable" in json.loads(record[0])["reasons"]
+    assert _replay_marker(ns) == "1"
+    assert _entry_rows(ns) == retained
+    assert _cursor_rows(ns) == cursors

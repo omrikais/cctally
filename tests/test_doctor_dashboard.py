@@ -17,6 +17,7 @@ http.client requests, parse JSON), rather than the slower subprocess
 pattern. `redirect_paths` pins HOME so doctor_gather_state never
 touches the developer's real ~/.local/share/cctally.
 """
+import contextlib
 import datetime as dt
 import http.client
 import json
@@ -24,8 +25,16 @@ import pathlib
 import socket
 import sys
 import threading
+import time
+
+import pytest
 
 from conftest import load_script, redirect_paths
+from tests._doctor_maintenance_helpers import (
+    held_exclusive as _held_exclusive,
+    move_stats_into_completed_incident as _move_stats_into_completed_incident,
+    seed_real_store as _seed_real_store,
+)
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, shorten_sse_keepalive, start, stop
 
 
@@ -394,3 +403,90 @@ def test_sse_envelope_doctor_block_serializes_as_json(tmp_path, monkeypatch):
     # If the frame parsed via json.loads above, the dict is by definition
     # JSON-serializable. Re-stringify to confirm round-trip stability.
     json.dumps(payload["doctor"])
+
+
+# ---------------------------------------------------------------------------
+# #1005: GET /api/doctor during stats maintenance
+# ---------------------------------------------------------------------------
+
+def _timed_doctor_get(port, bound_s):
+    start = time.monotonic()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=bound_s)
+    try:
+        conn.request("GET", "/api/doctor")
+        response = conn.getresponse()
+        body = response.read()
+    except (TimeoutError, socket.timeout) as exc:
+        raise AssertionError(
+            f"/api/doctor gave no response within {bound_s}s "
+            f"({time.monotonic() - start:.2f}s elapsed)") from exc
+    finally:
+        conn.close()
+    elapsed = time.monotonic() - start
+    assert response.status == 200, response.status
+    payload = json.loads(body)
+    return elapsed, {check["id"]: check for category in payload["categories"]
+                     for check in category["checks"]}
+
+
+def _assert_maintenance_freshness(check):
+    assert check["severity"] == "warn", check
+    assert check["summary"] == "unavailable (stats.db maintenance in progress)"
+    assert check["remediation"] == "Retry after the stats.db maintenance finishes."
+    assert check["details"]["freshness_unavailable_reason"] == "stats_maintenance"
+    assert check["details"]["effective_freshness_at"] is None
+    assert check["details"]["effective_freshness_age_s"] is None
+
+
+def test_api_doctor_reports_held_stats_maintenance_promptly(
+        tmp_path, monkeypatch):
+    """T1 (failure: the Doctor modal hangs ~40 s per open during stats
+    maintenance, one full 5 s opener wait per guarded stats read)."""
+    ns = load_script()
+    srv, _snap = _start_handler(ns, tmp_path, monkeypatch)
+    try:
+        import _cctally_core
+        _seed_real_store()
+        with _held_exclusive(_cctally_core.STATS_LOCK_MAINTENANCE_PATH):
+            elapsed, checks = _timed_doctor_get(srv.server_address[1], 90.0)
+            assert elapsed < 3.0, f"/api/doctor took {elapsed:.2f}s"
+            assert "stats.db maintenance is in progress" in (
+                checks["db.stats.file"]["summary"]), checks["db.stats.file"]
+            _assert_maintenance_freshness(checks["data.latest_snapshot_age"])
+    finally:
+        stop(srv, srv._test_thread)
+
+
+
+
+@pytest.mark.parametrize("journal_lock", ["held", "absent"])
+def test_api_doctor_reports_the_publication_window_promptly(
+        tmp_path, monkeypatch, journal_lock):
+    """T1b (failure: during a rebuild's physical publication — stats.db absent
+    behind a live interrupted-rebuild family — the interrupted-rebuild probe
+    blocks on `journal.lock`, or creates it, and the stats opens still pay
+    their full waits)."""
+    ns = load_script()
+    srv, _snap = _start_handler(ns, tmp_path, monkeypatch)
+    try:
+        import _cctally_core
+        _seed_real_store()
+        _move_stats_into_completed_incident()
+        journal_lock_path = _cctally_core.JOURNAL_LOCK_PATH
+        if journal_lock == "held":
+            journal_holder = _held_exclusive(journal_lock_path)
+        else:
+            journal_lock_path.unlink(missing_ok=True)
+            journal_holder = contextlib.nullcontext()
+        with _held_exclusive(_cctally_core.STATS_LOCK_MAINTENANCE_PATH), \
+                journal_holder:
+            elapsed, checks = _timed_doctor_get(srv.server_address[1], 20.0)
+            assert elapsed < 3.0, f"/api/doctor took {elapsed:.2f}s"
+            stats_file = checks["db.stats.file"]
+            assert (stats_file["severity"], stats_file["summary"]) == (
+                "warn", "stats.db rebuild is in progress"), stats_file
+            _assert_maintenance_freshness(checks["data.latest_snapshot_age"])
+            if journal_lock == "absent":
+                assert not journal_lock_path.exists()
+    finally:
+        stop(srv, srv._test_thread)

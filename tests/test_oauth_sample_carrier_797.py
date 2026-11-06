@@ -305,7 +305,7 @@ def test_oauth_samples_survive_epoch_1020_rebuild_row_for_row(app, monkeypatch):
     T.rebuild(app)
     conn = sqlite3.connect(str(core.DB_PATH))
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1023
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == core.STATS_INDEX_EPOCH
     finally:
         conn.close()
     assert rows() == before

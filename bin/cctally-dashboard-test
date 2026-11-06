@@ -518,8 +518,8 @@ def need(cond, msg):
     if not cond:
         errs.append(msg)
 
-need(d.get("source_schema_version") == 12,
-     "source_schema_version != 12: %r" % (d.get("source_schema_version"),))
+need(d.get("source_schema_version") == 13,
+     "source_schema_version != 13: %r" % (d.get("source_schema_version"),))
 
 sources = d.get("sources") or {}
 claude = sources.get("claude") or {}

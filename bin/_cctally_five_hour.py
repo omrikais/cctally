@@ -47,6 +47,7 @@ from dataclasses import dataclass
 import _cctally_core  # `weekly_held_exclusion`: the held-column guard (#836)
 import _lib_accounts  # pure stdlib kernel; UNATTRIBUTED sentinel (#341)
 import _lib_rebuild_progress  # #997 D9 progress ticks (stdlib only)
+import _lib_stats_content_revision  # #1050 identical child-set check
 from _lib_five_hour import latest_five_hour_reading
 from _cctally_core import _command_as_of, eprint, now_utc_iso, open_db, parse_iso_datetime
 
@@ -2034,60 +2035,76 @@ def project_open_block_end(
         ),
     )
     # Replace-all children, keyed on the window (not block_id) so an orphan
-    # child of an earlier parent rebuild is cleaned up as well.
+    # child of an earlier parent rebuild is cleaned up as well. An identical
+    # stored set is left in place (#1050): a DELETE and re-INSERT of the same
+    # rows would advance the content revision with nothing changed.
     block_id = int(current["id"])
-    conn.execute(
-        "DELETE FROM five_hour_block_models "
-        "WHERE five_hour_window_key = ? AND account_key = ?",
-        (window_key, account_key),
-    )
-    if totals.get("by_model"):
-        conn.executemany(
-            """
-            INSERT INTO five_hour_block_models (
-              block_id, five_hour_window_key, model,
-              input_tokens, output_tokens,
-              cache_create_tokens, cache_read_tokens,
-              cost_usd, entry_count, account_key
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    block_id, window_key, model,
-                    b["input_tokens"], b["output_tokens"],
-                    b["cache_create_tokens"], b["cache_read_tokens"],
-                    b["cost_usd"], b["entry_count"], account_key,
-                )
-                for model, b in totals["by_model"].items()
-            ],
+    model_rows = _open_block_child_rows(
+        block_id, window_key, account_key, "model", totals.get("by_model"))
+    if not _lib_stats_content_revision.child_set_unchanged(
+            conn, "five_hour_block_models", five_hour_window_key=window_key,
+            account_key=account_key, replacement=model_rows):
+        conn.execute(
+            "DELETE FROM five_hour_block_models "
+            "WHERE five_hour_window_key = ? AND account_key = ?",
+            (window_key, account_key),
         )
-    conn.execute(
-        "DELETE FROM five_hour_block_projects "
-        "WHERE five_hour_window_key = ? AND account_key = ?",
-        (window_key, account_key),
-    )
-    if totals.get("by_project"):
-        conn.executemany(
-            """
-            INSERT INTO five_hour_block_projects (
-              block_id, five_hour_window_key, project_path,
-              input_tokens, output_tokens,
-              cache_create_tokens, cache_read_tokens,
-              cost_usd, entry_count, account_key
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    block_id, window_key, project_path,
-                    b["input_tokens"], b["output_tokens"],
-                    b["cache_create_tokens"], b["cache_read_tokens"],
-                    b["cost_usd"], b["entry_count"], account_key,
+        if model_rows:
+            conn.executemany(
+                """
+                INSERT INTO five_hour_block_models (
+                  block_id, five_hour_window_key, model,
+                  input_tokens, output_tokens,
+                  cache_create_tokens, cache_read_tokens,
+                  cost_usd, entry_count, account_key
                 )
-                for project_path, b in totals["by_project"].items()
-            ],
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [tuple(row.values()) for row in model_rows],
+            )
+    project_rows = _open_block_child_rows(
+        block_id, window_key, account_key, "project_path",
+        totals.get("by_project"))
+    if not _lib_stats_content_revision.child_set_unchanged(
+            conn, "five_hour_block_projects", five_hour_window_key=window_key,
+            account_key=account_key, replacement=project_rows):
+        conn.execute(
+            "DELETE FROM five_hour_block_projects "
+            "WHERE five_hour_window_key = ? AND account_key = ?",
+            (window_key, account_key),
         )
+        if project_rows:
+            conn.executemany(
+                """
+                INSERT INTO five_hour_block_projects (
+                  block_id, five_hour_window_key, project_path,
+                  input_tokens, output_tokens,
+                  cache_create_tokens, cache_read_tokens,
+                  cost_usd, entry_count, account_key
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [tuple(row.values()) for row in project_rows],
+            )
+
+
+def _open_block_child_rows(block_id, window_key, account_key, label,
+                           breakdown) -> "list[dict]":
+    """One open block's child rows from a `_compute_block_totals` breakdown,
+    as column → value mappings in the INSERT's column order."""
+    return [
+        {
+            "block_id": block_id, "five_hour_window_key": window_key,
+            label: name,
+            "input_tokens": b["input_tokens"],
+            "output_tokens": b["output_tokens"],
+            "cache_create_tokens": b["cache_create_tokens"],
+            "cache_read_tokens": b["cache_read_tokens"],
+            "cost_usd": b["cost_usd"], "entry_count": b["entry_count"],
+            "account_key": account_key,
+        }
+        for name, b in (breakdown or {}).items()
+    ]
 
 
 def _materialize_open_candidate(conn, key, acct, start_row) -> int:

@@ -100,9 +100,7 @@ the native `cctally codex quota` commands and setup-managed lifecycle hooks;
 S4 still owns dashboard reconciliation, S6 now owns normalization and assembly,
 and S7–S8 still own routes, search, export, sharing, and browser storage.
 
-The cache migration `024_codex_fused_ingest_rebuild` deliberately clears old
-Codex-derived rows so the next local rollout sync can rederive provider-root
-and thread facts without fabricating them from an older accounting-only cache.
+The cache migration `024_codex_fused_ingest_rebuild` schedules a full replay of the local rollouts so the next Codex sync can rederive provider-root and thread facts without fabricating them from an older accounting-only cache. The migration itself keeps the cached Codex history; the sync replaces it only after confirming the rollouts can be read. On a Python without a zstd decoder, compressed rollouts cannot be read, so the cached history is kept and reported until a decoder is available (Python 3.14+ or `backports.zstd`), when the replay runs. Migrations `026_codex_conversation_key_backfill` and `027_codex_fork_preamble_rebuild` schedule the same replay.
 
 ## S6 conversation normalization
 

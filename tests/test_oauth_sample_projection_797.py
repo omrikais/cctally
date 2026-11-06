@@ -40,8 +40,9 @@ EARLY = "1970-01-01T00:00:00.000000Z"
 COLUMNS = ("account_key, observation_id, requested_at_utc, captured_at_utc, "
            "weekly_percent, weekly_resets_at_utc, five_hour_percent, "
            "five_hour_resets_at_utc, five_hour_window_key")
-INDEX_SQL = ("SELECT observation_id, account_key, captured_at_utc"
-             " FROM claude_weekly_observation_index")
+INDEX_SQL = ("SELECT observation_id, account_key, captured_at_utc,"
+             " weekly_percent, weekly_resets_at_utc, weekly_reading_genuine,"
+             " weekly_freshness_eligible FROM claude_weekly_observation_index")
 HISTORY_SQL = ("SELECT decision_op_id, observation_id, disposition"
                " FROM claude_weekly_correction_history")
 
@@ -241,8 +242,10 @@ def _reviewed(app, tmp_path, capsys, decisions, *, name):
     capsys.readouterr()
     base = ["db", "rederive", "--family", "claude-usage",
             "--reviewed-weekly-decisions", str(path), "--json"]
-    assert app.cmd_db_rederive(parser.parse_args(base)) == 0
-    preview = json.loads(capsys.readouterr().out)
+    rc = app.cmd_db_rederive(parser.parse_args(base))
+    captured = capsys.readouterr()
+    assert rc == 0, (captured.out, captured.err)
+    preview = json.loads(captured.out)
     manifest.update(expectedBaselinePlanHash=preview["baselinePlanHash"],
                     expectedDecisionPlanHash=preview["decisionPlanHash"])
     path.write_text(json.dumps(manifest))
@@ -296,6 +299,12 @@ def test_live_rebuild_rederive_completion_and_correction_rebuild_agree_row_for_r
     live_index = _counter(_rows(app, INDEX_SQL))
     assert sum(live_index.values()) == 10 and len(live_index) == 10
     assert {r[1] for r in live_index} == {_key("A"), _key("B")}
+    # #1018 twin spec 8.5: independently written expected values for the
+    # enriched columns — every direct reading is genuine and eligible, with
+    # its raw weekly value and the normalized reset.
+    assert sorted((r[1], r[3], r[4], r[5], r[6]) for r in live_index) == sorted(
+        [(_key("A"), float(w), _iso(WEEK_END), 1, 1) for w, _ in trace]
+        + [(_key("B"), float(w + 5), _iso(WEEK_END), 1, 1) for w, _ in trace])
 
     scratch: list = []
     original = _cctally_rederive.replay_scratch_records
@@ -320,11 +329,19 @@ def test_live_rebuild_rederive_completion_and_correction_rebuild_agree_row_for_r
                 "index": _counter(_rows(app, INDEX_SQL)),
                 "history": _counter(_rows(app, HISTORY_SQL))}
 
-    def scratch_agrees(expected, label):
+    def scratch_agrees(expected, label, counterfactual=None):
         assert scratch, f"{label} replayed no scratch"
         for found in scratch:
             assert found["samples"] == expected["samples"], label
-            assert found["index"] == expected["index"], label
+            # #1018 twin spec 8.5: equality is owed for IDENTICAL decision
+            # sets. A baseline replay without the retained reviewed op holds
+            # the counterfactual eligibility (the held reading eligible), and
+            # nothing else.
+            if found["history"] == expected["history"]:
+                assert found["index"] == expected["index"], label
+            else:
+                assert found["index"] in (expected["index"], counterfactual), (
+                    label, found["index"] - expected["index"])
             # A counterfactual baseline replay (the journal without a retained
             # reviewed op, for the baseline plan) holds a subset; the replay
             # of the journal itself holds exactly the published history.
@@ -369,6 +386,13 @@ def test_live_rebuild_rederive_completion_and_correction_rebuild_agree_row_for_r
             and (r.get("payload") or {}).get("kind", "").startswith(
                 "claude_weekly_observation_decision")]
     expected["history"] = collections.Counter({(op, held, "hold"): 1})
+    # The hold makes exactly the held reading ineligible (spec 5.1), and the
+    # counterfactual baseline differs from it in that one flag.
+    counterfactual = expected["index"]
+    expected["index"] = _counter(
+        row[:6] + ((0,) if row[0] == held else (row[6],))
+        for row in counterfactual.elements())
+    assert counterfactual != expected["index"]
     assert published() == expected, "correction rebuild"
     ops = _rows(app, "SELECT decision_op_id FROM claude_weekly_correction_ops")
     assert ops == [(op,)]
@@ -376,11 +400,16 @@ def test_live_rebuild_rederive_completion_and_correction_rebuild_agree_row_for_r
     assert published() == expected, "ordinary rebuild after the hold"
     scratch.clear()
     T.rederive(app)
-    scratch_agrees(expected, "rederive scratch after the hold")
+    scratch_agrees(expected, "rederive scratch after the hold", counterfactual)
+    # The plain rederive's baseline replay excludes the retained reviewed op:
+    # its index differs from the published one in exactly the held flag.
+    assert [found["index"] == counterfactual for found in scratch].count(
+        True) >= 1, [found["index"] - expected["index"] for found in scratch]
     scratch.clear()
     drop_index()
     T.rebuild(app)
-    scratch_agrees(expected, "completion scratch after the hold")
+    scratch_agrees(expected, "completion scratch after the hold",
+                   counterfactual)
     assert published() == expected, "completing rebuild after the hold"
     assert _rows(app, "SELECT decision_op_id FROM claude_weekly_correction_ops"
                  ) == ops
@@ -665,7 +694,9 @@ def test_observation_index_attribution_is_live_ingests_on_every_path(
     def index(path=None):
         conn = sqlite3.connect(str(path or core.DB_PATH))
         try:
-            rows = {r[0]: (r[1], r[2]) for r in conn.execute(INDEX_SQL)}
+            # #1018 twin review F2: every column, the enriched ones
+            # included, so the rebuild legs below compare all of them.
+            rows = {r[0]: tuple(r[1:]) for r in conn.execute(INDEX_SQL)}
             staging = conn.execute(
                 "SELECT name FROM sqlite_master WHERE name ="
                 " 'rebuild_weekly_observation_unstamped'").fetchall()
@@ -681,6 +712,14 @@ def test_observation_index_attribution_is_live_ingests_on_every_path(
         stamped["id"]: account_b, explicit["id"]: unattributed,
         bound["id"]: unattributed, current["id"]: unattributed}
     assert live[before["id"]][1] == "2026-01-04T09:00:00.000000Z"
+    # Independently written enriched values: every reading is genuine (a
+    # historical-policy record names no required account, whichever account
+    # it is attributed to) and captured before its normalized reset.
+    resets = _iso(_INDEX_RESETS)
+    assert {k: v[2:] for k, v in live.items()} == {
+        before["id"]: (1.0, resets, 1, 1), after["id"]: (1.0, resets, 1, 1),
+        stamped["id"]: (1.0, resets, 1, 1), explicit["id"]: (1.0, resets, 1, 1),
+        bound["id"]: (1.0, resets, 1, 1), current["id"]: (2.0, resets, 1, 1)}
     assert ns["cmd_db_rebuild"](argparse.Namespace(db="stats", json=True)) == 0
     capsys.readouterr()
     assert index() == live, "rebuild"
@@ -696,3 +735,395 @@ def test_observation_index_attribution_is_live_ingests_on_every_path(
             target_path=str(dest), high_water=pinned,
             update_quota_cache=False)
     assert index(dest) == {before["id"]: live[before["id"]]}
+
+
+# --------------------------------------------------------------------------
+# #1018 twin spec 5.1: the enriched observation index (epoch 1024)
+# --------------------------------------------------------------------------
+
+ENRICHED_SQL = (
+    "SELECT observation_id, weekly_percent, weekly_resets_at_utc,"
+    " weekly_reading_genuine, weekly_freshness_eligible"
+    " FROM claude_weekly_observation_index")
+_FACTS_RESET = WEEK_END
+_FACTS_ACCOUNT = "a" * 32
+_OTHER_ACCOUNT = "b" * 32
+
+
+def _publication(weekly_kind, *, weekly_account=_FACTS_ACCOUNT,
+                 five_kind=None, five_account=_FACTS_ACCOUNT):
+    provenance = {"sevenDay": {"kind": weekly_kind, "account": weekly_account}}
+    if five_kind is not None:
+        provenance["fiveHour"] = {"kind": five_kind, "account": five_account}
+    return provenance
+
+
+def _facts_payload(variant):
+    """One payload per detector-mask branch (spec 5.1 genuineness)."""
+    payload = {"weekly_percent": 41.0, "resets_at": _FACTS_RESET,
+               "captured_at": _iso(NOW), "source": "statusline"}
+    if variant == "historical":
+        return payload
+    if variant == "unsupported":
+        return dict(payload, detector_policy="2")
+    payload["detector_policy"] = 2
+    if variant == "direct":
+        return payload
+    publication = dict(payload, publication_id="p:1")
+    kinds = {
+        "candidate": _publication("candidate"),
+        "retained_low": _publication("retained_low"),
+        "projection": _publication("projection"),
+        "candidate_other_account": _publication(
+            "candidate", weekly_account=_OTHER_ACCOUNT),
+        "candidate_no_account": _publication("candidate", weekly_account=None),
+        "unknown_kind": _publication("observed"),
+        "five_hour_projection": _publication("candidate",
+                                             five_kind="projection"),
+        "five_hour_other_account": _publication(
+            "candidate", five_kind="candidate", five_account=_OTHER_ACCOUNT),
+        "five_hour_unclassified": _publication("candidate"),
+    }
+    if variant == "no_provenance":
+        return publication
+    publication["publication"] = kinds[variant]
+    if variant.startswith("five_hour"):
+        publication["five_hour_percent"] = 12.0
+    return publication
+
+
+_FACT_VARIANTS = (
+    "historical", "unsupported", "direct", "no_provenance", "candidate",
+    "retained_low", "projection", "candidate_other_account",
+    "candidate_no_account", "unknown_kind", "five_hour_projection",
+    "five_hour_other_account", "five_hour_unclassified")
+
+
+@pytest.mark.parametrize("variant", _FACT_VARIANTS)
+@pytest.mark.parametrize("account", (_FACTS_ACCOUNT, _OTHER_ACCOUNT))
+def test_weekly_reading_genuineness_reproduces_the_detector_mask(
+        variant, account):
+    """#1018 twin spec 5.1 (failure: the freshness index calls a reading
+    genuine that the detector treats as filled from the store, withheld or
+    another account's, so a projection-filled publication confirms the
+    displayed weekly value)."""
+    import _cctally_journal as jr
+    import _cctally_oauth_samples as S
+    import _cctally_record as R
+    payload = _facts_payload(variant)
+    record = {"t": "obs", "provider": "claude", "src": "statusline",
+              "id": f"o:{variant}", "at": _iso(NOW), "account": account,
+              "payload": payload}
+    facts = S.weekly_observation_facts(record)
+    assert facts is not None
+    mask = R._detector_observation_mask(
+        payload, jr.detector_policy_of(payload), account_key=account,
+        five_hour=payload.get("five_hour_percent") is not None)
+    assert S.weekly_reading_genuine(facts, account) == (
+        mask is not None and mask[0])
+
+
+def test_weekly_reset_spelling_is_the_samples_spelling():
+    """#1018 twin spec 5.1 (failure: the index spells a reset differently from
+    `claude_oauth_samples`, so equality on the window never matches)."""
+    import _cctally_oauth_samples as S
+    import _lib_oauth_samples as P
+    for offset in (-1800, -1799, -1, 0, 1, 1799, 1800):
+        reset = WEEK_END + offset
+        payload = {"weekly_percent": 10.0, "resets_at": reset, "source": "api",
+                   "captured_at": _iso(NOW), KEY: _q(NOW - 1),
+                   "account_binding": {"accountKey": "k", "status": "ok"}}
+        sample = P.sample_from_observation(
+            payload, account_key="k", observation_id="o:1",
+            captured_at_utc=payload["captured_at"])
+        facts = S.weekly_observation_facts({
+            "t": "obs", "provider": "claude", "src": "refresh-usage",
+            "id": "o:1", "at": _iso(NOW), "account": "k", "payload": payload})
+        assert facts.weekly_resets_at_utc == sample.weekly_resets_at_utc
+    assert S.weekly_observation_facts({
+        "t": "evt", "provider": "claude", "src": "record-usage", "id": "e:1",
+        "payload": {"kind": "weekly_credit_effects"}}) is None
+
+
+def _index_obs(oid, *, captured, account=_FACTS_ACCOUNT, variant="direct",
+               weekly=41.0, resets_at=_FACTS_RESET, **extra):
+    payload = dict(_facts_payload(variant), weekly_percent=weekly,
+                   resets_at=resets_at, captured_at=captured)
+    payload.update(extra)
+    record = {"t": "obs", "provider": "claude", "src": "statusline",
+              "id": oid, "at": captured, "payload": payload}
+    if account is not None:
+        record["account"] = account
+    return record
+
+
+def _decision(op_id, oid, disposition):
+    return {"t": "op", "id": op_id, "payload": {
+        "kind": "claude_weekly_observation_decision_v2", "schema_version": 2,
+        "weekly_axis_decisions": [
+            {"observationId": oid, "disposition": disposition}]}}
+
+
+def _enriched(conn):
+    return {r[0]: tuple(r[1:]) for r in conn.execute(ENRICHED_SQL)}
+
+
+def test_enriched_index_columns_at_each_transition(app):
+    """#1018 twin spec 5.1 and 8.5, written independently of any derivation
+    path (failure: every path agrees on a wrong flag — a capture at the reset,
+    a hold, a projection axis or another account's staged reading counted as
+    a fresh confirmation, or an accept that never restores eligibility)."""
+    import _cctally_oauth_samples as S
+    reset_text = _iso(_FACTS_RESET)
+    at_reset = dt.datetime.fromtimestamp(_FACTS_RESET, dt.timezone.utc)
+
+    def canon(moment):
+        return moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    before_reset = canon(at_reset - dt.timedelta(microseconds=1))
+    conn = app.open_db()
+    try:
+        # Live and scratch projection.
+        S.project_observation(conn, _index_obs("o:plain", captured=_iso(NOW)))
+        S.project_observation(conn, _index_obs(
+            "o:projection", captured=_iso(NOW + 1), variant="projection"))
+        S.project_observation(conn, _index_obs(
+            "o:minus", captured=before_reset))
+        S.project_observation(conn, _index_obs(
+            "o:exact", captured=canon(at_reset)))
+        S.project_observation(conn, _index_obs(
+            "o:plus", captured=canon(at_reset + dt.timedelta(microseconds=1))))
+        # Reset normalization: 31 minutes past the hour is the next hour.
+        S.project_observation(conn, _index_obs(
+            "o:normalized", captured=_iso(NOW + 2),
+            resets_at=_FACTS_RESET - 3600 + 31 * 60))
+        S.project_observation(conn, _index_obs(
+            "o:no-weekly-reset", captured=_iso(NOW + 3), resets_at="soon"))
+        # A decision folded before its observation still applies on insert.
+        S.apply_weekly_observation_decision_op(
+            conn, _decision("op:early", "o:early", "hold"))
+        S.project_observation(conn, _index_obs("o:early", captured=_iso(NOW)))
+        # The apply-only rebuild, including the staged legacy attribution of
+        # an unstamped record against the cutover account.
+        projector = S.RebuildProjector(conn)
+        projector.offer(_index_obs("o:rebuilt", captured=_iso(NOW + 4)))
+        projector.offer(_index_obs(
+            "o:staged", captured=_iso(NOW + 5), account=None))
+        projector.offer(_index_obs(
+            "o:staged-other", captured=_iso(NOW + 6), account=None,
+            variant="candidate"))
+        projector.offer(_index_obs(
+            "o:staged-match", captured=_iso(NOW + 7), account=None,
+            variant="candidate", publication=_publication(
+                "candidate", weekly_account=_OTHER_ACCOUNT)))
+        projector.offer(_index_obs(
+            "o:staged-own", captured=_iso(NOW + 8), account=None))
+        conn.commit()
+        projector.flush()
+        conn.execute("BEGIN")
+        S.apply_weekly_observation_decision_op(
+            conn, _decision("op:staged", "o:staged-own", "hold"))
+        conn.commit()
+        S.attribute_staged_observations(conn, _OTHER_ACCOUNT)
+        before = _enriched(conn)
+        # Hold, then accept, at the three reset-boundary captures.
+        for oid in ("o:minus", "o:exact", "o:plus", "o:plain"):
+            S.apply_weekly_observation_decision_op(
+                conn, _decision(f"op:hold:{oid}", oid, "hold"))
+        held = _enriched(conn)
+        for oid in ("o:minus", "o:exact", "o:plus", "o:plain"):
+            S.apply_weekly_observation_decision_op(
+                conn, _decision(f"op:accept:{oid}", oid, "accept"))
+        accepted = _enriched(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    normalized = _iso(_FACTS_RESET)
+    assert before == {
+        "o:plain": (41.0, reset_text, 1, 1),
+        "o:projection": (41.0, reset_text, 0, 0),
+        "o:minus": (41.0, reset_text, 1, 1),
+        "o:exact": (41.0, reset_text, 1, 0),
+        "o:plus": (41.0, reset_text, 1, 0),
+        "o:normalized": (41.0, normalized, 1, 1),
+        "o:no-weekly-reset": (41.0, None, 1, 0),
+        "o:early": (41.0, reset_text, 1, 0),
+        "o:rebuilt": (41.0, reset_text, 1, 1),
+        "o:staged": (41.0, reset_text, 1, 1),
+        # A v2 publication naming account A, attributed to the cutover's B,
+        # and one naming B itself.
+        "o:staged-other": (41.0, reset_text, 0, 0),
+        "o:staged-match": (41.0, reset_text, 1, 1),
+        # A staged reading held before it is moved stays ineligible.
+        "o:staged-own": (41.0, reset_text, 1, 0),
+    }
+    assert {k: held[k][3] for k in ("o:minus", "o:exact", "o:plus",
+                                    "o:plain")} == {
+        "o:minus": 0, "o:exact": 0, "o:plus": 0, "o:plain": 0}
+    assert {k: accepted[k][3] for k in ("o:minus", "o:exact", "o:plus",
+                                        "o:plain")} == {
+        "o:minus": 1, "o:exact": 0, "o:plus": 0, "o:plain": 1}
+
+
+def _canonical(epoch: float) -> str:
+    return _q(epoch)
+
+
+def test_enriched_index_rows_agree_on_every_derivation_path(
+        app, monkeypatch, tmp_path, capsys):
+    """#1018 twin R6 and spec 8.5 (failure: the live store, the ordinary
+    rebuild, the rederive and completion scratch replays or the completing
+    rebuild disagree on an enriched index column — genuineness, the
+    normalized reset or freshness eligibility — for a reading without an
+    OAuth sample, a staged legacy reading, a projection-filled weekly axis,
+    an off-hour reset, a credit drop or a reviewed hold then accept; or every
+    path agrees on a wrong value).
+
+    Every scenario is written by the real writers except the legacy prefix
+    (the previous release's bytes) and the store-projected publication, and
+    every expected value below is written independently of any path."""
+    import _cctally_core as core
+    import _cctally_journal as jr
+    import _cctally_rederive
+    import _lib_journal as J
+    a, b = _key("A"), _key("B")
+    # Staged legacy attribution: two unstamped pre-boundary readings around
+    # the cutover op, which names account B.
+    before = _legacy_reading(J, _iso(NOW - 7200),
+                             payload={"weekly_percent": 20.0,
+                                      "resets_at": WEEK_END})
+    cutover = J.make_op(
+        at=_iso(NOW - 5400), src="accounts-cutover",
+        payload={"kind": "accounts_cutover", "claude_legacy_account": b},
+        writer_generation=None)
+    cutover["id"] = jr.CUTOVER_OP_ID
+    after = _legacy_reading(J, _iso(NOW - 3600),
+                            payload={"weekly_percent": 21.0,
+                                     "resets_at": WEEK_END})
+    T.raw_append([before, cutover, after])
+    # A direct OAuth reading (with its sample), then status-line readings
+    # with no OAuth sample: one on the hour, one on an off-hour reset that
+    # normalizes to the same window.
+    _refresh(app, monkeypatch, at=NOW, weekly=30, five=10)
+    T.current(app, monkeypatch, at=_iso(NOW + 60), weekly=30,
+              week_end=_iso(WEEK_END), source="statusline")
+    T.current(app, monkeypatch, at=_iso(NOW + 120), weekly=31,
+              week_end=_iso(WEEK_END - 3600 + 31 * 60), source="statusline")
+    # A v2 publication whose weekly axis is a store projection, beside a
+    # changed genuine five-hour reading.
+    reading = next(r for r in reversed(T.journal_records())
+                   if r.get("t") == "obs")
+    payload = dict(reading["payload"], weekly_percent=31.0,
+                   captured_at=_iso(NOW + 180), detector_policy=2,
+                   publication_id=f"pub:{NOW + 180}", five_hour_percent=12.0,
+                   publication={"sevenDay": {"kind": "projection",
+                                             "account": a},
+                                "fiveHour": {"kind": "candidate",
+                                             "account": a}})
+    projection = J.make_obs(at=_iso(NOW + 180), src=reading["src"],
+                            provider="claude", payload=payload,
+                            account=reading.get("account"))
+    jr.append_record(projection)
+    assert jr.run_stats_ingest(mode="authoritative").error is None
+    # A credit drop (the in-place auto-credit path writes its synthetic
+    # snapshot; the index keeps one row per admitted reading).
+    _refresh(app, monkeypatch, at=NOW + 600, weekly=0, five=11)
+    oauth = _obs_id(app, _iso(NOW))
+    status_on_hour = _obs_id(app, _iso(NOW + 60))
+    status_off_hour = _obs_id(app, _iso(NOW + 120))
+    credit = _obs_id(app, _iso(NOW + 600))
+    # Reviewed decisions through `db rederive`: a hold then an accept of one
+    # reading, and a hold that stays on another. (`db rederive` refuses a
+    # decision op it did not write, so this journal cannot record a decision
+    # before its observation. The apply-only rebuild flushes every queued
+    # index row before its Phase 1 fold applies any decision op, so the
+    # rebuild legs below exercise the applier maintaining eligibility on
+    # already-indexed rows; a decision present before its observation is
+    # inserted is covered at unit level by `op:early` in
+    # `test_enriched_index_columns_at_each_transition`.)
+    _set_clock(monkeypatch, NOW + 2000)
+    _reviewed(app, tmp_path, capsys, [(status_on_hour, "hold")], name="h1")
+    _set_clock(monkeypatch, NOW + 2100)
+    _reviewed(app, tmp_path, capsys, [(status_on_hour, "accept")], name="a1")
+    _set_clock(monkeypatch, NOW + 2200)
+    _reviewed(app, tmp_path, capsys, [(status_off_hour, "hold")],
+              name="h2")
+
+    reset = _iso(WEEK_END)
+    # Independently written: (account, capture, weekly, reset, genuine,
+    # eligible before any decision).
+    base = {
+        before["id"]: (b, _canonical(NOW - 7200), 20.0, reset, 1, 1),
+        after["id"]: (b, _canonical(NOW - 3600), 21.0, reset, 1, 1),
+        oauth: (a, _canonical(NOW), 30.0, reset, 1, 1),
+        status_on_hour: (a, _canonical(NOW + 60), 30.0, reset, 1, 1),
+        status_off_hour: (a, _canonical(NOW + 120), 31.0, reset, 1, 1),
+        projection["id"]: (a, _canonical(NOW + 180), 31.0, reset, 0, 0),
+        credit: (a, _canonical(NOW + 600), 0.0, reset, 1, 1),
+    }
+    ops = [r["id"] for r in T.journal_records() if r.get("t") == "op"
+           and (r.get("payload") or {}).get("kind", "").startswith(
+               "claude_weekly_observation_decision")]
+    assert len(ops) == 3
+
+    def expected_for(history):
+        """The index ``history``'s effective decisions imply: latest op (in
+        journal order) wins, and a hold clears eligibility."""
+        effective = {}
+        for op_id in ops:
+            for (decision_op, observation, disposition), count in (
+                    history.items()):
+                if decision_op == op_id and count:
+                    effective[observation] = disposition
+        return _counter(
+            (oid,) + row[:5] + (
+                0 if effective.get(oid) == "hold" else row[5],)
+            for oid, row in base.items())
+
+    def index(rows):
+        return _counter(tuple(r) for r in rows)
+
+    scratch: list = []
+    original = _cctally_rederive.replay_scratch_records
+
+    def capturing(conn, records, *args, **kwargs):
+        events = original(conn, records, *args, **kwargs)
+        scratch.append({
+            "index": index(conn.execute(INDEX_SQL)),
+            "history": _counter(tuple(r) for r in conn.execute(HISTORY_SQL)),
+        })
+        return events
+
+    monkeypatch.setattr(_cctally_rederive, "replay_scratch_records", capturing)
+
+    def published():
+        history = _counter(_rows(app, HISTORY_SQL))
+        return history, index(_rows(app, INDEX_SQL))
+
+    history, live = published()
+    assert {row[2] for row in history} == {"hold", "accept"}
+    assert live == expected_for(history), "live ingest"
+    held = {r[0]: r[6] for r in live}
+    assert held[status_off_hour] == 0 and held[status_on_hour] == 1, held
+
+    def scratch_agrees(label):
+        assert scratch, f"{label} replayed no scratch"
+        for found in scratch:
+            assert found["index"] == expected_for(found["history"]), (
+                label, found["index"] - expected_for(found["history"]),
+                expected_for(found["history"]) - found["index"])
+        assert any(found["history"] == history for found in scratch), label
+        scratch.clear()
+
+    T.rebuild(app)
+    assert published() == (history, live), "ordinary rebuild"
+    T.rederive(app)
+    scratch_agrees("rederive scratch")
+    assert published() == (history, live), "after plain rederive"
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        path = core.DB_PATH.with_name(core.DB_PATH.name + suffix)
+        if path.exists():
+            path.unlink()
+    T.rebuild(app)
+    scratch_agrees("completion scratch")
+    assert published() == (history, live), "completing rebuild"

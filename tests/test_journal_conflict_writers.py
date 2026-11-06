@@ -2389,3 +2389,273 @@ def test_doctor_shallow_gather_does_not_scan_for_conflicts(ns):
     assert state.journal_conflicts is None
     assert state.journal_protocol_violations is None
     assert state.journal_protocol_error is None
+
+
+# --------------------------------------------------------------------------
+# #1054: the deep scan's checkpoint (spec 7.1, T1-T3)
+# --------------------------------------------------------------------------
+
+def _snapshot_evt(event_id, percent, *, account_key="acct-a"):
+    payload = {
+        "captured_at_utc": AT,
+        "week_start_date": "2026-07-20",
+        "week_end_date": "2026-07-27",
+        "week_start_at": "2026-07-20T00:00:00+00:00",
+        "week_end_at": "2026-07-27T00:00:00+00:00",
+        "weekly_percent": percent,
+        "source": "test",
+        "payload_json": "{}",
+    }
+    if account_key is not None:
+        payload["account_key"] = account_key
+    return J.make_evt(kind="snapshot_accept", id=event_id, at=AT,
+                      payload=payload)
+
+
+def _scan_obs(percent):
+    return J.make_obs(at=AT, src="statusline", provider="claude",
+                      payload={"weekly_percent": percent})
+
+
+def _t1_journal(jr):
+    """Spec 7.1 T1: four segments. Each line is tagged "hit" (a record the
+    scan keeps or acts on), "skip" (decoded or malformed but not a hit) or
+    "blank"; a trailing ``None`` tag marks a torn fragment."""
+    legacy = J.unstamped_record(_snapshot_evt("sa:x", 10.0, account_key=None))
+    commit = J.make_correction_batch(
+        batch_id="batch:t1-commit-only", family="claude-usage", at=AT,
+        actions=[{"action": "replace", "id": "sa:t1", "rev": 1, "at": AT,
+                  "payload": {"kind": "snapshot_accept",
+                              "weekly_percent": 2.0}}],
+    )[-1]
+    cutover = {"v": 1, "t": "zzz", "id": jr.CUTOVER_OP_ID, "at": AT,
+               "payload": {"kind": "accounts_cutover",
+                           "claude_legacy_account": "acct-a"}}
+    encode = J.encode_line
+    return {
+        "observations-2026-01.jsonl": [
+            ("skip", encode(_scan_obs(1.0))),
+            ("blank", b"\n"),
+            ("hit", encode(_snapshot_evt("sa:x", 10.0))),
+            ("skip", b'{"t":"zzz"}\n'),
+            ("skip", encode(_scan_obs(2.0))),
+            ("skip", b"{not json\n"),
+            ("hit", encode(cutover)),
+            ("skip", encode(_scan_obs(3.0))),
+            ("hit", encode(legacy)),
+            ("hit", encode(commit)),
+            ("skip", encode(_scan_obs(4.0))),
+            ("skip", encode(_scan_obs(5.0))),
+        ],
+        "observations-2026-02.jsonl": [],
+        "observations-2026-03.jsonl": [(None, b'{"t":"obs","partial')],
+        "observations-2026-04.jsonl": [
+            ("skip", encode(_scan_obs(6.0))),
+            ("hit", encode(_snapshot_evt("sa:y", 20.0))),
+            ("hit", encode(_snapshot_evt("sa:y", 21.0))),
+            ("skip", encode(_scan_obs(7.0))),
+            (None, b'{"t":"ob'),
+        ],
+    }
+
+
+def _write_journal(layout):
+    import _cctally_core
+    jdir = _cctally_core.JOURNAL_DIR
+    jdir.mkdir(parents=True, exist_ok=True)
+    for name, lines in layout.items():
+        (jdir / name).write_bytes(b"".join(raw for _tag, raw in lines))
+    return jdir
+
+
+def _t1_expected_fingerprint(layout):
+    """The oracle: the selector over the physical decoded order, with the
+    legacy event stamped with the cutover account exactly as rebuild does."""
+    slots = []
+    for lines in layout.values():
+        for tag, raw in lines:
+            if tag not in ("hit", "skip"):
+                continue
+            record = J.decode_line(raw.rstrip(b"\n"))
+            if record is None:
+                continue
+            if record.get("t") == "evt" and "account_key" not in record[
+                    "payload"]:
+                record["payload"]["account_key"] = "acct-a"
+            slots.append(record if record.get("t") in (
+                "evt", "correction", "correction_batch", "op") else None)
+    selection = J.resolve_effective_events(slots)
+    (violation,) = selection.protocol_violations
+    return violation.to_dict()
+
+
+def _journal_values(state):
+    """Every journal value the gather computes, for cold/warm equality."""
+    return {name: value for name, value in vars(state).items()
+            if name.startswith("journal_") or name == "legacy_writer"}
+
+
+def _scan_index_path():
+    import _cctally_core
+    return _cctally_core.JOURNAL_DIR / ".doctor-scan-index"
+
+
+def _published_entries():
+    import _lib_doctor_scan_index as dsi
+    raw = _scan_index_path().read_bytes()
+    entries = dsi.decode(raw, json.loads(raw)["version"])
+    assert entries is not None
+    return entries
+
+
+def _index_identity():
+    st = _scan_index_path().stat()
+    return st.st_ino, st.st_mtime_ns, st.st_size
+
+
+def test_doctor_deep_scan_checkpoint_reproduces_every_journal_value(ns):
+    """T1 (#1054): detects a reconstruction that drops a placeholder, shifts
+    an ordinal or a prior high-water, loses a special-id record, or skips
+    legacy normalization. The absent conflict on sa:x is observable only
+    through normalization with the cutover candidate's account, and the
+    sequence-bearing fingerprint moves with any shifted ordinal."""
+    jr = _jr()
+    layout = _t1_journal(jr)
+    _write_journal(layout)
+    expected_violation = _t1_expected_fingerprint(layout)
+
+    def check(state):
+        assert state.journal_malformed_count == 1
+        assert state.journal_torn_tail_count == 2
+        assert [c["eventId"] for c in state.journal_conflicts] == ["sa:y"]
+        assert state.journal_protocol_error is None
+        assert state.journal_protocol_violations == [expected_violation]
+        assert expected_violation["kind"] == "commit_without_begin"
+
+    cold = ns["doctor_gather_state"](deep=True)
+    check(cold)
+    assert _scan_index_path().exists()
+    # Spec 5.3: an empty segment is skipped, so it gets no entry.
+    assert set(_published_entries()) == set(layout) - {
+        "observations-2026-02.jsonl"}
+    warm = ns["doctor_gather_state"](deep=True)
+    check(warm)
+    assert _journal_values(warm) == _journal_values(cold)
+
+
+def test_doctor_deep_scan_checkpoint_keeps_a_protocol_error(ns, monkeypatch):
+    """T1 (#1054): detects a warm run that loses the out-of-scope record
+    behind a JournalProtocolError, which would turn a FAIL into a clean
+    journal.protocol leg, and a checkpoint published only after a
+    successful selection (spec 5.5), which would leave every doctor run on
+    such a journal cold."""
+    _write_journal({"observations-2026-01.jsonl": [
+        ("skip", J.encode_line(_scan_obs(1.0))),
+        ("hit", J.encode_line(_snapshot_evt("sa:x", 1.0) | {"rev": 1})),
+        ("skip", J.encode_line(_scan_obs(2.0))),
+    ]})
+    _scan_index_path().unlink(missing_ok=True)
+    calls = {"n": 0}
+    real_decode = J.decode_line
+
+    def counting(raw):
+        calls["n"] += 1
+        return real_decode(raw)
+
+    monkeypatch.setattr(J, "decode_line", counting)
+    cold = ns["doctor_gather_state"](deep=True)
+    cold_decodes = calls["n"]
+    assert cold.journal_protocol_error
+    assert _scan_index_path().exists()
+    calls["n"] = 0
+    warm = ns["doctor_gather_state"](deep=True)
+    # The warm run reused the checkpoint the failed selection published:
+    # the two covered observations were not decoded again.
+    assert cold_decodes - calls["n"] == 2
+    assert _journal_values(warm) == _journal_values(cold)
+
+
+def test_doctor_deep_scan_warm_run_decodes_only_the_hits(ns, monkeypatch):
+    """T2 (#1054): detects an always-cold implementation, which T1 alone
+    would pass. Against a cold run over the same bytes, a warm run skips
+    exactly the covered non-hit lines: ordinary observations and the
+    unknown-type record between the hits, not only the malformed line."""
+    jr = _jr()
+    layout = _t1_journal(jr)
+    _write_journal(layout)
+    ns["doctor_gather_state"](deep=True)
+    calls = {"n": 0}
+    real_decode = J.decode_line
+
+    def counting(raw):
+        calls["n"] += 1
+        return real_decode(raw)
+
+    monkeypatch.setattr(J, "decode_line", counting)
+    ns["doctor_gather_state"](deep=True)
+    warm = calls["n"]
+    _scan_index_path().unlink()
+    calls["n"] = 0
+    ns["doctor_gather_state"](deep=True)
+    cold = calls["n"]
+    skipped = sum(1 for lines in layout.values()
+                  for tag, _raw in lines if tag == "skip")
+    assert cold - warm == skipped
+
+
+@pytest.mark.parametrize("violation", [
+    "malformed", "torn", "conflict", "protocol-error"])
+def test_doctor_deep_scan_finds_a_violation_appended_after_its_checkpoint(
+        ns, violation):
+    """T3 (#1054): detects trust in the checkpoint past its verified prefix.
+    The violation's bytes are appended after a published checkpoint with no
+    ingest or rebuild in between, so the stats index still describes the
+    earlier journal; the immediate deep run must report it, and must equal
+    a cold run over the same bytes."""
+    jr = _jr()
+    segment = "observations-2026-07.jsonl"
+    jdir = _write_journal({segment: [
+        ("skip", J.encode_line(_scan_obs(1.0))),
+        ("hit", J.encode_line(_snapshot_evt("sa:base", 10.0))),
+        ("skip", J.encode_line(_scan_obs(2.0))),
+    ]})
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    before = ns["doctor_gather_state"](deep=True)
+    assert _scan_index_path().exists()
+    assert (before.journal_malformed_count, before.journal_torn_tail_count,
+            before.journal_conflicts, before.journal_protocol_error) == (
+                0, 0, [], None)
+    # An idle run over unchanged bytes does not rewrite the checkpoint (a
+    # needless multi-MB write per doctor run on a real journal).
+    published = _index_identity()
+    ns["doctor_gather_state"](deep=True)
+    assert _index_identity() == published
+    appended = {
+        "malformed": b"{broken\n",
+        "torn": b'{"t":"obs","torn',
+        "conflict": J.encode_line(_snapshot_evt("sa:base", 99.0)),
+        "protocol-error": J.encode_line(
+            _snapshot_evt("sa:late", 5.0) | {"rev": 1}),
+    }[violation]
+    with open(jdir / segment, "ab") as fh:
+        fh.write(appended)
+
+    warm = ns["doctor_gather_state"](deep=True)
+    if violation == "torn":
+        # A torn tail is never covered, so the entry is unchanged.
+        assert _index_identity() == published
+    else:
+        assert _index_identity() != published
+        assert _published_entries()[segment].covered == (
+            jdir / segment).stat().st_size
+    if violation == "malformed":
+        assert warm.journal_malformed_count == 1
+    elif violation == "torn":
+        assert warm.journal_torn_tail_count == 1
+    elif violation == "conflict":
+        assert [c["eventId"] for c in warm.journal_conflicts] == ["sa:base"]
+    else:
+        assert "revision must be 0" in warm.journal_protocol_error
+    _scan_index_path().unlink()
+    cold = ns["doctor_gather_state"](deep=True)
+    assert _journal_values(warm) == _journal_values(cold)

@@ -279,3 +279,70 @@ def test_real_rebuild_doctor_and_dashboard_survive_all_structural_classes(
 
     assert _sha256(segment) == journal_hash
     assert _sha256(alerts_path) == alerts_hash
+
+
+def test_doctor_finds_structural_classes_appended_after_its_checkpoint(
+    monkeypatch, tmp_path,
+):
+    """T3 (#1054): detects a deep doctor that trusts its checkpoint past the
+    verified prefix, or serves the stats-preloaded protocol rows. Every
+    structural class is appended after a published checkpoint with no
+    ingest or rebuild in between; the immediate deep run, a cold run and
+    the rebuild oracle must name the same violations, while the shallow
+    gather still shows the earlier clean journal."""
+    from conftest import load_script, redirect_paths
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core
+    import _cctally_journal as jr
+
+    journal_dir = _cctally_core.JOURNAL_DIR
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    segment = journal_dir / "observations-2026-07.jsonl"
+    base = journal.make_evt(
+        kind="snapshot_accept",
+        id="sa:overlap",
+        at=AT,
+        payload={
+            key: value
+            for key, value in _snapshot_payload(10.0).items()
+            if key != "kind"
+        },
+    )
+    before = journal.make_correction_batch(
+        batch_id="batch:valid-before",
+        family="claude-usage",
+        at=AT,
+        actions=[_replace("sa:overlap", 20.0, 1)],
+    )
+    segment.write_bytes(
+        b"".join(journal.encode_line(r) for r in [base, *before]))
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    first = ns["doctor_gather_state"](deep=True)
+    assert first.journal_protocol_violations == []
+    index = journal_dir / ".doctor-scan-index"
+    assert index.exists()
+
+    appended = []
+    for index_no, kind in enumerate(KINDS):
+        appended.extend(_invalid_batch(kind, index_no))
+    with segment.open("ab") as handle:
+        handle.write(b"".join(journal.encode_line(r) for r in appended))
+
+    warm = ns["doctor_gather_state"](deep=True)
+    shallow = ns["doctor_gather_state"](deep=False)
+    index.unlink()
+    cold = ns["doctor_gather_state"](deep=True)
+    oracle = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "oracle.db"),
+    )
+    expected = [item.to_dict() for item in oracle.protocol_violations]
+    assert [(item["batchId"], item["kind"]) for item in expected] == [
+        (f"batch:invalid-{index_no}", kind)
+        for index_no, kind in enumerate(KINDS)
+    ]
+    assert warm.journal_protocol_violations == expected
+    assert cold.journal_protocol_violations == expected
+    assert shallow.journal_protocol_violations == []

@@ -24,14 +24,24 @@ host-local offset while boundaries are canonical UTC).
 """
 from __future__ import annotations
 
+import bisect
 import datetime as dt
+import hashlib
+import json
+import math
+import os
+import secrets
 import sqlite3
 import sys
+import threading
 from dataclasses import replace
+from typing import NamedTuple
 
 from _cctally_core import (
     _canonicalize_optional_iso, make_week_ref, parse_iso_datetime,
 )
+import _cctally_quota as _quota
+import _lib_pricing
 from _cctally_quota import assert_projection_readable, codex_quota_breakdown
 from _lib_accounts import UNATTRIBUTED
 from _lib_codex_pools import is_model_scoped_codex_quota
@@ -45,6 +55,7 @@ from _lib_json_envelope import _iso_z
 from _lib_quota import QuotaWindowIdentity
 
 import _lib_milestone_history as _mh
+import _lib_stats_content_revision as _content_revision
 
 UTC = dt.timezone.utc
 
@@ -374,41 +385,51 @@ def _claude_cycle_rows(conn: sqlite3.Connection, ref, *, account_key=None,
     for its CURRENT cycle, so the index, the detail and the card read one
     segment (spec 5.2 step 2) rather than re-deriving it from the cut instant.
     """
-    acct_s, acct_p = _account_predicate(account_key, "s.account_key")
-    acct_m, _ = _account_predicate(account_key, "m.account_key")
-    acct_e, _ = _account_predicate(account_key, "e.account_key")
-    acct_r, _ = _account_predicate(account_key, "account_key")
+    acct_r, acct_p = _account_predicate(account_key, "account_key")
     if cohort_id is None:
-        cohort_id = 0
-        if ref.week_start_at:
-            row = conn.execute(
-                "SELECT e.id FROM week_reset_events e "
-                "WHERE unixepoch(e.effective_reset_at_utc)=unixepoch(?)"
-                + acct_e + " "
-                "AND (EXISTS ("
-                "  SELECT 1 FROM weekly_usage_snapshots s "
-                "  WHERE s.week_start_date=?" + acct_s + " AND ("
-                "    unixepoch(s.week_end_at)=unixepoch(e.old_week_end_at) OR "
-                "    unixepoch(s.week_end_at)=unixepoch(e.new_week_end_at)"
-                "  )"
-                ") OR EXISTS ("
-                "  SELECT 1 FROM percent_milestones m "
-                "  WHERE m.week_start_date=?" + acct_m + " AND ("
-                "    unixepoch(m.week_end_at)=unixepoch(e.old_week_end_at) OR "
-                "    unixepoch(m.week_end_at)=unixepoch(e.new_week_end_at)"
-                "  )"
-                ")) ORDER BY e.id DESC LIMIT 1",
-                (ref.week_start_at,) + acct_p + (ref.key,) + acct_p
-                + (ref.key,) + acct_p,
-            ).fetchone()
-            if row is not None:
-                cohort_id = int(row[0])
+        cohort_id = _claude_cycle_cohort_id(conn, ref, account_key=account_key)
     return conn.execute(
         "SELECT * FROM percent_milestones WHERE week_start_date=? "
         "AND reset_event_id=?" + acct_r + " "
         "ORDER BY unixepoch(captured_at_utc) ASC, percent_threshold ASC",
         (ref.key, cohort_id) + acct_p,
     ).fetchall()
+
+
+def _claude_cycle_cohort_id(conn: sqlite3.Connection, ref, *,
+                            account_key=None) -> int:
+    """The cycle's weekly milestone cohort (`percent_milestones.
+    reset_event_id`) as derived from its effective start: the newest reset
+    event effective at that instant that names this storage week, else ``0``.
+    Shared by the cohort read and the #1050 stamp, which scopes on it."""
+    acct_s, acct_p = _account_predicate(account_key, "s.account_key")
+    acct_m, _ = _account_predicate(account_key, "m.account_key")
+    acct_e, _ = _account_predicate(account_key, "e.account_key")
+    cohort_id = 0
+    if ref.week_start_at:
+        row = conn.execute(
+            "SELECT e.id FROM week_reset_events e "
+            "WHERE unixepoch(e.effective_reset_at_utc)=unixepoch(?)"
+            + acct_e + " "
+            "AND (EXISTS ("
+            "  SELECT 1 FROM weekly_usage_snapshots s "
+            "  WHERE s.week_start_date=?" + acct_s + " AND ("
+            "    unixepoch(s.week_end_at)=unixepoch(e.old_week_end_at) OR "
+            "    unixepoch(s.week_end_at)=unixepoch(e.new_week_end_at)"
+            "  )"
+            ") OR EXISTS ("
+            "  SELECT 1 FROM percent_milestones m "
+            "  WHERE m.week_start_date=?" + acct_m + " AND ("
+            "    unixepoch(m.week_end_at)=unixepoch(e.old_week_end_at) OR "
+            "    unixepoch(m.week_end_at)=unixepoch(e.new_week_end_at)"
+            "  )"
+            ")) ORDER BY e.id DESC LIMIT 1",
+            (ref.week_start_at,) + acct_p + (ref.key,) + acct_p
+            + (ref.key,) + acct_p,
+        ).fetchone()
+        if row is not None:
+            cohort_id = int(row[0])
+    return cohort_id
 
 
 def _five_hour_detail_revision(conn, start_iso, end_iso, *,
@@ -511,8 +532,100 @@ def _unavailable_join_component(conn, start_iso, end_iso,
     return ("u" + _mh.compute_detail_stamp(*ids),)
 
 
+class _ClaudeRevisionScopes:
+    """The #1050 content-revision material of ONE index build (spec 4.6).
+
+    Read once per `build_claude_week_index`: the build's `ContentRevision`
+    and every scope row, in one read snapshot — the caller's transaction when
+    one is open (the detail route's), otherwise a short ``BEGIN`` …
+    ``ROLLBACK`` of its own. The scope rows are strict to ``account_key`` when
+    the index is scoped and merged across every account (``unattributed``
+    included) otherwise, exactly as the index reads its rows.
+
+    A ``current`` store names the relevant revision of each cycle; any other
+    state (absent, partial, unsupported, unreadable) cannot certify a stamp,
+    so every entry of the build carries the same fresh nonce instead and the
+    client never serves a detail cached under an earlier one.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, *, account_key=None):
+        own = not conn.in_transaction
+        if own:
+            conn.execute("BEGIN")
+        try:
+            try:
+                revision = _content_revision.read_claude_content_revision(conn)
+            except _content_revision.StatsContentRevisionUnreadable:
+                revision = None
+            trusted = (revision is not None
+                       and revision.state == _content_revision.STATE_CURRENT)
+            rows = (_content_revision.read_scope_rows(
+                conn, account_key=account_key) if trusted else [])
+        finally:
+            if own:
+                conn.rollback()
+        self.trusted = trusted
+        self.cycle_basis = revision.cycle_basis if trusted else None
+        self.nonce = None if trusted else secrets.token_hex(8)
+        self._keyed: dict = {"cohort": {}, "bucket": {}}
+        blocks, points = [], []
+        for row in rows:
+            if row.kind in self._keyed:
+                keyed = self._keyed[row.kind]
+                keyed[row.scope_key] = max(
+                    keyed.get(row.scope_key, row.revision), row.revision)
+            elif row.start_epoch is None or row.end_epoch is None:
+                continue  # an unparseable bound never matches, as in SQL
+            elif row.kind == "block":
+                blocks.append((row.start_epoch, row.end_epoch, row.revision))
+            elif row.kind == "reset_point":
+                points.append((row.start_epoch, row.revision))
+        blocks.sort()
+        points.sort()
+        self._blocks = blocks
+        self._block_starts = [b[0] for b in blocks]
+        self._points = points
+        self._point_epochs = [p[0] for p in points]
+
+    def component(self, conn, ref, cohort_id, start_iso, end_iso) -> tuple:
+        """The stamp component for one cycle: ``("c" + …,)`` over the MAX
+        revision of its cohort, its bucket, every block intersecting
+        ``[start, end)`` and every reset point in ``[start, end]``; ``()``
+        when no scope is relevant and the store was never published or
+        repaired (so such a cycle keeps its bytes); ``("u" + nonce,)`` on an
+        untrusted store."""
+        if not self.trusted:
+            return ("u" + self.nonce,)
+        relevant = [
+            rev for rev in (
+                self._keyed["cohort"].get(f"{ref.key}|{cohort_id}"),
+                self._keyed["bucket"].get(ref.key),
+            ) if rev is not None
+        ]
+        if (self._blocks or self._points) and start_iso and end_iso:
+            start, end = conn.execute(
+                "SELECT unixepoch(?), unixepoch(?)",
+                (start_iso, end_iso)).fetchone()
+            if start is not None and end is not None:
+                # Blocks starting before the cycle's end, then ending after
+                # its start; reset points inside the closed interval.
+                upto = bisect.bisect_left(self._block_starts, end)
+                relevant.extend(rev for _s, b_end, rev in self._blocks[:upto]
+                                if b_end > start)
+                lo = bisect.bisect_left(self._point_epochs, start)
+                hi = bisect.bisect_right(self._point_epochs, end)
+                relevant.extend(rev for _e, rev in self._points[lo:hi])
+        if not relevant and self.cycle_basis is None:
+            return ()
+        return ("c" + _mh.compute_detail_stamp(
+            self.cycle_basis, max(relevant, default=None)),)
+
+
 def _index_entry(conn, ref, current_cycle_key, tz, *, unavailable_rows,
-                 decorated=False, account_key=None, cohort_id=None) -> dict:
+                 revision_scopes, decorated=False, account_key=None,
+                 cohort_id=None) -> dict:
+    if cohort_id is None:
+        cohort_id = _claude_cycle_cohort_id(conn, ref, account_key=account_key)
     rows = _claude_cycle_rows(
         conn, ref, account_key=account_key, cohort_id=cohort_id)
     milestone_count = len(rows)
@@ -535,6 +648,10 @@ def _index_entry(conn, ref, current_cycle_key, tz, *, unavailable_rows,
     unavailable = _unavailable_join_component(
         conn, start_z, end_z, unavailable_rows)
     scope_part = () if account_key is None else ("a" + account_key,)
+    # #1050 spec 4.6: the cycle's stored-content revision, so an in-place
+    # correction of any row this cycle reads re-stamps it (and only it).
+    revision_part = revision_scopes.component(
+        conn, ref, cohort_id, start_z, end_z)
 
     # #750 S4 §5.3. A CURRENT single-segment cycle neither fetches its detail
     # nor uses one that arrives, so a gap in the LIVE cycle would stay
@@ -563,7 +680,7 @@ def _index_entry(conn, ref, current_cycle_key, tz, *, unavailable_rows,
         "has_observation_gap": has_gap,
         "detail_stamp": _mh.compute_detail_stamp(
             key, milestone_count, block_count, segment_count, max_captured,
-            *block_revision, *unavailable, *scope_part,
+            *block_revision, *revision_part, *unavailable, *scope_part,
         ),
     }
 
@@ -655,9 +772,11 @@ def build_claude_week_index(conn: sqlite3.Connection, *, account_key=None,
         current_cycle_key = (
             _claude_cycle_key(current_ref) if current_ref else None)
         unavailable_rows = _unavailable_join_rows(conn)
+        revision_scopes = _ClaudeRevisionScopes(conn)
         entries = [
             _index_entry(conn, ref, current_cycle_key, tz,
-                         unavailable_rows=unavailable_rows, decorated=decorated)
+                         unavailable_rows=unavailable_rows,
+                         revision_scopes=revision_scopes, decorated=decorated)
             for ref in refs
         ]
     else:
@@ -667,10 +786,12 @@ def build_claude_week_index(conn: sqlite3.Connection, *, account_key=None,
             _claude_cycle_key(current_ref) if current_ref else None)
         unavailable_rows = _unavailable_join_rows(
             conn, account_key=account_key)
+        revision_scopes = _ClaudeRevisionScopes(conn, account_key=account_key)
         entries = [
             _index_entry(
                 conn, ref, current_cycle_key, tz,
-                unavailable_rows=unavailable_rows, decorated=decorated,
+                unavailable_rows=unavailable_rows,
+                revision_scopes=revision_scopes, decorated=decorated,
                 account_key=account_key,
                 cohort_id=(scope.reset_event_id
                            if ref is current_ref else None),
@@ -1260,28 +1381,12 @@ def _select_live_physical_cycle(cycles: list, boundary):
     return min(pool, key=_rank)
 
 
-def _codex_milestone_count(stats_conn, cyc) -> tuple[int, str | None]:
-    """Unique threshold count + max captured-at for one selected identity."""
-    resets = cyc.member_reset_isos
-    placeholders = ",".join("unixepoch(?)" for _ in resets)
-    row = stats_conn.execute(
-        "SELECT COUNT(DISTINCT percent_threshold), MAX(captured_at_utc) "
-        "FROM quota_percent_milestones "
-        "WHERE source='codex' AND source_root_key=? AND account_key=? "
-        "  AND logical_limit_key=? "
-        "  AND observed_slot=? AND window_minutes=? "
-        f"  AND unixepoch(resets_at_utc) IN ({placeholders}) AND orphaned_at IS NULL",
-        (cyc.root, cyc.account_key, cyc.limit, cyc.slot, cyc.window, *resets),
-    ).fetchone()
-    return int(row[0] or 0), row[1]
-
-
 def _codex_five_hour_rows(stats_conn, cyc, *, include_orphaned=False) -> list:
     """Every retained 5h block on the selected root intersecting [start, end).
 
     The account filter admits the cycle's own key OR the ``unattributed``
     sentinel, and deliberately NOT strict equality. Unlike
-    ``_codex_milestone_count`` — whose block and milestone parameters both come
+    ``_codex_cycle_raw_rows`` — whose block and milestone parameters both come
     from one ``block.identity`` and so cannot disagree — this query spans
     identities, selecting by root plus time range. The 300-minute windows are a
     separate physical-window group from the weekly one and
@@ -1333,7 +1438,8 @@ def _codex_five_hour_rows(stats_conn, cyc, *, include_orphaned=False) -> list:
     return rows
 
 
-def _codex_five_hour_clusters(stats_conn, cyc, *, include_orphaned=False) -> list:
+def _codex_five_hour_clusters(stats_conn, cyc, *, include_orphaned=False,
+                              rows=None) -> list:
     """Retained 5h blocks intersecting the cycle, jitter-canonicalized.
 
     The 300-minute rows carry the same second-level ``resets_at`` jitter as the
@@ -1341,9 +1447,16 @@ def _codex_five_hour_clusters(stats_conn, cyc, *, include_orphaned=False) -> lis
     clustered the same way — one canonical block per physical reset — before
     counting/rendering. Returns cluster-representative ``_CodexCycle`` blocks
     (``.members`` set), ordered by ascending start.
+
+    ``rows`` (#1050) clusters rows the caller already read with
+    ``_codex_five_hour_rows`` — `_codex_cycle_inputs`' block rows — in that
+    function's own order, so the stamp and the detail enumerate one population.
     """
+    if rows is None:
+        rows = _codex_five_hour_rows(
+            stats_conn, cyc, include_orphaned=include_orphaned)
     blocks: list = []
-    for row in _codex_five_hour_rows(stats_conn, cyc, include_orphaned=include_orphaned):
+    for row in rows:
         block = _CodexCycle(row)
         if block.start is None or block.reset is None:
             continue
@@ -1359,9 +1472,580 @@ def _codex_five_hour_clusters(stats_conn, cyc, *, include_orphaned=False) -> lis
     return clusters
 
 
-def _codex_cycle_entry(stats_conn, cyc, tz) -> dict:
-    milestone_count, max_captured = _codex_milestone_count(stats_conn, cyc)
-    block_count = len(_codex_five_hour_clusters(stats_conn, cyc))
+# ── #1050 spec 4.7: every input of a Codex cycle detail ─────────────────────
+#
+# The Codex cycle detail publishes block `current_percent`, the cycle ladder
+# and every included block's ladder (crossings, high-water percent, physical
+# boundaries), and per-milestone dollars and tokens priced at read time from
+# `codex_session_entries` at the resolved speed. Its stamp named none of those
+# values, so a cached detail survived every in-place rewrite of them. One
+# helper reads all of them, and both the index entry (the stamp) and the
+# detail route consume it.
+
+#: Every `quota_percent_milestones` column a Codex detail reads, its unique key
+#: (`source, source_root_key, account_key, logical_limit_key, observed_slot,
+#: window_minutes, resets_at_utc, percent_threshold`) first, so the rows sort
+#: by that key as plain tuples (every key column is NOT NULL).
+_CODEX_MILESTONE_INPUT_COLUMNS = (
+    "source, source_root_key, account_key, logical_limit_key, observed_slot, "
+    "window_minutes, resets_at_utc, percent_threshold, captured_at_utc, "
+    "source_path, line_offset, high_water_percent"
+)
+_CODEX_MILESTONE_KEY_WIDTH = 8
+
+
+class CodexCycleInputs(NamedTuple):
+    """Everything one Codex cycle detail's published values depend on.
+
+    * ``cycle_rows`` — the cycle's raw qualifying ``quota_percent_milestones``
+      rows across its jitter-member resets (the stamp's distinct-threshold count
+      and raw maximum capture come from these), ordered by unique key.
+    * ``block_ladder_rows`` — per selection the detail prices (the cycle's own
+      members, then every included five-hour block cluster's members): the
+      ladder rows ``codex_quota_breakdown`` reads for that member, by unique key.
+    * ``block_rows`` — the five-hour block rows ``_codex_five_hour_rows``
+      returns, by unique key.
+    * ``first_boundaries`` — per priced member, the physical
+      ``(captured_at_utc, source_path, line_offset)`` the breakdown opens from,
+      ``"absent"`` when it has none, ``"unread"`` when the member has no ladder.
+    * ``selection_aggregates`` — per priced member with a boundary, the
+      aggregate twin of its accounting read.
+    * ``accounting_seq``, ``speed`` (resolved), ``pricing_identity``.
+    * ``block_clusters`` — derived from the block rows in their read order, the
+      clusters the detail renders; excluded from the content hash.
+    """
+
+    cycle_rows: tuple
+    block_ladder_rows: tuple
+    block_rows: tuple
+    first_boundaries: tuple
+    selection_aggregates: tuple
+    accounting_seq: "int | None"
+    speed: str
+    pricing_identity: str
+    block_clusters: tuple
+
+
+def _canonical_digest(value) -> str:
+    return hashlib.sha256(json.dumps(
+        value, allow_nan=False, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _member_ident(member) -> tuple:
+    return (member.root, member.account_key, member.limit, member.slot,
+            member.window, member.reset_iso)
+
+
+def _codex_cycle_raw_rows(stats_conn, cyc) -> tuple:
+    """The cycle's raw qualifying milestone rows: the population the stamp's
+    count and maximum capture have always covered, now read whole."""
+    resets = cyc.member_reset_isos
+    placeholders = ",".join("unixepoch(?)" for _ in resets)
+    rows = stats_conn.execute(
+        f"SELECT {_CODEX_MILESTONE_INPUT_COLUMNS} "
+        "FROM quota_percent_milestones "
+        "WHERE source='codex' AND source_root_key=? AND account_key=? "
+        "  AND logical_limit_key=? "
+        "  AND observed_slot=? AND window_minutes=? "
+        f"  AND unixepoch(resets_at_utc) IN ({placeholders}) AND orphaned_at IS NULL",
+        (cyc.root, cyc.account_key, cyc.limit, cyc.slot, cyc.window, *resets),
+    ).fetchall()
+    return tuple(sorted(tuple(r) for r in rows))
+
+
+def _codex_member_ladder_rows(stats_conn, member) -> tuple:
+    """One member's ladder exactly as ``_cctally_quota._load_active_milestones``
+    selects it (text-equal reset, the member's own account), every column."""
+    rows = stats_conn.execute(
+        f"SELECT {_CODEX_MILESTONE_INPUT_COLUMNS} "
+        "FROM quota_percent_milestones "
+        "WHERE source='codex' AND source_root_key=? AND account_key=? "
+        "  AND logical_limit_key=? AND observed_slot=? AND window_minutes=? "
+        "  AND resets_at_utc=? AND orphaned_at IS NULL",
+        (member.root, member.account_key, member.limit, member.slot,
+         member.window, member.reset_iso),
+    ).fetchall()
+    return tuple(sorted(tuple(r) for r in rows))
+
+
+def _codex_block_row_key(row) -> tuple:
+    # (source_root_key, account_key, logical_limit_key, observed_slot,
+    #  window_minutes, resets_at_utc): the unique key minus the constant source.
+    return (row[0], row[6], row[1], row[2], row[3], row[7])
+
+
+def _codex_cache_file_identity(cache_conn) -> "tuple | None":
+    try:
+        rows = cache_conn.execute("PRAGMA database_list").fetchall()
+        path = next(str(r[2]) for r in rows if str(r[1]) == "main" and r[2])
+        stat = os.stat(path)
+    except (OSError, StopIteration, sqlite3.Error, TypeError, ValueError):
+        return None
+    return (stat.st_dev, stat.st_ino)
+
+
+def _codex_accounting_seq(cache_conn) -> "int | None":
+    try:
+        row = cache_conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_accounting_mutation_seq'").fetchone()
+    except sqlite3.Error:
+        return None
+    try:
+        return None if row is None else int(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _codex_quota_log_seq(cache_conn) -> "int | None":
+    try:
+        row = cache_conn.execute(
+            "SELECT seq FROM sqlite_sequence "
+            "WHERE name='quota_window_change_log'").fetchone()
+    except sqlite3.Error:
+        return None
+    return 0 if row is None else int(row[0])
+
+
+def _codex_snapshot_seq(cache_conn) -> "int | None":
+    try:
+        row = cache_conn.execute(
+            "SELECT seq FROM sqlite_sequence "
+            "WHERE name='quota_window_snapshots'").fetchone()
+    except sqlite3.Error:
+        return None
+    return 0 if row is None else int(row[0])
+
+
+def _reset_epoch(text) -> "int | None":
+    parsed = _parse_utc(text)
+    return None if parsed is None else math.floor(parsed.timestamp())
+
+
+def _codex_boundary_order_key(row) -> tuple:
+    """``_first_block_physical_tuple``'s ``ORDER BY unixepoch(captured_at_utc),
+    unixepoch(resets_at_utc), source_path, line_offset`` over a bulk row
+    ``(reset_epoch, captured_epoch, captured_text, path, offset, account)``:
+    SQLite sorts a NULL ``unixepoch`` first."""
+    return (row[1] is not None, row[1] or 0, row[0], row[3], row[4])
+
+
+def _codex_fold_boundary_row(out: dict, row: tuple) -> None:
+    """Fold one snapshot ``(reset_epoch, captured_epoch, captured_text, path,
+    offset, account)`` into its reset's per-flavour minimum (see
+    `_codex_bulk_first_boundaries`). A minimum over a superset is the minimum
+    of the old minimum and the new rows, so folding is also how appended rows
+    join a memoized identity."""
+    slots = out.get(row[0])
+    if slots is None:
+        slots = out[row[0]] = [None, None, {}]
+    key = _codex_boundary_order_key(row)
+    if slots[0] is None or key < slots[0][0]:
+        slots[0] = (key, row)
+    account = row[5]
+    if account is None or account == UNATTRIBUTED:
+        if slots[1] is None or key < slots[1][0]:
+            slots[1] = (key, row)
+    else:
+        prior = slots[2].get(account)
+        if prior is None or key < prior[0]:
+            slots[2][account] = (key, row)
+
+
+def _codex_bulk_first_boundaries(cache_conn, identity_parts) -> dict:
+    """Every first boundary of one raw quota identity, in one pass (#1050).
+
+    ``_first_block_physical_tuple`` cannot seek its own predicate:
+    ``unixepoch(resets_at_utc)=unixepoch(?)`` matches no index expression, so
+    each call scans the identity's whole snapshot history (11-70 ms on the
+    #997 store), and the index needs one per priced member. This is that
+    query's exact twin over every reset at once: per reset second, the
+    minimum row in the same order for each account-predicate flavour the
+    boundary read takes (``_codex_cache_account_predicate(...,
+    admit_unattributed=True)``): every row (no scope), the unattributed rows
+    (``NULL`` or the sentinel), and each real account's own rows — a real
+    scope admits its own rows plus the unattributed ones.
+    """
+    root, limit, slot, window = identity_parts
+    out: dict = {}
+    for row in cache_conn.execute(
+            "SELECT unixepoch(resets_at_utc), unixepoch(captured_at_utc), "
+            "       captured_at_utc, source_path, line_offset, account_key "
+            "FROM quota_window_snapshots "
+            "WHERE source='codex' AND source_root_key=? "
+            "  AND logical_limit_key=? AND observed_slot=? "
+            "  AND window_minutes=? AND unixepoch(resets_at_utc) IS NOT NULL",
+            (root, limit, slot, window)):
+        _codex_fold_boundary_row(out, tuple(row))
+    return out
+
+
+def _codex_boundary_from_bulk(slots, account_scope):
+    """One member's boundary from its reset's bulk slots, parsed exactly as
+    ``_first_block_physical_tuple`` parses its row (a row that does not parse
+    is no boundary)."""
+    if slots is None:
+        return None
+    if account_scope is None:
+        best = slots[0]
+    elif account_scope == UNATTRIBUTED:
+        best = slots[1]
+    else:
+        candidates = [c for c in (slots[2].get(account_scope), slots[1])
+                      if c is not None]
+        best = min(candidates, key=lambda c: c[0]) if candidates else None
+    if best is None:
+        return None
+    row = best[1]
+    try:
+        return (_quota._parse_utc(str(row[2]), "captured_at_utc"),
+                str(row[3]), int(row[4]))
+    except (TypeError, ValueError):
+        return None
+
+
+class _CodexCycleInputsMemo:
+    """Process memo of the Codex cycle-index stamps' expensive inputs (#1050).
+
+    The index stamps every retained cycle, and the pricing inputs are
+    per-member reads over `quota_window_snapshots` and `codex_session_entries`.
+    Read one by one they cost seconds per index build, so the source build
+    hands the index this memo. Only the index uses it: the detail route always
+    reads fresh, through the breakdown's own boundary read, so
+    `test_1050_codex_detail_stamp_equals_index_stamp` checks the memo against
+    a fresh read.
+
+    * **First boundaries** come from one bulk pass per raw identity
+      (`_codex_bulk_first_boundaries`), kept while the cache file is the same
+      and every Codex mutation since is an append. The triggers on
+      `quota_window_snapshots` append one row to the AUTOINCREMENT
+      `quota_window_change_log` for every Codex insert, delete and semantic
+      update, and neither sequence is ever reused, so when the ledger's
+      high-water moved by exactly the number of Codex snapshot rows now present
+      above the snapshot high-water last seen, every change was an insert of
+      one of those rows (a delete or update adds a ledger row without adding
+      such a row) and they fold in (`_codex_fold_boundary_row`). Anything else
+      re-reads the boundaries. The projector prunes the ledger, which leaves
+      its high-water where it is, so this never reads ledger rows.
+    * **Entry aggregates** are kept per selection and invalidated by
+      `codex_accounting_change_log`, as
+      `_lib_snapshot_cache.build_cached_codex_accounting` already trusts it: a
+      selection drops when a changed path's old or new timestamp extent
+      intersects it. A replaced file, a counter that went backwards, a ledger
+      gap, a `full` change or too many dirty paths go cold.
+    * **Per-cycle results** are keyed on the caller's `codex_stats_digest`,
+      which (with the two #1050 relations) covers every stats column the helper
+      reads, plus the cycle's own selection; an entry is reused only while
+      every boundary and aggregate it was built from is unchanged. One stats
+      generation is kept at a time.
+    """
+
+    _MAX_DIRTY_PATHS = 512
+    _MAX_ENTRIES = 8192
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cache_ident = None
+        self.accounting_seq = None
+        self.quota_log_seq = None
+        self.snapshot_seq = None
+        self.path_extents: dict = {}
+        self.bulk_boundaries: dict = {}
+        self.aggregates: dict = {}
+        self.models = None
+        self.stats_key = None
+        self.cycles: dict = {}
+        self.usable = False
+
+    def _cold(self):
+        self.path_extents = {}
+        self.bulk_boundaries = {}
+        self.aggregates = {}
+        self.models = None
+        self.cycles = {}
+
+    def sync(self, cache_conn, stats_key) -> None:
+        """Bring the memo to ``cache_conn``'s state before an index build."""
+        ident = _codex_cache_file_identity(cache_conn)
+        seq = _codex_accounting_seq(cache_conn)
+        log_seq = _codex_quota_log_seq(cache_conn)
+        snapshot_seq = _codex_snapshot_seq(cache_conn)
+        if stats_key != self.stats_key:
+            self.cycles = {}
+            self.stats_key = stats_key
+        if (ident is None or seq is None or log_seq is None
+                or snapshot_seq is None):
+            self.usable = False
+            self.cache_ident = None
+            self._cold()
+            return
+        cold = (ident != self.cache_ident or self.accounting_seq is None
+                or seq < self.accounting_seq)
+        if not cold and seq > self.accounting_seq:
+            cold = not self._apply_accounting_changes(cache_conn, seq)
+        if cold:
+            self._cold()
+            try:
+                self.path_extents = {
+                    (str(root or ""), str(path)): (lo, hi)
+                    for root, path, lo, hi in cache_conn.execute(
+                        "SELECT source_root_key, source_path, "
+                        "       MIN(timestamp_utc), MAX(timestamp_utc) "
+                        "FROM codex_session_entries "
+                        "GROUP BY source_root_key, source_path")
+                }
+            except sqlite3.Error:
+                self.usable = False
+                self.cache_ident = None
+                return
+        elif ((log_seq, snapshot_seq)
+              != (self.quota_log_seq, self.snapshot_seq)
+              and not self._apply_quota_appends(
+                  cache_conn, log_seq, snapshot_seq)):
+            self.bulk_boundaries = {}
+        self.cache_ident = ident
+        self.accounting_seq = seq
+        self.quota_log_seq = log_seq
+        self.snapshot_seq = snapshot_seq
+        self.usable = True
+        for store in (self.aggregates, self.cycles):
+            if len(store) > self._MAX_ENTRIES:
+                store.clear()
+
+    def _apply_quota_appends(self, cache_conn, log_seq, snapshot_seq) -> bool:
+        """Fold appended snapshots into the memoized boundaries, or ``False``
+        when the change since the last sync is not provably append-only."""
+        if (self.quota_log_seq is None or self.snapshot_seq is None
+                or log_seq < self.quota_log_seq
+                or snapshot_seq < self.snapshot_seq):
+            return False
+        expected = log_seq - self.quota_log_seq
+        if expected > self._MAX_DIRTY_PATHS * 8:
+            return False
+        try:
+            rows = tuple(cache_conn.execute(
+                "SELECT source_root_key, logical_limit_key, observed_slot, "
+                "       window_minutes, unixepoch(resets_at_utc), "
+                "       unixepoch(captured_at_utc), captured_at_utc, "
+                "       source_path, line_offset, account_key "
+                "FROM quota_window_snapshots "
+                "WHERE id > ? AND id <= ? AND source='codex'",
+                (self.snapshot_seq, snapshot_seq)))
+        except sqlite3.Error:
+            return False
+        if len(rows) != expected:
+            return False
+        for row in rows:
+            bulk = self.bulk_boundaries.get(tuple(row[:4]))
+            if bulk is not None and row[4] is not None:
+                _codex_fold_boundary_row(bulk, tuple(row[4:]))
+        return True
+
+    def _apply_accounting_changes(self, cache_conn, seq) -> bool:
+        last = self.accounting_seq
+        try:
+            changes = tuple(cache_conn.execute(
+                "SELECT mutation_seq, change_kind, source_root_key, source_path "
+                "FROM codex_accounting_change_log "
+                "WHERE mutation_seq > ? ORDER BY mutation_seq, seq", (last,)))
+        except sqlite3.Error:
+            return False
+        if (not changes or int(changes[0][0]) > last + 1
+                or int(changes[-1][0]) != seq
+                or any(row[1] == "full" for row in changes)):
+            return False
+        dirty = {(str(row[2] or ""), str(row[3]))
+                 for row in changes if row[1] == "path" and row[3]}
+        if len(dirty) > self._MAX_DIRTY_PATHS:
+            return False
+        intervals: dict = {}
+        try:
+            for root, path in dirty:
+                old = self.path_extents.pop((root, path), None)
+                new = cache_conn.execute(
+                    "SELECT MIN(timestamp_utc), MAX(timestamp_utc) "
+                    "FROM codex_session_entries "
+                    "WHERE source_root_key=? AND source_path=?",
+                    (root, path)).fetchone()
+                if new is not None and new[0] is not None:
+                    self.path_extents[(root, path)] = (new[0], new[1])
+                    intervals.setdefault(root, []).append((new[0], new[1]))
+                if old is not None:
+                    intervals.setdefault(root, []).append(old)
+        except sqlite3.Error:
+            return False
+        for key in tuple(self.aggregates):
+            root, lo, hi = key[0], key[1], key[2]
+            if any(a <= hi and b >= lo for a, b in intervals.get(root, ())):
+                del self.aggregates[key]
+        self.models = None
+        return True
+
+    def boundary(self, cache_conn, parts, reset_epoch, account_scope):
+        bulk = self.bulk_boundaries.get(parts)
+        if bulk is None:
+            bulk = self.bulk_boundaries[parts] = _codex_bulk_first_boundaries(
+                cache_conn, parts)
+        return _codex_boundary_from_bulk(bulk.get(reset_epoch), account_scope)
+
+    def entry_models(self, cache_conn) -> tuple:
+        if self.models is None:
+            self.models = _quota.codex_entry_models(cache_conn)
+        return self.models
+
+
+_CODEX_CYCLE_INPUTS_MEMO = _CodexCycleInputsMemo()
+
+
+def _codex_first_boundary(cache_conn, member, account_scope, memo, used):
+    """The physical tuple ``codex_quota_breakdown`` opens ``member``'s ladder
+    from: the breakdown's own read, or with the index memo its bulk twin."""
+    if memo is not None:
+        key = ((member.root, member.limit, member.slot, member.window),
+               math.floor(member.reset.timestamp()), account_scope)
+        value = memo.boundary(cache_conn, *key)
+        used.append(("b", key, value))
+        return value
+    ident = QuotaWindowIdentity(
+        source="codex", source_root_key=member.root,
+        logical_limit_key=member.limit, observed_slot=member.slot,
+        window_minutes=member.window, account_key=member.account_key,
+        limit_id=member.limit_id, limit_name=member.limit_name,
+    )
+    return _quota._first_block_physical_tuple(
+        ident, member.reset, cache_conn=cache_conn, account_key=account_scope)
+
+
+def _codex_selection_aggregate(cache_conn, member, query_start, query_end,
+                               account_scope, memo, used, models_box):
+    key = (member.root, query_start, query_end, account_scope)
+    if memo is not None and key in memo.aggregates:
+        value = memo.aggregates[key]
+        used.append(("a", key, value))
+        return value
+    if memo is not None:
+        models = memo.entry_models(cache_conn)
+    else:
+        # The model list is read once per helper call, not per selection.
+        if not models_box:
+            models_box.append(_quota.codex_entry_models(cache_conn))
+        models = models_box[0]
+    value = _quota.codex_entry_selection_aggregate(
+        cache_conn, source_root_key=member.root, query_start=query_start,
+        query_end=query_end, account_key=account_scope, models=models)
+    if memo is not None:
+        memo.aggregates[key] = value
+        used.append(("a", key, value))
+    return value
+
+
+def _codex_cycle_inputs(stats_conn, cache_conn, cyc, *, speed: str,
+                        account_scope: "str | None",
+                        _memo=None, _used=None) -> CodexCycleInputs:
+    """Read every input of ``cyc``'s Codex detail (#1050 spec 4.7).
+
+    ``account_scope`` is the route's or the index's account focus — the scope
+    the two cache reads use (``_union_cluster_milestones``) — never
+    ``cyc.account_key``. ``speed`` is resolved here exactly as the breakdown
+    resolves it, so the stamp records the tier the dollars were priced at.
+
+    ``cache_conn=None`` opens the breakdown's own read-only cache connection,
+    exactly as ``codex_quota_breakdown`` does for such a caller; a missing
+    cache reads every boundary as absent.
+
+    The reads keep the projection-gate classification of the reads they
+    replace: the block rows still come from the gated
+    ``_codex_five_hour_rows``, and ``quota_percent_milestones`` is not a
+    projection family.
+    """
+    used = _used if _used is not None else []
+    cycle_rows = _codex_cycle_raw_rows(stats_conn, cyc)
+    raw_block_rows = _codex_five_hour_rows(stats_conn, cyc)
+    clusters = tuple(_codex_five_hour_clusters(
+        stats_conn, cyc, rows=raw_block_rows))
+    selections = [(cyc.block_key, cyc)] + [(b.block_key, b) for b in clusters]
+    owns_cache = cache_conn is None
+    cache = cache_conn
+    if owns_cache:
+        try:
+            cache = _quota._cache_connection()
+        except (FileNotFoundError, sqlite3.Error):
+            cache = None
+    ladders: list = []
+    boundaries: list = []
+    aggregates: list = []
+    models_box: list = []
+    try:
+        for selection_key, cluster in selections:
+            for member in cluster.cluster_members:
+                ident = list(_member_ident(member))
+                rows = _codex_member_ladder_rows(stats_conn, member)
+                ladders.append([selection_key, ident, [list(r) for r in rows]])
+                if not rows:
+                    boundaries.append([selection_key, ident, "unread"])
+                    continue
+                start = (None if cache is None else _codex_first_boundary(
+                    cache, member, account_scope, _memo, used))
+                if start is None:
+                    boundaries.append([selection_key, ident, "absent"])
+                    continue
+                boundaries.append([selection_key, ident, [
+                    start[0].astimezone(UTC).isoformat(), start[1], start[2]]])
+                # The breakdown's ladder is ordered by threshold; its last row
+                # bounds the accounting read.
+                last = max(rows, key=lambda r: r[7])
+                query_start, query_end = _quota.codex_entry_selection_bounds(
+                    start[0], last[8])
+                count, max_rowid, per_model = _codex_selection_aggregate(
+                    cache, member, query_start, query_end, account_scope,
+                    _memo, used, models_box)
+                aggregates.append([selection_key, ident, query_start,
+                                   query_end, count, max_rowid,
+                                   [list(m) for m in per_model]])
+        accounting_seq = (None if cache is None
+                          else _codex_accounting_seq(cache))
+    finally:
+        if owns_cache and cache is not None:
+            cache.close()
+    return CodexCycleInputs(
+        cycle_rows=cycle_rows,
+        block_ladder_rows=tuple(ladders),
+        block_rows=tuple(sorted(
+            (tuple(r) for r in raw_block_rows), key=_codex_block_row_key)),
+        first_boundaries=tuple(boundaries),
+        selection_aggregates=tuple(aggregates),
+        accounting_seq=accounting_seq,
+        speed=_cctally()._resolve_codex_speed(speed),
+        pricing_identity=_lib_pricing.live_codex_pricing_identity(),
+        block_clusters=clusters,
+    )
+
+
+def _codex_inputs_stats_digest(inputs: CodexCycleInputs) -> str:
+    """The digest of everything but the per-tick scalars, so the index can
+    memoize it per cycle and recombine on an accounting move."""
+    return _canonical_digest([
+        [list(r) for r in inputs.cycle_rows],
+        list(inputs.block_ladder_rows),
+        [list(r) for r in inputs.block_rows],
+        list(inputs.first_boundaries),
+        list(inputs.selection_aggregates),
+    ])
+
+
+def _codex_content_component(selection_digest: str, accounting_seq, speed,
+                             pricing_identity) -> str:
+    """#1050 spec 4.7: the stamp's content component — SHA-256 over the
+    canonical JSON of every stats row and cost input, the rows entering
+    through their own SHA-256 so an accounting move recombines without
+    re-hashing every row."""
+    return "i" + _canonical_digest([
+        selection_digest, accounting_seq, speed, pricing_identity])[:16]
+
+
+def _codex_entry_dict(cyc, tz, milestone_count, block_count, max_captured,
+                      component) -> dict:
     key = cyc.key
     return {
         "key": key,
@@ -1373,10 +2057,69 @@ def _codex_cycle_entry(stats_conn, cyc, tz) -> dict:
         "milestone_count": milestone_count,
         "block_count": block_count,
         "detail_stamp": _mh.compute_detail_stamp(
-            key, milestone_count, block_count, max_captured
+            key, milestone_count, block_count, max_captured, component,
         ),
     }
 
+
+def _codex_stamp_parts(inputs: CodexCycleInputs) -> tuple:
+    """``(milestone_count, block_count, max_captured)``: the distinct
+    thresholds and the raw maximum capture over the cycle's raw rows
+    (independent of the detail's earliest-crossing pick), and the clusters."""
+    milestone_count = len({row[7] for row in inputs.cycle_rows})
+    max_captured = max((row[8] for row in inputs.cycle_rows), default=None)
+    return milestone_count, len(inputs.block_clusters), max_captured
+
+
+def _codex_cycle_entry(stats_conn, cache_conn, cyc, tz, *, speed,
+                       account_scope, inputs=None, memo=None) -> dict:
+    """The index entry for ``cyc``, stamped from `_codex_cycle_inputs`.
+
+    ``inputs`` lets the detail stamp from the read it renders from; ``memo``
+    is the index's process memo (`_CodexCycleInputsMemo`)."""
+    if inputs is not None or memo is None or not memo.usable:
+        if inputs is None:
+            inputs = _codex_cycle_inputs(
+                stats_conn, cache_conn, cyc, speed=speed,
+                account_scope=account_scope)
+        milestone_count, block_count, max_captured = _codex_stamp_parts(inputs)
+        component = _codex_content_component(
+            _codex_inputs_stats_digest(inputs), inputs.accounting_seq,
+            inputs.speed, inputs.pricing_identity)
+        return _codex_entry_dict(cyc, tz, milestone_count, block_count,
+                                 max_captured, component)
+    cycle_key = (
+        account_scope, cyc.key, _iso_z(cyc.start), _iso_z(cyc.end),
+        bool(cyc.is_current),
+        tuple(_member_ident(m) for m in cyc.cluster_members),
+    )
+    cached = memo.cycles.get(cycle_key)
+    # Both kinds revalidate by VALUE. Presence alone is not enough for an
+    # aggregate: two cycles can share one key (a 5-hour block straddling
+    # their boundary), and after a late entry evicts it the first cycle
+    # recomputes and reinserts it, so the second would find the key present
+    # and keep a digest of the old value (#1050 spec 4.7 stamp equality).
+    if cached is not None and all(
+            (memo.boundary(cache_conn, *key) == value)
+            if kind == "b"
+            else (key in memo.aggregates and memo.aggregates[key] == value)
+            for kind, key, value in cached[4]):
+        milestone_count, block_count, max_captured, selection_digest, _ = cached
+    else:
+        used: list = []
+        inputs = _codex_cycle_inputs(
+            stats_conn, cache_conn, cyc, speed=speed,
+            account_scope=account_scope, _memo=memo, _used=used)
+        milestone_count, block_count, max_captured = _codex_stamp_parts(inputs)
+        selection_digest = _codex_inputs_stats_digest(inputs)
+        memo.cycles[cycle_key] = (milestone_count, block_count, max_captured,
+                                  selection_digest, tuple(used))
+    component = _codex_content_component(
+        selection_digest, memo.accounting_seq,
+        _cctally()._resolve_codex_speed(speed),
+        _lib_pricing.live_codex_pricing_identity())
+    return _codex_entry_dict(cyc, tz, milestone_count, block_count,
+                             max_captured, component)
 
 def _codex_cycle_label(cyc, tz) -> str:
     start_iso = cyc.start.astimezone(UTC).isoformat()
@@ -1389,14 +2132,34 @@ def _codex_cycle_label(cyc, tz) -> str:
 
 
 def build_codex_cycle_index(stats_conn, *, identity, now_utc,
-                            account_key=None) -> list:
+                            account_key=None, cache_conn=None, speed="auto",
+                            stats_digest=None) -> list:
     """Newest-first Codex cycle index over the durable projection (spec §1c,
     §3). Enumerates the hero root's reset-defined ledger with no depth cap;
     one selected full native identity per physical reset.
 
     ``account_key`` (#416 Slice 3A review B3) builds the index for ONE account,
     so a focused hero renders its own milestone history instead of the first
-    account's. ``None`` is the merged parent index and is byte-stable."""
+    account's. ``None`` is the merged parent index.
+
+    ``cache_conn`` and ``speed`` (#1050 spec 4.7) are the cost inputs every
+    stamp now names, read exactly as the detail route reads them, with
+    ``account_key`` as the account scope; ``cache_conn=None`` opens the
+    breakdown's own read-only connection, as the detail does for such a caller.
+    ``stats_digest`` is the caller's `codex_stats_digest` of the generation it
+    builds from: given together with ``cache_conn`` it admits the process memo
+    (`_CodexCycleInputsMemo`), which the source build relies on to keep the
+    index's cost near what it was before the stamps carried every input.
+    Precondition: the memo keys its per-cycle results on ``stats_digest`` and
+    reuses them without re-reading the stats rows they came from, so a caller
+    supplying it must guarantee that a result built from rows newer than the
+    digest is never published as the digest's. Either ``stats_conn`` reads
+    the same pinned snapshot the digest was computed in, or the call sits
+    inside a before/after validation that re-reads the digest and discards
+    the build on movement. The dashboard source build is the second kind: it
+    leaves stats.db in statement-scoped autocommit (#393) and its
+    reconciliation re-reads ``codex_stats_digest`` after construction
+    (`_cctally_tui._tui_build_source_bundle`, `stats_generation_moved`)."""
     now = now_utc.astimezone(UTC) if now_utc.tzinfo else now_utc.replace(tzinfo=UTC)
     tz = _resolve_display_tz()
     cycles = _load_codex_cycles(
@@ -1404,8 +2167,26 @@ def build_codex_cycle_index(stats_conn, *, identity, now_utc,
         preferred_identity=getattr(identity, "quota_identity", None),
         current_boundary=identity, now_utc=now, account_key=account_key,
     )
-    return [_codex_cycle_entry(stats_conn, c, tz) for c in cycles]
+    if cache_conn is None or stats_digest is None:
+        return [
+            _codex_cycle_entry(stats_conn, cache_conn, c, tz, speed=speed,
+                               account_scope=account_key)
+            for c in cycles
+        ]
+    memo = _CODEX_CYCLE_INPUTS_MEMO
+    with memo.lock:
+        memo.sync(cache_conn, stats_digest)
+        return [
+            _codex_cycle_entry(stats_conn, cache_conn, c, tz, speed=speed,
+                               account_scope=account_key, memo=memo)
+            for c in cycles
+        ]
 
+
+def reset_codex_cycle_inputs_memo() -> None:
+    """Drop the index's process memo (tests and measurements)."""
+    global _CODEX_CYCLE_INPUTS_MEMO
+    _CODEX_CYCLE_INPUTS_MEMO = _CodexCycleInputsMemo()
 
 def _shape_codex_milestone(row, *, key_parts, block_key) -> dict:
     captured_iso = row.captured_at.astimezone(UTC).isoformat()
@@ -1506,9 +2287,13 @@ def _union_cluster_milestones(cluster, block_key, speed, cache_conn, stats_conn,
 
 
 def _codex_cycle_blocks(stats_conn, cache_conn, cyc, speed,
-                        account_key=None) -> "list | None":
+                        account_key=None, clusters=None) -> "list | None":
+    """``clusters`` (#1050): the block clusters `_codex_cycle_inputs` read, so
+    the detail renders the population its stamp names."""
     out: list = []
-    for block in _codex_five_hour_clusters(stats_conn, cyc):
+    if clusters is None:
+        clusters = _codex_five_hour_clusters(stats_conn, cyc)
+    for block in clusters:
         block_key = block.block_key
         milestones = _union_cluster_milestones(
             block, block_key, speed, cache_conn, stats_conn,
@@ -1585,6 +2370,15 @@ def build_codex_cycle_detail(
             return (None, "pruned")
         return (None, "unknown")
 
+    # #1050 spec 4.7: ONE read of every input, stamped and rendered from. The
+    # ladders' dollars still come from `codex_quota_breakdown`, over the same
+    # rows: the route holds one read transaction per database around all of it.
+    try:
+        inputs = _codex_cycle_inputs(
+            stats_conn, cache_conn, match, speed=speed,
+            account_scope=account_key)
+    except sqlite3.Error:
+        return (None, "projection_incoherent")
     milestones = _union_cluster_milestones(
         match, match.block_key, speed, cache_conn, stats_conn,
         account_key=account_key,
@@ -1592,11 +2386,14 @@ def build_codex_cycle_detail(
     if milestones is None:
         return (None, "projection_incoherent")
     blocks = _codex_cycle_blocks(
-        stats_conn, cache_conn, match, speed, account_key=account_key)
+        stats_conn, cache_conn, match, speed, account_key=account_key,
+        clusters=inputs.block_clusters)
     if blocks is None:
         return (None, "projection_incoherent")
 
-    entry = _codex_cycle_entry(stats_conn, match, tz)
+    entry = _codex_cycle_entry(
+        stats_conn, cache_conn, match, tz, speed=speed,
+        account_scope=account_key, inputs=inputs)
     return {
         "source": "codex",
         "key": entry["key"],

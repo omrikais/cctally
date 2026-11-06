@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { render, act, fireEvent } from '@testing-library/react';
 import { HeroStrip } from './HeroStrip';
 import { _resetForTests, updateSnapshot, getState, dispatch } from '../store/store';
@@ -150,6 +152,34 @@ describe('<HeroStrip /> (#264 S1 — 3 zones)', () => {
     expect(chip).not.toBeNull();
     expect(chip?.className).toContain('chip-stale');
     expect(chip?.textContent).toContain('⚠');
+  });
+
+  // #1018 twin: the age the hero reads is the server's, counted from the newest
+  // confirming weekly reading. Taken verbatim from the Claude source copy of a
+  // dashboard golden the real serializer published (the top-level copy there is
+  // sentinelized by the harness), never written by hand.
+  function serverFreshness(scenario: string): NonNullable<NonNullable<Envelope['current_week']>['freshness']> {
+    const golden = JSON.parse(readFileSync(
+      resolve(process.cwd(), `../../tests/fixtures/dashboard/${scenario}/golden-data.json`), 'utf8'));
+    const freshness = golden.sources.claude.data.hero.current_week.freshness;
+    expect(freshness).not.toBeNull();
+    return freshness;
+  }
+
+  it.each([
+    ['ok', 'fresh', false],
+    ['credited-week', 'stale', true],
+  ] as const)('renders the server-derived age of the %s golden as %s', (scenario, tint, warns) => {
+    const env = heroEnvelope();
+    env.current_week!.freshness = serverFreshness(scenario);
+    _resetForTests();
+    updateSnapshot(env);
+    const { container } = render(<HeroStrip />);
+    const chip = container.querySelector('.sup-fresh') as HTMLElement;
+    expect(chip).not.toBeNull();
+    expect(chip.getAttribute('data-freshness')).toBe(tint);
+    expect(chip.className).toContain(`chip-${tint}`);
+    expect(chip.textContent?.includes('⚠')).toBe(warns);
   });
 
   it('humanizes the freshness age on the Snapshot row (#259)', () => {

@@ -1295,3 +1295,67 @@ def test_uncontained_stored_location_is_ignored(archive_estate, tmp_path):
         conn.rollback()
     finally:
         conn.close()
+
+
+def _quota_rows(path, root, limit_key, count, start=0):
+    return [
+        ("codex", root, path, start + i,
+         f"2026-07-20T{(start + i) // 3600 % 24:02d}:"
+         f"{(start + i) // 60 % 60:02d}:{(start + i) % 60:02d}Z",
+         "primary", limit_key, "codex", None, 300, 10.0,
+         "2026-07-21T00:00:00Z")
+        for i in range(count)
+    ]
+
+
+def _root_qualified_delete_steps(tmp_path, others):
+    ns = load_script()
+    conn = sqlite3.connect(tmp_path / f"quota-{others}.db")
+    try:
+        ns["_cctally_db"]._apply_cache_schema(conn)
+        sql = (
+            "INSERT INTO quota_window_snapshots (source, source_root_key, "
+            " source_path, line_offset, captured_at_utc, observed_slot, "
+            " logical_limit_key, limit_id, limit_name, window_minutes, "
+            " used_percent, resets_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+        root = "a" * 32
+        conn.executemany(sql, _quota_rows("/r/target.jsonl", root,
+                                          "limit-target", 10))
+        # The other rows share the root but not the partition, so only the
+        # DELETE's own access path can grow with them.
+        for n in range(0, others, 100):
+            conn.executemany(sql, _quota_rows(
+                f"/r/other-{n}.jsonl", root, "limit-other", 100, start=n))
+        conn.commit()
+        counter = [0]
+
+        def tick():
+            counter[0] += 1
+            return 0
+
+        import _cctally_cache
+
+        conn.set_progress_handler(tick, 1)
+        _cctally_cache._delete_codex_file_derived_rows(
+            conn, "/r/target.jsonl", source_root_key=root,
+            match_source_root=True)
+        conn.set_progress_handler(None, 0)
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM quota_window_snapshots "
+            "WHERE source_path='/r/target.jsonl'").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM quota_window_snapshots").fetchone()[0] == others
+        return counter[0]
+    finally:
+        conn.close()
+
+
+def test_root_qualified_quota_delete_seeks_the_file(tmp_path):
+    """#971 T4 (failure: the prune's root-qualified quota DELETE walks every
+    quota row of the root for each deleted file, about 45 ms per file on a
+    real store). Deleting one file's quota rows takes VM steps independent of
+    the other quota rows the root holds."""
+    small = _root_qualified_delete_steps(tmp_path, 100)
+    big = _root_qualified_delete_steps(tmp_path, 10_000)
+    assert big <= small + 64, (small, big)

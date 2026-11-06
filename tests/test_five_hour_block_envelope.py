@@ -599,18 +599,34 @@ def test_839_decorated_live_block_publishes_its_account_identity(ctx):
 
 
 def _seed_839_snapshot(conn, account, percent, key, captured, *, held=0,
-                       five_hour_percent=12.0, resets_at=None):
+                       five_hour_percent=12.0, resets_at=None,
+                       observation_id=None):
+    """``observation_id`` (#1018 twin) also gives the row an originating
+    observation: an eligible `claude_weekly_observation_index` row of the
+    same reading, so the Current Week card's freshness has its confirmation
+    (captured with the row, in the row's provider window)."""
     conn.execute(
         "INSERT INTO weekly_usage_snapshots "
         "(week_start_date, week_end_date, week_start_at, week_end_at, "
         " captured_at_utc, weekly_percent, five_hour_percent, "
         " five_hour_window_key, five_hour_resets_at, weekly_observation_held, "
-        " account_key, payload_json) "
+        " account_key, payload_json, journal_id) "
         "VALUES ('2026-04-27', '2026-05-04', "
         " '2026-04-27T00:00:00+00:00', '2026-05-04T00:00:00+00:00', "
-        " ?, ?, ?, ?, ?, ?, ?, '{}')",
-        (captured, percent, five_hour_percent, key, resets_at, held, account),
+        " ?, ?, ?, ?, ?, ?, ?, '{}', ?)",
+        (captured, percent, five_hour_percent, key, resets_at, held, account,
+         None if observation_id is None else f"sa:{observation_id}"),
     )
+    if observation_id is not None:
+        import _lib_oauth_samples
+        conn.execute(
+            "INSERT INTO claude_weekly_observation_index (observation_id,"
+            " account_key, captured_at_utc, weekly_percent,"
+            " weekly_resets_at_utc, weekly_reading_genuine,"
+            " weekly_freshness_eligible)"
+            " VALUES (?, ?, ?, ?, '2026-05-04T00:00:00Z', 1, 1)",
+            (observation_id, account,
+             _lib_oauth_samples.canonical_instant(captured), percent))
     conn.commit()
 
 
@@ -1471,7 +1487,8 @@ def _seed_836_undecorated(ns, conn, *, real_alice):
     owner = "alice" if real_alice else "unattributed"
     _seed_839_snapshot(conn, "unattributed", 40.0, key,
                        "2026-04-30T09:59:00Z")
-    _seed_839_snapshot(conn, owner, 43.0, key, "2026-04-30T11:00:00Z")
+    _seed_839_snapshot(conn, owner, 43.0, key, "2026-04-30T11:00:00Z",
+                       observation_id="obs-836-displayed")
     reset = _seed_836_reset(conn, "unattributed",
                             detected="2026-04-29T09:00:00Z",
                             effective="2026-04-29T09:00:00Z")
@@ -1491,7 +1508,10 @@ def _seed_836_undecorated(ns, conn, *, real_alice):
 
 #: Serialized on the pre-change tree (base `a71610718`) for both controls,
 #: which publish identically: the merged cycle (the unattributed credit's
-#: re-anchor), merged spend and the merged weekly milestones.
+#: re-anchor), merged spend and the merged weekly milestones. #1050 re-pinned
+#: the two `detail_stamp` values only (the seed's rows are tracked writes, so
+#: each cycle stamp carries its revision component); every other byte of
+#: `current_week` is unchanged.
 _836_UNDECORATED_BASELINE = json.loads(r'''
 {
     "dollar_per_pct": 0.08235294117647059,
@@ -1536,7 +1556,7 @@ _836_UNDECORATED_BASELINE = json.loads(r'''
     "week_index": [
         {
             "block_count": 0,
-            "detail_stamp": "30e2558efad70a82",
+            "detail_stamp": "f5c8c0c31173df63",
             "end_at_utc": "2026-05-04T00:00:00Z",
             "has_observation_gap": false,
             "is_current": true,
@@ -1548,7 +1568,7 @@ _836_UNDECORATED_BASELINE = json.loads(r'''
         },
         {
             "block_count": 0,
-            "detail_stamp": "a9b494a3922a9104",
+            "detail_stamp": "3b25562b7b51e0c5",
             "end_at_utc": "2026-04-29T09:00:00Z",
             "has_observation_gap": false,
             "is_current": false,

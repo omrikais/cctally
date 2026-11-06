@@ -33,6 +33,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 # Load the sibling so its `_resolve_project_key` (alias of
 # `_cctally_cache._resolve_project_key`) resolves cleanly.
 import _cctally_cache  # noqa: E402
+from _fixture_builders import make_git_repository_marker  # noqa: E402
 
 _resolve_project_key = _cctally_cache._resolve_project_key
 
@@ -89,7 +90,7 @@ def test_cross_nav_binds_when_cwd_is_subdirectory(tmp_path: pathlib.Path):
     # terminates on the canonical root.
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / ".git").mkdir()
+    make_git_repository_marker(repo)
     subdir = repo / "src" / "sub"
     subdir.mkdir(parents=True)
 
@@ -120,7 +121,7 @@ def test_cross_nav_binds_when_cwd_equals_bucket(tmp_path: pathlib.Path):
     does not regress the non-monorepo path."""
     repo = tmp_path / "repo2"
     repo.mkdir()
-    (repo / ".git").mkdir()
+    make_git_repository_marker(repo)
 
     bucket_path = str(repo.resolve())
     envelope = {
@@ -141,10 +142,10 @@ def test_cross_nav_skips_when_no_envelope_match(tmp_path: pathlib.Path):
     project_key stays None (cell renders as plain text per spec §4.1)."""
     repo_a = tmp_path / "a"
     repo_a.mkdir()
-    (repo_a / ".git").mkdir()
+    make_git_repository_marker(repo_a)
     repo_b = tmp_path / "b"
     repo_b.mkdir()
-    (repo_b / ".git").mkdir()
+    make_git_repository_marker(repo_b)
 
     envelope = {
         "current_week": {

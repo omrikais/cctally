@@ -137,6 +137,14 @@ class SnapshotSignature(NamedTuple):
     # referenced snapshot moves no leg above. Empty on a store with no retired
     # snapshot and no unavailable five-hour join, so it is byte-neutral there.
     claude_weekly_retired_digest: str = ""
+    # #1050 spec 4.5 item 1: the published leg of stats.db's Claude content
+    # revision (`_lib_stats_content_revision.revision_leg`). An in-place
+    # rewrite of a Claude-published row (a Model-A convergence, a reviewed
+    # rederive, the open-block projection) moves none of the append-shaped
+    # legs above; the trigger-maintained revision moves on every one. `""` on a
+    # never-mutated, never-repaired, never-published store (byte-neutral), and
+    # a fresh `"?"` nonce per read on an untrusted one, so it never idles.
+    claude_content_revision: str = ""
 
 
 def _max_id(conn: sqlite3.Connection, table: str) -> int:
@@ -254,6 +262,7 @@ def compute_signature(
     accounts_digest: str = "",
     claude_stats_digest: str = "",
     claude_weekly_retired_digest: str = "",
+    claude_content_revision: str = "",
 ) -> SnapshotSignature:
     """Composite data-version signature across cache.db + stats.db (spec §3).
 
@@ -281,6 +290,7 @@ def compute_signature(
         codex_ingest_backlog_sig=_codex_ingest_backlog_sig(cache_conn),
         claude_stats_digest=str(claude_stats_digest),
         claude_weekly_retired_digest=str(claude_weekly_retired_digest),
+        claude_content_revision=str(claude_content_revision),
     )
 
 

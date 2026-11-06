@@ -236,11 +236,11 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 51,
+                            "registry_size": 52,
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1023,
+                            "epoch": 1024,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -354,7 +354,8 @@
                                     "048_codex_quota_physical_group_order",
                                     "049_codex_rollout_containers",
                                     "050_preserve_claude_cost_attribution",
-                                    "051_codex_retained_identities"
+                                    "051_codex_retained_identities",
+                                    "052_codex_delete_trigger_plans"
                                 ],
                                 "skipped": []
                             },
@@ -647,13 +648,17 @@
                             [
                                 "cache.db",
                                 "051_codex_retained_identities"
+                            ],
+                            [
+                                "cache.db",
+                                "052_codex_delete_trigger_plans"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "63 pending",
+                    "summary": "64 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -849,6 +854,11 @@
             "checks": [
                 {
                     "details": {
+                        "effective_freshness_age_s": 7200,
+                        "effective_freshness_at": "2026-05-13T12:22:31+00:00",
+                        "freshness_unavailable_reason": null,
+                        "latest_reading_age_s": null,
+                        "latest_reading_at": null,
                         "latest_snapshot_age_s": 7200,
                         "latest_snapshot_at": "2026-05-13T12:22:31+00:00"
                     },

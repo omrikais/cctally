@@ -1005,7 +1005,8 @@ PRODUCER_SOURCE_EXCLUSIONS = (
 #: to 161, and #797/#823/#840's provider-sample pair and its provider-activity
 #: and staleness-proof kernels to 165, and #944's Claude cost attribution
 #: kernel and glue to 167, and #1015's correction-lineage kernel to 168, and
-#: #939's Codex worker attempt records to 169.
+#: #939's Codex worker attempt records to 169, and #1054's deep-scan
+#: checkpoint kernel to 172 entries (counted on the tuple below).
 #: The cost is
 #: independent of corpus scale. Roughly a quarter of recent commits
 #: touch one of these files, and each such change rebuilds any corpus root
@@ -1121,6 +1122,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_diff_kernel.py",
     "bin/_lib_display_tz.py",
     "bin/_lib_doctor.py",
+    "bin/_lib_doctor_scan_index.py",
     "bin/_lib_five_hour.py",
     "bin/_lib_fmt.py",
     "bin/_lib_forecast.py",
@@ -1154,6 +1156,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_record.py",
     "bin/_lib_rederive.py",
     "bin/_lib_render.py",
+    "bin/_lib_retained_records.py",
     "bin/_lib_retained_size.py",
     "bin/_lib_segment_summary.py",
     "bin/_lib_selector_state.py",
@@ -1166,6 +1169,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_source_retry.py",
     "bin/_lib_sqlite_close.py",
     "bin/_lib_stale_proof.py",
+    "bin/_lib_stats_content_revision.py",
     "bin/_lib_stats_damage.py",
     "bin/_lib_stats_publish.py",
     "bin/_lib_stats_wal.py",

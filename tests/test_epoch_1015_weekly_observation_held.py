@@ -32,7 +32,10 @@ from conftest import load_script, redirect_paths
 
 FIXED = dt.datetime(2026, 9, 12, 12, 0, 0, tzinfo=dt.timezone.utc)
 PREVIOUS_EPOCH = 1014
-NEW_EPOCH = 1023  # current head (#1015); the column was introduced at 1015
+#: The CURRENT head: the column arrived at epoch 1015, and an upgraded 1014
+#: store reaches the head; the later history is the comment above
+#: `STATS_INDEX_EPOCH` in `bin/_cctally_core.py`.
+NEW_EPOCH = _cctally_core.STATS_INDEX_EPOCH
 TABLE = "weekly_usage_snapshots"
 COLUMN = "weekly_observation_held"
 
@@ -72,7 +75,7 @@ def _resolve_epoch_transition():
 
 
 def test_the_epoch_is_bumped_and_the_legacy_registry_is_untouched():
-    assert _cctally_core.STATS_INDEX_EPOCH == NEW_EPOCH
+    assert _cctally_core.STATS_INDEX_EPOCH >= 1015
     assert _cctally_core.LEGACY_STATS_HEAD == 13
     import _cctally_db
     assert len(_cctally_db._STATS_MIGRATIONS) == 13, "the registry is FROZEN"
@@ -148,11 +151,18 @@ def _drop_column(conn) -> None:
     """Give the store the previous epoch's shape: no column. A later epoch's
     index that names the column (#901's epoch-1017 current-week read indexes)
     did not exist at the previous epoch either, and SQLite refuses to drop a
-    column an index still names, so those indexes go first."""
+    column an index still names, so those indexes go first. The same holds for
+    #1050's content-revision triggers, which compare every column of the
+    table and are not part of any earlier epoch's index."""
     for (name,) in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' "
             "AND tbl_name=? AND sql LIKE ?", (TABLE, f"%{COLUMN}%")).fetchall():
         conn.execute(f"DROP INDEX {name}")
+    for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND tbl_name=? AND name LIKE 'trg_content_revision_%'",
+            (TABLE,)).fetchall():
+        conn.execute(f"DROP TRIGGER {name}")
     conn.execute(f"ALTER TABLE {TABLE} DROP COLUMN {COLUMN}")
 
 

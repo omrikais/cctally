@@ -108,6 +108,66 @@ describe('DoctorCheckRow humanizes Latest snapshot age (#259)', () => {
   });
 });
 
+describe('DoctorCheckRow Latest snapshot effective freshness (#1018)', () => {
+  // Each case carries a CONFLICTING legacy `latest_snapshot_age_s` (4860 s =
+  // "1h 21m ago"), so a row that kept reading the legacy key renders the
+  // wrong age and the case fails.
+  const legacy = { latest_snapshot_at: '2026-06-13T00:00:00+00:00', latest_snapshot_age_s: 4860 };
+  const line = (container: HTMLElement): string =>
+    (container.querySelector('.doctor-modal__check > p') as HTMLElement).textContent ?? '';
+
+  it('humanizes a numeric effective_freshness_age_s, not the legacy age', () => {
+    const { container } = render(
+      <DoctorCheckRow
+        c={{
+          id: 'data.latest_snapshot_age',
+          title: 'Latest snapshot',
+          severity: 'ok',
+          summary: '60s ago',
+          details: { ...legacy, effective_freshness_at: '2026-06-13T01:20:00+00:00', effective_freshness_age_s: 60 },
+        }}
+      />
+    );
+    expect(line(container)).toContain('1m ago');
+    expect(line(container)).not.toContain('1h 21m ago');
+  });
+  it('renders the server summary when effective_freshness_age_s is present but null', () => {
+    const { container } = render(
+      <DoctorCheckRow
+        c={{
+          id: 'data.latest_snapshot_age',
+          title: 'Latest snapshot',
+          severity: 'warn',
+          summary: 'unavailable (stats.db maintenance in progress)',
+          details: {
+            ...legacy,
+            effective_freshness_at: null,
+            effective_freshness_age_s: null,
+            freshness_unavailable_reason: 'stats_maintenance',
+          },
+        }}
+      />
+    );
+    expect(line(container)).toContain('unavailable (stats.db maintenance in progress)');
+    expect(line(container)).not.toContain('1h 21m ago');
+  });
+  it('falls back to the legacy age when the effective key is absent (an older server)', () => {
+    const { container } = render(
+      <DoctorCheckRow
+        c={{
+          id: 'data.latest_snapshot_age',
+          title: 'Latest snapshot',
+          severity: 'fail',
+          summary: '4860s ago',
+          details: legacy,
+        }}
+      />
+    );
+    expect(line(container)).toContain('1h 21m ago');
+    expect(line(container)).not.toContain('4860s ago');
+  });
+});
+
 describe('DoctorCheckRow nullable details', () => {
   it('renders unavailable statusline ages as explicit JSON null values', () => {
     render(

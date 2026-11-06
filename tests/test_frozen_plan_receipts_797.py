@@ -53,7 +53,7 @@ def quiet_render(t, session, percent, *, at, transcript=True) -> bool:
     sl = t.sl
     forks = []
 
-    def record(_lock_fd, fd):
+    def record(fd):
         forks.append(fd)
         sl._release_reservation(fd)
 
@@ -66,7 +66,7 @@ def quiet_render(t, session, percent, *, at, transcript=True) -> bool:
         payload["transcript_path"] = str(session.path)
     parsed = t.app._lib_statusline.parse_statusline_stdin(json.dumps(payload).encode())
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(sl, "_fork_persist", record)
+        mp.setattr(sl, "_dispatch_render_worker", record)
         sl._statusline_persist(parsed)
     t.log.append(("quiet-render", session.name, float(percent), at))
     return bool(forks)

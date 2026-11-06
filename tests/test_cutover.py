@@ -363,15 +363,13 @@ def test_stats_registry_is_frozen_at_13(ns):
         "assertion in _cctally_db enforces this")
 
 
-def test_epoch_constants(ns):
+def test_the_legacy_stats_head_constant_stays_13(ns):
     core = _core()
-    # #661 S2 added `meter_rate_change_events` at 1011, #750 S2 added that
-    # table's four rate-change disclosure columns at 1012, and #750 S3 added
-    # reset-event origin identity plus the transactional debounce state at 1013.
-    # #769 S11 added the weekly held-provenance column at 1015.
-    # #825/#832 moved it to 1018 (the account-bound admission predicate),
-    # and #797/#823/#840 to 1019 (revision 2 of that fence, spec 4.6 B6), and #1019/#1014 to 1020 (revision 3), then #943 to 1021, then #1015 to 1022, then #948 to 1023.
-    assert core.STATS_INDEX_EPOCH == 1023
+    # This module's subject, the cutover, introduced the epoch model at epoch
+    # 1000. The legacy stats registry stays frozen at head 13: a stats schema
+    # change is an epoch bump. The epoch value itself is pinned once, in
+    # tests/test_stats_index_epoch_pin.py; its history is the comment above
+    # `STATS_INDEX_EPOCH` in `bin/_cctally_core.py`.
     assert core.LEGACY_STATS_HEAD == 13
 
 

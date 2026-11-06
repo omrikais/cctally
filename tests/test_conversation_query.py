@@ -5497,3 +5497,318 @@ def test_ordinary_prose_naming_a_task_is_never_a_placeholder():
     assert call["result"]["text"] == "We moved as task tA to the background yesterday."
     assert "background_status" not in call
     assert _bg_notification_items(items)
+
+
+# ===========================================================================
+# #1036 — search snippets as structured parts from collision-checked markers.
+# The client used to bracket-parse `snippet`, so a literal `[WARN]` in a
+# transcript rendered as a highlight and lost its brackets. The kernel now
+# publishes `snippet_parts` (literal text + match flags) beside the unchanged
+# legacy `snippet` (the CLI's form, O2).
+# ===========================================================================
+_FTS_COLS = ("text", "search_tool", "search_thinking")
+_COL_KIND = {0: "all", 1: "tools", 2: "thinking"}
+
+
+def _marker(n, which):
+    return "cctally:" + str(n) + ":" + which + ""
+
+
+def _original_snippet(c, col, match_expr, rid, left="[", right="]",
+                      table="conversation_fts", src="conversation_messages",
+                      rid_col="id"):
+    """SQLite's own snippet() with literal decorations, on the same connection:
+    the exact bytes the pre-#1036 kernel published (or, with empty decorations,
+    the plain excerpt)."""
+    row = c.execute(
+        f"SELECT snippet({table}, {int(col)}, '{left}', '{right}', ' … ', 12) "
+        f"FROM {table} JOIN {src} s ON s.{rid_col} = {table}.rowid "
+        f"WHERE {table} MATCH ? AND s.{rid_col} = ?", (match_expr, rid)).fetchone()
+    return row[0] if row else None
+
+
+def _needle_expr(col=0):
+    return cq._kind_match_expr(_COL_KIND[col], cq._fts_query("needle", prefix_last=True))
+
+
+def _one_msg(c, rid, **kw):
+    base = dict(id=rid, session_id=f"s{rid}", uuid=f"u{rid}",
+                source_path=f"f{rid}.jsonl", byte_offset=0,
+                timestamp_utc=f"2026-06-01T00:00:{rid:02d}Z",
+                entry_type="assistant", cwd="/home/u/proj")
+    base.update(kw)
+    _msg(c, **base)
+
+
+class _ParamRecordingConn:
+    """Records every (sql, params) pair; forwards everything else."""
+    def __init__(self, conn):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "calls", [])
+
+    def execute(self, sql, params=()):
+        self.calls.append((" ".join(str(sql).split()), tuple(params)))
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+@pytest.mark.parametrize("column", _FTS_COLS)
+def test_1036_snippet_parts_keep_source_brackets(column):
+    """Detects the #1036 defect at its source: the published excerpt must keep
+    every literal bracket and mark exactly the FTS token, on each FTS column
+    (prose; tool and thinking through _prefer_snippet_columns), with a non-BMP
+    character inside the fragment, while `snippet` keeps its legacy bytes."""
+    require_fts5()
+    c = _conn()
+    body = "[WARN] needle arr[0] [x] \U0001d11e done"
+    _one_msg(c, 1, **{column: body})
+    hit, = cq.search_conversations(c, "needle")["hits"]
+    assert hit["snippet_parts"] == [
+        {"text": "[WARN] ", "match": False},
+        {"text": "needle", "match": True},
+        {"text": " arr[0] [x] \U0001d11e done", "match": False}]
+    col = _FTS_COLS.index(column)
+    assert hit["snippet"] == _original_snippet(c, col, _needle_expr(col), 1)
+
+
+_LEGACY_BODIES = [
+    "needle needle needle tail",                                    # adjacent
+    "needle " + " ".join(f"w{i}" for i in range(20)),               # at start
+    " ".join(f"w{i}" for i in range(20)) + " needle",               # at end
+    " ".join(f"w{i}" for i in range(15)) + " [pi] needle "
+    + " ".join(f"v{i}" for i in range(15)),                         # both edges
+    "needle " + " ".join(f"w{i}" for i in range(30)) + " needle",   # far apart
+]
+
+
+@pytest.mark.parametrize("body", _LEGACY_BODIES)
+def test_1036_legacy_snippet_equals_original_expression(body):
+    """Detects drift of the legacy `snippet` bytes (O2: the CLI prints them)
+    from SQLite's original snippet(…,'[',']',' … ',12): a moved ellipsis, a
+    lost or doubled bracket, merged adjacent matches."""
+    require_fts5()
+    c = _conn()
+    _one_msg(c, 1, text=body)
+    hit, = cq.search_conversations(c, "needle")["hits"]
+    assert hit["snippet"] == _original_snippet(c, 0, _needle_expr(), 1)
+
+
+@pytest.mark.parametrize("body", _LEGACY_BODIES)
+def test_1036_parts_rebuild_legacy_and_plain_excerpt(body):
+    """Detects parts that do not concatenate to SQLite's plain excerpt, carry
+    empty unmatched parts, merge adjacent matches, or fail to rebuild the
+    legacy string."""
+    require_fts5()
+    c = _conn()
+    _one_msg(c, 1, text=body)
+    hit, = cq.search_conversations(c, "needle")["hits"]
+    parts = hit["snippet_parts"]
+    assert "".join(p["text"] for p in parts) == _original_snippet(
+        c, 0, _needle_expr(), 1, left="", right="")
+    assert cq._legacy_from_parts(parts) == hit["snippet"]
+    assert all(p["text"] for p in parts if not p["match"])
+    assert [p["text"] for p in parts if p["match"]] == \
+        ["needle"] * hit["snippet"].count("[needle]")
+
+
+def test_1036_empty_and_null_columns_extract_as_original():
+    """Detects an empty or NULL FTS column producing a fabricated part or a
+    changed legacy value ("" stays "", NULL stays NULL). The conversation
+    columns are NOT NULL, so NULL is driven through the extraction helper over
+    a nullable external-content table."""
+    require_fts5()
+    c = _conn()
+    _one_msg(c, 1, text="", search_tool="needle here")
+    for col in (0, 2):
+        (legacy, parts), = cq._fts_snippets(c, _needle_expr(1), [1], col=col).values()
+        assert legacy == _original_snippet(c, col, _needle_expr(1), 1) == ""
+        assert parts == []
+    n = sqlite3.connect(":memory:")
+    n.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+    n.execute("CREATE VIRTUAL TABLE docs_fts USING fts5(a, b, content='docs', "
+              "content_rowid='id')")
+    n.execute("INSERT INTO docs VALUES(1, NULL, 'needle here')")
+    n.execute("INSERT INTO docs_fts(rowid, a, b) VALUES(1, NULL, 'needle here')")
+    got = cq._extract_fts_snippets(
+        n, fts_table="docs_fts", content_table="docs", content_rowid="id",
+        source_col="a", col=0, match_expr="needle", rowids=[1])
+    assert got == {1: (_original_snippet(n, 0, "needle", 1, table="docs_fts",
+                                         src="docs"), [])}
+
+
+def test_1036_marker_collision_retries_only_the_colliding_row():
+    """Detects a transcript that contains the marker characters (or a whole
+    marker) being parsed as a highlight, and one colliding row degrading its
+    batch neighbours: the colliding row is retried at the next candidate and
+    the clean row is accepted at candidate 0."""
+    require_fts5()
+    c = _conn()
+    tricky = ("  " + _marker(0, "open") + " " + _marker(0, "close")
+              + " cctally:1:op needle")
+    _one_msg(c, 1, text=tricky)
+    _one_msg(c, 2, text="plain [b] needle")
+    proxy = _ParamRecordingConn(c)
+    got = cq._fts_snippets(proxy, _needle_expr(), [1, 2], col=0)
+    by_candidate = {}
+    for _sql, params in proxy.calls:
+        for n in range(64):
+            if params and params[0] == _marker(n, "open"):
+                by_candidate.setdefault(n, set()).update(
+                    p for p in params if isinstance(p, int))
+    assert by_candidate == {0: {1, 2}, 1: {1}}
+    for rid in (1, 2):
+        legacy, parts = got[rid]
+        assert legacy == _original_snippet(c, 0, _needle_expr(), rid)
+        assert "".join(p["text"] for p in parts) == _original_snippet(
+            c, 0, _needle_expr(), rid, left="", right="")
+        assert [p["text"] for p in parts if p["match"]] == ["needle"]
+    assert got[2][1] == [{"text": "plain [b] ", "match": False},
+                         {"text": "needle", "match": True}]
+
+
+def test_1036_marker_exhaustion_publishes_plain_excerpt():
+    """Detects the 64-candidate fallback publishing synthetic brackets as
+    literal text: an exhausted row gets one unmatched part holding SQLite's
+    empty-marker excerpt, and `snippet` keeps the legacy expression."""
+    require_fts5()
+    c = _conn()
+    _one_msg(c, 1, text=" ".join(_marker(n, "open") for n in range(64)) + " needle")
+    (legacy, parts), = cq._fts_snippets(c, _needle_expr(), [1], col=0).values()
+    assert parts == [{"text": _original_snippet(
+        c, 0, _needle_expr(), 1, left="", right=""), "match": False}]
+    assert legacy == _original_snippet(c, 0, _needle_expr(), 1)
+
+
+def test_1036_prose_only_fts_shape_carries_parts():
+    """Detects the legacy single-column (`prose-only`) FTS store losing the
+    structured parts or the legacy bytes."""
+    c = _legacy_conn()
+    require_fts5()
+    _one_msg(c, 1, text="[WARN] needle [x]")
+    out = cq.search_conversations(c, "needle")
+    assert out["search_depth"] == "prose-only"
+    hit, = out["hits"]
+    assert hit["snippet_parts"] == [{"text": "[WARN] ", "match": False},
+                                    {"text": "needle", "match": True},
+                                    {"text": " [x]", "match": False}]
+    assert hit["snippet"] == _original_snippet(
+        c, 0, cq._fts_query("needle", prefix_last=True), 1)
+
+
+def test_1036_grouped_row_keeps_primary_snippet_when_replacement_misses():
+    """Detects the column replacement NULLing a grouped row's snippet (R3-P2):
+    badges aggregate over every row of a (session_id, uuid), so the tool-column
+    replacement can miss the selected row, which must keep its primary prose
+    snippet bytes and parts."""
+    require_fts5()
+    c = _conn()
+    _one_msg(c, 1, text="prose fallback", search_thinking="needle thought")
+    _one_msg(c, 2, session_id="s1", uuid="u1", text="",
+             search_tool="needle tool", byte_offset=1)
+    hit, = cq.search_conversations(c, "needle", kind="thinking")["hits"]
+    assert set(hit["match_kinds"]) == {"thinking", "tool"}
+    assert hit["snippet"] == "prose fallback"
+    assert hit["snippet_parts"] == [{"text": "prose fallback", "match": False}]
+
+
+def test_1036_like_and_plain_hits_carry_one_unmatched_part():
+    """Detects a LIKE (no-FTS5) hit inventing a highlight or omitting parts:
+    it carries exactly one unmatched part equal to its snippet, `[]` when empty."""
+    c = _conn()
+    _one_msg(c, 1, text="[WARN] needle [x]")
+    _one_msg(c, 2, text="", search_tool="needle in a tool")
+    hits = {h["uuid"]: h for h in cq.search_conversations(
+        c, "needle", fts_available=False)["hits"]}
+    assert hits["u1"]["snippet_parts"] == [
+        {"text": hits["u1"]["snippet"], "match": False}]
+    assert hits["u2"]["snippet"] == ""
+    assert hits["u2"]["snippet_parts"] == []
+    assert cq.plain_snippet_parts("a [b] c") == [{"text": "a [b] c", "match": False}]
+    assert cq.plain_snippet_parts("") == [] and cq.plain_snippet_parts(None) == []
+
+
+def _wal_store(tmp_path):
+    path = tmp_path / "conversations.db"
+    w = sqlite3.connect(path)
+    db._apply_cache_schema(w)
+    w.execute("PRAGMA journal_mode=WAL")
+    w.commit()
+    return path, w
+
+
+def test_1036_message_extraction_reads_the_page_snapshot(tmp_path, monkeypatch):
+    """Detects page selection and snippet extraction reading different
+    snapshots: a writer that rewrites one selected message and deletes another
+    between them must not drop a hit or change its snippet."""
+    require_fts5()
+    path, w = _wal_store(tmp_path)
+    _one_msg(w, 1, text="needle alpha")
+    _one_msg(w, 2, text="needle beta")
+    w.commit()
+    real = cq._extract_fts_snippets
+    fired = []
+
+    def racing(conn, **kw):
+        if not fired:
+            fired.append(1)
+            w.execute("UPDATE conversation_messages SET text='needle rewritten' "
+                      "WHERE id=2")
+            w.execute("DELETE FROM conversation_messages WHERE id=1")
+            w.commit()
+        return real(conn, **kw)
+
+    monkeypatch.setattr(cq, "_extract_fts_snippets", racing)
+    reader = sqlite3.connect(path)
+    out = cq.search_conversations(reader, "needle")
+    assert fired
+    assert [h["uuid"] for h in out["hits"]] == ["u2", "u1"]
+    assert [h["snippet"] for h in out["hits"]] == ["[needle] beta", "[needle] alpha"]
+    assert out["hits"][1]["snippet_parts"] == [
+        {"text": "needle", "match": True}, {"text": " alpha", "match": False}]
+    assert reader.in_transaction is False
+
+
+def test_1036_search_snapshot_transaction_ownership(tmp_path, monkeypatch):
+    """Detects a search that ends a caller's transaction, drops TEMP objects the
+    caller made first (account scoping's views), fails on the dashboard's
+    read-only reader, runs extraction outside its snapshot, or leaks its own
+    transaction after an FTS error (the LIKE fallback must still run)."""
+    require_fts5()
+    path, w = _wal_store(tmp_path)
+    _one_msg(w, 1, text="needle alpha")
+    w.execute(cc._AI_TITLE_UPSERT_SQL, ("s1", "needle title", "f1.jsonl", 0))
+    w.commit()
+    w.close()
+    real = cq._extract_fts_snippets
+    seen = []
+
+    def spy(conn, **kw):
+        seen.append(conn.in_transaction)
+        return real(conn, **kw)
+
+    monkeypatch.setattr(cq, "_extract_fts_snippets", spy)
+    ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    ro.execute("CREATE TEMP VIEW scoped AS SELECT id FROM conversation_messages")
+    for kind in ("all", "title"):
+        assert cq.search_conversations(ro, "needle", kind=kind)["hits"], kind
+        assert ro.in_transaction is False
+    assert seen == [True, True]
+    assert ro.execute("SELECT COUNT(*) FROM scoped").fetchone() == (1,)
+
+    c = sqlite3.connect(path)
+    c.execute("BEGIN")
+    c.execute("CREATE TEMP VIEW scoped_txn AS SELECT 1 AS one")
+    assert cq.search_conversations(c, "needle")["hits"]
+    assert c.in_transaction is True
+    assert c.execute("SELECT one FROM scoped_txn").fetchone() == (1,)
+    c.execute("ROLLBACK")
+
+    def broken(conn, **kw):
+        raise sqlite3.OperationalError("fts gone")
+
+    monkeypatch.setattr(cq, "_extract_fts_snippets", broken)
+    out = cq.search_conversations(ro, "needle")
+    assert out["mode"] == "like" and out["hits"]
+    assert ro.in_transaction is False

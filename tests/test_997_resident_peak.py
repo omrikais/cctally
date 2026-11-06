@@ -101,3 +101,86 @@ def test_rebuild_record_carries_peak_resident_bytes(tmp_path, monkeypatch):
     record = json.loads(paths[-1].read_text())
     assert record["peakResidentBytes"] == 123_456_789
     assert "peakHeapBytes" in record
+
+
+# --------------------------------------------------------------------------
+# #1004 T5 — the rebuild retains coordinates, not decoded records
+# --------------------------------------------------------------------------
+
+
+def _journal_of_ops(count: int) -> None:
+    """``count`` `account_observe` ops (retained, streamed, and kept by no
+    downstream structure before the quota leg) and one Codex quota
+    observation (a `None` slot) per ten ops, in two segments."""
+    import journal_fixture_496_s5b as F
+    import _lib_journal as J
+    core = importlib.import_module("_cctally_core")
+    records = []
+    for n in range(count):
+        at = f"2026-07-{1 + n // 1440 % 28:02d}T{n // 60 % 24:02d}:{n % 60:02d}:00Z"
+        records.append(J.make_account_observe(
+            at=at, account_key="claude:acct-1004", provider="claude",
+            label=f"probe-{n}"))
+        if not n % 10:
+            records.append(F.quota_obs(at, n))
+    half = len(records) // 2
+    F._append(pathlib.Path(core.JOURNAL_DIR), "observations-2026-07.jsonl",
+              records[:half])
+    F._append(pathlib.Path(core.JOURNAL_DIR), "observations-2026-08.jsonl",
+              records[half:])
+
+
+def test_rebuild_quota_leg_entry_retains_coordinates(tmp_path, monkeypatch):
+    """#1004 T5 (the rebuild reader): at the quota leg's entry the read pass
+    retains under 64 bytes per retained position (streamed records, `None`
+    slots and quota coordinates alike: an 8-byte slot, 12 bytes of
+    coordinates and an 8-byte digest), where it retained each decoded
+    record (several hundred bytes) before. Measured as the traced-heap
+    difference between a 2,000- and a 12,000-op journal, so a rebuild's
+    fixed cost cancels, with #997 D15's interning off (it only makes equal
+    short strings one object, and the interned-string table's resizing
+    otherwise moves a delta by megabytes) and after a warm-up rebuild."""
+    import gc
+    import tracemalloc
+    readings = {}
+    for label, count in (("small", 2_000), ("large", 12_000)):
+        ns = load_script()
+        redirect_paths(ns, monkeypatch, tmp_path / label)
+        jr = importlib.import_module("_cctally_journal")
+        jl = importlib.import_module("_lib_journal")
+        monkeypatch.setattr(jl, "compact_retained", lambda value: value)
+        _journal_of_ops(count)
+        seen: list = []
+        real = jr._rebuild_quota_cache_leg_raw
+
+        def measuring(quota_raw, decoded, *args, _real=real, _seen=seen,
+                      **kwargs):
+            gc.collect()
+            streamed = sum(1 for i in range(len(decoded))
+                           if getattr(decoded, "is_streamed",
+                                      lambda _i: False)(i))
+            _seen.append((tracemalloc.get_traced_memory()[0], len(decoded),
+                          streamed))
+            return _real(quota_raw, decoded, *args, **kwargs)
+
+        monkeypatch.setattr(jr, "_rebuild_quota_cache_leg_raw", measuring)
+        context = jr.RebuildContext(trigger="test-fixture")
+        jr.rebuild_stats_index(context=context)  # the warm-up
+        gc.collect()
+        tracemalloc.start()
+        try:
+            jr.rebuild_stats_index(context=context)
+        finally:
+            tracemalloc.stop()
+        readings[label] = seen[-1]
+    traced = readings["large"][0] - readings["small"][0]
+    positions = readings["large"][1] - readings["small"][1]
+    streamed = readings["large"][2] - readings["small"][2]
+    per_position = traced / positions
+    print(f"T5 rebuild quota-leg entry: {per_position:.1f} bytes per "
+          f"position, {traced / max(streamed, 1):.1f} per streamed record "
+          f"({positions} positions, {streamed} streamed)")
+    assert streamed >= 10_000, readings
+    assert per_position < 64, (
+        f"the rebuild's read pass retains {per_position:.1f} bytes per "
+        "position at the quota leg's entry")

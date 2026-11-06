@@ -136,7 +136,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 12,
+  "source_schema_version": 13,
   "sources": {
     "all": {
       "availability": "ok",
@@ -1439,7 +1439,7 @@
               "cycle_index": [
                 {
                   "block_count": 0,
-                  "detail_stamp": "9c28aab6d9b20ee8",
+                  "detail_stamp": "13809170a96640c6",
                   "end_at_utc": "2026-04-20T14:00:00Z",
                   "is_current": true,
                   "key": "milestone_cycle:lpRIuhv9XDz4hpApXJKC2Y0Bn3u4DT5Xsfbkgb0XZpc",

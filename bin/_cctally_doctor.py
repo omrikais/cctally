@@ -59,6 +59,18 @@ _CONFLICT_SCAN_RECORD_TYPES = _lib_journal_router.RETAINED_RECORD_TYPES
 _GUARD_LOG_TAIL_LINES = 256
 _GUARD_LOG_TAIL_BYTES = 64 * 1024
 
+#: #1005: the total time one gather may spend waiting on maintenance locks
+#: (every stats open, the open-time guard, and the cache-maintenance
+#: admission), drawn through `_cctally_store.bounded_diagnostic_waits`. Large
+#: enough to absorb a handshake-scale hold, small enough that a held lock is
+#: reported at once instead of costing a full 5 s per independent open.
+_DOCTOR_MAINTENANCE_WAIT_ALLOWANCE_S = 0.5
+
+#: #1018: the stats epoch that added `claude_weekly_observation_index`
+#: (#1015). Below it an absent table is expected; at or above it the table is
+#: required, so its absence makes freshness unreadable rather than silent.
+_OBSERVATION_INDEX_EPOCH = 1022
+
 
 def _cctally():
     """Resolve the current `cctally` module at call-time (spec §3.1)."""
@@ -510,7 +522,7 @@ def _gather_dashboard_disk_writes(
     directly — no self-HTTP and no recursive gather. Anywhere else (the CLI,
     the TUI) instances are discovered through their owner-readable
     descriptors; a stale one (dead or reused pid) is ignored and never
-    deleted, because doctor is read-only. Discovery runs only for the
+    deleted, because doctor never changes your data. Discovery runs only for the
     `cctally doctor` CLI (PR-11); with ``discover`` false nothing is probed and
     the mode is ``not_probed``."""
     import _lib_write_io as wio
@@ -610,6 +622,513 @@ def _scan_cause(exc: BaseException) -> str:
     if filename:
         text = f"{text}: {filename}"
     return f"{text} [{name}]" if name else text
+
+
+# ── #1054: the deep journal scan's shared per-record step ────────────────
+#
+# The deep scan reads every segment and, for every decoded record, runs the
+# steps below in this order. A checkpointed run (`.doctor-scan-index`, see
+# `bin/_lib_doctor_scan_index.py`) runs them only for the records that
+# *matter* and fills every other position with the placeholder the step
+# itself would have appended. That is exact only because both paths call ONE
+# step function: a change to the step, to `_deep_scan_matters` or to any
+# descriptor input must bump `_lib_doctor_scan_index.SHAPE_VERSION` unless
+# `_deep_scan_index_descriptors` already captures it (docs/journal-gotchas.md).
+
+#: The record ids the step acts on regardless of record type: the legacy
+#: accounts cutover (doctor's cutover-candidate capture) and the account-bound
+#: cutover and its two revisions (`_PassBoundary.observe`). Resolved on first
+#: use because `_cctally_journal` is imported call-time.
+_DEEP_SCAN_SPECIAL_IDS = None
+
+
+def _deep_scan_special_ids() -> frozenset:
+    global _DEEP_SCAN_SPECIAL_IDS
+    if _DEEP_SCAN_SPECIAL_IDS is None:
+        import _cctally_journal as _jr
+        import _lib_account_protocol
+        _DEEP_SCAN_SPECIAL_IDS = frozenset({
+            _jr.CUTOVER_OP_ID,
+            _lib_account_protocol.CUTOVER_OP_ID,
+            _lib_account_protocol.REVISION_OP_ID,
+            _lib_account_protocol.REVISION3_OP_ID,
+        })
+    return _DEEP_SCAN_SPECIAL_IDS
+
+
+def _deep_scan_matters(record: dict) -> bool:
+    """Whether the deep scan's step can do anything for ``record`` beyond
+    appending a placeholder: a record the selector retains, or one carrying
+    a special id. `id` is checked to be a string before set membership, so
+    an unhashable id is simply not special."""
+    if record.get("t") in _lib_journal_router.RETAINED_RECORD_TYPES:
+        return True
+    rid = record.get("id")
+    if not isinstance(rid, str):
+        return False
+    special = _DEEP_SCAN_SPECIAL_IDS
+    if special is None:
+        special = _deep_scan_special_ids()
+    return rid in special
+
+
+class _DeepScanState:
+    """The deep scan's per-pass accumulators, shared by the fresh and the
+    checkpointed path. `decoded_records` and `deep_coordinates` are
+    positionally parallel: one slot and one coordinate per decoded record,
+    the coordinate None for a record that does not matter (its slot is None
+    too, so `_apply_pass_admission` skips it either way)."""
+
+    __slots__ = ("pass_boundary", "decoded_records", "deep_coordinates",
+                 "protocol_evidence", "protocol_evidence_owners",
+                 "cutover_candidates", "_capture_evidence", "_cutover_id",
+                 "_observe", "_append_slot", "_append_coordinate",
+                 "_append_owner", "_append_candidate", "_selector_slot",
+                 "_special_ids")
+
+    def __init__(self):
+        import _cctally_journal as _jr
+        self.pass_boundary = _jr._PassBoundary()
+        self.decoded_records: list = []
+        self.deep_coordinates: list = []
+        self.protocol_evidence: list = []
+        self.protocol_evidence_owners: list = []
+        self.cutover_candidates: list = []
+        self._capture_evidence = _jr._capture_protocol_prefix_evidence
+        self._cutover_id = _jr.CUTOVER_OP_ID
+        # #1054: the step runs once per decoded record (millions on a real
+        # journal), so it reads these pre-bound slots instead of module
+        # globals and attribute chains. Every container is created above and
+        # never rebound, so each bound `append` stays its container's.
+        self._observe = self.pass_boundary.observe
+        self._append_slot = self.decoded_records.append
+        self._append_coordinate = self.deep_coordinates.append
+        self._append_owner = self.protocol_evidence_owners.append
+        self._append_candidate = self.cutover_candidates.append
+        self._selector_slot = _lib_journal_router.selector_slot
+        self._special_ids = _deep_scan_special_ids()
+
+    def placeholders(self, count: int) -> None:
+        """``count`` positions for decoded records that do not matter."""
+        if count > 0:
+            filler = [None] * count
+            self.decoded_records.extend(filler)
+            self.deep_coordinates.extend(filler)
+
+
+def _deep_scan_step(record: dict, segment: str, offset: int,
+                    prior_high_water, state: _DeepScanState) -> None:
+    """One decoded record's deep-scan work, in the scan's order: boundary
+    observation, protocol-prefix evidence with its owner ordinal, the legacy
+    cutover-candidate capture, then the selector slot and the coordinate.
+
+    "Matters" is computed inline and is exactly `_deep_scan_matters`:
+    `selector_slot` returns the record iff its `t` is a retained type, else
+    None, and the id test is the same string-then-membership check."""
+    state._observe(record)
+    evidence = state.protocol_evidence
+    state._capture_evidence(record, prior_high_water, evidence)
+    if len(evidence) > len(state.protocol_evidence_owners):
+        state._append_owner(len(state.decoded_records))
+    rid = record.get("id")
+    # first cutover op wins, exactly as `find_accounts_cutover_op` scans —
+    # captured here so the conflict scan does not decode the whole journal
+    # twice.
+    if rid == state._cutover_id:
+        state._append_candidate((record, segment, offset))
+    # RETAIN ONLY what the selector consumes. `obs` lines are ~97% of a real
+    # journal and `resolve_effective_events` ignores them entirely — keeping
+    # their dictionaries cost 4.3 GB of peak RSS for an identical result
+    # (#374 review). They still consume a lightweight slot because their
+    # physical sequence is part of three durable violation fingerprints
+    # (#508).
+    slot = state._selector_slot(record)
+    state._append_slot(slot)
+    state._append_coordinate(
+        (segment, offset)
+        if slot is not None
+        or (isinstance(rid, str) and rid in state._special_ids)
+        else None)
+
+
+#: The deep scan's disposable checkpoint, beside the segments it describes.
+#: `list_segments` lists only `*.jsonl` segment names, so it is invisible to
+#: every journal reader; doctor is its only writer and its only reader.
+_DOCTOR_SCAN_INDEX_NAME = ".doctor-scan-index"
+
+
+#: A publication temporary older than this is an orphan of a killed doctor:
+#: no live publication holds its temporary file anywhere near this long.
+_DEEP_SCAN_TEMP_MAX_AGE_SECONDS = 3600
+_DEEP_SCAN_TEMP_PREFIX = _DOCTOR_SCAN_INDEX_NAME + "."
+_DEEP_SCAN_TEMP_SUFFIX = ".tmp"
+
+
+def _load_deep_scan_index(jdir: pathlib.Path, version: str):
+    """``(entries, clean)``: the checkpoint's valid entries, or ``{}`` when
+    it is absent, foreign or unreadable, and whether the document held
+    exactly those entries. Read with `open`, never `Path.read_bytes`, so a
+    failure injected into the segment reads cannot reach it (and it cannot
+    mask one). Only ordinary exceptions are swallowed."""
+    import _lib_doctor_scan_index as _dsi
+    try:
+        with open(jdir / _DOCTOR_SCAN_INDEX_NAME, "rb") as handle:
+            raw = handle.read()
+        entries, clean = _dsi.decode_document(raw, version)
+        return (entries or {}), clean
+    except Exception:  # noqa: BLE001 — a missing or bad cache is a cold run
+        return {}, False
+
+
+def _sweep_stale_deep_scan_temps(jdir: pathlib.Path) -> None:
+    """Remove the publication temporaries a killed doctor left behind: only
+    names with this module's `mkstemp` prefix and suffix, only regular files
+    (never a symlink) and only ones untouched for an hour, so a concurrent
+    doctor's live temporary is kept. Best-effort; never creates the
+    directory."""
+    import stat
+    import time
+    try:
+        names = os.listdir(jdir)
+    except OSError:
+        return
+    cutoff = time.time() - _DEEP_SCAN_TEMP_MAX_AGE_SECONDS
+    shortest = len(_DEEP_SCAN_TEMP_PREFIX) + len(_DEEP_SCAN_TEMP_SUFFIX)
+    for name in names:
+        if (len(name) <= shortest
+                or not name.startswith(_DEEP_SCAN_TEMP_PREFIX)
+                or not name.endswith(_DEEP_SCAN_TEMP_SUFFIX)):
+            continue
+        path = os.path.join(jdir, name)
+        try:
+            info = os.lstat(path)
+            if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+                os.unlink(path)
+        except OSError:
+            continue
+
+
+def _publish_deep_scan_index(jdir: pathlib.Path, version: str,
+                             entries: list, previous: dict,
+                             previous_clean: bool) -> None:
+    """Atomically replace the checkpoint with ``entries`` (spec 5.5).
+
+    Stale temporaries of killed doctors are swept first. When the loaded
+    document was clean and holds exactly ``entries`` (``previous``) the
+    write is skipped, so an idle doctor does not rewrite a multi-MB file.
+    Otherwise a unique temporary file in the journal directory, mode 0600,
+    then `os.replace`: no fsync (the file is disposable and every entry is
+    verified on reuse) and no lock (concurrent doctors are last-writer-wins).
+    The journal directory is never created. Any ordinary failure is
+    swallowed and leaves no temporary file, so the run's output and exit
+    status never depend on it."""
+    import tempfile
+    import _lib_doctor_scan_index as _dsi
+    tmp_path = None
+    try:
+        _sweep_stale_deep_scan_temps(jdir)
+        if (previous_clean and len(entries) == len(previous)
+                and all(previous.get(entry.name) == entry
+                        for entry in entries)):
+            return
+        payload = _dsi.encode(version, entries)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(jdir), prefix=_DEEP_SCAN_TEMP_PREFIX,
+            suffix=_DEEP_SCAN_TEMP_SUFFIX)
+        try:
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, jdir / _DOCTOR_SCAN_INDEX_NAME)
+        tmp_path = None
+    except Exception:  # noqa: BLE001 — the checkpoint is best-effort
+        pass
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _deep_decode_hits(data: bytes, entry) -> "list | None":
+    """The decoded hit records of a verified prefix, or None when any hit
+    does not start a line, does not decode or does not matter — checked for
+    every hit before the caller touches any scan state."""
+    import _lib_journal as _jl
+    records = []
+    for offset, _ordinal in entry.hits:
+        if offset and data[offset - 1] != 0x0A:
+            return None
+        newline = data.find(b"\n", offset, entry.covered)
+        if newline <= offset:
+            return None
+        record = _jl.decode_line(data[offset:newline])
+        if record is None or not _deep_scan_matters(record):
+            return None
+        records.append(record)
+    return records
+
+
+def _deep_scan_segment(segment: str, data: bytes, entry, prior_high_water,
+                       state: _DeepScanState):
+    """Scan one segment's bytes; return ``(new entry, malformed lines,
+    prior high-water)``.
+
+    With a usable checkpoint entry (its prefix verified against ``data`` and
+    every hit decoding to a record that matters) the cached prefix
+    contributes its malformed count, the shared step for each hit and a
+    placeholder for every other decoded position; the running prior
+    high-water then becomes ``(segment, covered)``, the value the fresh loop
+    holds at the first suffix line. Everything from ``covered`` on — or the
+    whole segment without a usable entry — is processed exactly like the
+    fresh loop. The prefix hash is continued over the suffix, so each byte
+    is hashed once. A torn tail is never covered and never stored."""
+    import hashlib
+    import _lib_journal as _jl
+    import _lib_doctor_scan_index as _dsi
+    end = data.rfind(b"\n") + 1
+    hasher = None
+    hit_records = None
+    if entry is not None:
+        hasher = _dsi.verify_prefix(entry.sha256, entry.covered, data)
+        if hasher is not None:
+            hit_records = _deep_decode_hits(data, entry)
+            if hit_records is None:
+                hasher = None
+    if hasher is not None:
+        malformed = entry.malformed
+        position = 0
+        for (offset, ordinal), record in zip(entry.hits, hit_records):
+            state.placeholders(ordinal - position)
+            _deep_scan_step(
+                record, segment, offset,
+                (segment, offset) if offset > 0 else prior_high_water,
+                state)
+            position = ordinal + 1
+        state.placeholders(entry.decoded - position)
+        decoded = entry.decoded
+        hits = list(entry.hits)
+        start = entry.covered
+        if start > 0:
+            prior_high_water = (segment, start)
+    else:
+        hasher = hashlib.sha256()
+        malformed = 0
+        decoded = 0
+        hits = []
+        start = 0
+    hasher.update(memoryview(data)[start:end])
+    coordinates = state.deep_coordinates
+    # #1054: the loop below runs once per journal line, so its callables are
+    # locals. The step is read from the module global at call time, not at
+    # import, so a patched `_deep_scan_step` still intercepts every record.
+    decode_line = _jl.decode_line
+    step = _deep_scan_step
+    append_hit = hits.append
+    # every element except the last is a complete line; the last is either
+    # "" (ended in \n) or the torn partial — not a mid-file line, so it is
+    # never counted as malformed.
+    offset = start
+    for raw in (data if start == 0 else data[start:]).split(b"\n")[:-1]:
+        if not raw:
+            prior_high_water = (segment, offset + 1)
+            offset += 1
+            continue
+        record = decode_line(raw)
+        if record is None:
+            malformed += 1
+            prior_high_water = (segment, offset + len(raw) + 1)
+            offset += len(raw) + 1
+            continue
+        step(record, segment, offset, prior_high_water, state)
+        if coordinates[-1] is not None:
+            append_hit((offset, decoded))
+        decoded += 1
+        prior_high_water = (segment, offset + len(raw) + 1)
+        offset += len(raw) + 1
+    if end > 0:
+        prior_high_water = (segment, end)
+    new_entry = _dsi.Entry(segment, end, hasher.hexdigest(), decoded,
+                           malformed, tuple(hits), None)
+    return new_entry, malformed, prior_high_water
+
+
+def _deep_boundary_fields(boundary) -> "dict | None":
+    """The admission boundary as the explicit fields `classify_admission`
+    reads (spec 5.4): the cutover's position and frozen extents, and for
+    each attached revision its presence, position, frozen extents and
+    linkage. Spool baselines and inventory evidence are not admission
+    inputs. The dataclass equality is deliberately not used: it ignores the
+    attached revisions."""
+    if boundary is None:
+        return None
+
+    def extents(fence):
+        return sorted([str(seg), int(end)]
+                      for seg, end in fence.frozen_extents.items())
+
+    revision = boundary.revision
+    revision3 = boundary.revision3
+    return {
+        "cutover": {"segment": boundary.segment,
+                    "end_offset": boundary.end_offset,
+                    "frozen_extents": extents(boundary)},
+        "revision": None if revision is None else {
+            "segment": revision.segment,
+            "end_offset": revision.end_offset,
+            "frozen_extents": extents(revision),
+            "cutover_segment": revision.cutover_segment,
+            "cutover_offset": revision.cutover_offset,
+        },
+        "revision3": None if revision3 is None else {
+            "segment": revision3.segment,
+            "end_offset": revision3.end_offset,
+            "frozen_extents": extents(revision3),
+            "cutover_segment": revision3.cutover_segment,
+            "cutover_offset": revision3.cutover_offset,
+            "revision2_segment": revision3.revision2_segment,
+            "revision2_offset": revision3.revision2_offset,
+        },
+    }
+
+
+def _deep_exclusion_read(path, segment: str, lo: int, hi: int, boundary,
+                         cached):
+    """One read of ``[lo, hi)`` classifying excluded records; returns
+    ``(excluded records, hasher)``, or None when ``cached`` was offered and
+    could not be used.
+
+    With ``cached`` the `RangeHasher` proves ``[lo, cached.covered)`` from
+    the very chunks this read classifies: lines starting before ``covered``
+    are not decoded, lines from ``covered`` on are decoded only once the
+    comparison matched, and a mismatch — or a stream that ended before
+    reaching ``covered`` — abandons the read. Prefix lines are never
+    buffered, so the iterator's one-chunk memory bound holds."""
+    import _cctally_journal as _jr
+    import _lib_account_protocol
+    import _lib_doctor_scan_index as _dsi
+    import _lib_journal as _jl
+    hasher = _dsi.RangeHasher(
+        lo, None if cached is None else cached.covered,
+        None if cached is None else cached.sha256)
+    covered = lo if cached is None else cached.covered
+    out = []
+    lines = _jr._iter_segment_lines(path, lo, hi, on_bytes=hasher)
+    try:
+        for _name, offset, raw in lines:
+            if cached is not None:
+                if hasher.prefix_state == "mismatch":
+                    return None
+                if offset < covered:
+                    continue
+            record = _jl.decode_line(raw)
+            if record is None:
+                continue
+            point = _lib_account_protocol.Coordinate(segment, offset)
+            verdict = _lib_account_protocol.classify_admission(
+                record, point, boundary)
+            if not verdict.admitted:
+                out.append(_jr.ExcludedRecord(coordinate=point,
+                                              family=verdict.family))
+    finally:
+        lines.close()
+    if cached is not None:
+        if hasher.prefix_state != "match":
+            return None
+        out = [
+            _jr.ExcludedRecord(
+                coordinate=_lib_account_protocol.Coordinate(segment, offset),
+                family=family)
+            for offset, family in cached.excluded
+        ] + out
+    return out, hasher
+
+
+def _deep_excluded_population(boundary, index: dict,
+                              contributions: dict) -> list:
+    """`_cctally_journal.excluded_population` with per-segment reuse (#1054
+    spec 5.4); same contract and observation point.
+
+    It re-lists and re-stats the segments at call time, so it sees bytes
+    and segments appended after the main pass. Per segment the range is
+    ``[frozen extent, complete-line end)``; a segment removed since the
+    listing is skipped and any other failure raises to the caller's
+    unavailable handling. A cached exclusion is offered only when its
+    boundary fingerprint and ``lo`` match and its ``covered`` lies in the
+    current range; when it cannot be used the segment is recomputed cold
+    by a second read. A contribution is recorded in ``contributions`` only
+    from a read that consumed exactly ``hi - lo`` bytes."""
+    import _cctally_journal as _jr
+    import _lib_doctor_scan_index as _dsi
+    import _lib_journal as _jl
+    if boundary is None:
+        return []
+    fingerprint = _dsi.boundary_fingerprint(_deep_boundary_fields(boundary))
+    out = []
+    for seg in sorted(_jr._segment_sizes(), key=_jl.segment_sort_key):
+        path = _cctally_core.JOURNAL_DIR / seg
+        lo = boundary.frozen_extents.get(seg, 0)
+        try:
+            hi = _jr._complete_line_offset(path, os.path.getsize(path))
+        except FileNotFoundError:
+            continue
+        if hi <= lo:
+            continue
+        entry = index.get(seg)
+        cached = None if entry is None else entry.exclusion
+        if cached is not None and not (
+                cached.boundary == fingerprint and cached.lo == lo
+                and lo <= cached.covered <= hi):
+            cached = None
+        result = None
+        if cached is not None:
+            result = _deep_exclusion_read(path, seg, lo, hi, boundary, cached)
+        if result is None:
+            result = _deep_exclusion_read(path, seg, lo, hi, boundary, None)
+        excluded, hasher = result
+        out.extend(excluded)
+        if hasher.consumed == hi - lo:
+            contributions[seg] = _dsi.Exclusion(
+                fingerprint, lo, hi, hasher.digest(),
+                tuple((item.coordinate.offset, item.family)
+                      for item in excluded))
+    return out
+
+
+def _deep_scan_index_descriptors() -> dict:
+    """Every derived input of the checkpoint version (spec 5.2): the
+    retained record types, the special ids, the protocol-resolution kinds,
+    each constant `_lib_account_protocol.classify_admission` and its helpers
+    read, and the stats epoch. `CCTALLY_VERSION` is deliberately absent: a
+    release that changes none of these keeps every checkpoint."""
+    import _lib_account_protocol as ap
+    import _lib_journal
+    return {
+        "retained_record_types": sorted(
+            _lib_journal_router.RETAINED_RECORD_TYPES),
+        "special_ids": sorted(_deep_scan_special_ids()),
+        "protocol_resolution_kinds": sorted(
+            _lib_journal.PROTOCOL_RESOLUTION_KINDS),
+        "admission": {
+            "writer_generation_key": ap.WRITER_GENERATION_KEY,
+            "protocol_generation": ap.PROTOCOL_GENERATION,
+            "revision_key": ap.REVISION_KEY,
+            "protocol_revision": ap.PROTOCOL_REVISION,
+            "successor_revision_key": ap.SUCCESSOR_REVISION_KEY,
+            "successor_revision": ap.SUCCESSOR_REVISION,
+            "administrative_record_types": sorted(ap._ADMIN_RECORD_TYPES),
+            "claude_op_kinds": sorted(ap._CLAUDE_OP_KINDS),
+            "codex_op_kinds": sorted(ap._CODEX_OP_KINDS),
+            "administrative_op_kinds": sorted(ap._ADMIN_OP_KINDS),
+            "protocol_op_kinds": sorted(ap._PROTOCOL_OP_KINDS),
+            "claude_evt_kinds": sorted(ap._CLAUDE_EVT_KINDS),
+            "quota_evt_kinds": sorted(ap._QUOTA_EVT_KINDS),
+        },
+        "stats_index_epoch": _cctally_core.STATS_INDEX_EPOCH,
+    }
 
 
 def _durable_inventory_marker(conn) -> bool:
@@ -938,8 +1457,9 @@ def _codex_quota_verify_activity_24h(*, now_utc: "dt.datetime") -> dict:
 
 #: How much journal tail the `accounts.codex_window_attribution` leg will read
 #: to decide whether an attribution op is sitting unconsumed. Past this, the
-#: condition is left unreported: `doctor` is a read-only health report, not an
-#: ingest, and the state it would have reported self-heals on the next sync.
+#: condition is left unreported: `doctor` is a health report that never
+#: changes your data, not an ingest, and the state it would have reported
+#: self-heals on the next sync.
 _WINDOW_ATTRIBUTION_TAIL_BUDGET_BYTES = 8 * 1024 * 1024
 
 #: The same discipline on the same leg's OTHER unbounded read. Every distinct
@@ -1002,7 +1522,6 @@ def _gather_codex_window_attribution_state() -> "dict | None":
         return None
     try:
         import _cctally_cache
-        import _cctally_journal
         import _cctally_quota
         import _lib_codex_window_attribution as _wa
         import _lib_journal
@@ -1046,7 +1565,16 @@ def _gather_codex_window_attribution_state() -> "dict | None":
         # is left unreported rather than guessed at, because it self-heals on
         # the next sync either way.
         cursor = _cctally_cache.load_codex_window_attribution_cursor(conn)
-        high_water = _cctally_journal.journal_high_water()
+        # #1005: lock-free, like `stats_interrupted_rebuild_evidence`. The
+        # leaf-locked `journal_high_water()` blocks while a writer holds
+        # `journal.lock` and creates that file, and a read-only gather must
+        # do neither; the scan below already tolerates a torn tail line.
+        try:
+            import _cctally_store
+
+            high_water = _cctally_store._lock_free_journal_high_water()
+        except OSError:
+            high_water = None
         if cursor is not None and high_water is not None:
             state["cursor_behind"] = _unconsumed_window_attribution_ops(
                 cursor, high_water)
@@ -1657,6 +2185,204 @@ def _read_rollup_pricing_state(conn) -> "tuple[dict | None, str | None, object]"
     return record, stored_fp, observation
 
 
+@contextlib.contextmanager
+def _freshness_read_transaction(conn):
+    """One deferred read transaction around the snapshot selection (#1018).
+
+    The tie-group selection runs several statements; without one read view a
+    publication or delete between them could empty J1's group, and the
+    fallback would then wrongly treat it as all-future. Always ended here, so
+    no shared lock outlives the selection into the connection's later probes.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+
+
+def _stats_table_exists(conn, name: str) -> bool:
+    """Table presence from `sqlite_master`, never from a caught error: a
+    `database is locked` is an `OperationalError` too."""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone() is not None
+
+
+def _parse_capture_utc(value, label: str) -> dt.datetime:
+    """A stored capture spelling as an aware UTC instant.
+
+    A spelling without an offset is UTC, never host time: the selection's
+    tie groups come from SQLite's ``julianday()``, which reads it as UTC, so
+    a host-local parse would report a moment SQLite never grouped.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{label} is not an ISO datetime: {value!r}")
+    text = value.strip()
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{label} must be ISO datetime") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _latest_snapshot_capture(conn, now_utc: dt.datetime):
+    """Newest held-inclusive `weekly_usage_snapshots` capture <= ``now_utc``.
+
+    Chronological, because the writer keeps its ISO spelling (offsets, mixed
+    precision): text MAX is not. ``julianday`` buckets by millisecond, so the
+    choice is exact by tie groups (spec 5.3): the newest bucket <= now, every
+    row of it parsed and filtered against ``now_utc``; if that bucket is all
+    after now, the next older bucket, all of whose rows precede now. Raises
+    ``sqlite3.Error``/``ValueError`` when the source cannot be read.
+    """
+    if not _stats_table_exists(conn, "weekly_usage_snapshots"):
+        return None  # no snapshots yet
+    label = "weekly_usage_snapshots.captured_at_utc"
+    now_jd = now_utc.astimezone(dt.timezone.utc).isoformat()
+
+    def _group(julian):
+        rows = conn.execute(
+            "SELECT captured_at_utc FROM weekly_usage_snapshots "
+            "WHERE julianday(captured_at_utc) = ?",
+            (julian,),
+        ).fetchall()
+        return [
+            moment for moment in
+            (_parse_capture_utc(row[0], label) for row in rows)
+            if moment <= now_utc
+        ]
+
+    with _freshness_read_transaction(conn):
+        # fetchall, so each statement is exhausted and reset before the next.
+        j1 = conn.execute(
+            "SELECT MAX(julianday(captured_at_utc)) FROM weekly_usage_snapshots "
+            "WHERE julianday(captured_at_utc) <= julianday(?)",
+            (now_jd,),
+        ).fetchall()[0][0]
+        if j1 is None:
+            return None
+        valid = _group(j1)
+        if valid:
+            return max(valid)
+        j2 = conn.execute(
+            "SELECT MAX(julianday(captured_at_utc)) FROM weekly_usage_snapshots "
+            "WHERE julianday(captured_at_utc) < ?",
+            (j1,),
+        ).fetchall()[0][0]
+        if j2 is None:
+            return None
+        valid = _group(j2)
+        return max(valid) if valid else None
+
+
+def _latest_admitted_reading(conn, now_utc: dt.datetime):
+    """Newest admitted Claude weekly reading <= ``now_utc`` (#1018).
+
+    `claude_weekly_observation_index` holds one row per admitted observation
+    carrying a weekly reading, projected before snapshot dedup, and stores the
+    fixed-width canonical instant, so text comparison is exact chronological
+    comparison. A store below the epoch that added it has no table and falls
+    back to snapshots; a current store missing it is unreadable.
+    """
+    if not _stats_table_exists(conn, "claude_weekly_observation_index"):
+        epoch = conn.execute("PRAGMA user_version").fetchone()[0]
+        if int(epoch or 0) < _OBSERVATION_INDEX_EPOCH:
+            return None
+        raise sqlite3.DatabaseError(
+            "claude_weekly_observation_index is missing from a "
+            f"current-epoch stats.db (user_version {epoch})"
+        )
+    row = conn.execute(
+        "SELECT MAX(captured_at_utc) FROM claude_weekly_observation_index "
+        "WHERE captured_at_utc <= ?",
+        (now_utc.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return _parse_capture_utc(
+        row[0], "claude_weekly_observation_index.captured_at_utc"
+    )
+
+
+def _gather_freshness_sources(conn, now_utc: dt.datetime):
+    """``(latest_snapshot_at, latest_reading_at, reason)`` for one gather.
+
+    Each source runs independently, so one failure keeps the other's value;
+    ``reason`` is ``"stats_unreadable"`` when either could not be read.
+    """
+    unreadable = False
+    latest_snapshot_at = latest_reading_at = None
+    try:
+        latest_snapshot_at = _latest_snapshot_capture(conn, now_utc)
+    except (sqlite3.Error, ValueError):
+        unreadable = True
+    try:
+        latest_reading_at = _latest_admitted_reading(conn, now_utc)
+    except (sqlite3.Error, ValueError):
+        unreadable = True
+    return (
+        latest_snapshot_at,
+        latest_reading_at,
+        "stats_unreadable" if unreadable else None,
+    )
+
+
+def _stats_maintenance_lock_refused() -> bool:
+    """True when ``stats.db.maintenance.lock`` exists and a non-blocking
+    shared probe is refused. Read-only: no ``O_CREAT``, never waits."""
+    try:
+        fd = os.open(str(_cctally_core.STATS_LOCK_MAINTENANCE_PATH), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _classify_absent_stats(stats_db_status) -> "str | None":
+    """Why an absent stats.db yields no freshness evidence (spec 5.3).
+
+    During a rebuild's physical publication the old family can be quarantined
+    before its replacement is installed, so an absent file is a fresh install
+    only when no maintenance evidence says otherwise.
+    """
+    import _cctally_store
+
+    status = stats_db_status if isinstance(stats_db_status, dict) else {}
+    interrupted = status.get("_interrupted_rebuild")
+    if interrupted:
+        if interrupted.get("live") is True:
+            return "stats_maintenance"
+        return "stats_unreadable"  # db.stats.file names the recovery
+    if status.get("_interrupted_inspection_error"):
+        # An inspection failure never reads as a fresh install.
+        if _stats_maintenance_lock_refused():
+            return "stats_maintenance"
+        return "stats_unreadable"
+    db_path = _cctally_core.DB_PATH
+    if (
+        _cctally_store._cctally_db._quarantine_pending_path(db_path).exists()
+        or _cctally_store._stats_repair_marker(db_path).exists()
+    ):
+        return "stats_maintenance"
+    if _stats_maintenance_lock_refused():
+        return "stats_maintenance"
+    return None
+
+
 def doctor_gather_state(
     *,
     now_utc: "dt.datetime | None" = None,
@@ -1667,11 +2393,12 @@ def doctor_gather_state(
 ):
     """Gather doctor state while excluding cache-family replacement.
 
-    Doctor is read-only, so it never creates the maintenance lock.  When the
-    lock already exists it holds maintenance-shared from the marker check
-    through every cache probe.  A live/stale marker or a pending quarantine
-    suppresses all raw SQLite cache opens; when a cache exists but its lock is
-    absent, probes also degrade rather than racing a newly starting repair.
+    Doctor never changes your data, so it never creates the maintenance
+    lock.  When the lock already exists it holds maintenance-shared from the
+    marker check through every cache probe.  A live/stale marker or a pending
+    quarantine suppresses all raw SQLite cache opens; when a cache exists but
+    its lock is absent, probes also degrade rather than racing a newly
+    starting repair.
 
     ``force_cold_inputs`` bypasses every reused raw input (#583 S5 §2.3), so a
     caller can obtain a genuinely fresh gather at a chosen instant. It exists
@@ -1683,6 +2410,28 @@ def doctor_gather_state(
     the TUI and every snapshot build gather on each rebuild, where serial
     2-second probes of every live descriptor do not belong.
     """
+    import _cctally_store
+
+    # #1005: entered FIRST, so the cache-maintenance admission below and every
+    # stats open inside the impl share one wait allowance.
+    with _cctally_store.bounded_diagnostic_waits(
+        _DOCTOR_MAINTENANCE_WAIT_ALLOWANCE_S
+    ):
+        return _doctor_gather_state_admitted(
+            now_utc=now_utc,
+            runtime_bind=runtime_bind,
+            deep=deep,
+            force_cold_inputs=force_cold_inputs,
+            discover_dashboards=discover_dashboards,
+        )
+
+
+def _doctor_gather_state_admitted(
+    *, now_utc, runtime_bind, deep, force_cold_inputs, discover_dashboards,
+):
+    """The cache-maintenance admission and the gather, inside the scope."""
+    import _cctally_store
+
     cache_lock = None
     cache_probe_allowed = not _cctally_core.CACHE_DB_PATH.exists()
     cache_repair_marker = {
@@ -1695,8 +2444,18 @@ def doctor_gather_state(
             lock_path = _cctally_core.CACHE_LOCK_MAINTENANCE_PATH
             if lock_path.exists():
                 cache_lock = open(lock_path, "r")
-                fcntl.flock(cache_lock, fcntl.LOCK_SH)
-                cache_probe_allowed = True
+                # #1005 R11: bounded by the gather's allowance instead of a
+                # blocking flock. On decline every cache probe degrades
+                # through the existing "cache maintenance excludes read
+                # probes" path.
+                if _cctally_store.diagnostic_flock(
+                    cache_lock, fcntl.LOCK_SH, 5.0
+                ):
+                    cache_probe_allowed = True
+                else:
+                    cache_lock.close()
+                    cache_lock = None
+                    cache_probe_allowed = False
 
             c = _cctally()
             db_mod = c._load_sibling("_cctally_db")
@@ -1726,8 +2485,6 @@ def doctor_gather_state(
                 fcntl.flock(cache_lock, fcntl.LOCK_UN)
                 cache_lock.close()
                 cache_lock = None
-
-        import _cctally_store
 
         with _cctally_store.suppress_interrupted_stats_recovery():
             return _doctor_gather_state_impl(
@@ -2006,12 +2763,22 @@ def _doctor_gather_state_impl(
 
     with _lib_perf.phase("doctor.db_status"):
         # ── DB ───────────────────────────────────────────────────────────
+        interrupted_inspection_error = None
         try:
             import _cctally_store
 
-            interrupted = _cctally_store.stats_interrupted_rebuild_evidence(
-                _cctally_core.DB_PATH
-            )
+            try:
+                interrupted = _cctally_store.stats_interrupted_rebuild_evidence(
+                    _cctally_core.DB_PATH
+                )
+            except OSError as exc:
+                # #1005: the lock-free high-water read lost a listing race
+                # twice, or the file system refused it. The evidence is
+                # unknown, never "no rebuild": the report continues, and the
+                # freshness leg refuses to read an absent file as a fresh
+                # install.
+                interrupted = None
+                interrupted_inspection_error = str(exc)
             if interrupted is not None and interrupted.get("live") is True:
                 stats_db_status = {
                     "path": str(_cctally_core.DB_PATH),
@@ -2034,6 +2801,10 @@ def _doctor_gather_state_impl(
             stats_db_status = {"path": str(_cctally_core.DB_PATH), "user_version": 0,
                                "registry_size": len(c._STATS_MIGRATIONS),
                                "migrations": [], "_open_error": str(exc)}
+        if interrupted_inspection_error is not None:
+            stats_db_status["_interrupted_inspection_error"] = (
+                interrupted_inspection_error
+            )
         # stats.db is the epoch-versioned journal index (DB journal redesign §7.1):
         # feed the epoch constant to the pure kernel so db.version_ahead classifies
         # uv==1000 as HEALTHY (not a #145 version-ahead FAIL). registry_size stays the
@@ -2069,9 +2840,12 @@ def _doctor_gather_state_impl(
     with _lib_perf.phase("doctor.stats_freshness"):
         # ── Data freshness ───────────────────────────────────────────────
         latest_snapshot_at = None
+        latest_reading_at = None
+        freshness_unavailable_reason = None
         forked_bucket_counts: dict | None = None
         credited_weeks: list[dict] | None = None
         try:
+            conn = None
             if _cctally_core.DB_PATH.exists():
                 # #386 spec section 3.1, third clause: EVERY opener of the live stats
                 # family participates in the replacement protocol, read-only probes
@@ -2081,7 +2855,19 @@ def _doctor_gather_state_impl(
                 # such on this project twice. Participation, not read-only-ness, is
                 # what the clause requires.
                 import _cctally_store as _store_mod
-                conn = _store_mod.stats_open_guarded(_cctally_core.DB_PATH)
+                try:
+                    conn = _store_mod.stats_open_guarded(_cctally_core.DB_PATH)
+                except _store_mod._cctally_db.StatsDbMaintenanceError:
+                    # #1018 C6: neither source can be read, which is not
+                    # silence; the check reports it as unavailable.
+                    freshness_unavailable_reason = "stats_maintenance"
+                except Exception:
+                    freshness_unavailable_reason = "stats_unreadable"
+            else:
+                freshness_unavailable_reason = _classify_absent_stats(
+                    stats_db_status
+                )
+            if conn is not None:
                 try:
                     # HELD-INCLUSIVE, and that is the decision rather than an
                     # omission (#769 S11, #824). Two different freshness
@@ -2106,16 +2892,17 @@ def _doctor_gather_state_impl(
                     # Pinned by `test_doctor_latest_snapshot_age_counts_a_held_row`
                     # so a later change that silently converts this leg to the
                     # second question fails rather than passing quietly.
-                    try:
-                        row = conn.execute(
-                            "SELECT MAX(captured_at_utc) FROM weekly_usage_snapshots"
-                        ).fetchone()
-                        if row and row[0]:
-                            latest_snapshot_at = parse_iso_datetime(
-                                row[0], "weekly_usage_snapshots.captured_at_utc",
-                            ).astimezone(dt.timezone.utc)
-                    except sqlite3.OperationalError:
-                        pass  # table missing — treat as no snapshots yet
+                    #
+                    # #1018: a snapshot row is written only when a reading
+                    # CHANGES value, so flat usage leaves it old while the
+                    # pipeline is healthy. The second source, the newest
+                    # admitted reading in the observation index, answers the
+                    # same pipeline question; the check takes the newer.
+                    (
+                        latest_snapshot_at,
+                        latest_reading_at,
+                        freshness_unavailable_reason,
+                    ) = _gather_freshness_sources(conn, now_utc)
                     # Forked-bucket invariant probe. Each fork count is
                     # a raw SELECT against the already-open connection —
                     # no bonus open_db() recursion. Tables missing →
@@ -2370,7 +3157,8 @@ def _doctor_gather_state_impl(
             # Non-blocking flock probe: if a transcript writer/reingest holds the
             # conversations.db lock, the rollup may be mid-recompute → in progress. We
             # acquire LOCK_EX|LOCK_NB and immediately release; failure (held) is the
-            # signal. Never blocks (LOCK_NB), so doctor stays read-only + prompt.
+            # signal. Never blocks (LOCK_NB), so doctor stays prompt and never
+            # changes your data.
             if not conv_rollup_sync_in_progress:
                 lock_path = _cctally_core.CONVERSATIONS_LOCK_PATH
                 if lock_path is not None and pathlib.Path(lock_path).exists():
@@ -2794,7 +3582,7 @@ def _doctor_gather_state_impl(
         #
         # Raw JSON read (NOT load_config or _load_config_unlocked): both
         # call `ensure_dirs()`, which creates `~/.local/share/cctally/`
-        # and `logs/` on a fresh HOME. Doctor is a read-only diagnostic
+        # and `logs/` on a fresh HOME. Doctor never changes your data
         # (H1 invariant) — it must never mutate user state, even by
         # creating an empty directory tree. Corrupt JSON yields
         # `dashboard_bind_stored = "loopback"` (the same fallback the
@@ -2936,11 +3724,12 @@ def _doctor_gather_state_impl(
     # ── Meta ─────────────────────────────────────────────────────────
     with _lib_perf.phase("doctor.journal"):
         # ── Journal (DB journal redesign §9) ─────────────────────────────
-        # Read-only legs over the append-only journal: presence + appendability,
-        # torn-tail/malformed counts (deep-gated — reads whole segments), the ingest
-        # cursor lag vs. the high-water, and the auto-heal incident history. Every
-        # probe degrades to its always-OK posture on any error (the pure kernel then
-        # reports "no journal" / "not scanned").
+        # Legs over the append-only journal, read-only except the deep scan's
+        # disposable checkpoint (journal/.doctor-scan-index, #1054): presence +
+        # appendability, torn-tail/malformed counts (deep-gated — reads whole
+        # segments), the ingest cursor lag vs. the high-water, and the auto-heal
+        # incident history. Every probe degrades to its always-OK posture on any
+        # error (the pure kernel then reports "no journal" / "not scanned").
         import _lib_journal as _jl
         journal_present = False
         journal_appendable = None
@@ -3022,9 +3811,6 @@ def _doctor_gather_state_impl(
                 if deep and segs:
                     malformed = 0
                     torn = 0
-                    decoded_records: list = []
-                    protocol_evidence = []
-                    protocol_evidence_owners = []
                     prior_high_water = None
                     cutover_value = None
                     # #825/#832 (spec 5.3, 8): the deep scan applies the same
@@ -3032,10 +3818,24 @@ def _doctor_gather_state_impl(
                     # within this one pass and applied after it — and
                     # recomputes the excluded population the legacy-writer leg
                     # compares.
-                    pass_boundary = _jr._PassBoundary()
-                    deep_coordinates: list = []
-                    cutover_candidates: list = []
+                    scan_state = _DeepScanState()
+                    pass_boundary = scan_state.pass_boundary
+                    decoded_records = scan_state.decoded_records
+                    deep_coordinates = scan_state.deep_coordinates
+                    protocol_evidence = scan_state.protocol_evidence
+                    protocol_evidence_owners = (
+                        scan_state.protocol_evidence_owners)
+                    cutover_candidates = scan_state.cutover_candidates
                     deep_excluded: list = []
+                    # #1054: the doctor-written checkpoint. Every entry is
+                    # proven against the bytes read below before any of it is
+                    # used, and the new one covers exactly the segments read.
+                    import _lib_doctor_scan_index as _dsi
+                    scan_version = _dsi.index_version(
+                        _deep_scan_index_descriptors())
+                    scan_index, scan_index_clean = _load_deep_scan_index(
+                        jdir, scan_version)
+                    scan_entries: list = []
                     for seg in segs:
                         try:
                             data = (jdir / seg).read_bytes()
@@ -3047,59 +3847,16 @@ def _doctor_gather_state_impl(
                             journal_scan_error = _scan_cause(exc)
                             break
                         if not data:
+                            # Spec 5.3: an empty segment is skipped — no
+                            # entry, and the prior high-water is untouched.
                             continue
                         if not data.endswith(b"\n"):
                             torn += 1
-                        # every element except the last is a complete line; the last
-                        # is either "" (ended in \n) or the torn partial — not a
-                        # mid-file line, so it is never counted as malformed.
-                        offset = 0
-                        for raw in data.split(b"\n")[:-1]:
-                            if not raw:
-                                prior_high_water = (seg, offset + 1)
-                                offset += 1
-                                continue
-                            record = _jl.decode_line(raw)
-                            if record is None:
-                                malformed += 1
-                                prior_high_water = (
-                                    seg,
-                                    offset + len(raw) + 1,
-                                )
-                                offset += len(raw) + 1
-                                continue
-                            pass_boundary.observe(record)
-                            _jr._capture_protocol_prefix_evidence(
-                                record,
-                                prior_high_water,
-                                protocol_evidence,
-                            )
-                            if (len(protocol_evidence)
-                                    > len(protocol_evidence_owners)):
-                                protocol_evidence_owners.append(
-                                    len(decoded_records))
-                            # first cutover op wins, exactly as
-                            # `find_accounts_cutover_op` scans — captured here so the
-                            # conflict scan does not decode the whole journal twice.
-                            if record.get("id") == _jr.CUTOVER_OP_ID:
-                                cutover_candidates.append(
-                                    (record, seg, offset))
-                            # RETAIN ONLY what the selector consumes. `obs` lines are
-                            # ~97% of a real journal (984k of 1.02M) and
-                            # `resolve_effective_events` ignores them entirely —
-                            # keeping their dictionaries cost 4.3 GB of peak RSS for
-                            # an identical result (#374 review). They still consume a
-                            # lightweight slot because their physical sequence is
-                            # part of three durable violation fingerprints (#508).
-                            decoded_records.append(
-                                _lib_journal_router.selector_slot(record)
-                            )
-                            deep_coordinates.append((seg, offset))
-                            prior_high_water = (
-                                seg,
-                                offset + len(raw) + 1,
-                            )
-                            offset += len(raw) + 1
+                        seg_entry, seg_malformed, prior_high_water = (
+                            _deep_scan_segment(seg, data, scan_index.get(seg),
+                                               prior_high_water, scan_state))
+                        malformed += seg_malformed
+                        scan_entries.append(seg_entry)
                     admission_boundary = None
                     if journal_scan_error is None:
                         try:
@@ -3109,10 +3866,12 @@ def _doctor_gather_state_impl(
                             # K9K10-R6: a None boundary admits everything:
                             # zero excluded records and an unfiltered scan.
                             journal_scan_error = _scan_cause(exc)
+                    exclusion_contributions: dict = {}
                     if journal_scan_error is None:
                         try:
-                            deep_excluded = _jr.excluded_population(
-                                admission_boundary)
+                            deep_excluded = _deep_excluded_population(
+                                admission_boundary, scan_index,
+                                exclusion_contributions)
                         except Exception as exc:  # noqa: BLE001
                             # K9K10-R11: an unreadable tail is never a
                             # smaller population.
@@ -3124,6 +3883,17 @@ def _doctor_gather_state_impl(
                     else:
                         journal_malformed_count = malformed
                         journal_torn_tail_count = torn
+                        # An exclusion contribution rides on its segment's
+                        # main entry; a segment the main pass did not read
+                        # gets no entry at all.
+                        _publish_deep_scan_index(jdir, scan_version, [
+                            _dsi.Entry(entry.name, entry.covered,
+                                       entry.sha256, entry.decoded,
+                                       entry.malformed, entry.hits,
+                                       exclusion_contributions.get(
+                                           entry.name))
+                            for entry in scan_entries
+                        ], scan_index, scan_index_clean)
                 if deep and segs and journal_scan_error is None:
                     _jr._apply_pass_admission(
                         decoded_records, deep_coordinates, admission_boundary)
@@ -3381,6 +4151,8 @@ def _doctor_gather_state_impl(
         stats_db_status=stats_db_status,
         cache_db_status=cache_db_status,
         latest_snapshot_at=latest_snapshot_at,
+        latest_reading_at=latest_reading_at,
+        freshness_unavailable_reason=freshness_unavailable_reason,
         cache_entries_count=cache_entries_count,
         cache_last_entry_at=cache_last_entry_at,
         claude_jsonl_present=claude_jsonl_present,

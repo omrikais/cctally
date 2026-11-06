@@ -2013,3 +2013,72 @@ describe('qualified Claude conversation adapters', () => {
     });
   });
 });
+
+// #1036 / #1037 — the qualified search forwards structured snippet parts, and
+// the qualified detail carries the reader header's project label and branch
+// (it used to hard-code `—` / null, so every Codex header read `— · —`).
+describe('qualified header fields and snippet parts (#1036 / #1037)', () => {
+  const emptyPage = { total: 0, returned: 0, before: null, after: null, has_before: false, has_after: false };
+  type DetailBody = Parameters<typeof adaptQualifiedDetail>[1];
+
+  it('maps a Codex detail project label, branch and branch status', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, title: 'Codex thread', items: [], page: emptyPage,
+      project_label: 'cctally-dev', git_branch: 'main', git_branch_status: 'recorded',
+    } as DetailBody);
+    expect(detail.project_label).toBe('cctally-dev');
+    expect(detail.git_branch).toBe('main');
+    expect(detail.provider_meta?.git_branch_status).toBe('recorded');
+  });
+
+  it('carries a not-recorded or unreadable status with a null branch', () => {
+    for (const status of ['not_recorded', 'unreadable'] as const) {
+      const detail = adaptQualifiedDetail(ref, {
+        status: 'ok', conversation_key: ref.key, items: [], page: emptyPage,
+        project_label: null, git_branch: null, git_branch_status: status,
+      } as DetailBody);
+      expect(detail.project_label).toBe('—');
+      expect(detail.git_branch).toBeNull();
+      expect(detail.provider_meta?.git_branch_status).toBe(status);
+    }
+  });
+
+  it('maps a Claude qualified detail without inventing a branch status', () => {
+    const claudeRef = { source: 'claude' as const, key: 'v1.claude-detail' };
+    const detail = adaptQualifiedDetail(claudeRef, {
+      status: 'ok', conversation_key: claudeRef.key, items: [], page: emptyPage,
+      project_label: 'desi1_proteomics', git_branch: 'main',
+    } as DetailBody);
+    expect(detail.project_label).toBe('desi1_proteomics');
+    expect(detail.git_branch).toBe('main');
+    expect(detail.provider_meta).not.toHaveProperty('git_branch_status');
+  });
+
+  it('keeps the placeholders for an old body and ignores an unknown status', () => {
+    const old = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, items: [], page: emptyPage,
+    } as DetailBody);
+    expect(old.project_label).toBe('—');
+    expect(old.git_branch).toBeNull();
+    expect(old.provider_meta).not.toHaveProperty('git_branch_status');
+    const bogus = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, items: [], page: emptyPage,
+      git_branch_status: 'detached',
+    } as unknown as DetailBody);
+    expect(bogus.provider_meta).not.toHaveProperty('git_branch_status');
+  });
+
+  it('forwards structured snippet parts on a qualified search hit', () => {
+    const parts = [{ text: '[WARN] ', match: false }, { text: 'harness', match: true }];
+    const search = adaptQualifiedSearch('claude', {
+      status: 'ok', query: 'harness', total: 1, mode: 'fts', depth: 'full',
+      hits: [{
+        conversation_key: 'v1.claude', item_key: 'cliv1.x', title: 'T',
+        snippet: '[WARN] [harness]', snippet_parts: parts, badges: [],
+        last_activity_utc: null, project_label: null,
+      }],
+      page: { returned: 1, cursor: null },
+    });
+    expect(search.hits[0].snippet_parts).toEqual(parts);
+  });
+});

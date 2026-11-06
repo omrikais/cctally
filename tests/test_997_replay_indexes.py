@@ -239,3 +239,90 @@ def test_replay_indexes_only_serve_order_insensitive_statements(ns, tmp_path):
     offending = {sql: plan for sql, plan in served.items()
                  if not any(p.search(sql) for p in _ORDER_INSENSITIVE)}
     assert not offending, offending
+
+
+# --------------------------------------------------------------------------
+# #1004 T5 — completion's first replay sees coordinates, not decoded records
+# --------------------------------------------------------------------------
+
+
+class _Measured(Exception):
+    """Stops a completion once its first replay was reached."""
+
+
+def _completion_window(count: int) -> None:
+    """One ingested reading, the account-bound boundary, then ``count``
+    readings whose ingest never ran: completion's window holds them all."""
+    import _cctally_journal as jr
+    import _lib_journal as J
+    base = dt.datetime(2026, 7, 27, 1, tzinfo=UTC)
+
+    def reading(n):
+        at = (base + dt.timedelta(seconds=30 * n)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        return J.make_obs(
+            at=at, src="record-usage", provider="claude", account="acct-a",
+            payload={"captured_at": at, "source": "statusline",
+                     "weekly_percent": 1 + n % 90, "resets_at": W2})
+
+    jr.append_record(reading(0))
+    jr.run_stats_ingest(mode="authoritative")
+    jr.ensure_account_bound_cutover()
+    jr.append_records([reading(n) for n in range(1, count + 1)])
+
+
+def test_completion_first_replay_retains_coordinates(monkeypatch, tmp_path):
+    """#1004 T5 (completion's window): at the first replay's entry the
+    prefix retains under 64 bytes per retained position (window and slot
+    positions alike: an 8-byte slot, 12 bytes of coordinates and an 8-byte
+    digest), where the window held every decoded reading (≈ 1 KB) before.
+    Measured as the traced-heap difference between a 1,000- and a
+    6,000-reading window, with #997 D15's interning off and after a
+    warm-up."""
+    import gc
+    import tracemalloc
+    readings = {}
+    for label, count in (("small", 1_000), ("large", 6_000)):
+        ns = load_script()
+        redirect_paths(ns, monkeypatch, tmp_path / label)
+        import _cctally_completion
+        import _cctally_journal as jr
+        import _lib_journal
+        monkeypatch.setattr(_lib_journal, "compact_retained",
+                            lambda value: value)
+        _completion_window(count)
+        seen: list = []
+
+        def measuring(base, tmp, name, prefix, *args, _seen=seen, **kwargs):
+            gc.collect()
+            window = prefix.window
+            streamed = sum(1 for i in range(len(window))
+                           if getattr(window, "is_streamed",
+                                      lambda _i: False)(i))
+            _seen.append((tracemalloc.get_traced_memory()[0],
+                          len(prefix.slots) + len(window), streamed))
+            raise _Measured
+
+        monkeypatch.setattr(_cctally_completion, "_replay", measuring)
+        context = jr.RebuildContext(trigger="test-fixture")
+        with pytest.raises(_Measured):  # the warm-up
+            _cctally_completion.complete_and_rebuild(context=context)
+        gc.collect()
+        tracemalloc.start()
+        try:
+            with pytest.raises(_Measured):
+                _cctally_completion.complete_and_rebuild(context=context)
+        finally:
+            tracemalloc.stop()
+        readings[label] = seen[-1]
+    traced = readings["large"][0] - readings["small"][0]
+    positions = readings["large"][1] - readings["small"][1]
+    streamed = readings["large"][2] - readings["small"][2]
+    per_position = traced / positions
+    print(f"T5 completion first replay: {per_position:.1f} bytes per "
+          f"position, {traced / max(streamed, 1):.1f} per streamed record "
+          f"({positions} positions, {streamed} streamed)")
+    assert streamed >= 5_000, readings
+    assert per_position < 64, (
+        f"completion's prefix retains {per_position:.1f} bytes per position "
+        "at its first replay")

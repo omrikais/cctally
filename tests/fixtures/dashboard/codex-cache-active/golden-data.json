@@ -136,7 +136,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 12,
+  "source_schema_version": 13,
   "sources": {
     "all": {
       "availability": "partial",

@@ -277,15 +277,27 @@ _REPLAY_SCRATCH_INDEXES = (
 )
 
 
+#: #1003 D2: the page cache (KiB) of a full replay's disposable scratch. A
+#: replay batch dirties more distinct pages than SQLite's 2 MiB default holds,
+#: so each overflow spilled pages the batch kept re-dirtying and wrote them
+#: again; 64 MiB removes every spill (256 MiB writes the same bytes). SQLite
+#: allocates cache pages only as a transaction touches them, and completion
+#: closes each replay copy before opening the next.
+DISPOSABLE_SCRATCH_CACHE_SIZE_KIB = 65536
+
+
 def apply_disposable_scratch_policy(conn: sqlite3.Connection) -> None:
     """Put a full replay's disposable scratch connection on the #997 policy:
-    rollback journal in memory, no fsync, and the replay indexes when
-    `weekly_usage_snapshots` exists. Called right after the scratch is opened,
-    outside any transaction; commits before returning."""
+    rollback journal in memory, no fsync, a 64 MiB page cache (#1003 D2), and
+    the replay indexes when `weekly_usage_snapshots` exists. Called right
+    after the scratch is opened, outside any transaction; commits before
+    returning. The live rebuild's `.rebuilding-*` scratch never comes here."""
     if conn.in_transaction:
         conn.commit()
     conn.execute("PRAGMA journal_mode=MEMORY")
     conn.execute("PRAGMA synchronous=OFF")
+    conn.execute(
+        f"PRAGMA cache_size=-{int(DISPOSABLE_SCRATCH_CACHE_SIZE_KIB)}")
     has_usage = conn.execute(
         "SELECT 1 FROM sqlite_schema WHERE type = 'table' "
         "AND name = 'weekly_usage_snapshots'").fetchone()
@@ -609,6 +621,7 @@ _INGEST_LOCK_HELD = _cctally_core._STATS_INGEST_LOCK_HELD
 _INTERRUPTED_RECOVERY_SUPPRESSED = (
     _cctally_core._STATS_INTERRUPTED_RECOVERY_SUPPRESSED
 )
+_DIAGNOSTIC_ALLOWANCE = _cctally_core._STATS_DIAGNOSTIC_WAIT_ALLOWANCE
 
 
 def in_stats_write_scope() -> bool:
@@ -625,6 +638,42 @@ def holds_ingest_lock() -> bool:
     self-deadlock, while any other caller must genuinely wait or decline.
     """
     return _INGEST_LOCK_HELD.get() > 0
+
+
+@dataclass
+class _DiagnosticWaitAllowance:
+    """The one mutable record a ``bounded_diagnostic_waits`` scope shares."""
+
+    remaining_s: float
+
+
+@contextlib.contextmanager
+def bounded_diagnostic_waits(allowance_s: float):
+    """Bound every maintenance-lock wait in this context by one allowance (#1005).
+
+    Doctor's gather opens stats.db through several independent guarded opens,
+    and each one used to pay the opener's full 5 s wait while maintenance held
+    the lock: 8 × 5 s ≈ 40 s for one report. Inside this scope every wait made
+    through ``diagnostic_flock`` (the opener's shared, re-acquisition and
+    exclusive-upgrade waits, ``stats_open_time_guard``'s loop, and Doctor's own
+    cache-maintenance admission) draws from ONE cumulative allowance. Elapsed
+    acquisition time is charged on success, expiry and exception and never
+    replenished; once it is spent each acquisition still makes exactly one
+    non-blocking attempt, so a released lock is still taken and nothing latches.
+
+    Nested scopes share the outer record rather than minting a fresh one, and
+    exit restores the prior context, also on an exception. Outside any scope
+    every caller keeps its own timeout, byte for byte.
+    """
+    if _DIAGNOSTIC_ALLOWANCE.get() is not None:
+        yield
+        return
+    token = _DIAGNOSTIC_ALLOWANCE.set(
+        _DiagnosticWaitAllowance(max(0.0, float(allowance_s))))
+    try:
+        yield
+    finally:
+        _DIAGNOSTIC_ALLOWANCE.reset(token)
 
 
 @contextlib.contextmanager
@@ -896,22 +945,16 @@ def stats_open_time_guard(
     )
     acquired = False
     try:
-        deadline = time.monotonic() + (
+        # #1005: the same poll as before outside a Doctor scope; inside one,
+        # `diagnostic_flock` caps it by the remaining allowance (the smaller
+        # of that and any `wait_seconds` override) and charges it.
+        if not diagnostic_flock(
+            fd, fcntl.LOCK_EX,
             _STATS_OPEN_TIME_MAINTENANCE_WAIT_S if wait_seconds is None
-            else float(wait_seconds)
-        )
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except (BlockingIOError, OSError) as exc:
-                if time.monotonic() >= deadline:
-                    _GUARD_FAILURE.set(
-                        "contention" if isinstance(exc, BlockingIOError)
-                        else "error")
-                    raise _maintenance_busy_error("exclusive")
-                time.sleep(0.02)
+            else float(wait_seconds),
+        ):
+            raise _maintenance_busy_error("exclusive")
+        acquired = True
         _cctally_core.note_stats_maintenance_acquired()
         try:
             with stats_write_scope("open-time"):
@@ -990,16 +1033,43 @@ _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG = (
 )
 
 
-def _stats_open_maintenance_timeout_message() -> str:
-    """Name a confirmed detached rebuild when it owns the maintenance wait."""
+def _confirmed_stats_heal_active() -> bool:
+    """A confirmed corruption heal whose detached worker may be running."""
     request = _read_stats_heal_request()
-    if (
+    return bool(
         request
         and request.get("forensicsDisposition") == "confirmed"
         and _stats_heal_worker_active()
-    ):
+    )
+
+
+def _stats_open_maintenance_timeout_message() -> str:
+    """Name a confirmed detached rebuild when it owns the maintenance wait."""
+    if _confirmed_stats_heal_active():
         return str(_cctally_db.StatsHealDeferred("pending"))
     return _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
+
+
+def active_stats_recovery_deferral() -> "_cctally_db.StatsRebuildDeferred | None":
+    """The pending deferral a running detached stats recovery stands for (#932).
+
+    Both detached recoveries hold the maintenance lock EXCLUSIVE for their
+    whole rebuild, so an open during one times out with a plain
+    `StatsDbMaintenanceError` rather than a deferral. A caller that already
+    holds an explicit deferral frame uses this to tell "the recovery is still
+    running" from a genuine maintenance conflict: a confirmed heal with a live
+    worker is ``StatsHealDeferred("pending")``, else a positively owned epoch
+    rebuild is ``StatsEpochRebuildDeferred("pending")``, else ``None``. Reads
+    the workers' records only; takes no lock, writes nothing, never raises.
+    """
+    try:
+        if _confirmed_stats_heal_active():
+            return _cctally_db.StatsHealDeferred("pending")
+        if _stats_epoch_rebuild_worker_active():
+            return _cctally_db.StatsEpochRebuildDeferred("pending")
+    except Exception:  # noqa: BLE001 — unknown recovery state is no recovery
+        return None
+    return None
 
 
 #: Why this context's most recent bounded maintenance wait expired
@@ -1023,6 +1093,56 @@ def _maintenance_busy_error(mode: str) -> "_cctally_db.StatsDbMaintenanceError":
     return exc
 
 
+def diagnostic_flock(fh, operation: int, timeout_s: float) -> bool:
+    """Poll for ``operation`` on ``fh`` (a file object or fd), bounded (#1005).
+
+    ``True`` when the lock is held, ``False`` on expiry (nothing acquired, so
+    the caller must not release). Outside a ``bounded_diagnostic_waits`` scope
+    this is the opener's historical loop unchanged: poll every 0.02 s until
+    ``timeout_s``. Inside one it is the single place the shared allowance is
+    charged: the deadline is ``now + min(timeout_s, remaining)``, no sleep
+    passes that deadline or follows the last attempt, and the call's elapsed
+    time is subtracted (floored at 0) however it ends. With nothing left it
+    makes exactly one ``LOCK_NB`` attempt.
+
+    ``_GUARD_FAILURE`` is set exactly as before, so ``_maintenance_busy_error``
+    still tells contention from an OS error.
+    """
+    allowance = _DIAGNOSTIC_ALLOWANCE.get()
+    _GUARD_FAILURE.set(None)
+    if allowance is None:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fh, operation | fcntl.LOCK_NB)
+                return True
+            except (BlockingIOError, OSError) as exc:
+                if time.monotonic() >= deadline:
+                    _GUARD_FAILURE.set(
+                        "contention" if isinstance(exc, BlockingIOError)
+                        else "error")
+                    return False
+                time.sleep(0.02)
+    start = time.monotonic()
+    deadline = start + min(float(timeout_s), allowance.remaining_s)
+    try:
+        while True:
+            try:
+                fcntl.flock(fh, operation | fcntl.LOCK_NB)
+                return True
+            except (BlockingIOError, OSError) as exc:
+                now = time.monotonic()
+                if now >= deadline:
+                    _GUARD_FAILURE.set(
+                        "contention" if isinstance(exc, BlockingIOError)
+                        else "error")
+                    return False
+                time.sleep(min(0.02, deadline - now))
+    finally:
+        elapsed = max(0.0, time.monotonic() - start)
+        allowance.remaining_s = max(0.0, allowance.remaining_s - elapsed)
+
+
 def _flock_bounded(lock_fh, operation: int, timeout_s: float) -> bool:
     """Poll for ``operation`` on ``lock_fh`` until ``timeout_s`` expires.
 
@@ -1030,20 +1150,9 @@ def _flock_bounded(lock_fh, operation: int, timeout_s: float) -> bool:
     the caller must not release). Same shape as ``_heal_flock_bounded``, but it
     operates on an already-open file object rather than minting an fd, because
     the opener holds one file object across its whole marker/pending/connect
-    sequence.
+    sequence. Delegates to ``diagnostic_flock`` so a Doctor scope bounds it.
     """
-    deadline = time.monotonic() + timeout_s
-    _GUARD_FAILURE.set(None)
-    while True:
-        try:
-            fcntl.flock(lock_fh, operation | fcntl.LOCK_NB)
-            return True
-        except (BlockingIOError, OSError) as exc:
-            if time.monotonic() >= deadline:
-                _GUARD_FAILURE.set(
-                    "contention" if isinstance(exc, BlockingIOError) else "error")
-                return False
-            time.sleep(0.02)
+    return diagnostic_flock(lock_fh, operation, timeout_s)
 
 
 def _stats_repair_marker(db_path) -> pathlib.Path:
@@ -1416,6 +1525,33 @@ def _has_completed_stats_quarantine_incident(
     return False
 
 
+def _lock_free_journal_high_water() -> "tuple[str, int] | None":
+    """``(latest segment, size)`` read without ``journal.lock`` (#1005).
+
+    The value ``journal_high_water()`` returns, but with no leaf lock and no
+    created file, as ``_cctally_rederive._read_only_journal_high_water`` does.
+    A writer may remove an empty future segment under ``journal.lock``
+    between the listing and the size read, so a ``FileNotFoundError`` there
+    re-lists once; a second failure, or any other ``OSError``, propagates.
+    """
+    import _cctally_journal
+
+    for attempt in range(2):
+        segments = _cctally_journal.list_segments()
+        if not segments:
+            return None
+        latest = segments[-1]
+        try:
+            return (
+                latest,
+                os.path.getsize(_cctally_core.JOURNAL_DIR / latest),
+            )
+        except FileNotFoundError:
+            if attempt:
+                raise
+    raise AssertionError("unreachable")
+
+
 def stats_interrupted_rebuild_evidence(
     db_path: pathlib.Path,
 ) -> "dict | None":
@@ -1429,9 +1565,7 @@ def stats_interrupted_rebuild_evidence(
         or not _has_completed_stats_quarantine_incident(db_path, artifacts)
     ):
         return None
-    import _cctally_journal
-
-    high_water = _cctally_journal.journal_high_water()
+    high_water = _lock_free_journal_high_water()
     if high_water is None or high_water[1] == 0:
         return None
     lock_fh = open(lock_path, "r+")
@@ -1648,6 +1782,13 @@ def stats_open_guarded(
                 # deadlock while upgrading; recheck under exclusive because a
                 # live owner may have completed it in the gap.
                 fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                if _DIAGNOSTIC_ALLOWANCE.get() is not None:
+                    # #1005 C3: a diagnostic (Doctor) open never resumes a
+                    # pending quarantine — handle discovery and the family
+                    # quarantine are mutations. Report maintenance instead,
+                    # with no fabricated `blocked_by`: nothing was contended.
+                    raise _cctally_db.StatsDbMaintenanceError(
+                        _stats_open_maintenance_timeout_message())
                 if not _flock_bounded(
                     lock_fh, fcntl.LOCK_EX, _STATS_OPEN_RESUME_WAIT_S
                 ):

@@ -11,9 +11,13 @@ carries the split onto rows that already exist — was unproven:
   * an existing split-free row gaining its split IN PLACE (row count unchanged);
   * the per-file cursors advancing back to the real size/offset;
   * the flag being cleared after a clean full walk, but NOT after a targeted
-    one and NOT after an unclean one.
+    one and NOT after one with an on-disk defect;
+  * #916: a walk whose only defect is orphan rows retiring it too, because the
+    chained clause is chosen per file from that file's own ``-1`` cursor.
 """
 from __future__ import annotations
+
+import os
 
 import pytest
 from conftest import load_script, redirect_paths
@@ -172,17 +176,177 @@ def test_a_targeted_sync_leaves_the_flag_armed(env):
     assert got[str(b)] is None, "guard: the untargeted file must still be bare"
 
 
-def test_an_unclean_walk_leaves_the_flag_armed(env):
-    """An orphaned tracked file makes the walk unclean (D5a). The flag rides
-    the same condition as the walk-complete marker, so it must stay armed and
-    retry on the next clean walk."""
+TOKEN = "claude_ingest_walk_orphan_residual"
+MARKER = "claude_ingest_walk_complete"
+
+
+def _meta(conn, key):
+    return conn.execute(
+        "SELECT value FROM cache_meta WHERE key=?", (key,)).fetchone()
+
+
+def _size_of(conn, path):
+    return dict((p, sz) for p, sz, _o in _cursors(conn))[str(path)]
+
+
+def test_a_residual_only_walk_retires_the_flag_and_writes_the_token(env):
+    """#916 A3(b); rewritten from ``test_an_unclean_walk_leaves_the_flag_armed``,
+    whose coupling (orphans keep the flag armed) this design reverses.
+
+    Detects: a store whose orphan predates migration 030 keeping the split
+    flag armed forever. The flag is in the accounting frontier's pending set,
+    so such a store could never seed and every dashboard tick re-read every
+    transcript. Retiring it is safe because the orphan is the only file still
+    at ``-1``, and that cursor re-selects the chained clause if it ever
+    reappears (``test_a_reappearing_minus_one_orphan_replays_after_retirement``).
+    """
+    import _lib_ingest_frontier as frontier
     ns, conn, projects = env
     a, b, c = _populated(ns, conn, projects)
     b.unlink()
     _arm(ns, conn)
-    ns["sync_cache"](conn)
+    state = frontier.DashboardIngestFrontier(ns["_cctally_core"].APP_DIR)
+    cutoff = state.capture_cutoff()
+    stats = ns["sync_cache"](conn)
 
+    assert _flag(conn) is None, "a residual-only walk must retire the flag"
+    assert _meta(conn, TOKEN) is not None, "a residual-only walk writes the token"
+    assert _meta(conn, MARKER) is None, "the orphan still withholds the marker (D5a)"
+    assert _size_of(conn, b) == -1, (
+        "the orphan keeps its owed re-walk: nothing visited it")
+    assert frontier.provider_sync_certifiable("full", stats), stats
+    roots = (projects.parent,)
+    assert state.seed_provider("claude", conn, roots=roots, cutoff=cutoff), (
+        f"last_seed_failure={state.last_seed_failure}")
+    plan = state.plan_provider("claude", conn, roots=roots)
+    assert plan.mode == "caught_up", (plan.mode, plan.reason)
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="chmod-0 unreadable injection has no effect when running as root",
+)
+def test_an_on_disk_defect_leaves_the_flag_armed(env):
+    """The property the rewritten test used to carry, on the defect that still
+    means it: a walk that skipped an on-disk file without ingesting it has not
+    re-walked that file, so the flag must stay armed and retry next time."""
+    import _lib_ingest_frontier as frontier
+    ns, conn, projects = env
+    a, b, c = _populated(ns, conn, projects)
+    _arm(ns, conn)
+    a.chmod(0)
+    try:
+        stats = ns["sync_cache"](conn)
+    finally:
+        a.chmod(0o644)
+
+    assert stats.files_failed == 1, "guard: the unreadable file must fail its read"
     assert _flag(conn) == ("1",), "an unclean walk retired the flag"
-    assert conn.execute(
-        "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
-    ).fetchone() is None, "guard: this walk must actually be unclean"
+    assert _meta(conn, MARKER) is None and _meta(conn, TOKEN) is None
+    assert not frontier.provider_sync_certifiable("full", stats), stats
+
+
+def test_a_reappearing_minus_one_orphan_replays_after_retirement(env, capsys):
+    """#916 A3(c). Detects: an orphan whose ``-1`` cursor outlived the flag
+    reappearing with a NULL-key row, replaying from offset 0 through the
+    single-target SQL, and losing its whole file to an IntegrityError rollback
+    (skipped on every later walk too)."""
+    ns, conn, projects = env
+    a, b, c = _populated(ns, conn, projects)
+    c.unlink()
+    _arm(ns, conn)
+    ns["sync_cache"](conn)
+    assert _flag(conn) is None, "guard: the residual-only walk must retire the flag"
+    assert _size_of(conn, c) == -1, "guard: the orphan must still owe its re-walk"
+
+    _emit_nullkey(c, SID_C, 10000)
+    capsys.readouterr()
+    stats = ns["sync_cache"](conn)
+
+    assert stats.files_failed == 0, capsys.readouterr().err
+    rows = conn.execute(
+        "SELECT cache_create_tokens, cache_create_1h_tokens, cache_create_5m_tokens "
+        "FROM session_entries WHERE source_path=?", (str(c),)).fetchall()
+    assert rows == [(100000, 10000, 90000)], (
+        "the replay must update the retained row in place, split included")
+    size = c.stat().st_size
+    assert [(sz, off) for p, sz, off in _cursors(conn) if p == str(c)] == [(size, size)]
+    assert _meta(conn, MARKER) is not None and _meta(conn, TOKEN) is None, (
+        "the residual cleared, so the walk is complete again")
+
+
+def _upsert_sql_by_file(statements, files):
+    """Which ``session_entries`` UPSERT each file executed: chained or single."""
+    used = {}
+    for statement in statements:
+        if not statement.lstrip().startswith("INSERT INTO session_entries"):
+            continue
+        kind = ("chained" if "ON CONFLICT(source_path, line_offset)" in statement
+                else "single")
+        for f in files:
+            if f"'{f}'" in statement:
+                used.setdefault(str(f), set()).add(kind)
+    return used
+
+
+def _traced_sync(ns, conn):
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        stats = ns["sync_cache"](conn)
+    finally:
+        conn.set_trace_callback(None)
+    return stats, statements
+
+
+def test_new_files_use_single_target_sql_with_the_flag_absent(env):
+    """#916 R2-P2. Detects: the per-file re-walk predicate reading a stale
+    ``prev_size`` local, so a new file first in the walk raises
+    UnboundLocalError and a new file after a ``-1`` replay inherits its
+    chained clause, silently converting migration 020's loud physical-key
+    backstop into an update. Observes the SQL each file executed."""
+    ns, conn, projects = env
+    a, b, c = _populated(ns, conn, projects)
+    c.unlink()
+    _arm(ns, conn)
+    ns["sync_cache"](conn)
+    # The state under test, whichever walk retired the flag.
+    conn.execute("DELETE FROM cache_meta WHERE key=?", (FLAG,))
+    conn.commit()
+    assert _size_of(conn, c) == -1, "guard: the orphan must still owe its re-walk"
+
+    _emit_nullkey(c, SID_C, 10000)
+    first = projects / "0-new-first.jsonl"   # sorts before every SID_* file
+    last = projects / "zz-new-last.jsonl"    # sorts after the -1 replay
+    _emit(ns, first, "00000000-0000-0000-0000-0000000030f1",
+          msg="m_first", req="r_first", h=1000)
+    _emit(ns, last, "00000000-0000-0000-0000-0000000030f2",
+          msg="m_last", req="r_last", h=2000)
+    stats, statements = _traced_sync(ns, conn)
+
+    assert stats.files_failed == 0, stats
+    assert _upsert_sql_by_file(statements, (first, c, last)) == {
+        str(first): {"single"}, str(c): {"chained"}, str(last): {"single"},
+    }, "only the file still owed its re-walk may use the chained clause"
+
+
+def test_a_store_without_minus_one_cursors_keeps_the_loud_physical_backstop(
+        env, capsys):
+    """#916 A7. Detects: the per-file predicate widening beyond ``-1`` cursors,
+    so a steady-state physical duplicate (an ingest bug, per migration 020)
+    is silently merged instead of failing loudly."""
+    ns, conn, projects = env
+    a, b, c = _populated(ns, conn, projects)
+    assert _flag(conn) is None and all(sz > 0 for _p, sz, _o in _cursors(conn))
+    # Rewind the null-key file's cursor so its line replays from offset 0.
+    conn.execute("UPDATE session_files SET size_bytes=1, last_byte_offset=0 "
+                 "WHERE path=?", (str(c),))
+    conn.commit()
+    capsys.readouterr()
+    stats, statements = _traced_sync(ns, conn)
+
+    assert _upsert_sql_by_file(statements, (c,)) == {str(c): {"single"}}
+    assert stats.files_failed == 1, "the physical duplicate must stay loud"
+    assert "db error" in capsys.readouterr().err
+    assert conn.execute("SELECT COUNT(*) FROM session_entries WHERE source_path=?",
+                        (str(c),)).fetchone()[0] == 1

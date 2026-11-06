@@ -24,7 +24,7 @@ One page per subcommand. Pages follow a consistent shape:
 | --- | --- |
 | `cache-report` | [cache-report.md](cache-report.md) |
 | `cache-sync` | [cache-sync.md](cache-sync.md) |
-| `doctor` | [doctor.md](doctor.md) — read-only health report (install / hooks / OAuth / DB / freshness / pricing / safety) |
+| `doctor` | [doctor.md](doctor.md) — health report (read-only except its disposable journal-scan cache) (install / hooks / OAuth / DB / freshness / pricing / safety) |
 | `explain` | [explain.md](explain.md) — which subjects account for the window's locally retained cost, over seven contributor classes: four accounting-native and three conversation-derived |
 | `pricing-check` | [pricing-check.md](pricing-check.md) — detect stale/missing embedded model pricing (coverage / LiteLLM drift / `/v1/models` existence) |
 | `range-cost` | [range-cost.md](range-cost.md) |

@@ -1274,6 +1274,25 @@ def _sync_failure_envelope(
             "action": "cctally db repair --db stats --yes",
         }
 
+    # #932 §4.1: an epoch deferral whose admission FAILED has no rebuild
+    # running (no marker, no worker), so "rebuilding" would be false. It is the
+    # existing server-sync error until a later admission succeeds.
+    def field(item, key, default=None):
+        return (item.get(key, default) if isinstance(item, dict)
+                else getattr(item, key, default))
+
+    for item in attributions or ():
+        if (field(item, "database") == "stats"
+                and not bool(field(item, "corruption", False))
+                and bool(field(item, "deferred", False))
+                and field(item, "deferral_outcome") == "failed"):
+            return {
+                "kind": "server_sync",
+                "label": "⚠ server sync error",
+                "detail": "The server could not complete its background sync.",
+                "action": None,
+            }
+
     if attributed("stats"):
         return {
             "kind": "maintenance_active",
@@ -1676,6 +1695,29 @@ def _header_rate_and_delta(current_rate, current_week_start, trend):
     return current_rate, None
 
 
+def current_week_freshness(captured, *, now_utc: "dt.datetime",
+                           oauth_usage_cfg: "dict | None" = None
+                           ) -> "dict | None":
+    """`current_week.freshness` (``{label, captured_at, age_seconds}``) of a
+    confirming-reading instant, or None when there is none. The one
+    derivation the envelope and the source payload's idle refresh share
+    (#1018 twin spec 5.4/5.5)."""
+    if not isinstance(captured, dt.datetime):
+        return None
+    if captured.tzinfo is None:
+        captured = captured.replace(tzinfo=dt.timezone.utc)
+    age_s = max(0.0, (now_utc - captured).total_seconds())
+    _fresh_cfg = (
+        oauth_usage_cfg if oauth_usage_cfg is not None
+        else sys.modules["cctally"]._OAUTH_USAGE_DEFAULTS
+    )
+    return {
+        "label":        sys.modules["cctally"]._freshness_label(age_s, _fresh_cfg),
+        "captured_at":  _iso_z(captured),
+        "age_seconds":  int(age_s),
+    }
+
+
 def snapshot_to_envelope(snap: "DataSnapshot", *,
                          now_utc: "dt.datetime",
                          monotonic_now: "float | None" = None,
@@ -1850,25 +1892,14 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
             elif tp == 90:
                 budget_90 = dpd
 
-    # Freshness envelope for current_week — derived from
-    # cw.latest_snapshot_at (a datetime, not an ISO string). None when
-    # cw is absent or has no snapshot timestamp; the React client renders
-    # a placeholder in that case. Refs spec §3.4.
-    cw_freshness: "dict | None" = None
-    if cw is not None and cw.latest_snapshot_at is not None:
-        captured = cw.latest_snapshot_at
-        if captured.tzinfo is None:
-            captured = captured.replace(tzinfo=dt.timezone.utc)
-        age_s = max(0.0, (now_utc - captured).total_seconds())
-        _fresh_cfg = (
-            oauth_usage_cfg if oauth_usage_cfg is not None
-            else sys.modules["cctally"]._OAUTH_USAGE_DEFAULTS
-        )
-        cw_freshness = {
-            "label":        sys.modules["cctally"]._freshness_label(age_s, _fresh_cfg),
-            "captured_at":  _iso_z(captured),
-            "age_seconds":  int(age_s),
-        }
+    # Freshness envelope for current_week (spec §3.4) — derived from
+    # cw.latest_weekly_reading_at, the newest genuine reading confirming the
+    # displayed value (#1018 twin spec 5.4). None when cw is absent or has no
+    # resolvable confirmation; the React client renders a placeholder then.
+    # `last_snapshot_age_sec` below keeps the stored row's capture.
+    cw_freshness = current_week_freshness(
+        None if cw is None else getattr(cw, "latest_weekly_reading_at", None),
+        now_utc=now_utc, oauth_usage_cfg=oauth_usage_cfg)
 
     week_lbl: "str | None" = None
     reset_at_utc: "dt.datetime | None" = None

@@ -8,7 +8,8 @@ The underlying `latest_snapshot_at` is unchanged from snapshot_warn
 (`_NOW - 124s`), so the existing "· last snapshot: 2m 04s ago" line
 keeps its value; the new chip ("⏱ as of HH:MM:SS · 124s ago") appends
 below it. This isolates the chip path from any changes to the rest of
-the panel layout.
+the panel layout. #1018 twin: the chip names the confirming weekly
+reading, which this fixture places at the stored row's own capture.
 """
 import dataclasses
 import importlib.machinery
@@ -28,5 +29,6 @@ _CW = dataclasses.replace(
     _BASE.current_week,
     freshness_label="stale",
     freshness_age=124,
+    latest_weekly_reading_at=_BASE.current_week.latest_snapshot_at,
 )
 SNAPSHOT = dataclasses.replace(_BASE, current_week=_CW)

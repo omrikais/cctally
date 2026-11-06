@@ -47,7 +47,8 @@ def _open_stats(core, tmp_path, name="scratch-stats.db"):
 def test_current_epoch_creates_the_four_selector_tables(core, tmp_path):
     conn = _open_stats(core, tmp_path)
     try:
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1023
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == (
+            core.STATS_INDEX_EPOCH)
         names = {
             row[0]
             for row in conn.execute(
@@ -2074,5 +2075,7 @@ def test_the_tui_catches_the_refusal_before_its_broad_handlers():
         )
         guarded += 1
     # Non-vacuity: the walk really found the three call sites the finding named
-    # (two in `_tui_build_snapshot_once`, one in `_tui_build_idle_snapshot`).
-    assert guarded == 3, guarded
+    # (two in `_tui_build_snapshot_once`, one in `_tui_build_idle_snapshot`),
+    # plus #1050's tick-less `_tui_read_claude_input_identity`, which lets the
+    # typed refusal propagate to its bench or test caller.
+    assert guarded == 4, guarded

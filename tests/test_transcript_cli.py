@@ -39,14 +39,21 @@ def _ns_search(query, **kw):
     return argparse.Namespace(**base)
 
 
-def _seed_codex(ns, tmp_path, monkeypatch, *, scenario="modern-full"):
+def _seed_codex(ns, tmp_path, monkeypatch, *, scenario="modern-full",
+                transform=None):
     """Ingest one Codex corpus scenario into the redirected cache and return
     ``(conversation_key, rollout_path)``. ``redirect_paths`` must have already run
-    (or is run here when ``needs_redirect`` — see callers)."""
+    (or is run here when ``needs_redirect`` — see callers). ``transform`` maps
+    the rollout text before it is written (a bracket-bearing variant)."""
     provider = tmp_path / "provider"
     rollout = provider / "sessions" / "2026" / "07" / "15" / f"{scenario}.jsonl"
     rollout.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(CODEX_CORPUS / f"{scenario}.jsonl", rollout)
+    if transform is None:
+        shutil.copyfile(CODEX_CORPUS / f"{scenario}.jsonl", rollout)
+    else:
+        rollout.write_text(
+            transform((CODEX_CORPUS / f"{scenario}.jsonl").read_text("utf-8")),
+            "utf-8")
     monkeypatch.setenv("CODEX_HOME", str(provider))
     conn = ns["open_cache_db"]()
     try:
@@ -274,6 +281,264 @@ def test_search_pagination(tmp_path, monkeypatch, capsys):
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["total"] == 3 and len(payload["hits"]) == 2
+
+
+# ---- #1036 — `transcript search` output is byte-frozen (operator decision O2) --
+#
+# The viewer's search hits gained a structured `snippet_parts` list and the FTS
+# extraction moved to collision-checked markers. The CLI must not change at all:
+# a drifted legacy `snippet` (a bracket lost or doubled, an ellipsis moved) or a
+# leaked `snippet_parts` key would silently alter what scripts parse. The
+# expected bytes below were captured from the tree BEFORE the #1036 change
+# (base cfca3d438) over excerpts carrying literal brackets, an adjacent match,
+# a fragment cut at both edges, a bracketed title and a bracketed Codex message.
+
+_BASELINE_LONG = (
+    "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi "
+    "omicron [pi] needle rho sigma tau upsilon phi chi psi omega one two three "
+    "four five six seven eight nine ten")
+
+
+def _seed_search_baseline(ns):
+    """Claude messages + one AI title with bracket-bearing text for the frozen
+    `transcript search` baseline."""
+    _seed(ns, session_id="bk1", cwd="/home/u/proj",
+          text="[WARN] needle arr[0] [x] needle needle done",
+          ts="2026-06-01T00:00:00Z", entry_type="assistant")
+    _seed(ns, session_id="bk2", cwd="/home/u/other", text=_BASELINE_LONG,
+          ts="2026-06-02T00:00:00Z", entry_type="assistant")
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute(ns["_load_sibling"]("_cctally_cache")._AI_TITLE_UPSERT_SQL,
+                     ("bk1", "Review [P1] findings for the tail poll",
+                      "bk1.jsonl", 0))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _force_like_mode(ns):
+    """Set the `fts5_unavailable` flag on every store the search connection can
+    resolve, so the Claude CLI search takes its LIKE fallback."""
+    for opener in ("open_cache_db", "open_conversations_db"):
+        conn = ns[opener]()
+        try:
+            try:
+                conn.execute("INSERT OR REPLACE INTO cache_meta(key, value) "
+                             "VALUES('fts5_unavailable', '1')")
+                conn.commit()
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+
+def _bracket_codex_rollout(text):
+    return text.replace("Synthetic assistant response",
+                        "Synthetic [WARN] assistant arr[0] [x] response")
+
+
+def _capture_search_outputs(ns, tmp_path, monkeypatch, capsys):
+    """{case: stdout} for Claude FTS / title / LIKE and Codex search, table and
+    --json. The Codex conversation and item keys and the scratch path are
+    replaced by stable tokens (per-run values that #1036 does not touch)."""
+    out = {}
+
+    def run(name, query, **kw):
+        assert ns["cmd_transcript"](_ns_search(query, **kw)) == 0
+        out[name] = capsys.readouterr().out
+
+    _seed_search_baseline(ns)
+    capsys.readouterr()
+    for kind, query in (("all", "needle"), ("title", "findings")):
+        run(f"claude-{kind}-table", query, kind=kind)
+        run(f"claude-{kind}-json", query, kind=kind, json=True)
+    key, _rollout = _seed_codex(ns, tmp_path, monkeypatch,
+                                transform=_bracket_codex_rollout)
+    capsys.readouterr()
+    run("codex-table", "assistant", source="codex", tz="utc")
+    run("codex-json", "assistant", source="codex", json=True, tz="utc")
+    _force_like_mode(ns)
+    capsys.readouterr()
+    run("claude-like-table", "needle")
+    run("claude-like-json", "needle", json=True)
+    tokens = {key: "<KEY>", str(tmp_path): "<TMP>"}
+    for hit in json.loads(out["codex-json"])["hits"]:
+        tokens[hit["itemKey"]] = "<ITEM>"
+    for name, text in out.items():
+        for value, token in tokens.items():
+            text = text.replace(value, token)
+        out[name] = text
+    return out
+
+
+_SEARCH_BASELINE: dict = {
+    'claude-all-table': (
+        '┌─────────┬──────────────────────┬─────────┬───────┬──────────────────────────────────────────────────────────────────┐\n'
+        '│ Session │ When                 │ Project │ Kinds │ Snippet                                                          │\n'
+        '├─────────┼──────────────────────┼─────────┼───────┼──────────────────────────────────────────────────────────────────┤\n'
+        '│ bk1     │ 2026-06-01T00:00:00Z │ proj    │ -     │ [WARN] [needle] arr[0] [x] [needle] [needle] done                │\n'
+        '├─────────┼──────────────────────┼─────────┼───────┼──────────────────────────────────────────────────────────────────┤\n'
+        '│ bk2     │ 2026-06-02T00:00:00Z │ other   │ -     │ … mu nu xi omicron [pi] [needle] rho sigma tau upsilon phi chi … │\n'
+        '└─────────┴──────────────────────┴─────────┴───────┴──────────────────────────────────────────────────────────────────┘\n'
+        '\n'
+        '2 of 2 match(es)\n'
+    ),
+    'claude-all-json': (
+        '{\n'
+        '  "schemaVersion": 1,\n'
+        '  "query": "needle",\n'
+        '  "mode": "fts",\n'
+        '  "hits": [\n'
+        '    {\n'
+        '      "sessionId": "bk1",\n'
+        '      "uuid": "bk1-u1",\n'
+        '      "projectLabel": "proj",\n'
+        '      "title": "Review [P1] findings for the tail poll",\n'
+        '      "ts": "2026-06-01T00:00:00Z",\n'
+        '      "snippet": "[WARN] [needle] arr[0] [x] [needle] [needle] done",\n'
+        '      "matchKinds": [],\n'
+        '      "costUsd": 0.0\n'
+        '    },\n'
+        '    {\n'
+        '      "sessionId": "bk2",\n'
+        '      "uuid": "bk2-u1",\n'
+        '      "projectLabel": "other",\n'
+        '      "title": "other",\n'
+        '      "ts": "2026-06-02T00:00:00Z",\n'
+        '      "snippet": " \\u2026 mu nu xi omicron [pi] [needle] rho sigma tau upsilon phi chi \\u2026 ",\n'
+        '      "matchKinds": [],\n'
+        '      "costUsd": 0.0\n'
+        '    }\n'
+        '  ],\n'
+        '  "total": 2,\n'
+        '  "kind": "all",\n'
+        '  "searchDepth": "full"\n'
+        '}\n'
+    ),
+    'claude-title-table': (
+        '┌─────────┬──────────────────────┬─────────┬───────┬──────────────────────────────────────────┐\n'
+        '│ Session │ When                 │ Project │ Kinds │ Snippet                                  │\n'
+        '├─────────┼──────────────────────┼─────────┼───────┼──────────────────────────────────────────┤\n'
+        '│ bk1     │ 2026-06-01T00:00:00Z │ proj    │ title │ Review [P1] [findings] for the tail poll │\n'
+        '└─────────┴──────────────────────┴─────────┴───────┴──────────────────────────────────────────┘\n'
+        '\n'
+        '1 of 1 match(es)\n'
+    ),
+    'claude-title-json': (
+        '{\n'
+        '  "schemaVersion": 1,\n'
+        '  "query": "findings",\n'
+        '  "mode": "fts",\n'
+        '  "hits": [\n'
+        '    {\n'
+        '      "sessionId": "bk1",\n'
+        '      "uuid": "bk1-u1",\n'
+        '      "projectLabel": "proj",\n'
+        '      "title": "Review [P1] findings for the tail poll",\n'
+        '      "ts": "2026-06-01T00:00:00Z",\n'
+        '      "snippet": "Review [P1] [findings] for the tail poll",\n'
+        '      "matchKinds": [\n'
+        '        "title"\n'
+        '      ],\n'
+        '      "costUsd": 0.0\n'
+        '    }\n'
+        '  ],\n'
+        '  "total": 1,\n'
+        '  "kind": "title",\n'
+        '  "searchDepth": "full"\n'
+        '}\n'
+    ),
+    'codex-table': (
+        '┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬──────────────────────┬─────────────┬───────────┬────────────────────────────────────────────────┐\n'
+        '│ Key                                                                                                                                                                                                                                                               │ When                 │ Project     │ Kinds     │ Snippet                                        │\n'
+        '├───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────┼─────────────┼───────────┼────────────────────────────────────────────────┤\n'
+        '│ <KEY> │ 2026-07-14 12:13 UTC │ project-red │ assistant │ Synthetic [WARN] assistant arr[0] [x] response │\n'
+        '└───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴──────────────────────┴─────────────┴───────────┴────────────────────────────────────────────────┘\n'
+        '\n'
+        '1 of 1 match(es)\n'
+    ),
+    'codex-json': (
+        '{\n'
+        '  "schemaVersion": 1,\n'
+        '  "source": "codex",\n'
+        '  "query": "assistant",\n'
+        '  "mode": "fts",\n'
+        '  "total": 1,\n'
+        '  "hits": [\n'
+        '    {\n'
+        '      "conversationKey": "<KEY>",\n'
+        '      "itemKey": "<ITEM>",\n'
+        '      "title": "Synthetic first meaningful user prompt",\n'
+        '      "snippet": "Synthetic [WARN] assistant arr[0] [x] response",\n'
+        '      "badges": [\n'
+        '        "assistant"\n'
+        '      ],\n'
+        '      "lastActivityUtc": "2026-07-14T12:13:00Z",\n'
+        '      "projectLabel": "project-red"\n'
+        '    }\n'
+        '  ],\n'
+        '  "nextCursor": null\n'
+        '}\n'
+    ),
+    'claude-like-table': (
+        '┌─────────┬──────────────────────┬─────────┬───────┬────────────────────────────────────────────────────────────────────────────────────────────┐\n'
+        '│ Session │ When                 │ Project │ Kinds │ Snippet                                                                                    │\n'
+        '├─────────┼──────────────────────┼─────────┼───────┼────────────────────────────────────────────────────────────────────────────────────────────┤\n'
+        '│ bk2     │ 2026-06-02T00:00:00Z │ other   │ -     │ … iota kappa lambda mu nu xi omicron [pi] needle rho sigma tau upsilon phi chi psi omega … │\n'
+        '├─────────┼──────────────────────┼─────────┼───────┼────────────────────────────────────────────────────────────────────────────────────────────┤\n'
+        '│ bk1     │ 2026-06-01T00:00:00Z │ proj    │ -     │ [WARN] needle arr[0] [x] needle needle done                                                │\n'
+        '└─────────┴──────────────────────┴─────────┴───────┴────────────────────────────────────────────────────────────────────────────────────────────┘\n'
+        '\n'
+        '2 of 2 match(es)\n'
+    ),
+    'claude-like-json': (
+        '{\n'
+        '  "schemaVersion": 1,\n'
+        '  "query": "needle",\n'
+        '  "mode": "like",\n'
+        '  "hits": [\n'
+        '    {\n'
+        '      "sessionId": "bk2",\n'
+        '      "uuid": "bk2-u1",\n'
+        '      "projectLabel": "other",\n'
+        '      "title": "other",\n'
+        '      "ts": "2026-06-02T00:00:00Z",\n'
+        '      "snippet": "\\u2026 iota kappa lambda mu nu xi omicron [pi] needle rho sigma tau upsilon phi chi psi omega \\u2026",\n'
+        '      "matchKinds": [],\n'
+        '      "costUsd": 0.0\n'
+        '    },\n'
+        '    {\n'
+        '      "sessionId": "bk1",\n'
+        '      "uuid": "bk1-u1",\n'
+        '      "projectLabel": "proj",\n'
+        '      "title": "Review [P1] findings for the tail poll",\n'
+        '      "ts": "2026-06-01T00:00:00Z",\n'
+        '      "snippet": "[WARN] needle arr[0] [x] needle needle done",\n'
+        '      "matchKinds": [],\n'
+        '      "costUsd": 0.0\n'
+        '    }\n'
+        '  ],\n'
+        '  "total": 2,\n'
+        '  "kind": "all",\n'
+        '  "searchDepth": "full"\n'
+        '}\n'
+    ),
+}
+
+
+def test_1036_search_output_bytes_frozen(tmp_path, monkeypatch, capsys):
+    """Detects any byte change in `transcript search` (table and --json, Claude
+    FTS / title / LIKE and Codex) from the #1036 snippet rework, including a
+    `snippet_parts` key leaking into the CLI JSON."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    got = _capture_search_outputs(ns, tmp_path, monkeypatch, capsys)
+    assert set(got) == set(_SEARCH_BASELINE)
+    for name, expected in _SEARCH_BASELINE.items():
+        assert got[name] == expected, name
+    for name, text in got.items():
+        assert "snippet_parts" not in text and "snippetParts" not in text, name
 
 
 # ---- #294 S7 — dual-form export + --speed (spec §4.1) ----------------------
@@ -638,3 +903,163 @@ def test_850_anonymized_export_writes_nothing_when_the_count_read_fails(
 
     assert ns["main"](["transcript", "export", key, "--raw"]) == 0
     assert capsysbinary.readouterr().out.startswith(b"#")
+
+
+# ---- #972 O6: a relabeled conversation's export scrubs both names -----------
+
+_O6_ACCOUNT = ("acct-o6", "o6@example.test")
+
+
+def _o6_store(ns, tmp_path, monkeypatch, conversations):
+    """Codex conversations whose cwds are worktrees the reconcile relabels.
+
+    ``conversations`` is ``[(repository, worktree_name, prompt_label)]`` under
+    ``tmp_path/fs``. Each worktree is live for the first pass (its rollup is the
+    worktree folder) and removed before the second (the reconcile moves it to
+    the repository). Returns ``(keys, cwds, account_key)`` in input order.
+    """
+    from _codex_zstd_fixtures import conversation_records, write_rollout
+    from _fixture_builders import make_git_repository_marker
+    from test_codex_bounded_ingest import _auth_json, _expected_key
+
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # The provider root sorts after every cwd, so the first cwd is project-1.
+    provider = tmp_path / "z-codex"
+    day = provider / "sessions" / "2026" / "07" / "20"
+    day.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(provider))
+    (provider / "auth.json").write_text(_auth_json(*_O6_ACCOUNT))
+    cwds = []
+    for index, (repository, name, label) in enumerate(conversations):
+        repo = tmp_path / "fs" / repository
+        make_git_repository_marker(repo)
+        worktree = repo / ".worktrees" / name
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text(f"gitdir: {repo}/.git/worktrees/{name}\n")
+        rollout = day / (f"rollout-2026-07-20T11-00-0{index}-"
+                         f"0199aaaa-bbbb-7ccc-8ddd-eeeeffff000{index}.jsonl")
+        write_rollout(rollout, conversation_records(
+            1, session_id=f"0199aaaa-bbbb-7ccc-8ddd-eeeeffff0a0{index}",
+            label=label, cwd=str(worktree)))
+        cwds.append(worktree)
+    cache = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](cache)
+        keys = [cache.execute(
+            "SELECT conversation_key FROM codex_conversation_threads "
+            "WHERE cwd = ?", (str(cwd),)).fetchone()[0] for cwd in cwds]
+    finally:
+        cache.close()
+
+    def labels():
+        conn = ns["open_conversations_db"]()
+        try:
+            ns["sync_codex_conversations"](conn)
+            return [conn.execute(
+                "SELECT project_label FROM main.codex_conversation_rollups "
+                "WHERE conversation_key = ?", (key,)).fetchone()[0]
+                for key in keys]
+        finally:
+            conn.close()
+
+    assert labels() == [name for _r, name, _l in conversations]
+    for cwd in cwds:
+        shutil.rmtree(cwd)
+    assert labels() == [repository for repository, _n, _l in conversations]
+    account_key = _expected_key(*_O6_ACCOUNT)
+    stats = ns["open_db"]()
+    try:
+        stats.execute(
+            "INSERT OR IGNORE INTO accounts (account_key, provider, natural_id, "
+            "email, label, plan_type, label_source, first_seen_utc, "
+            "last_seen_utc) VALUES (?,'codex',?,?,'o6',NULL,'auto',?,?)",
+            (account_key, account_key, _O6_ACCOUNT[1],
+             "2026-07-01T00:00:00Z", "2026-07-01T00:00:00Z"))
+        stats.commit()
+    finally:
+        stats.close()
+    return keys, cwds, account_key
+
+
+def _o6_export(ns, capsysbinary, key, *, account=None, raw=False):
+    capsysbinary.readouterr()
+    args = _ns_export(key, raw=raw)
+    args.account = account
+    rc = ns["cmd_transcript"](args)
+    captured = capsysbinary.readouterr()
+    return rc, captured.out.decode("utf-8"), captured.err.decode("utf-8")
+
+
+def test_codex_export_scrubs_repository_and_folder_names(
+        tmp_path, monkeypatch, capsysbinary):
+    """#972 O6. A rollup relabeled from its worktree folder to its repository
+    must leave NEITHER name in an anonymized export: the cwd's own basename and
+    its rollup label both scrub to that root's project-N, unscoped and scoped.
+    Detects a shared transcript leaking a private repository or branch name."""
+    ns = load_script()
+    keys, cwds, account_key = _o6_store(
+        ns, tmp_path, monkeypatch,
+        [("secret-repo", "private-feature", "secret-repo vs private-feature ")])
+    rc, raw, _err = _o6_export(ns, capsysbinary, keys[0], raw=True)
+    assert rc == 0 and "Prompt secret-repo vs private-feature" in raw
+    for account in (None, account_key):
+        rc, out, err = _o6_export(ns, capsysbinary, keys[0], account=account)
+        assert rc == 0, (account, err)
+        assert "secret-repo" not in out and "private-feature" not in out, account
+        assert "Prompt project-1 vs project-1" in out, account
+    conn = ns["open_conversations_db"]()
+    try:
+        cq = ns["_load_sibling"]("_lib_conversation_query")
+        anon_mod = ns["_load_sibling"]("_lib_conversation_anon")
+        plan = cq.build_anon_plan_for_sources(
+            conn, home_dir=str(tmp_path / "data"), sources={"codex"}).plan
+        assert anon_mod.scrub_text(str(cwds[0]), plan) == "project-1"
+    finally:
+        conn.close()
+
+
+def test_scoped_plan_still_refuses_unproven_path(
+        tmp_path, monkeypatch, capsysbinary):
+    """#972 O6 keeps the scoped admission rule: when the cwd's session_meta is
+    stamped by another account, the scoped export refuses (exit 3, no bytes)
+    rather than taking the rollup label as proof of ownership."""
+    ns = load_script()
+    keys, _cwds, account_key = _o6_store(
+        ns, tmp_path, monkeypatch,
+        [("secret-repo", "private-feature", "secret-repo vs private-feature ")])
+    conn = ns["open_conversations_db"]()
+    try:
+        conn.execute(
+            "UPDATE codex_conversation_events SET account_key = 'acct-other' "
+            "WHERE record_type = 'session_meta'")
+        conn.commit()
+    finally:
+        conn.close()
+    rc, out, err = _o6_export(ns, capsysbinary, keys[0], account=account_key)
+    assert rc == 3 and out == ""
+    assert "ambiguous account provenance" in err
+
+
+def test_colliding_bare_word_moves_to_lowest_root(
+        tmp_path, monkeypatch, capsysbinary):
+    """#972 O6 / V-8. ``secret`` is the folder of the first root and the rollup
+    label of the second, so it scrubs to the LOWER-numbered root (project-1),
+    and the CLI and the dashboard export agree byte for byte."""
+    from test_codex_conversation_api import _entity_path, _get, _wire_handler
+    ns = load_script()
+    keys, _cwds, _account = _o6_store(
+        ns, tmp_path, monkeypatch,
+        [("repo", "secret", "first "), ("secret", "other", "secret word ")])
+    rc, cli, err = _o6_export(ns, capsysbinary, keys[1])
+    assert rc == 0, err
+    assert "Prompt project-1 word" in cli and "secret" not in cli
+    srv = _wire_handler(ns, no_sync=True)
+    try:
+        status, http, _ctype = _get(
+            srv.server_address[1],
+            _entity_path(keys[1], "/export") + "?anonymize=1")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert status == 200
+    assert http == cli.encode("utf-8")

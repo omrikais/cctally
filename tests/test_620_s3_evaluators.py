@@ -619,9 +619,16 @@ def test_a_session_that_cannot_be_seeded_leaves_the_evaluated_population(
 # --- 2.3 short conversations carrying large context ---------------------
 
 def _seed_context_conversation(ns, *, session, humans, replies,
-                               pre_window_humans=0, model=OPUS):
+                               pre_window_humans=0, model=OPUS,
+                               out_of_window_replies=(), meta_body=None):
     """`humans` in-window human turns, `pre_window_humans` before the window,
-    and one priced assistant turn per `(input, cache_read, cache_create)`."""
+    and one priced assistant turn per `(input, cache_read, cache_create)`
+    (an optional fourth element is the output tokens).
+
+    `out_of_window_replies` are priced assistant turns of the same shape in
+    the same file, model and account an hour before the window opens;
+    `meta_body` is a retained `meta` row ahead of the in-window prompts.
+    """
     path = f"/tmp/projects/{session}.jsonl"
     conv = ns["open_conversations_db"]()
     cache = ns["open_cache_db"]()
@@ -635,6 +642,27 @@ def _seed_context_conversation(ns, *, session, humans, replies,
                             at=WINDOW_START - dt.timedelta(hours=index + 2),
                             source_path=path)
             offset += 1
+        for index, (inp, cache_read, cache_create, *rest) in enumerate(
+                out_of_window_replies):
+            msg, req = f"{session}-early-m{index}", f"{session}-early-r{index}"
+            at = (WINDOW_START - dt.timedelta(hours=1)
+                  + dt.timedelta(minutes=index))
+            _insert_message(conv, session_id=session, offset=offset,
+                            entry_type="assistant", text="reply",
+                            blocks=_blocks("reply"), at=at, source_path=path,
+                            model=model, msg_id=msg, req_id=req)
+            _seed_entry(cache, path=path, offset=offset, at=at, msg_id=msg,
+                        req_id=req, model=model, input_tokens=inp,
+                        cache_read=cache_read, cache_create=cache_create,
+                        output_tokens=rest[0] if rest else 500)
+            offset += 1
+        if meta_body is not None:
+            _insert_message(conv, session_id=session, offset=offset,
+                            entry_type="meta", text="",
+                            blocks=_blocks(meta_body),
+                            at=WINDOW_START + dt.timedelta(minutes=30),
+                            source_path=path)
+            offset += 1
         for index in range(humans):
             _insert_message(conv, session_id=session, offset=offset,
                             entry_type="human", text=f"prompt {index}",
@@ -643,7 +671,8 @@ def _seed_context_conversation(ns, *, session, humans, replies,
                                                            minutes=index),
                             source_path=path)
             offset += 1
-        for index, (inp, cache_read, cache_create) in enumerate(replies):
+        for index, (inp, cache_read, cache_create, *rest) in enumerate(
+                replies):
             msg, req = f"{session}-m{index}", f"{session}-r{index}"
             at = WINDOW_START + dt.timedelta(hours=2, minutes=index)
             _insert_message(conv, session_id=session, offset=offset,
@@ -652,7 +681,8 @@ def _seed_context_conversation(ns, *, session, humans, replies,
                             model=model, msg_id=msg, req_id=req)
             _seed_entry(cache, path=path, offset=offset, at=at, msg_id=msg,
                         req_id=req, model=model, input_tokens=inp,
-                        cache_read=cache_read, cache_create=cache_create)
+                        cache_read=cache_read, cache_create=cache_create,
+                        output_tokens=rest[0] if rest else 500)
             offset += 1
         conv.commit()
         cache.commit()
@@ -790,6 +820,180 @@ def test_an_opus_5_5_request_is_measured_against_its_1m_window(
     assert facts.predicate_evaluated is True
     assert facts.evidence["conversationCount"].value == 0
     assert facts.subjects == ()
+
+
+# #1022: a prior-generation bare id may have run in a 200K or a 1M window.
+# Restated here, never imported, so a member dropped from the evaluator's set
+# fails this module instead of agreeing with it.
+TWO_WINDOW_IDS = (
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+    "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
+    "claude-sonnet-4",
+)
+# A 1,300-token Opus 4 request: decided and far below the floor, so the class
+# keeps an evaluated population when the conversation under test leaves it.
+CONTROL_REQUEST = (1_000, 100, 200)
+UNDECIDABLE = ("undecidable", None)
+DECIDED = ("decided", None)
+
+
+def _input_side(total):
+    """`total` input-side tokens over input and both cache legs."""
+    return (10_000, total - 20_000, 10_000)
+
+
+def _context_outcome(ns, *, model, replies, **seed_kw):
+    """Seed a two-turn conversation under test beside a decided control and
+    return how the class decided it: `UNDECIDABLE`, `DECIDED` (evaluated, not
+    qualifying) or `("qualifies", maxContextWindowFraction)`."""
+    _seed_context_conversation(ns, session="sess-control", humans=2,
+                               replies=[CONTROL_REQUEST])
+    _seed_context_conversation(ns, session="sess-target", humans=2,
+                               replies=replies, model=model, **seed_kw)
+    facts = _class_facts("short_high_context")
+    assert facts.preempting_cause is None
+    gap = kernel.GAP_UNKNOWN_CONTEXT_WINDOW in facts.population.gap_codes
+    if facts.evidence["conversationCount"].value:
+        assert not gap
+        return ("qualifies", facts.evidence["maxContextWindowFraction"].value)
+    if gap:
+        # The conversation left the evaluated population; the control stayed.
+        assert facts.population.evaluability_coverage == pytest.approx(
+            1 / (1 + len(replies)))
+        return UNDECIDABLE
+    assert facts.population.evaluability_coverage == 1.0
+    return DECIDED
+
+
+def _assert_outcome(got, want):
+    assert got[0] == want[0]
+    if want[1] is not None:
+        assert got[1] == pytest.approx(want[1], abs=1e-12)
+
+
+@pytest.mark.parametrize("total, want", [
+    (159_999, DECIDED),
+    (160_000, UNDECIDABLE),
+    (200_000, UNDECIDABLE),
+    (200_001, DECIDED),
+    (800_000, ("qualifies", 0.8)),
+])
+def test_a_two_window_request_is_decided_only_where_its_size_proves_it(
+        tmp_path, monkeypatch, total, want):
+    """Detects a prior-generation request measured against a 200K window it
+    provably did not have (200,001 tokens qualifying at 1.000005, 800,000 at
+    4.0 instead of exactly 0.8 of 1M) and a request in the 80%-of-200K band
+    qualifying on a guessed window instead of being undecided. 200,000 itself
+    proves nothing: the boundary is `>`, never `>=`."""
+    ns = _stores(tmp_path, monkeypatch)
+    _assert_outcome(_context_outcome(ns, model="claude-opus-4-8",
+                                     replies=[_input_side(total)]), want)
+
+
+def test_output_tokens_never_count_toward_a_two_window_request(
+        tmp_path, monkeypatch):
+    """Detects output counted in the numerator: 190,000 input-side tokens
+    plus 20,000 output would cross 200,000 and be decided at 1M, where the
+    input side alone keeps the request in the undecided band."""
+    ns = _stores(tmp_path, monkeypatch)
+    _assert_outcome(_context_outcome(
+        ns, model="claude-opus-4-8",
+        replies=[(10_000, 170_000, 10_000, 20_000)]), UNDECIDABLE)
+
+
+@pytest.mark.parametrize("model", TWO_WINDOW_IDS + (
+    "claude-sonnet-4-5-20250929", "claude-sonnet-4-20250514",
+    "CLAUDE-OPUS-4-6"))
+@pytest.mark.parametrize("total, want", [(180_000, UNDECIDABLE),
+                                         (300_000, DECIDED)])
+def test_every_two_window_id_is_recognised_after_normalization(
+        tmp_path, monkeypatch, model, total, want):
+    """Detects a missing member of the two-window set, a dated id whose
+    suffix is not stripped and an uppercase id that is not lowercased: each
+    would qualify at 0.9 of 200K (band) or at 1.5 (above 200K)."""
+    ns = _stores(tmp_path, monkeypatch)
+    _assert_outcome(_context_outcome(ns, model=model,
+                                     replies=[_input_side(total)]), want)
+
+
+@pytest.mark.parametrize("model, want", [
+    ("claude-opus-4-5-20251101", ("qualifies", 0.9)),
+    ("claude-haiku-4-5-20251001", ("qualifies", 0.9)),
+    ("claude-opus-4-20250514", ("qualifies", 0.9)),
+    ("claude-opus-4-9", ("qualifies", 0.9)),
+    ("claude-opus-5-5", DECIDED),
+    ("claude-opus-4-8[1m]", DECIDED),
+])
+def test_a_non_member_keeps_its_single_known_window(
+        tmp_path, monkeypatch, model, want):
+    """Detects a family-substring or prefix match pulling a 200K-only or an
+    unregistered id into the two-window set (it would turn undecided at
+    180,000), and an explicit `[1m]` or current-generation id losing its 1M
+    window (0.18 would become a qualifying 0.9)."""
+    ns = _stores(tmp_path, monkeypatch)
+    _assert_outcome(_context_outcome(ns, model=model,
+                                     replies=[_input_side(180_000)]), want)
+
+
+def test_the_two_window_rule_never_reads_the_status_line_family_table(
+        tmp_path, monkeypatch):
+    """Detects the 200K/1M constants being read through the status line's
+    family defaults: with `opus` and `sonnet` patched to 500,000 there, an
+    Opus 4.8 request at 180,000 stays undecided (not a decided 0.36) and one
+    at 300,000 stays decided at 1M, while a single-window Opus 4.5 request
+    follows the patched table (0.36, not a qualifying 0.9)."""
+    ns = _stores(tmp_path, monkeypatch)
+    statusline = _sources()._cctally()._load_sibling("_cctally_statusline")
+    for family in ("opus", "sonnet"):
+        monkeypatch.setitem(
+            statusline.CLAUDE_MODEL_CONTEXT_WINDOW_DEFAULT_FAMILY, family,
+            500_000)
+    _seed_context_conversation(ns, session="sess-control", humans=2,
+                               replies=[CONTROL_REQUEST])
+    for session, model, total in (
+            ("sess-band", "claude-opus-4-8", 180_000),
+            ("sess-proven", "claude-opus-4-8", 300_000),
+            ("sess-single", "claude-opus-4-5-20251101", 180_000)):
+        _seed_context_conversation(ns, session=session, humans=2,
+                                   replies=[_input_side(total)], model=model)
+    facts = _class_facts("short_high_context")
+    assert kernel.GAP_UNKNOWN_CONTEXT_WINDOW in facts.population.gap_codes
+    # Only the band conversation left the evaluated population.
+    assert facts.population.evaluability_coverage == pytest.approx(3 / 4)
+    assert facts.evidence["conversationCount"].value == 0
+
+
+@pytest.mark.parametrize("totals, want", [
+    ((850_000, 180_000), ("qualifies", 0.85)),
+    ((300_000, 180_000), UNDECIDABLE),
+])
+def test_an_undecidable_sibling_neither_blocks_nor_qualifies_a_conversation(
+        tmp_path, monkeypatch, totals, want):
+    """Detects the undecided gap checked before qualification (850,000 +
+    180,000 turning unevaluable instead of qualifying at 0.85) and an
+    undecidable request's 200K fraction entering the maximum (300,000 +
+    180,000 qualifying at 0.9 instead of staying undecided)."""
+    ns = _stores(tmp_path, monkeypatch)
+    _assert_outcome(_context_outcome(
+        ns, model="claude-opus-4-8",
+        replies=[_input_side(total) for total in totals]), want)
+
+
+@pytest.mark.parametrize("seed_kw", [
+    {"out_of_window_replies": [_input_side(300_000)]},
+    {"meta_body": ("<local-command-stdout>Set model to Opus 4.8 "
+                   "(1M context)</local-command-stdout>")},
+], ids=["out-of-window-proof", "model-marker"])
+def test_no_other_record_proves_an_in_window_requests_window(
+        tmp_path, monkeypatch, seed_kw):
+    """Detects a window inferred from anything but the request itself: a
+    300,000-token request of the same file, model and account outside the
+    window, or a retained `/model` marker announcing a 1M context, must leave
+    an in-window 180,000 request undecided rather than decided at 1M."""
+    ns = _stores(tmp_path, monkeypatch)
+    _assert_outcome(_context_outcome(ns, model="claude-opus-4-8",
+                                     replies=[_input_side(180_000)],
+                                     **seed_kw), UNDECIDABLE)
 
 
 def test_a_conversation_exhausting_its_normalize_budget_is_unevaluable(

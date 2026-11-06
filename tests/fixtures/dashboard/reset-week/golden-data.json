@@ -276,7 +276,7 @@
     "week_index": [
       {
         "block_count": 0,
-        "detail_stamp": "546943a02c138a59",
+        "detail_stamp": "eebdb14bd3e0072b",
         "end_at_utc": "2026-04-20T14:00:00Z",
         "has_observation_gap": false,
         "is_current": true,
@@ -288,7 +288,7 @@
       },
       {
         "block_count": 0,
-        "detail_stamp": "9d6c40e1f6663986",
+        "detail_stamp": "d2bf73e6804af714",
         "end_at_utc": "2026-04-17T13:00:00Z",
         "has_observation_gap": false,
         "is_current": false,
@@ -1313,7 +1313,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 12,
+  "source_schema_version": 13,
   "sources": {
     "all": {
       "availability": "ok",
@@ -1628,7 +1628,7 @@
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "546943a02c138a59",
+                "detail_stamp": "eebdb14bd3e0072b",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,
@@ -1640,7 +1640,7 @@
               },
               {
                 "block_count": 0,
-                "detail_stamp": "9d6c40e1f6663986",
+                "detail_stamp": "d2bf73e6804af714",
                 "end_at_utc": "2026-04-17T13:00:00Z",
                 "has_observation_gap": false,
                 "is_current": false,
@@ -3375,7 +3375,7 @@
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "546943a02c138a59",
+                "detail_stamp": "eebdb14bd3e0072b",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,
@@ -3387,7 +3387,7 @@
               },
               {
                 "block_count": 0,
-                "detail_stamp": "9d6c40e1f6663986",
+                "detail_stamp": "d2bf73e6804af714",
                 "end_at_utc": "2026-04-17T13:00:00Z",
                 "has_observation_gap": false,
                 "is_current": false,

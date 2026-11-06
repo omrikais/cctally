@@ -267,6 +267,8 @@ The dashboard binds its HTTP port immediately and serves the current cached snap
 
 `--no-sync` freezes ingestion, the startup snapshot, and the two conversation derivations the transcript store used to run on every open: the legacy transcript-row import, and the Codex retained-event contract rebuild. The rebuild is the expensive one — on a large transcript history it has been measured at 135 seconds of startup against comparable launches of 15 and 30 seconds — and `--no-sync` exists precisely to avoid paying it. The suppression is process-wide, so an ordinary browse or a live-tail stream does not perform it either.
 
+When the statistics index is being rebuilt or repaired at startup, the frozen dashboard shows its loading state and takes its snapshot once that background recovery finishes.
+
 `--no-sync` does **not** freeze the schema. The dashboard still applies the schema and runs the migration dispatcher once at startup, because under `--no-sync` no other process opens the transcript store for writing and the read-only reader refuses a store that is behind the current schema rather than migrating it from a request thread. Without that one open, a `--no-sync` dashboard would serve a degraded conversation surface indefinitely.
 
 There is a consequence worth stating plainly. When a store owes the Codex contract rebuild — normally just after an upgrade — a `--no-sync` dashboard serves `normalization_pending` for Codex conversation reads: the conversation viewer shows the pending state and the Codex project, cost and rebuild filter axes stay unavailable. That is the frozen-data trade the flag asks for. Run `cctally cache-sync --source codex`, or start the dashboard without `--no-sync`, and the rebuild happens once and the reads return to normal.

@@ -540,6 +540,244 @@ def test_doctor_latest_snapshot_age_counts_a_held_row(app):
     assert state.latest_snapshot_at == T1
 
 
+# --- #1018: the check measures accepted readings, not only materialized rows --
+
+#: 2026-06-13T00:00:00Z: the flat-reading sequence's minute 0.
+FLAT_T0 = 1781308800
+
+
+def _at(seconds: int) -> dt.datetime:
+    return dt.datetime.fromtimestamp(FLAT_T0 + seconds, UTC)
+
+
+def _record_reading(app, monkeypatch, *, at_s: int, percent: float = 51.0):
+    """One real `cmd_record_usage` reading at ``FLAT_T0 + at_s``, captured at
+    exactly that instant (the `tests/test_832_projection_account_characterization.py`
+    `_record` pattern). Identical weekly and five-hour values with identical
+    resets are a FLAT reading: accepted and indexed, but deduplicated out of
+    `weekly_usage_snapshots`."""
+    import argparse
+    import time
+    monkeypatch.setattr(time, "time", lambda: float(FLAT_T0 + at_s))
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(_at(at_s)))
+    monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
+    args = argparse.Namespace(
+        percent=percent, resets_at=str(FLAT_T0 + 3 * 86400),
+        five_hour_percent=0, five_hour_resets_at=str(FLAT_T0 + 4 * 3600),
+        source="statusline")
+    assert app.cmd_record_usage(args, nudge_dashboard=False) == 0
+
+
+def _count(app, table: str) -> int:
+    conn = app.open_db()
+    try:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _freshness_check(app, now: dt.datetime):
+    import _lib_doctor
+    doctor = app._load_sibling("_cctally_doctor")
+    state = doctor.doctor_gather_state(now_utc=now)
+    report = _lib_doctor.run_checks(state)
+    check = next(c for category in report.categories for c in category.checks
+                 if c.id == "data.latest_snapshot_age")
+    return state, check
+
+
+_SILENT_REMEDIATION = (
+    "No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.")
+
+
+def test_doctor_flat_readings_report_fresh_and_silence_still_fails(
+        app, monkeypatch):
+    """T5 (failure: #1018 — an hour of flat usage leaves one old snapshot row
+    and Doctor FAILs a healthy install with "Hooks may be broken"; and the
+    converse, a silent pipeline reported fresh)."""
+    for minute in (0, 1, 30, 60, 75, 80):
+        _record_reading(app, monkeypatch, at_s=minute * 60)
+    assert _count(app, "weekly_usage_snapshots") == 1
+    assert _count(app, "claude_weekly_observation_index") == 6
+
+    state, check = _freshness_check(app, _at(81 * 60))
+    assert (check.severity, check.summary, check.remediation) == (
+        "ok", "60s ago", None)
+    assert state.latest_snapshot_at == _at(0)
+    assert state.latest_reading_at == _at(80 * 60)
+    assert check.details["latest_snapshot_at"] == _at(0).isoformat()
+    assert check.details["latest_reading_at"] == _at(80 * 60).isoformat()
+    assert check.details["effective_freshness_at"] == _at(80 * 60).isoformat()
+    assert check.details["effective_freshness_age_s"] == 60
+
+    _state, silent = _freshness_check(app, _at(145 * 60))
+    assert (silent.severity, silent.summary, silent.remediation) == (
+        "fail", "3900s ago", _SILENT_REMEDIATION)
+
+
+def test_doctor_freshness_held_row_decides_at_check_level(app):
+    """T5 (failure: a kernel that ignores the held-inclusive snapshot source
+    reports `never` for a store whose only fresh write is a held row)."""
+    _insert(app, captured_at=NOW - dt.timedelta(hours=2),
+            weekly_percent=GENUINE_WEEKLY, held=0)
+    _insert(app, captured_at=NOW - dt.timedelta(minutes=1),
+            weekly_percent=DIVERGENT_WEEKLY, held=1,
+            five_hour_percent=FRESH_FIVE_HOUR,
+            five_hour_resets_at=FIVE_HOUR_RESETS_AT)
+    assert _count(app, "claude_weekly_observation_index") == 0
+    _state, check = _freshness_check(app, NOW)
+    assert (check.severity, check.summary) == ("ok", "60s ago")
+
+
+def _latest_claude_obs():
+    """The newest Claude usage `obs` the real recording path journaled."""
+    import _cctally_journal
+    import _lib_journal
+    latest = None
+    for segment in _cctally_journal.list_segments():
+        with open(_cctally_core.JOURNAL_DIR / segment, "rb") as fh:
+            for line in fh:
+                try:
+                    record = _lib_journal.decode_line(line)
+                except Exception:
+                    continue
+                if (record.get("t") == "obs"
+                        and record.get("provider") == "claude"
+                        and "weekly_percent" in (record.get("payload") or {})):
+                    latest = record
+    assert latest is not None
+    return latest
+
+
+def _admission_twin(reading: dict, at: dt.datetime, weekly_percent: float):
+    """An otherwise eligible Claude observation built from a real reading's
+    shape: valid `weekly_percent`, `resets_at` and capture fields (#1018 R1
+    F7 — `test_journal_admission._usage_obs` lacks `resets_at`, which would
+    make the excluded control vacuous)."""
+    import _lib_journal
+    payload = dict(reading["payload"])
+    payload["weekly_percent"] = weekly_percent
+    if "captured_at" in payload:
+        payload["captured_at"] = _iso(at)
+    return _lib_journal.make_obs(
+        at=_iso(at), src=reading["src"], provider="claude", payload=payload,
+        account=reading.get("account"))
+
+
+def _unrelated_controls(app, monkeypatch, now: dt.datetime, control: str):
+    import _cctally_journal as jr
+    import _lib_journal as J
+    stamp = _iso(now - dt.timedelta(minutes=1))
+    if control == "codex_observation":
+        jr.append_record(J.make_obs(
+            at=stamp, src="codex-quota", provider="codex", payload={
+                "limit_id": "native-primary", "limit_name": "Primary",
+                "window_minutes": 300, "used_percent": 10.0,
+                "resets_at_utc": _iso(now + dt.timedelta(hours=3)),
+                "plan_type": "pro", "individual_limit_json": None,
+                "reached_type": None, "observed_model": "gpt-5.3-codex"}))
+    elif control == "claude_cost_ops":
+        import _lib_claude_attribution as K
+        jr.append_record(J.make_claude_cost_account(
+            basis=K.BASIS_AGREEMENT, reason=None, account_key="a" * 32,
+            decided_at=stamp, journal_hw=list(jr.journal_high_water()),
+            closing_capture={"at": stamp, "account_key": "a" * 32},
+            evidence=[[stamp, jr.list_segments()[-1], 0]],
+            items=[["k1", "m-1", "r-1", stamp]]))
+    elif control == "claude_obs_without_weekly":
+        payload = dict(_latest_claude_obs()["payload"])
+        payload.pop("weekly_percent")
+        jr.append_record(J.make_obs(
+            at=stamp, src="statusline", provider="claude", payload=payload))
+    elif control == "reading_after_now":
+        _record_reading(app, monkeypatch, at_s=3 * 3600, percent=52.0)
+        return
+    else:
+        raise AssertionError(control)
+    result = jr.run_stats_ingest(mode="authoritative")
+    assert result.error is None, result.error
+
+
+@pytest.mark.parametrize("control", [
+    "codex_observation", "claude_cost_ops", "claude_obs_without_weekly",
+    "reading_after_now",
+])
+def test_doctor_freshness_ignores_unrelated_evidence(app, monkeypatch, control):
+    """T6 (failure: Codex traffic, cost-attribution ops, a Claude record with
+    no weekly reading, or a reading captured after now freshens a Claude
+    pipeline that has been silent for two hours)."""
+    _record_reading(app, monkeypatch, at_s=0)
+    now = _at(2 * 3600)
+    _unrelated_controls(app, monkeypatch, now, control)
+    state, check = _freshness_check(app, now)
+    assert state.latest_reading_at == _at(0)
+    assert (check.severity, check.summary, check.remediation) == (
+        "fail", "7200s ago", _SILENT_REMEDIATION)
+
+
+def _admission_excluded_total(app) -> int:
+    """`journal_admission_summary.excluded_total`, 0 before the first
+    post-cutover ingest writes the row."""
+    conn = app.open_db()
+    try:
+        row = conn.execute(
+            "SELECT excluded_total FROM journal_admission_summary "
+            "WHERE id = 1").fetchone()
+    finally:
+        conn.close()
+    return int(row[0]) if row is not None else 0
+
+
+@pytest.mark.parametrize("stamped", [False, True])
+def test_doctor_freshness_ignores_an_admission_excluded_reading(
+        app, monkeypatch, stamped):
+    """T6 (failure: a Claude observation that journal admission excludes — an
+    unstamped record appended after the account-bound cutover — freshens the
+    check). The stamped twin is the positive control: the same eligible
+    record reaches the index, which proves the excluded one was eligible."""
+    import _cctally_journal as jr
+    import _lib_journal as J
+    _record_reading(app, monkeypatch, at_s=0)
+    jr.ensure_account_bound_cutover()
+    now = _at(2 * 3600)
+    twin_at = now - dt.timedelta(minutes=1)
+    twin = _admission_twin(_latest_claude_obs(), twin_at, 63.0)
+    excluded_before = _admission_excluded_total(app)
+    if stamped:
+        jr.append_record(twin)
+    else:
+        excluded = J.unstamped_record(twin)
+        with open(_cctally_core.JOURNAL_DIR / jr.list_segments()[-1], "ab") as fh:
+            fh.write(J.encode_line(excluded))
+    result = jr.run_stats_ingest(mode="authoritative")
+    assert result.error is None, result.error
+    # Admission, not some other filter, is what kept the twin out: the
+    # summary counts it as excluded (cf. tests/test_journal_admission.py).
+    assert _admission_excluded_total(app) - excluded_before == (
+        0 if stamped else 1)
+
+    conn = app.open_db()
+    try:
+        indexed = conn.execute(
+            "SELECT COUNT(*) FROM claude_weekly_observation_index "
+            "WHERE captured_at_utc = ?",
+            (twin_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),)).fetchone()[0]
+        materialized = conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            "WHERE weekly_percent = 63.0").fetchone()[0]
+    finally:
+        conn.close()
+    state, check = _freshness_check(app, now)
+    if stamped:
+        assert indexed == 1, "the stamped twin must reach the index"
+        assert state.latest_reading_at == twin_at
+        assert check.severity == "ok"
+    else:
+        assert (indexed, materialized) == (0, 0)
+        assert state.latest_reading_at == _at(0)
+        assert (check.severity, check.summary) == ("fail", "7200s ago")
+
+
 def test_latest_usage_by_segment_skips_a_held_row(app):
     """`latest_usage_by_segment` answers which single row a cycle owns.
 
@@ -637,3 +875,543 @@ def test_account_source_card_still_lists_an_account_with_only_a_held_row(app):
     card = next(c for c in cards if c["accountKey"] == "acct-b")
     assert card["weeklyPercent"] is None
     assert card["fiveHourPercent"] == FRESH_FIVE_HOUR
+
+
+# --- #1018 twin spec 5.2: the confirming-reading selector -------------------
+
+#: The selector's window, in the samples' second-precision spelling.
+_SEL_RESET = dt.datetime(2026, 9, 14, 5, 0, tzinfo=UTC)
+_SEL_LOWER = dt.datetime(2026, 9, 7, 5, 0, tzinfo=UTC)
+_SEL_NOW = dt.datetime(2026, 9, 13, 5, 0, tzinfo=UTC)
+_SEL_PERCENT = 51.0
+
+
+def _sel_scope(**overrides):
+    import _cctally_oauth_samples as S
+    fields = dict(
+        account_key="acct-a",
+        weekly_resets_at_utc=_SEL_RESET.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        weekly_percent=_SEL_PERCENT,
+        lower_bound_utc=_iso(_SEL_LOWER),
+        upper_bound_utc=_iso(_SEL_RESET))
+    fields.update(overrides)
+    return S.WeeklyReadingScope(**fields)
+
+
+def _sel_row(conn, observation_id: str, captured: dt.datetime, *,
+             account: str = "acct-a", percent: float = _SEL_PERCENT,
+             reset: dt.datetime = _SEL_RESET, eligible: int = 1) -> None:
+    import _lib_oauth_samples
+    conn.execute(
+        "INSERT INTO claude_weekly_observation_index (observation_id,"
+        " account_key, captured_at_utc, weekly_percent, weekly_resets_at_utc,"
+        " weekly_reading_genuine, weekly_freshness_eligible)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (observation_id, account,
+         _lib_oauth_samples.canonical_instant(captured), percent,
+         reset.strftime("%Y-%m-%dT%H:%M:%SZ"), eligible, eligible))
+
+
+_MICRO = dt.timedelta(microseconds=1)
+
+
+@pytest.mark.parametrize("captured, scope_overrides, now, expected", [
+    # The upper bound (the provider reset) is exclusive at microsecond grain.
+    (_SEL_RESET - _MICRO, {}, _SEL_RESET + dt.timedelta(hours=1), True),
+    (_SEL_RESET, {}, _SEL_RESET + dt.timedelta(hours=1), False),
+    (_SEL_RESET + _MICRO, {}, _SEL_RESET + dt.timedelta(hours=1), False),
+    # The lower bound (the card's segment start) is inclusive.
+    (_SEL_LOWER, {}, _SEL_NOW, True),
+    (_SEL_LOWER - _MICRO, {}, _SEL_NOW, False),
+    # A capture after now never confirms; one exactly at now does.
+    (_SEL_NOW, {}, _SEL_NOW, True),
+    (_SEL_NOW + _MICRO, {}, _SEL_NOW, False),
+    # Exact float equality: one rounded tenth is not the displayed value.
+    (_SEL_NOW - dt.timedelta(minutes=1),
+     {"weekly_percent": _SEL_PERCENT + 0.04}, _SEL_NOW, False),
+    # Another account, another window.
+    (_SEL_NOW - dt.timedelta(minutes=1), {"account_key": "acct-b"},
+     _SEL_NOW, False),
+    (_SEL_NOW - dt.timedelta(minutes=1),
+     {"weekly_resets_at_utc": "2026-09-07T05:00:00Z"}, _SEL_NOW, False),
+])
+def test_weekly_reading_selector_bounds(
+        app, captured, scope_overrides, now, expected):
+    """#1018 twin spec 5.2 (failure: a reading captured at or after the
+    reset confirms the old window, a pre-segment or future reading, a
+    different value, account or window confirms the displayed one)."""
+    import _cctally_oauth_samples as S
+    conn = app.open_db()
+    try:
+        _sel_row(conn, "obs-1", captured)
+        conn.commit()
+        got = S.latest_weekly_reading_at(conn, _sel_scope(**scope_overrides),
+                                         now)
+    finally:
+        conn.close()
+    assert got == (captured if expected else None)
+
+
+def test_weekly_reading_selector_returns_the_newest_eligible(app):
+    """#1018 twin spec 5.2 (failure: an ineligible newer row, a newer row of
+    another value, account or window, or an older eligible row wins)."""
+    import _cctally_oauth_samples as S
+    base = _SEL_NOW - dt.timedelta(hours=2)
+    conn = app.open_db()
+    try:
+        _sel_row(conn, "old", base)
+        _sel_row(conn, "newest", base + dt.timedelta(minutes=30))
+        _sel_row(conn, "held", base + dt.timedelta(minutes=40), eligible=0)
+        _sel_row(conn, "other-value", base + dt.timedelta(minutes=50),
+                 percent=52.0)
+        _sel_row(conn, "other-account", base + dt.timedelta(minutes=55),
+                 account="acct-b")
+        _sel_row(conn, "other-window", base + dt.timedelta(minutes=58),
+                 reset=_SEL_RESET + dt.timedelta(days=7))
+        conn.commit()
+        got = S.latest_weekly_reading_at(conn, _sel_scope(), _SEL_NOW)
+    finally:
+        conn.close()
+    assert got == base + dt.timedelta(minutes=30)
+    assert got.tzinfo is not None
+
+
+# --- #1018 twin spec 5.3/8.1: the card ages from confirming readings ---------
+
+def _identify(monkeypatch, natural: "str | None") -> "str":
+    """Pin the active Claude identity the recording path binds (``None`` is
+    the stably-absent install, recorded as `unattributed`)."""
+    import _lib_accounts
+    if natural is None:
+        key = _lib_accounts.UNATTRIBUTED
+        identity = {"status": "stably_absent", "account_key": key,
+                    "natural_id": None}
+    else:
+        key = _lib_accounts.account_key("claude", natural)
+        identity = {"status": "identified", "account_key": key,
+                    "natural_id": natural, "email": f"{natural}@example.test",
+                    "plan_type": "max"}
+    monkeypatch.setattr(_cctally_core, "_resolve_active_claude_identity",
+                        lambda: dict(identity))
+    return key
+
+
+def _flat_stream(app, monkeypatch, *, decorated: bool, minutes) -> str:
+    """The owner's flat stream at ``minutes``; a decorated store first records
+    an earlier reading of a second real account. Returns the owner's key."""
+    if decorated:
+        _identify(monkeypatch, "flat-other")
+        _record_reading(app, monkeypatch, at_s=-120, percent=30.0)
+        owner = _identify(monkeypatch, "flat-owner")
+    else:
+        owner = _identify(monkeypatch, None)
+    for minute in minutes:
+        _record_reading(app, monkeypatch, at_s=minute * 60)
+    return owner
+
+
+def _card(app, now: dt.datetime):
+    conn = app.open_db()
+    try:
+        return app._tui_build_current_week(conn, now, skip_sync=True)
+    finally:
+        conn.close()
+
+
+def _envelope_current_week(app, cw, now: dt.datetime) -> dict:
+    snap = app.DataSnapshot(
+        current_week=cw, forecast=None, trend=[], sessions=[],
+        last_sync_at=None, last_sync_error=None, generated_at=now)
+    return app.snapshot_to_envelope(snap, now_utc=now)["current_week"]
+
+
+def _stored_rows(app, account: str) -> int:
+    conn = app.open_db()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE account_key = ?",
+            (account,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("decorated", [False, True],
+                         ids=["merged", "decorated"])
+@pytest.mark.parametrize("last_minute", [5, 75],
+                         ids=["stored-row-over-90s", "stored-row-over-60min"])
+def test_current_week_flat_readings_keep_weekly_evidence_fresh(
+        app, monkeypatch, decorated, last_minute):
+    """#1018 twin (failure: a healthy flat stream leaves one old stored row,
+    and the Current Week card and the dashboard's freshness read it, so a
+    pipeline confirming the same value every few seconds is shown aging or
+    stale)."""
+    owner = _flat_stream(app, monkeypatch, decorated=decorated,
+                         minutes=sorted({0, 2, last_minute}))
+    assert _stored_rows(app, owner) == 1
+    now = _at(last_minute * 60 + 10)
+    cw = _card(app, now)
+    assert cw is not None
+    assert cw.account_decorated is decorated
+    assert cw.latest_snapshot_at == _at(0)
+    assert (cw.freshness_label, cw.freshness_age) == ("fresh", 10)
+    wire = _envelope_current_week(app, cw, now)
+    freshness = wire["freshness"]
+    assert freshness["label"] == "fresh"
+    assert cw.latest_weekly_reading_at == _at(last_minute * 60)
+    assert freshness["age_seconds"] == 10
+    assert app.parse_iso_datetime(freshness["captured_at"], "t") == _at(
+        last_minute * 60)
+    assert wire["last_snapshot_age_sec"] == last_minute * 60 + 10
+
+
+def _index_rows_for(app, observation_id: str):
+    conn = app.open_db()
+    try:
+        return conn.execute(
+            "SELECT account_key, captured_at_utc, weekly_percent,"
+            " weekly_resets_at_utc FROM claude_weekly_observation_index"
+            " WHERE observation_id = ?", (observation_id,)).fetchone()
+    finally:
+        conn.close()
+
+
+def _newest_index_observation(app) -> str:
+    conn = app.open_db()
+    try:
+        return conn.execute(
+            "SELECT observation_id FROM claude_weekly_observation_index"
+            " ORDER BY captured_at_utc DESC LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _apply_decision(app, observation_id: str, disposition: str, *,
+                    retract: bool = False) -> None:
+    """Fold one reviewed weekly decision op; ``retract`` writes the schema-3
+    retraction, which the fold projects as an ordinary `hold`."""
+    import _cctally_oauth_samples as S
+    payload = {
+        "kind": "claude_weekly_observation_decision_v2",
+        "schema_version": 2, "weekly_axis_decisions": [
+            {"observationId": observation_id, "disposition": disposition}]}
+    if retract:
+        payload.update(schema_version=3,
+                       weekly_axis_retractions=[observation_id])
+    conn = app.open_db()
+    try:
+        S.apply_weekly_observation_decision_op(conn, {
+            "t": "op", "id": f"op:{observation_id}:{disposition}:{retract}",
+            "payload": payload})
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _foreign_index_row(app, *, account: "str | None" = None,
+                       reset_shift_days: int = 0, percent_delta: float = 0.0,
+                       at: dt.datetime) -> None:
+    """An ELIGIBLE index row of the displayed value whose account, window or
+    exact value differs: what a projected confirmation of another account, a
+    stale replica of the previous window, or a reading that only ROUNDS to
+    the displayed value would carry. (A real reading of a nearby value is
+    not held back: the recording path stores and displays it.)"""
+    import _lib_oauth_samples
+    sample = _index_rows_for(app, _newest_index_observation(app))
+    reset = (_lib_oauth_samples._parse_aware(sample[3])
+             + dt.timedelta(days=reset_shift_days))
+    conn = app.open_db()
+    try:
+        conn.execute(
+            "INSERT INTO claude_weekly_observation_index (observation_id,"
+            " account_key, captured_at_utc, weekly_percent,"
+            " weekly_resets_at_utc, weekly_reading_genuine,"
+            " weekly_freshness_eligible) VALUES (?, ?, ?, ?, ?, 1, 1)",
+            (f"foreign-{account}-{reset_shift_days}-{percent_delta}",
+             account or sample[0], _lib_oauth_samples.canonical_instant(at),
+             sample[2] + percent_delta, reset.strftime("%Y-%m-%dT%H:%M:%SZ")))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _projection_publication(app, monkeypatch, at: dt.datetime) -> None:
+    """A v2 publication whose weekly axis is a store projection (the displayed
+    value copied forward) carrying a CHANGED genuine five-hour reading."""
+    import _cctally_journal as jr
+    reading = _latest_claude_obs()
+    account = reading["payload"]["account_binding"]["accountKey"]
+    twin = _admission_twin(reading, at, 51.0)
+    payload = twin["payload"]
+    payload.update(
+        detector_policy=2, publication_id=f"pub:{_iso(at)}",
+        five_hour_percent=7.0,
+        publication={"sevenDay": {"kind": "projection", "account": account},
+                     "fiveHour": {"kind": "candidate", "account": account}})
+    import _lib_journal as J
+    jr.append_record(J.make_obs(
+        at=_iso(at), src=reading["src"], provider="claude", payload=payload,
+        account=reading.get("account")))
+    result = jr.run_stats_ingest(mode="authoritative")
+    assert result.error is None, result.error
+
+
+# Every control starts from the same stream (readings at minutes 0 and 2,
+# then 90 minutes of silence) and adds one piece of evidence at minute 91;
+# none of them may confirm the displayed value, so the card stays STALE and
+# ages from minute 2.
+@pytest.mark.parametrize("control", [
+    "lower_held_back", "within_a_rounded_tenth", "another_account",
+    "previous_window_replica", "reading_after_now", "hold", "retraction",
+    "projection_weekly_axis", "silence",
+])
+def test_current_week_freshness_ignores_unconfirming_evidence(
+        app, monkeypatch, control):
+    """#1018 twin R2 (failure: unrelated evidence — a held-back lower or
+    almost-equal value, another account's or the previous window's reading,
+    a capture after now, a reviewed hold or schema-3 retraction, or a
+    store-projected weekly axis beside a changed five-hour reading — presents
+    stale weekly evidence as fresh)."""
+    _flat_stream(app, monkeypatch, decorated=False, minutes=(0, 2))
+    confirming = _newest_index_observation(app)
+    at = _at(91 * 60)
+    now = _at(92 * 60)
+    if control == "lower_held_back":
+        _record_reading(app, monkeypatch, at_s=91 * 60, percent=50.0)
+    elif control == "within_a_rounded_tenth":
+        _foreign_index_row(app, percent_delta=0.04, at=at)
+    elif control == "another_account":
+        _foreign_index_row(app, account="b" * 32, at=at)
+    elif control == "previous_window_replica":
+        _foreign_index_row(app, reset_shift_days=-7, at=at)
+    elif control == "reading_after_now":
+        _record_reading(app, monkeypatch, at_s=93 * 60)
+    elif control == "hold":
+        _record_reading(app, monkeypatch, at_s=91 * 60)
+        _apply_decision(app, _newest_index_observation(app), "hold")
+    elif control == "retraction":
+        _record_reading(app, monkeypatch, at_s=91 * 60)
+        _apply_decision(app, _newest_index_observation(app), "hold",
+                        retract=True)
+    elif control == "projection_weekly_axis":
+        _projection_publication(app, monkeypatch, at)
+    elif control == "silence":
+        pass
+    cw = _card(app, now)
+    assert cw is not None
+    assert cw.used_pct == 51.0
+    expected = _at(2 * 60)
+    assert _index_rows_for(app, confirming) is not None
+    assert cw.latest_weekly_reading_at == expected, control
+    assert cw.freshness_label == "stale"
+    wire = _envelope_current_week(app, cw, now)
+    assert wire["freshness"]["label"] == "stale"
+    assert wire["freshness"]["age_seconds"] == 90 * 60
+
+
+def test_current_week_hold_then_accept_restores_the_confirmation(
+        app, monkeypatch):
+    """#1018 twin R2 (failure: a later reviewed accept leaves the held
+    reading ineligible, or a hold leaves it confirming)."""
+    _flat_stream(app, monkeypatch, decorated=False, minutes=(0, 2, 91))
+    latest = _newest_index_observation(app)
+    now = _at(91 * 60 + 10)
+    assert _card(app, now).latest_weekly_reading_at == _at(91 * 60)
+    _apply_decision(app, latest, "hold")
+    assert _card(app, now).latest_weekly_reading_at == _at(2 * 60)
+    _apply_decision(app, latest, "accept")
+    cw = _card(app, now)
+    assert cw.latest_weekly_reading_at == _at(91 * 60)
+    assert (cw.freshness_label, cw.freshness_age) == ("fresh", 10)
+
+
+def test_current_week_without_a_resolvable_reading_has_no_freshness(app):
+    """#1018 twin spec 5.3 (failure: a displayed row whose originating
+    observation does not resolve — a bootstrap or synthetic row — falls back
+    to the stored row's capture or to now)."""
+    _insert(app, captured_at=NOW - dt.timedelta(seconds=5),
+            weekly_percent=GENUINE_WEEKLY, held=0)
+    cw = _card(app, NOW)
+    assert cw is not None
+    assert cw.latest_snapshot_at == NOW - dt.timedelta(seconds=5)
+    assert cw.weekly_reading_scope is None
+    assert cw.latest_weekly_reading_at is None
+    assert (cw.freshness_label, cw.freshness_age) == (None, None)
+    wire = _envelope_current_week(app, cw, NOW)
+    assert wire["freshness"] is None
+    assert wire["last_snapshot_age_sec"] == 5
+
+
+def test_current_week_with_every_confirmation_held_has_no_freshness(
+        app, monkeypatch):
+    """#1018 twin spec 8.2 (failure: when every reading of the displayed value
+    is held, the card falls back to the stored row's capture instead of
+    publishing no freshness)."""
+    _flat_stream(app, monkeypatch, decorated=False, minutes=(0, 2))
+    conn = app.open_db()
+    try:
+        ids = [r[0] for r in conn.execute(
+            "SELECT observation_id FROM claude_weekly_observation_index")]
+    finally:
+        conn.close()
+    assert len(ids) == 2
+    for observation_id in ids:
+        _apply_decision(app, observation_id, "hold")
+    now = _at(3 * 60)
+    cw = _card(app, now)
+    assert cw is not None and cw.used_pct == 51.0
+    assert cw.weekly_reading_scope is not None
+    assert cw.latest_weekly_reading_at is None
+    assert (cw.freshness_label, cw.freshness_age) == (None, None)
+    wire = _envelope_current_week(app, cw, now)
+    assert wire["freshness"] is None
+    assert wire["last_snapshot_age_sec"] == 180
+
+
+def _credit_floor(app, account: str, at: dt.datetime) -> None:
+    """One weekly credit floor of the displayed week at ``at``."""
+    conn = app.open_db()
+    try:
+        [(week_start_date,)] = conn.execute(
+            "SELECT DISTINCT week_start_date FROM weekly_usage_snapshots"
+            " WHERE account_key = ?", (account,)).fetchall()
+        conn.execute(
+            "INSERT INTO weekly_credit_floors (week_start_date,"
+            " effective_at_utc, observed_pre_credit_pct, applied_at_utc,"
+            " account_key) VALUES (?, ?, 60.0, ?, ?)",
+            (week_start_date, _iso(at), _iso(at), account))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_current_week_lower_bound_uses_the_newest_floor_at_or_before_now(
+        app, monkeypatch):
+    """#1018 twin review F3 (failure: when the week's newest credit floor is
+    later than now — an as-of or replay build between two floors — the lower
+    bound ignores floors entirely, so a same-value reading captured before
+    the earlier, applicable floor confirms the post-credit value)."""
+    owner = _flat_stream(app, monkeypatch, decorated=False, minutes=(0, 2))
+    _credit_floor(app, owner, _at(3 * 60))
+    _credit_floor(app, owner, _at(200 * 60))
+    cw = _card(app, _at(5 * 60))
+    assert cw is not None and cw.used_pct == 51.0
+    assert cw.weekly_reading_scope is not None
+    assert cw.weekly_reading_scope.lower_bound_utc == (
+        _at(3 * 60).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+    assert cw.latest_weekly_reading_at is None
+    assert (cw.freshness_label, cw.freshness_age) == (None, None)
+
+
+def test_current_week_hold_then_accept_at_the_reset_boundary_captures(
+        app, monkeypatch):
+    """#1018 twin spec 8.1, end to end through the card (failure: a reading
+    captured exactly at or just after the window's provider reset confirms
+    the old window's value, or an accept after a hold restores eligibility
+    to one of those captures, or fails to restore the reading just before
+    the reset)."""
+    import _cctally_oauth_samples as S
+    _flat_stream(app, monkeypatch, decorated=False, minutes=(0, 2))
+    reading = _latest_claude_obs()
+    reset = dt.datetime.fromtimestamp(
+        int(reading["payload"]["resets_at"]), UTC)
+    captures = {"minus": reset - _MICRO, "exact": reset,
+                "plus": reset + _MICRO}
+    ids = {}
+    conn = app.open_db()
+    try:
+        for name, at in captures.items():
+            record = dict(_admission_twin(reading, at, 51.0))
+            ids[name] = record["id"]
+            S.project_observation(conn, record)
+        conn.commit()
+        eligible = {name: tuple(conn.execute(
+            "SELECT weekly_freshness_eligible FROM"
+            " claude_weekly_observation_index WHERE observation_id = ?",
+            (oid,)).fetchone()) for name, oid in ids.items()}
+    finally:
+        conn.close()
+    # Non-vacuity: all three are indexed, in the displayed account and
+    # window; only the capture strictly before the reset is eligible.
+    assert eligible == {"minus": (1,), "exact": (0,), "plus": (0,)}
+    now = reset + dt.timedelta(minutes=1)
+
+    def confirmation():
+        cw = _card(app, now)
+        assert cw is not None and cw.used_pct == 51.0
+        return cw.latest_weekly_reading_at
+
+    assert confirmation() == captures["minus"]
+    for oid in ids.values():
+        _apply_decision(app, oid, "hold")
+    assert confirmation() == _at(2 * 60)
+    for oid in ids.values():
+        _apply_decision(app, oid, "accept")
+    assert confirmation() == captures["minus"]
+
+
+def _two_account_stream(app, monkeypatch, *, decorated: bool,
+                        owner_first: bool):
+    """The owner's flat 51 % stream (stored at minute 0, flat at 2) beside a
+    second account's REAL readings of the same value: stored at -2 min and
+    repeated, flat, at minute 91. ``owner_first`` registers the owner with an
+    earlier 50 % reading before the other account's first reading. On a
+    decorated store the other account is a second real account; below the
+    threshold (the merged card) it is the unattributed bucket, the only
+    second account the merged card can display beside one real account."""
+    def owner():
+        return _identify(monkeypatch, "flat-owner")
+
+    def other():
+        return _identify(monkeypatch, "flat-other" if decorated else None)
+
+    if owner_first:
+        owner()
+        _record_reading(app, monkeypatch, at_s=-240, percent=50.0)
+    other_key = other()
+    _record_reading(app, monkeypatch, at_s=-120)
+    owner_key = owner()
+    _record_reading(app, monkeypatch, at_s=0)
+    _record_reading(app, monkeypatch, at_s=120)
+    other()
+    _record_reading(app, monkeypatch, at_s=91 * 60)
+    return owner_key, other_key
+
+
+@pytest.mark.parametrize("owner_first", [False, True],
+                         ids=["other-first", "owner-first"])
+@pytest.mark.parametrize("decorated", [False, True],
+                         ids=["merged", "decorated"])
+def test_current_week_another_accounts_reading_never_confirms(
+        app, monkeypatch, decorated, owner_first):
+    """#1018 twin R2, with real readings of two accounts in both insertion
+    orders (failure: another account's newer reading of the same value
+    confirms the displayed account's card, on the merged card or on the
+    decorated owner card)."""
+    owner, other = _two_account_stream(
+        app, monkeypatch, decorated=decorated, owner_first=owner_first)
+    # Preconditions: the other account's minute-91 reading is flat (no stored
+    # row, so the owner's row stays the displayed one) and is an eligible
+    # index row of the same value and window — it WOULD confirm a selector
+    # that ignored the account.
+    assert _stored_rows(app, owner) == (2 if owner_first else 1)
+    assert _stored_rows(app, other) == 1
+    conn = app.open_db()
+    try:
+        rows = conn.execute(
+            "SELECT weekly_percent, weekly_freshness_eligible FROM"
+            " claude_weekly_observation_index WHERE account_key = ?"
+            " AND captured_at_utc > ?",
+            (other, _iso(_at(90 * 60)).replace("Z", ".000000Z"))).fetchall()
+    finally:
+        conn.close()
+    assert [tuple(r) for r in rows] == [(51.0, 1)]
+    now = _at(92 * 60)
+    cw = _card(app, now)
+    assert cw is not None
+    assert cw.account_decorated is decorated
+    assert cw.used_pct == 51.0
+    assert cw.weekly_reading_scope.account_key == owner
+    assert cw.latest_weekly_reading_at == _at(2 * 60)
+    assert cw.freshness_label == "stale"
+    wire = _envelope_current_week(app, cw, now)
+    assert wire["freshness"]["age_seconds"] == 90 * 60

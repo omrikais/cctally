@@ -18,6 +18,7 @@ import sqlite3
 
 import pytest
 
+import _cctally_core
 import _sql_plan_guard as guard
 from conftest import load_script, redirect_paths
 
@@ -25,10 +26,10 @@ FIXED = dt.datetime(2026, 9, 12, 12, 0, 0, tzinfo=dt.timezone.utc)
 NOW = dt.datetime(2026, 7, 20, 12, tzinfo=dt.timezone.utc)
 LEGACY_NOW = dt.datetime(2026, 6, 3, 12, tzinfo=dt.timezone.utc)
 PREVIOUS_EPOCH = 1016
-# The current head: the indexes were introduced at 1017 and #825/#832 moved
-# the head to 1018 (#797/#823/#840 then to 1019, #1019/#1014 to 1020, then #943 to 1021, then #1015 to 1022, then #948 to 1023), so an upgraded install
-# reaches them at the current epoch.
-NEW_EPOCH = 1023
+# The current head: the indexes arrived at epoch 1017, and an upgraded install
+# reaches them at the current epoch; the later history is the comment above
+# `STATS_INDEX_EPOCH` in `bin/_cctally_core.py`.
+NEW_EPOCH = _cctally_core.STATS_INDEX_EPOCH
 READ_INDEXES = (
     "idx_quota_projection_state_digest", "idx_quota_blocks_digest",
     "idx_quota_milestones_digest", "idx_quota_threshold_events_digest",
@@ -117,7 +118,7 @@ def test_the_epoch_is_bumped_and_the_legacy_registry_is_untouched():
     import _cctally_core
     import _cctally_db
 
-    assert _cctally_core.STATS_INDEX_EPOCH == NEW_EPOCH
+    assert _cctally_core.STATS_INDEX_EPOCH >= 1017
     assert _cctally_core.LEGACY_STATS_HEAD == 13
     assert len(_cctally_db._STATS_MIGRATIONS) == 13, "the registry is FROZEN"
 

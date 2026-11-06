@@ -62,6 +62,17 @@ _GPT_56_SOL_LITELLM = {
 }
 
 
+# The preview identifier we alias to gpt-5.5-cyber instead of pricing directly
+# (#989); its model-only suppression needs the upstream row to stay non-stale.
+_GPT_55_CYBER_PREVIEW = "gpt-5.5-cyber-preview"
+_GPT_55_CYBER_PREVIEW_LITELLM = {
+    "litellm_provider": "openai",
+    "input_cost_per_token": 1.25e-05,
+    "cache_read_input_token_cost": 1.25e-06,
+    "output_cost_per_token": 7.5e-05,
+}
+
+
 def _litellm_inject(extra: dict | None = None) -> dict:
     """Keep every allowlisted divergence non-stale in sparse fakes.
 
@@ -73,6 +84,7 @@ def _litellm_inject(extra: dict | None = None) -> dict:
         _MYTHOS_PREVIEW: dict(_MYTHOS_PREVIEW_LITELLM),
         _GPT_56_ALIAS: dict(_GPT_56_SOL_LITELLM),
         _GPT_56_SOL: dict(_GPT_56_SOL_LITELLM),
+        _GPT_55_CYBER_PREVIEW: dict(_GPT_55_CYBER_PREVIEW_LITELLM),
     }
     result.update(extra or {})
     return result

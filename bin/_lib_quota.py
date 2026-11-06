@@ -256,6 +256,25 @@ class ResetAnchorComponents:
     def tolerance_seconds(self) -> int:
         return self._tolerance
 
+    def copy(self) -> "ResetAnchorComponents":
+        """An independent copy: mutating it never changes this index.
+
+        O(distinct raw resets). The provenance drain (#975, spec 4.2) starts
+        each identity from a copy of the committed-evidence base, so evidence
+        that identity resolves but does not store stays private to it.
+        """
+        other = object.__new__(type(self))
+        other._tolerance = self._tolerance
+        other._buckets = {
+            bucket: list(members) for bucket, members in self._buckets.items()}
+        other._parent = dict(self._parent)
+        other._rank = dict(self._rank)
+        other._anchor = dict(self._anchor)
+        other._first_order = dict(self._first_order)
+        other._member_order = dict(self._member_order)
+        other._next_order = self._next_order
+        return other
+
     def _bucket(self, value: dt.datetime) -> int:
         return int(value.timestamp() // self._tolerance)
 

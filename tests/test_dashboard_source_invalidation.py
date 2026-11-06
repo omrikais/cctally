@@ -541,7 +541,13 @@ def test_source_bundle_retains_the_prior_complete_generation_when_postvalidation
     tui_module = ns["_cctally_tui"]
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
+        # #1050: no input identity for the prior build. Reading one first
+        # would open (and so create) cache.db before this build observes it,
+        # stamping the prior Codex generation with a quota-dependency identity
+        # that the raced build below must then withdraw (#857) — a copy, not
+        # the prior object this test retains.
         prior = tui_module._tui_build_source_bundle(
+            claude_input_identity=None,
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -557,8 +563,12 @@ def test_source_bundle_retains_the_prior_complete_generation_when_postvalidation
             calls += 1
             return "a" * 64 if calls == 1 else "b" * 64
 
+        # #1050: the input identity is the dispatch read, taken before the
+        # inputs are assembled — before the digest starts moving.
+        identity = tui_module._tui_read_claude_input_identity(stats)
         monkeypatch.setattr(tui_module, "codex_stats_digest", moving_digest)
         rebuilt = tui_module._tui_build_source_bundle(
+            claude_input_identity=identity,
             projects_envelope={},
             stats_conn=stats,
             now_utc=now + ns["dt"].timedelta(minutes=1),
@@ -591,6 +601,7 @@ def test_source_bundle_publishes_pinned_snapshot_when_only_cache_moves(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = tui_module._tui_build_source_bundle(
+            claude_input_identity=tui_module._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -599,28 +610,20 @@ def test_source_bundle_publishes_pinned_snapshot_when_only_cache_moves(
             claude_cost_usd=0.0,
             claude_total_tokens=0,
         )
-        from _lib_snapshot_cache import SnapshotSignature
-
+        # #1050: the stats legs are the store's own; only the cache legs are
+        # scripted. The pinned start read equals the input identity (the
+        # dispatch read the supplied inputs were assembled under), and the
+        # post-build read sees the cache move after the pin.
+        real, revision = tui_module._tui_read_claude_input_identity(stats)
+        pinned = real._replace(
+            max_entry_id=1, max_codex_id=1, generation=0,
+            entry_mutation_seq=1, codex_physical_mutation_seq=1,
+        )
         signatures = iter((
-            SnapshotSignature(
-                max_entry_id=1,
-                max_wus_id=0,
-                max_wcs_id=0,
-                reset_sig=(0, 0),
-                max_codex_id=1,
-                generation=0,
-                entry_mutation_seq=1,
-                codex_physical_mutation_seq=1,
-            ),
-            SnapshotSignature(
-                max_entry_id=2,
-                max_wus_id=0,
-                max_wcs_id=0,
-                reset_sig=(0, 0),
-                max_codex_id=2,
-                generation=0,
-                entry_mutation_seq=2,
-                codex_physical_mutation_seq=2,
+            pinned,
+            pinned._replace(
+                max_entry_id=2, max_codex_id=2,
+                entry_mutation_seq=2, codex_physical_mutation_seq=2,
             ),
         ))
         monkeypatch.setitem(
@@ -628,6 +631,7 @@ def test_source_bundle_publishes_pinned_snapshot_when_only_cache_moves(
         )
 
         rebuilt = tui_module._tui_build_source_bundle(
+            claude_input_identity=(pinned, revision),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now + ns["dt"].timedelta(minutes=1),
@@ -780,6 +784,7 @@ def test_source_bundle_threads_the_canonical_fast_tier_and_week_start(
         monkeypatch.setattr(tui_module, "build_codex_source_state", capture)
 
         bundle = tui_module._tui_build_source_bundle(
+            claude_input_identity=tui_module._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -857,6 +862,7 @@ def test_source_bundle_publishes_the_complete_legacy_derived_claude_projection(
     try:
         claude_data = ns["_cctally_tui"]._tui_project_claude_source_data(legacy_envelope)
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -954,6 +960,7 @@ def test_source_bundle_retains_prior_whole_codex_state_on_ingest_contention(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -963,6 +970,7 @@ def test_source_bundle_retains_prior_whole_codex_state_on_ingest_contention(
             claude_total_tokens=0,
         )
         current = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -992,6 +1000,7 @@ def test_source_bundle_reports_unavailable_codex_when_contention_has_no_prior(
     stats = ns["open_db"]()
     try:
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc),
@@ -1019,6 +1028,7 @@ def test_source_bundle_retains_prior_whole_codex_state_on_ingest_failure(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1028,6 +1038,7 @@ def test_source_bundle_retains_prior_whole_codex_state_on_ingest_failure(
             claude_total_tokens=0,
         )
         current = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1063,6 +1074,7 @@ def test_source_bundle_retains_prior_whole_claude_state_on_ingest_degradation(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1072,6 +1084,7 @@ def test_source_bundle_retains_prior_whole_claude_state_on_ingest_degradation(
             claude_total_tokens=120,
         )
         current = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1110,6 +1123,7 @@ def test_source_bundle_reports_unavailable_claude_without_prior_on_ingest_degrad
     stats = ns["open_db"]()
     try:
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc),
@@ -1143,6 +1157,7 @@ def test_snapshot_keeps_prior_complete_source_bundle_when_signature_and_builder_
     stats = ns["open_db"]()
     try:
         prior_bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1212,6 +1227,7 @@ def test_source_bundle_hero_uses_native_cycle_while_periods_respect_visible_rang
         assert narrowed.data["periods"]["daily"]["rows"] == ()
 
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1291,6 +1307,7 @@ def test_dashboard_snapshot_retains_prior_claude_on_real_ingest_contention(
     stats = ns["open_db"]()
     try:
         prior_bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1331,6 +1348,7 @@ def test_source_bundle_reuses_exact_unchanged_provider_objects(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         first = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1344,6 +1362,7 @@ def test_source_bundle_reuses_exact_unchanged_provider_objects(
         )
         cache.commit()
         claude_changed = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1362,6 +1381,7 @@ def test_source_bundle_reuses_exact_unchanged_provider_objects(
         )
         cache.commit()
         codex_changed = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1742,6 +1762,7 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1763,6 +1784,7 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
                 lambda *_args, **_kwargs: source_module.ProjectionCoherence(False, "mismatch"),
             )
             incoherent = ns["_cctally_tui"]._tui_build_source_bundle(
+                claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
                 projects_envelope={},
                 stats_conn=stats,
                 now_utc=now,
@@ -1793,6 +1815,7 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
         assert incoherent.sources["all"].data["combined"] is None
 
         recovered = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -1828,6 +1851,7 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
                 lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("private /canary/root")),
             )
             failed_domain = ns["_cctally_tui"]._tui_build_source_bundle(
+                claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
                 projects_envelope={},
                 stats_conn=stats,
                 now_utc=now,
@@ -1847,6 +1871,7 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
         assert "private /canary/root" not in repr(failed_domain.sources["codex"].warnings)
 
         recovered_domain = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats,
             now_utc=now,
@@ -2091,9 +2116,11 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
         # crosses this bound by two orders of magnitude.
         # Measured at 9 on this fixture: seven relation aggregates plus the
         # warm digest memo's two fixed PRAGMA reads (`database_list`, which
-        # names the file it stats, and `journal_mode`).  The bound leaves room
-        # for one more fixed query without leaving room for a per-window query.
-        assert len(digest_statements) <= 10, (
+        # names the file it stats, and `journal_mode`). #1050 spec 4.7 appends
+        # two Codex relations (`quota_percent_milestones`,
+        # `quota_window_blocks`), so 11. The bound leaves room for one more
+        # fixed query without leaving room for a per-window query.
+        assert len(digest_statements) <= 12, (
             f"{len(digest_statements)} statements to digest a fixture of "
             f"{codex_entry_count:,} entries; the digest is no longer bounded"
         )
@@ -2220,6 +2247,7 @@ def test_source_bundle_rebuilds_on_account_switch(tmp_path, monkeypatch):
         monkeypatch.setattr(_cctally_account, "resolve_active_account_keys",
                             lambda: {_ACCT_A})
         first = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats, now_utc=now, display_tz_name="UTC",
             codex_ingest_contended=False, claude_cost_usd=1.0, claude_total_tokens=10,
@@ -2227,6 +2255,7 @@ def test_source_bundle_rebuilds_on_account_switch(tmp_path, monkeypatch):
         monkeypatch.setattr(_cctally_account, "resolve_active_account_keys",
                             lambda: {_ACCT_B})
         second = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats, now_utc=now, display_tz_name="UTC",
             codex_ingest_contended=False, claude_cost_usd=1.0, claude_total_tokens=10,
@@ -2343,6 +2372,7 @@ def test_codex_source_is_rebuilt_when_only_the_ingest_backlog_record_changes(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         first = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats, now_utc=now, display_tz_name="UTC",
             codex_ingest_contended=False, claude_cost_usd=0.0,
@@ -2357,6 +2387,7 @@ def test_codex_source_is_rebuilt_when_only_the_ingest_backlog_record_changes(
             cache.close()
 
         second = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             projects_envelope={},
             stats_conn=stats, now_utc=now + ns["dt"].timedelta(minutes=1),
             display_tz_name="UTC", codex_ingest_contended=False,
@@ -2402,6 +2433,25 @@ def _claude_data_for_week(tui_module, *, week_start: str, week_end: str):
             "five_hour_milestones": [],
         },
     })
+
+
+def _frozen_input_identity(ns, tui_module, stats):
+    """#1050: the Claude input identity under the same pin. The dispatch read
+    computes its signature through the snapshot-cache kernel, not the patched
+    namespace entry, so the pinned database legs are applied to the store's own
+    read here (its digests and content revision stay real, as the builder's
+    are) — otherwise the builder's frozen start read differs from the identity
+    and every build is rejected."""
+    real, revision = tui_module._tui_read_claude_input_identity(stats)
+    frozen = ns["compute_signature"]()
+    pinned = real._replace(**{
+        leg: getattr(frozen, leg) for leg in (
+            "max_entry_id", "max_wus_id", "max_wcs_id", "reset_sig",
+            "max_codex_id", "generation", "entry_mutation_seq",
+            "codex_physical_mutation_seq",
+        )
+    })
+    return pinned, revision
 
 
 def _frozen_signature_bundle_builder(ns, monkeypatch):
@@ -2456,6 +2506,8 @@ def test_claude_source_version_changes_on_a_clock_only_week_rollover(
         # deliberate lockstep invalidation of §3.6 instead.
         pinned_range_start = before - ns["dt"].timedelta(days=30)
         first = tui_module._tui_build_source_bundle(
+            claude_input_identity=_frozen_input_identity(
+                ns, tui_module, stats),
             projects_envelope={},
             stats_conn=stats, now_utc=before, display_tz_name="UTC",
             codex_ingest_contended=False,
@@ -2467,6 +2519,8 @@ def test_claude_source_version_changes_on_a_clock_only_week_rollover(
             ),
         )
         rolled = tui_module._tui_build_source_bundle(
+            claude_input_identity=_frozen_input_identity(
+                ns, tui_module, stats),
             projects_envelope={},
             stats_conn=stats, now_utc=after, display_tz_name="UTC",
             codex_ingest_contended=False,
@@ -2518,6 +2572,8 @@ def test_an_unchanged_claude_period_does_not_churn_the_source_version(
     now = ns["dt"].datetime(2026, 7, 19, 12, 0, tzinfo=ns["dt"].timezone.utc)
     try:
         first = tui_module._tui_build_source_bundle(
+            claude_input_identity=_frozen_input_identity(
+                ns, tui_module, stats),
             projects_envelope={},
             stats_conn=stats, now_utc=now, display_tz_name="UTC",
             codex_ingest_contended=False,
@@ -2528,6 +2584,8 @@ def test_an_unchanged_claude_period_does_not_churn_the_source_version(
             ),
         )
         again = tui_module._tui_build_source_bundle(
+            claude_input_identity=_frozen_input_identity(
+                ns, tui_module, stats),
             projects_envelope={},
             stats_conn=stats, now_utc=now + ns["dt"].timedelta(minutes=5),
             display_tz_name="UTC", codex_ingest_contended=False,
@@ -3142,6 +3200,7 @@ def test_857_a_race_retained_bundle_is_never_restamped_and_loses_its_provenance(
     stats = ns["open_db"]()
     try:
         prior = tui._tui_build_source_bundle(
+            claude_input_identity=tui._tui_read_claude_input_identity(stats),
             stats_conn=stats, now_utc=_857_AFTER, display_tz_name="UTC",
             codex_ingest_contended=False, claude_cost_usd=0.0,
             claude_total_tokens=0, projects_envelope={}, raw_config={},
@@ -3154,10 +3213,14 @@ def test_857_a_race_retained_bundle_is_never_restamped_and_loses_its_provenance(
         _857_insert_raw_quota_row(ns, cache, monkeypatch)
         newer = _857_current_identity(ns)
         assert newer != older
+        # #1050: the input identity is the dispatch read, taken before the
+        # digest starts moving.
+        identity = tui._tui_read_claude_input_identity(stats)
         digests = iter(("857-pre", "857-post"))
         monkeypatch.setattr(
             tui, "codex_stats_digest", lambda _conn: next(digests, "857-post"))
         raced = tui._tui_build_source_bundle(
+            claude_input_identity=identity,
             stats_conn=stats, now_utc=_857_AFTER + _857_TICK,
             display_tz_name="UTC", codex_ingest_contended=False,
             claude_cost_usd=0.0, claude_total_tokens=0, projects_envelope={},
@@ -4254,12 +4317,15 @@ def test_857_a_stats_rebuild_never_publishes_a_generation_a_cold_build_disagrees
             warm = snapshot.source_bundle.sources["codex"]
             break
     assert warm is not None, "the dashboard never recovered from the rebuild"
-    # This rebuild republishes identical RELEVANT contents: every digest the
-    # dispatch key carries re-derives to the same value over the new file, so
-    # the settled generation keeps idling — which is only correct because the
-    # cold build below agrees with it.
-    assert (calls["source_bundle"], calls["capture"], calls["build"]) == (
-        0, 0, 0)
+    # This rebuild republishes identical RELEVANT Codex contents: every Codex
+    # digest re-derives to the same value over the new file, so the settled
+    # Codex generation is reused — which is only correct because the cold
+    # build below agrees with it. #1050: the rebuild rewrites the publication
+    # stamp, which the Claude content revision names (spec 4.4), so the
+    # source bundle rebuilds for Claude while Codex captures and builds
+    # nothing.
+    assert calls["source_bundle"] >= 1
+    assert (calls["capture"], calls["build"]) == (0, 0)
 
     sc.reset_dispatch_state()
     tui._tui_reset_partial_retry_state()
@@ -4474,7 +4540,7 @@ def _1015_seed_correction(ns):
     stats = ns["open_db"]()
     try:
         stats.execute(
-            "INSERT INTO claude_weekly_observation_index VALUES (?,?,?)",
+            "INSERT INTO claude_weekly_observation_index (observation_id, account_key, captured_at_utc) VALUES (?,?,?)",
             ("obs-1", "acct-a", "2026-07-10T10:00:00+00:00"))
         stats.execute(
             "INSERT INTO claude_weekly_correction_history VALUES (?,?,?)",
@@ -5078,3 +5144,2252 @@ def test_836_the_decorated_claude_version_names_its_owner_and_index(ns836):
     snap, envelope, _ = _836_tick(ns836, _836_T + dt.timedelta(minutes=1))
     assert "account_key" not in envelope["current_week"]
     assert not re.search(r":o[0-9a-f]{16}(:|$)", _836_claude(snap).data_version)
+
+
+# --- #1018 twin spec 5.5: idle and reuse ticks refresh the confirmation -----
+
+def _1018_at(minute, second=0):
+    return dt.datetime(2026, 9, 5, 9, minute, second, tzinfo=dt.timezone.utc)
+
+
+def _1018_record(ns, monkeypatch, at):
+    """One real flat reading (51 %, five-hour 10 %) captured at ``at``."""
+    assert _836_record(ns, monkeypatch, at, 51.0, 10.0) == 0
+
+
+def _1018_freshness(snap):
+    """The card's freshness tuple and both Claude source copies."""
+    claude = _836_claude(snap)
+    return (
+        (snap.current_week.latest_weekly_reading_at,
+         snap.current_week.freshness_label, snap.current_week.freshness_age),
+        claude.data["hero"]["current_week"]["freshness"],
+        claude.data["quota"]["current_week"]["freshness"],
+        claude.domain_freshness["quota"],
+    )
+
+
+def _1018_copy(label, captured, age):
+    return {"label": label, "age_seconds": age,
+            "captured_at": captured.strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
+@pytest.mark.parametrize("path", ["pure-idle", "source-adapter-fallback"])
+def test_idle_flat_reading_refreshes_weekly_confirmation_without_rebuild(
+        ns836, monkeypatch, path):
+    """#1018 twin (failure: a flat reading adds no stored row and leaves the
+    dispatch signature unchanged, so the idle tick — pure, or through its
+    bounded source-adapter fallback — republishes the prior confirmation and
+    a healthy stream reads stale)."""
+    _1018_record(ns836, monkeypatch, _1018_at(0))
+    first, _env1, _ = _836_tick(ns836, _1018_at(0, 10))
+    before = _1018_freshness(first)
+    if path == "source-adapter-fallback":
+        monkeypatch.setattr(ns836["_cctally_tui"],
+                            "_tui_source_bundle_can_idle",
+                            lambda *_a, **_k: False)
+    _1018_record(ns836, monkeypatch, _1018_at(5))
+    second, env2, rebuilt = _836_tick(ns836, _1018_at(5, 10))
+    assert not rebuilt, "the flat reading forced a heavy rebuild"
+    fresh = _1018_copy("fresh", _1018_at(5), 10)
+    assert _1018_freshness(second) == (
+        (_1018_at(5), "fresh", 10), fresh, fresh, "fresh")
+    assert env2["current_week"]["freshness"] == fresh
+    assert env2["current_week"]["last_snapshot_age_sec"] == 310
+    # The previously published snapshot is replaced, never mutated.
+    assert _1018_freshness(first) == before
+    assert before[0] == (_1018_at(0), "fresh", 10)
+
+
+def test_idle_ticks_without_a_reading_cross_the_freshness_thresholds(
+        ns836, monkeypatch):
+    """#1018 twin (failure: an idle tick re-runs the lookup but keeps the
+    build-time label and age, so silence never ages the card or its source
+    copies, or advances the quota clock from the stored row instead)."""
+    _1018_record(ns836, monkeypatch, _1018_at(0))
+    snaps = []
+    for second, label, quota in ((10, "fresh", "fresh"),
+                                 (45, "aging", "fresh"),
+                                 (120, "stale", "stale")):
+        snap, env, rebuilt = _836_tick(ns836, _1018_at(0, 0)
+                                       + dt.timedelta(seconds=second))
+        assert rebuilt is (not snaps)
+        copy = _1018_copy(label, _1018_at(0), second)
+        assert _1018_freshness(snap) == (
+            (_1018_at(0), label, second), copy, copy, quota)
+        assert env["current_week"]["freshness"] == copy
+        snaps.append((snap, _1018_freshness(snap)))
+    for snap, observed in snaps:
+        assert _1018_freshness(snap) == observed
+
+
+def _1018_retire_confirmations(ns):
+    """Remove every eligible confirmation (the index flag only, as a reviewed
+    hold leaves it). #1050: that UPDATE is a tracked in-place correction, so
+    it moves the Claude content revision and the next tick rebuilds."""
+    conn = ns["open_db"]()
+    try:
+        conn.execute("UPDATE claude_weekly_observation_index"
+                     " SET weekly_freshness_eligible = 0")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_idle_stale_confirmation_that_disappears_publishes_none(
+        ns836, monkeypatch):
+    """#1018 twin (failure: the idle clock keeps the retained `stale` quota
+    value, or the card keeps its last confirmation, when the final eligible
+    confirmation is removed)."""
+    _1018_record(ns836, monkeypatch, _1018_at(0))
+    first, _env, _ = _836_tick(ns836, _1018_at(2))
+    stale = _1018_copy("stale", _1018_at(0), 120)
+    assert _1018_freshness(first) == (
+        (_1018_at(0), "stale", 120), stale, stale, "stale")
+    _1018_retire_confirmations(ns836)
+    second, env2, rebuilt = _836_tick(ns836, _1018_at(2, 5))
+    # #1050: the retirement is a stored correction the content revision
+    # names, so the tick rebuilds rather than idling on the prior source.
+    assert rebuilt
+    assert _1018_freshness(second) == ((None, None, None), None, None, "fresh")
+    assert env2["current_week"]["freshness"] is None
+    assert _836_claude(second).domain_freshness["hero"] == "fresh"
+    assert _1018_freshness(first) == (
+        (_1018_at(0), "stale", 120), stale, stale, "stale")
+
+
+def test_idle_stats_error_keeps_the_prior_confirmation(ns836, monkeypatch):
+    """#1018 twin (failure: an idle lookup error publishes `now`, drops the
+    label, or crashes the tick)."""
+    import sqlite3 as _sqlite3
+    import _cctally_oauth_samples
+    _1018_record(ns836, monkeypatch, _1018_at(0))
+    first, _env, _ = _836_tick(ns836, _1018_at(0, 10))
+
+    def boom(*_a, **_k):
+        raise _sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(_cctally_oauth_samples, "latest_weekly_reading_at",
+                        boom)
+    second, _env2, rebuilt = _836_tick(ns836, _1018_at(0, 20))
+    assert not rebuilt
+    assert second.current_week is first.current_week
+    assert (_836_claude(second).data["hero"]["current_week"]["freshness"]
+            == _836_claude(first).data["hero"]["current_week"]["freshness"])
+    assert second.last_sync_error and "disk I/O error" in second.last_sync_error
+
+
+def _1018_claude_data(freshness):
+    return {"hero": {"current_week": {"freshness": freshness}},
+            "quota": {"current_week": {"freshness": freshness}}}
+
+
+@pytest.mark.parametrize("next_freshness, quota", [
+    ({"label": "fresh", "age_seconds": 5,
+      "captured_at": "2026-07-16T00:00:55Z"}, "fresh"),
+    (None, "fresh"),
+], ids=["advanced", "to-none"])
+def test_claude_reuse_republishes_the_current_week_freshness(
+        tmp_path, monkeypatch, next_freshness, quota):
+    """#1018 twin (failure: a build that reuses the unchanged Claude source
+    while Codex rebuilds republishes the prior source copies and quota clock,
+    freezing a stale label, or keeps a retained `stale` once the confirmation
+    disappears)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    stats = ns["open_db"]()
+    tui_module = ns["_cctally_tui"]
+    now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
+    stale = {"label": "stale", "age_seconds": 900,
+             "captured_at": "2026-07-15T23:45:00Z"}
+    common = dict(projects_envelope={}, stats_conn=stats,
+                  display_tz_name="UTC", claude_cost_usd=0.0,
+                  claude_total_tokens=0)
+    try:
+        prior = tui_module._tui_build_source_bundle(
+            claude_input_identity=tui_module._tui_read_claude_input_identity(
+                stats),
+            now_utc=now, codex_ingest_contended=False,
+            claude_data=_1018_claude_data(stale), **common)
+        prior_claude = prior.sources["claude"]
+        assert prior_claude.domain_freshness["quota"] == "stale"
+        rebuilt = tui_module._tui_build_source_bundle(
+            claude_input_identity=tui_module._tui_read_claude_input_identity(
+                stats),
+            now_utc=now + ns["dt"].timedelta(minutes=1),
+            codex_ingest_contended=True, prior_bundle=prior,
+            claude_data=_1018_claude_data(next_freshness), **common)
+    finally:
+        stats.close()
+    claude = rebuilt.sources["claude"]
+    # Non-vacuity: the Claude source was REUSED, not rebuilt. A rebuild
+    # stamps its own build instant (one minute later) as `last_success_at`;
+    # the reuse path keeps the prior object's (#1018 twin review F7: an equal
+    # `data_version` alone is what a rebuild over unchanged evidence carries
+    # too).
+    assert prior_claude.last_success_at == now
+    assert claude.last_success_at == prior_claude.last_success_at, (
+        "non-vacuity: the Claude source was rebuilt, not reused")
+    assert claude.data_version == prior_claude.data_version
+    assert claude.data["hero"]["current_week"]["freshness"] == next_freshness
+    assert claude.data["quota"]["current_week"]["freshness"] == next_freshness
+    assert claude.domain_freshness["quota"] == quota
+    assert prior_claude.data["hero"]["current_week"]["freshness"] == stale
+    assert prior_claude.domain_freshness["quota"] == "stale"
+
+
+# --- #1018 twin review F1: a full-build lookup error recovers and is seen ---
+
+@pytest.mark.parametrize("failing", ["selector", "scope-lookup"])
+def test_full_build_reading_lookup_error_recovers_on_the_next_idle_tick(
+        ns836, monkeypatch, failing):
+    """#1018 twin review F1 (failure: one transient stats error in the full
+    build's confirming-reading lookup leaves the card without freshness for
+    as long as the idle path serves it — every tick of flat usage — with no
+    recorded failure, or costs the whole current-week card)."""
+    import sqlite3 as _sqlite3
+    import _cctally_oauth_samples
+    tui = ns836["_cctally_tui"]
+    _1018_record(ns836, monkeypatch, _1018_at(0))
+    if failing == "selector":
+        target, name = _cctally_oauth_samples, "latest_weekly_reading_at"
+    else:
+        target, name = tui, "_tui_weekly_reading_scope"
+    original = getattr(target, name)
+    calls = {"n": 0}
+
+    def fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _sqlite3.OperationalError("disk I/O error")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(target, name, fail_once)
+    first, _env1, rebuilt = _836_tick(ns836, _1018_at(0, 10))
+    assert rebuilt and calls["n"] == 1
+    # The card survives the failed lookup, without freshness.
+    assert first.current_week is not None
+    assert first.current_week.used_pct == 51.0
+    assert _1018_freshness(first) == ((None, None, None), None, None, "fresh")
+    # The next tick changes no data, so it is idle, and the lookup recovers.
+    second, env2, rebuilt = _836_tick(ns836, _1018_at(0, 20))
+    assert not rebuilt
+    fresh = _1018_copy("fresh", _1018_at(0), 20)
+    assert _1018_freshness(second) == (
+        (_1018_at(0), "fresh", 20), fresh, fresh, "fresh")
+    assert env2["current_week"]["freshness"] == fresh
+    # The failure was recorded like every other failed card read.
+    legs = [(f.leg, f.database, f.corruption) for f in first.sync_failures]
+    assert ("current-week-reading", "stats_or_cache", False) in legs, legs
+    assert "disk I/O error" in (first.last_sync_error or "")
+    assert not second.sync_failures
+
+
+def test_full_build_reading_lookup_corruption_reaches_the_stats_heal(
+        ns836, monkeypatch):
+    """#1018 twin review F1 (failure: corruption met only by the
+    confirming-reading lookup — e.g. in its partial index — is swallowed, so
+    it never reaches the stats corruption classification and heal)."""
+    import sqlite3 as _sqlite3
+    import _cctally_oauth_samples
+    import _cctally_store
+    tui = ns836["_cctally_tui"]
+    _1018_record(ns836, monkeypatch, _1018_at(0))
+
+    def corrupt(*_args, **_kwargs):
+        raise _sqlite3.DatabaseError("database disk image is malformed")
+
+    heals = []
+    monkeypatch.setattr(_cctally_oauth_samples, "latest_weekly_reading_at",
+                        corrupt)
+    monkeypatch.setattr(tui, "_tui_attribute_corruption",
+                        lambda *_a, **_k: ("stats", True))
+    monkeypatch.setattr(_cctally_store, "HEAL_HOOK",
+                        lambda *_a, **_k: heals.append(1) or True)
+    snap, _env, _ = _836_tick(ns836, _1018_at(0, 10))
+    assert heals == [1], "the corruption never reached the stats heal"
+    assert snap.current_week is not None and snap.current_week.used_pct == 51.0
+    assert ("current-week-reading", "stats", True) in [
+        (f.leg, f.database, f.corruption) for f in snap.sync_failures]
+
+
+# --- #1018 twin review F4/F9: one threshold set on every path ---------------
+
+def test_configured_freshness_thresholds_agree_on_full_and_idle_ticks(
+        ns836, monkeypatch):
+    """#1018 twin review F4 (failure: the full build derives the Claude source
+    copies and quota clock with the default oauth_usage thresholds while idle
+    ticks use the configured ones, so with custom thresholds the published
+    label flips between a full build and the next idle tick)."""
+    ns836["save_config"]({"oauth_usage": {
+        "fresh_threshold_seconds": 300, "stale_after_seconds": 600}})
+    _1018_record(ns836, monkeypatch, _1018_at(0))
+    # 120 s old: `stale` under the defaults (30 s / 90 s), `fresh` as
+    # configured.
+    first, _env1, rebuilt = _836_tick(ns836, _1018_at(2))
+    assert rebuilt
+    second, _env2, rebuilt = _836_tick(ns836, _1018_at(2, 10))
+    assert not rebuilt
+    full = _1018_copy("fresh", _1018_at(0), 120)
+    idle = _1018_copy("fresh", _1018_at(0), 130)
+    assert _1018_freshness(first) == (
+        (_1018_at(0), "fresh", 120), full, full, "fresh")
+    assert _1018_freshness(second) == (
+        (_1018_at(0), "fresh", 130), idle, idle, "fresh")
+
+
+def test_idle_initial_absence_then_a_reading_publishes_it(ns836, monkeypatch):
+    """#1018 twin spec 8.3 initial absence (failure: a card built with no
+    confirming reading keeps null freshness on every idle tick after the
+    first confirming reading arrives, because the idle path only re-ages a
+    confirmation it already had)."""
+    _1018_record(ns836, monkeypatch, _1018_at(0))
+    _1018_retire_confirmations(ns836)
+    first, env1, rebuilt = _836_tick(ns836, _1018_at(0, 10))
+    assert rebuilt
+    assert first.current_week.weekly_reading_scope is not None
+    assert _1018_freshness(first) == ((None, None, None), None, None, "fresh")
+    assert env1["current_week"]["freshness"] is None
+    _1018_record(ns836, monkeypatch, _1018_at(5))
+    second, env2, rebuilt = _836_tick(ns836, _1018_at(5, 10))
+    assert not rebuilt, "the flat reading forced a heavy rebuild"
+    fresh = _1018_copy("fresh", _1018_at(5), 10)
+    assert _1018_freshness(second) == (
+        (_1018_at(5), "fresh", 10), fresh, fresh, "fresh")
+    assert env2["current_week"]["freshness"] == fresh
+    assert _1018_freshness(first) == ((None, None, None), None, None, "fresh")
+
+
+# ── #1050: one correction-revision identity for in-place rewrites ────────
+#
+# The RED oracle of docs/superpowers/specs/2026-11-04-1050-correction-signal-
+# design.md §8.1/§8.2. An in-place rewrite of a Claude-published stats row (a
+# direct probe UPDATE, a Model-A convergence, a reviewed rederive, the open-
+# block projection) or of a Codex cycle-detail input moves none of the
+# dashboard's change signals, so a running dashboard keeps the pre-rewrite
+# figures on its idle path, a reused source keeps the old values and a cached
+# cycle detail is never refetched. Every case follows §8.1's five steps: tick,
+# apply the writer through its named production entry, assert the stored
+# change (setup proof, a plain `assert`), tick again, then check every §8.2
+# GREEN condition. The GREEN conditions are collected rather than raised one
+# at a time, so a RED run names every condition the base fails.
+#
+# Surfaces are read only through what a tick publishes (the snapshot, the
+# envelope, the source bundle) and through the dashboard's own detail-route
+# handler, whose signatures the later tasks keep stable.
+
+_1050_DATA_TABLES = (
+    "weekly_usage_snapshots", "weekly_cost_snapshots", "percent_milestones",
+    "five_hour_milestones", "five_hour_blocks", "five_hour_block_models",
+    "five_hour_block_projects", "five_hour_reset_events", "week_reset_events",
+    "weekly_credit_floors", "budget_milestones", "projected_milestones",
+    "project_budget_milestones", "quota_window_blocks",
+    "quota_percent_milestones",
+)
+
+
+class _1050_Green:
+    """The §8.2 GREEN conditions of one case, checked together."""
+
+    def __init__(self, case):
+        self.case = case
+        self.failed: list[str] = []
+
+    def check(self, ok, label):
+        if not ok:
+            self.failed.append(label)
+
+    def verify(self):
+        assert not self.failed, (
+            f"#1050 {self.case}: GREEN assertions failed: {self.failed}")
+
+
+def _1050_arm(ns, monkeypatch):
+    """Count full rebuilds (the idle path builds no forecast view) and start
+    from an empty dispatch memo, exactly as `ns836` does."""
+    import _lib_snapshot_cache as sc
+    sc.reset_dispatch_state()
+    tui = ns["_cctally_tui"]
+    calls = {"rebuild": 0}
+    original = tui._tui_build_forecast_view
+
+    def counted(*args, **kwargs):
+        calls["rebuild"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tui, "_tui_build_forecast_view", counted)
+    ns["_1050_calls"] = calls
+    return ns
+
+
+def _1050_disarm(ns):
+    import _lib_snapshot_cache as sc
+    sc.reset_dispatch_state()
+    ns["_cctally_tui"]._tui_reset_partial_retry_state()
+
+
+@pytest.fixture
+def ns1050(tmp_path, monkeypatch):
+    monkeypatch.setenv("TZ", "Etc/UTC")
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    yield _1050_arm(ns, monkeypatch)
+    _1050_disarm(ns)
+
+
+@pytest.fixture
+def iso1050(tmp_path, monkeypatch):
+    """The isolated module the rederive command tests run under."""
+    from conftest import load_isolated_cctally_module
+
+    monkeypatch.setenv("TZ", "Etc/UTC")
+    monkeypatch.setenv("CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER", "1")
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+    ns = vars(mod)
+    yield _1050_arm(ns, monkeypatch)
+    _1050_disarm(ns)
+
+
+def _1050_tick(ns, now):
+    """One real dashboard tick, with the prior snapshot and source bundle
+    threaded through the dispatch memo."""
+    import _lib_snapshot_cache as sc
+    before = ns["_1050_calls"]["rebuild"]
+    snap = ns["_tui_build_snapshot"](
+        now_utc=now, skip_sync=True, precompute_envelope=True,
+        runtime_bind="127.0.0.1", display_tz_pref_override="utc")
+    envelope = ns["snapshot_to_envelope"](snap, now_utc=now)
+    key, _published = sc.dispatch_state()
+    return SimpleNamespace(
+        snap=snap, envelope=envelope, key=key,
+        rebuilt=ns["_1050_calls"]["rebuild"] > before)
+
+
+def _1050_source(tick, provider="claude"):
+    return tick.snap.source_bundle.sources[provider]
+
+
+def _1050_card_pct(tick):
+    return _1050_source(tick).data["hero"]["current_week"]["used_pct"]
+
+
+def _1050_claude_index(tick):
+    return {e["key"]: e for e in (tick.snap.week_index or [])}
+
+
+def _1050_codex_index(tick):
+    quota = _1050_source(tick, "codex").data.get("quota") or {}
+    return {e["key"]: e for e in (quota.get("cycle_index") or ())}
+
+
+def _1050_route(ns, source, key, *, account=None):
+    """The dashboard's own `/api/milestones/<source>/week/<key>` handler."""
+    import urllib.parse
+    path = f"/api/milestones/{source}/week/" + urllib.parse.quote(key, safe="")
+    if account is not None:
+        path += "?account=" + account
+    sent = []
+    handler = SimpleNamespace(
+        path=path,
+        _send_milestones_json=lambda status, body: sent.append((status, body)),
+        log_error=lambda *args: sent.append(("log_error", args)),
+        send_error=lambda *args: sent.append(("send_error", args)),
+    )
+    ns["DashboardHTTPHandler"]._handle_get_milestones_week(handler, path)
+    assert len(sent) == 1 and sent[0][0] == 200, sent
+    return sent[0][1]
+
+
+def _1050_details(ns, source, keys):
+    return {key: _1050_route(ns, source, key) for key in keys}
+
+
+def _1050_store_rows(db_path):
+    """Every stored row of the published data tables, read-only."""
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        out = {}
+        for table in _1050_DATA_TABLES:
+            if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,)).fetchone() is None:
+                continue
+            out[table] = repr(conn.execute(
+                f"SELECT * FROM {table} ORDER BY rowid").fetchall())
+        return out
+    finally:
+        conn.close()
+
+
+def _1050_stats_path():
+    import _cctally_core
+    return _cctally_core.DB_PATH
+
+
+def _1050_cache_path():
+    import _cctally_core
+    return _cctally_core.CACHE_DB_PATH
+
+
+def _1050_signature_of(key):
+    for element in key or ():
+        if isinstance(element, SnapshotSignature):
+            return element
+    return None
+
+
+def _1050_diagnose(case, first, second):
+    """Print (never assert) which pre-existing legs moved between two ticks."""
+    import itertools
+    a, b = _1050_signature_of(first.key), _1050_signature_of(second.key)
+    moved = []
+    if a is not None and b is not None:
+        da, db = a._asdict(), b._asdict()
+        moved = sorted(name for name in set(da) | set(db)
+                       if da.get(name) != db.get(name))
+    others = [
+        index for index, (x, y) in enumerate(itertools.zip_longest(
+            first.key or (), second.key or ()))
+        if not isinstance(x, SnapshotSignature) and x != y
+    ]
+    sources = first.snap.source_bundle.sources
+    later = second.snap.source_bundle.sources
+    print(
+        f"[#1050 legs] {case}: rebuilt={second.rebuilt} "
+        f"signature_legs_moved={moved} other_key_elements_moved={others} "
+        f"data_version_moved={first.snap.data_version != second.snap.data_version} "
+        f"claude_version_moved="
+        f"{sources['claude'].data_version != later['claude'].data_version} "
+        f"codex_version_moved="
+        f"{sources['codex'].data_version != later['codex'].data_version}")
+
+
+def _1050_check_tick(green, first, second):
+    green.check(second.rebuilt, "the second tick is non-idle")
+    green.check(second.snap.data_version != first.snap.data_version,
+                "data_version changed")
+
+
+def _1050_check_claude_source(green, first, second, *, card_pct=None):
+    green.check(_1050_source(second) is not _1050_source(first),
+                "the Claude source object is new")
+    if card_pct is not None:
+        green.check(_1050_card_pct(second) == card_pct,
+                    f"the Claude source card percent is {card_pct}")
+
+
+def _1050_check_stamps(green, ns, source, first, second, details_before,
+                       details_after, *, affected=None):
+    """``affected``: the keys whose stamps must change (the others must keep
+    theirs); ``None`` means every cycle's stamp must change."""
+    index = _1050_claude_index if source == "claude" else _1050_codex_index
+    before, after = index(first), index(second)
+    for key in sorted(set(before) & set(after)):
+        must_move = affected is None or key in affected
+        index_moved = before[key]["detail_stamp"] != after[key]["detail_stamp"]
+        detail_moved = (details_before[key]["detail_stamp"]
+                        != details_after[key]["detail_stamp"])
+        what = "changed" if must_move else "unchanged"
+        green.check(index_moved == must_move,
+                    f"{source} index detail_stamp {what} for {key}")
+        green.check(detail_moved == must_move,
+                    f"{source} detail echoed stamp {what} for {key}")
+
+
+def _1050_check_rows(green, rows_before, rows_after):
+    green.check(rows_before == rows_after,
+                "the corrected store's rows are byte-equal across the ticks")
+
+
+# ---- P1–P4: the issue's probe, unarmed rows, direct UPDATEs ---------------
+
+_1050_P_NOW = dt.datetime(2026, 4, 30, 11, 30, tzinfo=dt.timezone.utc)
+_1050_P_CURRENT = "2026-04-27T00:00:00Z"
+_1050_P_PRIOR = "2026-04-20T00:00:00Z"
+
+
+def _1050_seed_probe(conn):
+    """The issue's probe seed (one cycle with a five-hour block, a five-hour
+    milestone and a weekly milestone, every milestone UNARMED) plus an earlier
+    cycle the rewrites never touch."""
+    prior = conn.execute(
+        "INSERT INTO weekly_usage_snapshots (week_start_date, week_end_date, "
+        "captured_at_utc, week_start_at, week_end_at, weekly_percent, "
+        "payload_json) VALUES ('2026-04-20', '2026-04-27', "
+        "'2026-04-26T11:00:00Z', '2026-04-20T00:00:00Z', "
+        "'2026-04-27T00:00:00Z', 80.0, '{}')").lastrowid
+    conn.execute(
+        "INSERT INTO percent_milestones (week_start_date, week_end_date, "
+        "week_start_at, week_end_at, percent_threshold, captured_at_utc, "
+        "usage_snapshot_id, cost_snapshot_id, cumulative_cost_usd, "
+        "marginal_cost_usd, five_hour_percent_at_crossing, reset_event_id) "
+        "VALUES ('2026-04-20', '2026-04-27', '2026-04-20T00:00:00Z', "
+        "'2026-04-27T00:00:00Z', 80, '2026-04-26T11:00:00Z', ?, 0, 5.0, 0.2, "
+        "NULL, 0)", (prior,))
+    snap_id = conn.execute(
+        "INSERT INTO weekly_usage_snapshots (week_start_date, week_end_date, "
+        "captured_at_utc, week_start_at, week_end_at, weekly_percent, "
+        "five_hour_percent, five_hour_window_key, payload_json) "
+        "VALUES ('2026-04-27', '2026-05-04', '2026-04-30T11:00:00Z', "
+        "'2026-04-27T00:00:00Z', '2026-05-04T00:00:00Z', 40.0, 30.0, "
+        "1777566600, '{}')").lastrowid
+    block_id = conn.execute(
+        "INSERT INTO five_hour_blocks (five_hour_window_key, "
+        "five_hour_resets_at, block_start_at, first_observed_at_utc, "
+        "last_observed_at_utc, final_five_hour_percent, "
+        "seven_day_pct_at_block_start, seven_day_pct_at_block_end, "
+        "crossed_seven_day_reset, is_closed, created_at_utc, "
+        "last_updated_at_utc, total_cost_usd) VALUES "
+        "(1777566600, '2026-04-30T16:30:00+00:00', '2026-04-30T11:30:00+00:00', "
+        "'2026-04-30T10:30:00+00:00', '2026-04-30T11:00:00+00:00', 30.0, 38.0, "
+        "40.0, 0, 0, '2026-04-30T10:30:00+00:00', '2026-04-30T11:00:00+00:00', "
+        "1.0)").lastrowid
+    conn.execute(
+        "INSERT INTO five_hour_milestones (block_id, five_hour_window_key, "
+        "percent_threshold, captured_at_utc, usage_snapshot_id, block_cost_usd, "
+        "reset_event_id) VALUES (?, 1777566600, 30, '2026-04-30T11:00:00Z', ?, "
+        "1.0, 0)", (block_id, snap_id))
+    conn.execute(
+        "INSERT INTO percent_milestones (week_start_date, week_end_date, "
+        "week_start_at, week_end_at, percent_threshold, captured_at_utc, "
+        "usage_snapshot_id, cost_snapshot_id, cumulative_cost_usd, "
+        "marginal_cost_usd, five_hour_percent_at_crossing, reset_event_id) "
+        "VALUES ('2026-04-27', '2026-05-04', '2026-04-27T00:00:00Z', "
+        "'2026-05-04T00:00:00Z', 40, '2026-04-30T11:00:00Z', ?, 0, 2.0, 0.1, "
+        "30.0, 0)", (snap_id,))
+    conn.commit()
+
+
+def _1050_first_block(detail):
+    return (detail.get("blocks") or [{}])[0]
+
+
+def _1050_first_weekly(detail):
+    segments = detail.get("segments") or [{}]
+    return (segments[0].get("milestones") or [{}])[0]
+
+
+# case → (statement, the stored column read back, its new value,
+#         the Claude source value probe, the cycle-detail value probe)
+_1050_PROBES = {
+    "p1_weekly_percent": (
+        "UPDATE weekly_usage_snapshots SET weekly_percent = 31.0 "
+        "WHERE week_start_date = '2026-04-27'",
+        "SELECT weekly_percent FROM weekly_usage_snapshots "
+        "WHERE week_start_date = '2026-04-27'", 31.0,
+        lambda data: data["hero"]["current_week"]["used_pct"],
+        None,
+    ),
+    "p2_block_cost_usd": (
+        "UPDATE five_hour_milestones SET block_cost_usd = 2.5",
+        "SELECT block_cost_usd FROM five_hour_milestones", 2.5,
+        lambda data: data["hero"]["current_week"]["five_hour_milestones"][0][
+            "block_cost_usd"],
+        lambda detail: _1050_first_block(detail)["milestones"][0][
+            "block_cost_usd"],
+    ),
+    "p3_block_total_cost_usd": (
+        "UPDATE five_hour_blocks SET total_cost_usd = 7.5",
+        "SELECT total_cost_usd FROM five_hour_blocks", 7.5,
+        None,
+        lambda detail: _1050_first_block(detail)["total_cost_usd"],
+    ),
+    "p4_cumulative_cost_usd": (
+        "UPDATE percent_milestones SET cumulative_cost_usd = 9.0 "
+        "WHERE week_start_date = '2026-04-27'",
+        "SELECT cumulative_cost_usd FROM percent_milestones "
+        "WHERE week_start_date = '2026-04-27'", 9.0,
+        lambda data: data["hero"]["current_week"]["milestones"][0][
+            "cumulative_usd"],
+        lambda detail: _1050_first_weekly(detail)["cumulative_usd"],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_1050_PROBES))
+def test_1050_probe_rewrite_republishes(ns1050, case):
+    """#1050 §8.1 P1–P4. Detects: an in-place UPDATE of a published Claude
+    value (weekly percent, five-hour milestone cost, block total, weekly
+    milestone cumulative cost) on unarmed rows leaves the running dashboard
+    idle on the pre-rewrite snapshot, reuses the old Claude source and keeps
+    the cycle's history stamp, so the open dashboard and a cached cycle
+    detail keep the old figure."""
+    ns = ns1050
+    statement, readback, value, source_probe, detail_probe = _1050_PROBES[case]
+    conn = ns["open_db"]()
+    try:
+        _1050_seed_probe(conn)
+    finally:
+        conn.close()
+    first = _1050_tick(ns, _1050_P_NOW)
+    index = _1050_claude_index(first)
+    current = [k for k, e in index.items()
+               if e["start_at_utc"] == _1050_P_CURRENT]
+    assert len(current) == 1 and any(
+        e["start_at_utc"] == _1050_P_PRIOR for e in index.values()), index
+    details_before = _1050_details(ns, "claude", index)
+
+    conn = ns["open_db"]()
+    try:
+        conn.execute(statement)
+        conn.commit()
+        assert conn.execute(readback).fetchone()[0] == value
+    finally:
+        conn.close()
+    rows_before = _1050_store_rows(_1050_stats_path())
+
+    second = _1050_tick(ns, _1050_P_NOW + dt.timedelta(minutes=1))
+    details_after = _1050_details(ns, "claude", index)
+    rows_after = _1050_store_rows(_1050_stats_path())
+    _1050_diagnose(case, first, second)
+    if detail_probe is not None:
+        assert detail_probe(details_after[current[0]]) == value, (
+            "non-vacuity: the fetched detail publishes the rewritten value")
+
+    green = _1050_Green(case)
+    _1050_check_tick(green, first, second)
+    _1050_check_claude_source(green, first, second)
+    if source_probe is not None:
+        green.check(source_probe(_1050_source(second).data) == value,
+                    f"the Claude source publishes {value}")
+    _1050_check_stamps(green, ns, "claude", first, second, details_before,
+                       details_after, affected=set(current))
+    _1050_check_rows(green, rows_before, rows_after)
+    green.verify()
+
+
+# ---- W1: Model-A convergence ------------------------------------------------
+
+_1050_W1_AT = "2026-07-25T15:00:00Z"
+_1050_W1_EVT = "sa:1050:w1"
+
+
+def _1050_snapshot_columns(*, start, end, captured, percent):
+    return {
+        "captured_at_utc": captured,
+        "week_start_date": start,
+        "week_end_date": end,
+        "week_start_at": f"{start}T00:00:00+00:00",
+        "week_end_at": f"{end}T00:00:00+00:00",
+        "weekly_percent": percent,
+        "source": "record-usage",
+        "payload_json": "{}",
+        "account_key": "unattributed",
+    }
+
+
+def _1050_emit_snapshot(jr, conn, evt_id, columns):
+    """One `snapshot_accept` Model-A emission inside one ingest cycle."""
+    ctx = jr.IngestContext(conn=conn, batch=[])
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rowid = jr.emit_model_a(
+            ctx, kind="snapshot_accept", evt_id=evt_id,
+            table="weekly_usage_snapshots", columns=columns,
+            at=columns["captured_at_utc"])
+        conn.commit()
+        return rowid
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _1050_journal_line_count(jr):
+    import _lib_journal
+    count = 0
+    for name in jr.list_segments():
+        with open(jr._cctally_core.JOURNAL_DIR / name, "rb") as fh:
+            count += sum(_lib_journal.decode_line(raw) is not None for raw in fh)
+    return count
+
+
+def test_1050_model_a_convergence_republishes(ns1050):
+    """#1050 §8.1 W1. Detects: a live Model-A convergence
+    (`emit_model_a` → CLASSIFY_CONFLICT → `_converge_row_from_effective`)
+    rewrites a snapshot's `weekly_percent` back to its retained effective
+    value with no journal append, and the dashboard keeps publishing the
+    drifted percent."""
+    ns = ns1050
+    import _cctally_journal as jr
+    conn = jr._cctally_core.open_db()
+    try:
+        _1050_emit_snapshot(jr, conn, "sa:1050:w1-prior", _1050_snapshot_columns(
+            start="2026-07-13", end="2026-07-20",
+            captured="2026-07-18T15:00:00Z", percent=80.0))
+        current = _1050_snapshot_columns(
+            start="2026-07-20", end="2026-07-27", captured=_1050_W1_AT,
+            percent=40.0)
+        rowid = _1050_emit_snapshot(jr, conn, _1050_W1_EVT, current)
+        assert rowid is not None
+        conn.execute(
+            "UPDATE weekly_usage_snapshots SET weekly_percent = 31.0 "
+            "WHERE id = ?", (rowid,))
+        conn.commit()
+    finally:
+        conn.close()
+    now = dt.datetime(2026, 7, 25, 15, 30, tzinfo=dt.timezone.utc)
+    first = _1050_tick(ns, now)
+    assert _1050_card_pct(first) == 31.0
+    index = _1050_claude_index(first)
+    affected = {k for k, e in index.items()
+                if e["start_at_utc"] == "2026-07-20T00:00:00Z"}
+    assert len(affected) == 1 and len(index) == 2, index
+    details_before = _1050_details(ns, "claude", index)
+
+    lines = _1050_journal_line_count(jr)
+    conn = jr._cctally_core.open_db()
+    try:
+        # A divergent re-emission under the retained id is a conflict: it
+        # appends nothing and converges the row to the effective 40.0.
+        assert _1050_emit_snapshot(
+            jr, conn, _1050_W1_EVT, dict(current, weekly_percent=55.0)) == rowid
+        assert conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots WHERE id = ?",
+            (rowid,)).fetchone()[0] == 40.0
+    finally:
+        conn.close()
+    assert _1050_journal_line_count(jr) == lines, "no journal record appended"
+    rows_before = _1050_store_rows(_1050_stats_path())
+
+    second = _1050_tick(ns, now + dt.timedelta(minutes=1))
+    details_after = _1050_details(ns, "claude", index)
+    rows_after = _1050_store_rows(_1050_stats_path())
+    _1050_diagnose("w1", first, second)
+
+    green = _1050_Green("w1")
+    _1050_check_tick(green, first, second)
+    _1050_check_claude_source(green, first, second, card_pct=40.0)
+    _1050_check_stamps(green, ns, "claude", first, second, details_before,
+                       details_after, affected=affected)
+    _1050_check_rows(green, rows_before, rows_after)
+    green.verify()
+
+
+# ---- W2/W5: a reviewed `db rederive` correction ----------------------------
+
+_1050_RD_AT = "2026-07-25T12:00:00Z"
+_1050_KNOWN_MODEL = "claude-3-5-sonnet-20241022"
+
+
+def _1050_insert_claude_entries(ns, rows, *, account):
+    """Claude cache rows: (offset, ISO timestamp, input tokens)."""
+    path = "/tmp/claude/projects/repo/1050-session.jsonl"
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO session_files "
+            "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+            " session_id, project_path) VALUES (?,?,?,?,?,?,?)",
+            (path, 100000, 1, 100000, _1050_RD_AT, "session-1050", "/repo"))
+        for offset, stamp, input_tokens in rows:
+            conn.execute(
+                "INSERT INTO session_entries "
+                "(source_path, line_offset, timestamp_utc, model, input_tokens, "
+                " output_tokens, cache_create_tokens, cache_read_tokens, "
+                " cache_create_1h_tokens, account_key) "
+                "VALUES (?,?,?,?,?,0,0,0,0,?)",
+                (path, offset, stamp, _1050_KNOWN_MODEL, input_tokens, account))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _1050_rederive(ns, capsys, *, yes):
+    capsys.readouterr()
+    code = ns["cmd_db_rederive"](
+        argparse_namespace(family="claude-usage", yes=yes, json=True))
+    out = capsys.readouterr().out
+    assert code == 0, out
+    return json.loads(out)
+
+
+def argparse_namespace(**kwargs):
+    import argparse
+    return argparse.Namespace(**kwargs)
+
+
+def _1050_seed_wrong_snapshot_journal(ns):
+    """The `test_wrong_snapshot_is_superseded_and_applied_plan_is_noop`
+    shape: the raw observation says 10.0, the retained `snapshot_accept`
+    (and its cost snapshot) a deliberately wrong 99.0, published by a
+    rebuild."""
+    import _cctally_journal as runtime
+    import _lib_journal as journal
+
+    resets = int(dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc).timestamp())
+    obs = journal.make_obs(
+        at=_1050_RD_AT, src="record-usage", provider="claude", account="acct-a",
+        payload={"captured_at": _1050_RD_AT, "source": "statusline",
+                 "weekly_percent": 10.0, "resets_at": resets})
+    cache = ns["open_cache_db"]()
+    try:
+        desired = ns["plan_claude_usage_rederive"](
+            [obs], cache_conn=cache,
+            journal_high_water=("observations-2026-07.jsonl", 1))
+    finally:
+        cache.close()
+    wrong = []
+    for action in desired.actions:
+        payload = dict(action.payload or {})
+        if payload.get("kind") == "snapshot_accept":
+            payload["weekly_percent"] = 99.0
+        if payload.get("kind") == "weekly_cost_snapshot":
+            payload["cost_usd"] += 5.0
+        wrong.append(journal.make_evt(
+            kind=payload.pop("kind"), id=action.event_id, at=action.at,
+            payload=payload))
+    fixed = dt.datetime(2026, 7, 25, 12, 0, tzinfo=dt.timezone.utc)
+    for record in [obs, *wrong]:
+        runtime.append_record(record, now_utc=fixed)
+    runtime.rebuild_stats_index(
+        context=runtime.RebuildContext(trigger="test-fixture"))
+
+
+def _1050_max_snapshot_id(ns):
+    conn = ns["open_db"]()
+    try:
+        return conn.execute(
+            "SELECT MAX(id) FROM weekly_usage_snapshots").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _1050_latest_weekly_percent(ns):
+    conn = ns["open_db"]()
+    try:
+        return conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_1050_reviewed_rederive_snapshot_republishes(
+        iso1050, capsys, monkeypatch):
+    """#1050 §8.1 W2. Detects: a completed reviewed `db rederive --yes`
+    supersedes a wrong `snapshot_accept` and republishes the corrected
+    `weekly_percent` in place (snapshot `MAX(id)` unchanged), yet the
+    dashboard reuses the Claude source with the wrong percent and keeps every
+    cycle's history stamp."""
+    ns = iso1050
+    import _cctally_journal as runtime
+    monkeypatch.setattr(runtime, "ALERT_DISPATCHER", lambda alerts: None)
+    _1050_insert_claude_entries(
+        ns, [(0, "2026-07-25T11:00:00+00:00", 100)], account="acct-a")
+    _1050_seed_wrong_snapshot_journal(ns)
+    now = dt.datetime(2026, 7, 25, 12, 30, tzinfo=dt.timezone.utc)
+    first = _1050_tick(ns, now)
+    assert _1050_card_pct(first) == 99.0
+    index = _1050_claude_index(first)
+    assert index
+    details_before = _1050_details(ns, "claude", index)
+
+    max_id = _1050_max_snapshot_id(ns)
+    applied = _1050_rederive(ns, capsys, yes=True)
+    assert applied["status"] == "applied", applied
+    assert _1050_latest_weekly_percent(ns) == pytest.approx(10.0)
+    assert _1050_max_snapshot_id(ns) == max_id
+    rows_before = _1050_store_rows(_1050_stats_path())
+
+    second = _1050_tick(ns, now + dt.timedelta(minutes=1))
+    details_after = _1050_details(ns, "claude", index)
+    rows_after = _1050_store_rows(_1050_stats_path())
+    _1050_diagnose("w2", first, second)
+
+    green = _1050_Green("w2")
+    _1050_check_tick(green, first, second)
+    _1050_check_claude_source(green, first, second, card_pct=10.0)
+    _1050_check_stamps(green, ns, "claude", first, second, details_before,
+                       details_after, affected=None)
+    _1050_check_rows(green, rows_before, rows_after)
+    green.verify()
+
+
+def _1050_observe(points, *, account):
+    """Append raw status-line observations and run the authoritative ingest
+    cycle after each, the record path's own write sequence."""
+    import _cctally_journal as runtime
+    import _lib_journal as journal
+
+    weekly_reset = int(
+        dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc).timestamp())
+    for at, five_reset, weekly_pct, five_pct in points:
+        payload = {"captured_at": at, "source": "statusline",
+                   "weekly_percent": weekly_pct, "resets_at": weekly_reset}
+        if five_reset is not None:
+            payload.update(five_hour_percent=five_pct,
+                           five_hour_resets_at=five_reset)
+        runtime.append_record(journal.make_obs(
+            at=at, src="record-usage", provider="claude", account=account,
+            payload=payload))
+        assert runtime.run_stats_ingest(mode="authoritative").ran is True
+
+
+def test_1050_weekly_milestone_cost_rederive_republishes(
+        iso1050, capsys, monkeypatch):
+    """#1050 §8.1 W5. Detects: a reviewed `db rederive --yes` whose scratch
+    replay re-derives a weekly `percent_milestone`'s as-of-bounded
+    `cumulative_cost_usd` (a Claude cache entry before the crossing that the
+    recorded milestone did not count) rewrites the cost in place with the
+    snapshots unchanged, yet the dashboard reuses the Claude source with the
+    old cost and keeps every cycle's history stamp."""
+    ns = iso1050
+    import _cctally_journal as runtime
+    monkeypatch.setattr(runtime, "ALERT_DISPATCHER", lambda alerts: None)
+    account = "acct-1050"
+    _1050_insert_claude_entries(
+        ns, [(0, "2026-07-25T11:55:00+00:00", 1_000_000)], account=account)
+    _1050_observe([
+        ("2026-07-25T12:00:00Z", "2026-07-25T15:00:00Z", 1.0, 1.0),
+        ("2026-07-25T12:45:00Z", "2026-07-25T15:00:00Z", 2.0, 2.0),
+    ], account=account)
+
+    def milestones():
+        conn = ns["open_db"]()
+        try:
+            return [tuple(r) for r in conn.execute(
+                "SELECT week_start_date, percent_threshold, reset_event_id, "
+                "       cumulative_cost_usd FROM percent_milestones "
+                "ORDER BY week_start_date, percent_threshold")]
+        finally:
+            conn.close()
+
+    recorded = milestones()
+    assert recorded and recorded[0][3] == pytest.approx(3.0), recorded
+    # The late cache entry lands before the first crossing; the recorded
+    # milestone never counted it. It lands BEFORE the first tick, so its own
+    # cache leg is already part of tick 1's dispatch read.
+    _1050_insert_claude_entries(
+        ns, [(100, "2026-07-25T11:58:00+00:00", 1_000_000)], account=account)
+    now = dt.datetime(2026, 7, 25, 13, 0, tzinfo=dt.timezone.utc)
+    first = _1050_tick(ns, now)
+    old_cumulative = (
+        _1050_source(first).data["hero"]["current_week"]["milestones"][0][
+            "cumulative_usd"])
+    assert old_cumulative == pytest.approx(3.0)
+    index = _1050_claude_index(first)
+    assert index
+    details_before = _1050_details(ns, "claude", index)
+
+    snapshots_before = _1050_max_snapshot_id(ns), _1050_latest_weekly_percent(ns)
+    preview = _1050_rederive(ns, capsys, yes=False)
+    assert preview["actionCountsByEventKind"]["percent_milestone"][
+        "supersede"] >= 1, preview
+    applied = _1050_rederive(ns, capsys, yes=True)
+    assert applied["status"] == "applied", applied
+    corrected = milestones()
+    assert [r[:3] for r in corrected] == [r[:3] for r in recorded], (
+        "milestone membership unchanged")
+    assert corrected[0][3] == pytest.approx(6.0) != recorded[0][3]
+    assert (_1050_max_snapshot_id(ns), _1050_latest_weekly_percent(ns)) == (
+        snapshots_before), "the snapshots are unchanged"
+    rows_before = _1050_store_rows(_1050_stats_path())
+
+    second = _1050_tick(ns, now + dt.timedelta(minutes=1))
+    details_after = _1050_details(ns, "claude", index)
+    rows_after = _1050_store_rows(_1050_stats_path())
+    _1050_diagnose("w5", first, second)
+    current = [k for k, e in index.items() if e["is_current"]]
+    assert current and _1050_first_weekly(details_after[current[0]])[
+        "cumulative_usd"] == pytest.approx(6.0), (
+        "non-vacuity: the fetched detail publishes the corrected cost")
+
+    green = _1050_Green("w5")
+    _1050_check_tick(green, first, second)
+    _1050_check_claude_source(green, first, second)
+    green.check(
+        _1050_source(second).data["hero"]["current_week"]["milestones"][0][
+            "cumulative_usd"] == pytest.approx(6.0),
+        "the Claude source publishes the corrected cumulative cost")
+    _1050_check_stamps(green, ns, "claude", first, second, details_before,
+                       details_after, affected=None)
+    _1050_check_rows(green, rows_before, rows_after)
+    green.verify()
+
+
+# ---- W4: the open-block projection on the live record path -----------------
+
+def test_1050_open_block_projection_republishes(ns1050, monkeypatch):
+    """#1050 §8.1 W4. Detects: a flat reading through the live record path
+    (`cmd_record_usage` → ingest → the dirty-window flush →
+    `project_open_block_end`) rewrites an open block's drifted
+    `total_cost_usd` back to its projection with no new entry and no new
+    snapshot, yet the dashboard stays idle and the current cycle's stamp,
+    and so a cached detail, keep the drifted total."""
+    ns = ns1050
+
+    def at(hour, minute):
+        return dt.datetime(2026, 9, 5, hour, minute, tzinfo=dt.timezone.utc)
+
+    # An earlier cycle the projection never touches.
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots (week_start_date, "
+            "week_end_date, captured_at_utc, week_start_at, week_end_at, "
+            "weekly_percent, payload_json) VALUES ('2026-08-25', "
+            "'2026-09-01', '2026-08-31T09:00:00Z', "
+            "'2026-08-25T15:00:00+00:00', '2026-09-01T15:00:00+00:00', 70.0, "
+            "'{}')")
+        conn.commit()
+    finally:
+        conn.close()
+    _1050_insert_claude_entries(
+        ns, [(0, "2026-09-05T08:30:00+00:00", 1_000_000)],
+        account="unattributed")
+    assert _836_record(ns, monkeypatch, at(9, 0), 51.0, 10.0) == 0
+
+    def open_total():
+        conn = ns["open_db"]()
+        try:
+            rows = conn.execute(
+                "SELECT total_cost_usd FROM five_hour_blocks "
+                "WHERE is_closed = 0").fetchall()
+            assert len(rows) == 1, rows
+            return rows[0][0]
+        finally:
+            conn.close()
+
+    projected = open_total()
+    assert projected == pytest.approx(3.0)
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "UPDATE five_hour_blocks SET total_cost_usd = 99.0 "
+            "WHERE is_closed = 0")
+        conn.commit()
+    finally:
+        conn.close()
+    first = _1050_tick(ns, at(9, 5))
+    index = _1050_claude_index(first)
+    affected = {k for k, e in index.items() if e["is_current"]}
+    assert len(affected) == 1 and len(index) >= 2, index
+    details_before = _1050_details(ns, "claude", index)
+    assert _1050_first_block(details_before[next(iter(affected))])[
+        "total_cost_usd"] == 99.0
+
+    max_id = _1050_max_snapshot_id(ns)
+    _1018_record(ns, monkeypatch, at(9, 7))
+    assert _1050_max_snapshot_id(ns) == max_id, "a flat reading: no new row"
+    assert open_total() == pytest.approx(projected)
+    rows_before = _1050_store_rows(_1050_stats_path())
+
+    second = _1050_tick(ns, at(9, 9))
+    details_after = _1050_details(ns, "claude", index)
+    rows_after = _1050_store_rows(_1050_stats_path())
+    _1050_diagnose("w4", first, second)
+    assert _1050_first_block(details_after[next(iter(affected))])[
+        "total_cost_usd"] == pytest.approx(projected)
+
+    green = _1050_Green("w4")
+    _1050_check_tick(green, first, second)
+    _1050_check_claude_source(green, first, second)
+    _1050_check_stamps(green, ns, "claude", first, second, details_before,
+                       details_after, affected=affected)
+    _1050_check_rows(green, rows_before, rows_after)
+    green.verify()
+
+
+# ---- §8.3 controls: identical replacement, restoration, the live close -----
+#
+# The child-set replacement of an open-block projection or a block-close
+# convergence is a no-op when nothing changed, so an identical re-run moves
+# no revision; a missing child set is still restored by a tracked INSERT;
+# and the live expiry close moves the revision and the block's scope.
+
+
+def _1050_revision_state():
+    """The kernel singleton `(format_version, domain_generation, seq)`
+    and every scope row, read-only."""
+    conn = sqlite3.connect(f"file:{_1050_stats_path()}?mode=ro", uri=True)
+    try:
+        singleton = tuple(conn.execute(
+            "SELECT format_version, domain_generation, seq "
+            "FROM stats_content_revision").fetchone())
+        scopes = [tuple(r) for r in conn.execute(
+            "SELECT * FROM stats_content_revision_scopes "
+            "ORDER BY kind, account_key, scope_key")]
+        return singleton, scopes
+    finally:
+        conn.close()
+
+
+def _1050_block_state(ns):
+    """The one block's parent clock and close state, and both child sets."""
+    conn = ns["open_db"]()
+    try:
+        parent = conn.execute(
+            "SELECT id, is_closed, journal_id, last_updated_at_utc "
+            "FROM five_hour_blocks").fetchall()
+        assert len(parent) == 1, parent
+        children = tuple(
+            tuple(tuple(r) for r in conn.execute(
+                f"SELECT * FROM {table} ORDER BY id"))
+            for table in ("five_hour_block_models", "five_hour_block_projects"))
+        return tuple(parent[0]), children
+    finally:
+        conn.close()
+
+
+def _1050_at_0905(hour, minute):
+    return dt.datetime(2026, 9, 5, hour, minute, tzinfo=dt.timezone.utc)
+
+
+def _1050_seed_open_block(ns, monkeypatch):
+    """W4's seed: an earlier cycle, one priced Claude entry and one live
+    reading at 09:00 that opens the 08:00–13:00 block."""
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots (week_start_date, "
+            "week_end_date, captured_at_utc, week_start_at, week_end_at, "
+            "weekly_percent, payload_json) VALUES ('2026-08-25', "
+            "'2026-09-01', '2026-08-31T09:00:00Z', "
+            "'2026-08-25T15:00:00+00:00', '2026-09-01T15:00:00+00:00', 70.0, "
+            "'{}')")
+        conn.commit()
+    finally:
+        conn.close()
+    _1050_insert_claude_entries(
+        ns, [(0, "2026-09-05T08:30:00+00:00", 1_000_000)],
+        account="unattributed")
+    assert _836_record(ns, monkeypatch, _1050_at_0905(9, 0), 51.0, 10.0) == 0
+    parent, children = _1050_block_state(ns)
+    assert parent[1] == 0 and all(children), (
+        "non-vacuity: an open block with both child sets", parent, children)
+
+
+def test_1050_identical_projection_and_convergence_leave_seq_and_tick_idle(
+        ns1050, monkeypatch):
+    """#1050 §8.3. Detects: an identical open-block projection re-run (a flat
+    reading through `cmd_record_usage`) or a repeated block-close convergence
+    (`_converge_row_from_effective`) deleting and re-inserting unchanged child
+    rows, which advances the revision and makes every later tick non-idle and
+    every cycle re-stamp with nothing changed."""
+    ns = ns1050
+    _1050_seed_open_block(ns, monkeypatch)
+    first = _1050_tick(ns, _1050_at_0905(9, 5))
+    state = _1050_revision_state()
+    parent, children = _1050_block_state(ns)
+
+    _1018_record(ns, monkeypatch, _1050_at_0905(9, 7))
+    parent_after, children_after = _1050_block_state(ns)
+    assert parent_after[3] != parent[3], "setup: the projection re-ran"
+    assert children_after == children, "the child rows are untouched"
+    assert _1050_revision_state() == state, (
+        "an identical projection moved the revision")
+    second = _1050_tick(ns, _1050_at_0905(9, 9))
+    _1050_diagnose("identical-projection", first, second)
+    assert not second.rebuilt, "an identical projection made the tick non-idle"
+
+    # The live expiry close freezes the block; its convergence is then
+    # repeated against the retained close event.
+    _1018_record(ns, monkeypatch, _1050_at_0905(13, 10))
+    parent, children = _1050_block_state(ns)
+    assert parent[1] == 1 and parent[2] is not None, (
+        "setup: a journaled close", parent)
+    third = _1050_tick(ns, _1050_at_0905(13, 12))
+    state = _1050_revision_state()
+    import _cctally_journal as jr
+    conn = ns["open_db"]()
+    try:
+        for _ in range(2):
+            assert jr._converge_row_from_effective(
+                conn, parent[2]) == jr.CONVERGE_APPLIED
+            conn.commit()
+    finally:
+        conn.close()
+    assert _1050_block_state(ns) == (parent, children), (
+        "the convergence changed no stored row")
+    assert _1050_revision_state() == state, (
+        "a repeated convergence moved the revision")
+    fourth = _1050_tick(ns, _1050_at_0905(13, 14))
+    _1050_diagnose("repeated-convergence", third, fourth)
+    assert not fourth.rebuilt, "a repeated convergence made the tick non-idle"
+
+
+def test_1050_open_child_restoration_is_global_only(ns1050, monkeypatch):
+    """#1050 §8.3. Detects: an open block whose child sets went missing being
+    left unrestored (or restored without moving the revision) by the no-op
+    comparison, so the dashboard idles over the restored model and project
+    rows; and a restoration re-stamping cycles, which a global-only child
+    table must never do."""
+    ns = ns1050
+    _1050_seed_open_block(ns, monkeypatch)
+    conn = ns["open_db"]()
+    try:
+        conn.execute("DELETE FROM five_hour_block_models")
+        conn.execute("DELETE FROM five_hour_block_projects")
+        conn.commit()
+    finally:
+        conn.close()
+    first = _1050_tick(ns, _1050_at_0905(9, 5))
+    index = _1050_claude_index(first)
+    assert len(index) >= 2, index
+    details_before = _1050_details(ns, "claude", index)
+    (fv, dg, seq), scopes = _1050_revision_state()
+
+    _1018_record(ns, monkeypatch, _1050_at_0905(9, 7))
+    _parent, children = _1050_block_state(ns)
+    assert all(children), "the projection restored both child sets"
+    (fv2, dg2, seq2), scopes2 = _1050_revision_state()
+    assert (fv2, dg2) == (fv, dg) and seq2 > seq, (
+        "a restoration by INSERT advances seq", seq, seq2)
+    assert scopes2 == scopes, "a child restoration touches no scope"
+
+    second = _1050_tick(ns, _1050_at_0905(9, 9))
+    details_after = _1050_details(ns, "claude", index)
+    _1050_diagnose("child-restoration", first, second)
+    green = _1050_Green("child-restoration")
+    _1050_check_tick(green, first, second)
+    _1050_check_claude_source(green, first, second)
+    _1050_check_stamps(green, ns, "claude", first, second, details_before,
+                       details_after, affected=set())
+    green.verify()
+
+
+def test_1050_live_expiry_close_republishes_closed_block_panel(
+        ns1050, monkeypatch):
+    """#1050 §8.3 live close chain. Detects: a flat reading after the block's
+    reset closing it by natural expiration (`cmd_record_usage` → the expiry
+    sweep → `freeze_five_hour_block_close`) without moving the revision or
+    the block's scope, or the dashboard keeping the computed Blocks-panel
+    row instead of the frozen close's retained facts."""
+    ns = ns1050
+    _1050_seed_open_block(ns, monkeypatch)
+    first = _1050_tick(ns, _1050_at_0905(13, 5))
+    assert first.snap.blocks_panel and all(
+        r.facts_source == "computed" for r in first.snap.blocks_panel), (
+        "non-vacuity: the open block's panel row is computed",
+        first.snap.blocks_panel)
+    (_fv, _dg, seq), scopes = _1050_revision_state()
+
+    max_id = _1050_max_snapshot_id(ns)
+    _1018_record(ns, monkeypatch, _1050_at_0905(13, 10))
+    assert _1050_max_snapshot_id(ns) == max_id, "a flat reading: no new row"
+    parent, _children = _1050_block_state(ns)
+    assert parent[1] == 1 and parent[2] is not None, (
+        "setup: the expiry close is journaled", parent)
+    (_fv, _dg, seq2), scopes2 = _1050_revision_state()
+    assert seq2 > seq, "the expiry close advances seq"
+    before = {s[:3]: s for s in scopes}
+    dirtied = [s for s in scopes2 if s[0] == "block"
+               and s[1] == "unattributed" and before.get(s[:3]) != s]
+    assert dirtied and all(s[-1] > seq for s in dirtied), (
+        "the expiry close dirties the block's scope", scopes, scopes2)
+
+    second = _1050_tick(ns, _1050_at_0905(13, 12))
+    _1050_diagnose("live-expiry-close", first, second)
+    green = _1050_Green("live-expiry-close")
+    _1050_check_tick(green, first, second)
+    def retained(tick):
+        return any(r.facts_source == "retained" and r.models
+                   for r in tick.snap.blocks_panel)
+
+    green.check(retained(second),
+                "the closed-block model panel is republished from the close")
+    # Non-vacuity of that condition: a forced full build serves the frozen
+    # close's retained facts.
+    import _lib_snapshot_cache as sc
+    sc.reset_dispatch_state()
+    forced = _1050_tick(ns, _1050_at_0905(13, 14))
+    assert forced.rebuilt and retained(forced), forced.snap.blocks_panel
+    green.verify()
+
+
+# ---- §8.3/§8.4 controls of the Claude signals (#1050 Task 4) --------------
+
+
+def _1050_projects_week_pct(envelope_block, week_start_at):
+    """The Projects trend's weekly percent for one week, or a sentinel."""
+    weeks = ((envelope_block or {}).get("trend") or {}).get("weeks") or ()
+    return next((w.get("total_pct") for w in weeks
+                 if w.get("week_start_at") == week_start_at), "absent")
+
+
+def test_1050_projects_memo_republishes_corrected_percent(ns1050):
+    """#1050 §8.3 Projects memo. Detects: the whole-envelope Projects memo
+    keyed only on append-shaped legs serving a warm envelope after an in-place
+    `weekly_percent` correction, so the Projects panel and the Claude source
+    copy keep the old attributed weekly percent on the rebuilt tick."""
+    ns = ns1050
+    conn = ns["open_db"]()
+    try:
+        _1050_seed_probe(conn)
+    finally:
+        conn.close()
+    _1050_insert_claude_entries(
+        ns, [(0, "2026-04-28T10:00:00+00:00", 100_000)],
+        account="unattributed")
+    first = _1050_tick(ns, _1050_P_NOW)
+    assert _1050_projects_week_pct(
+        first.snap.projects_envelope, _1050_P_CURRENT) == 40.0, (
+        "non-vacuity: the warm envelope attributes the 40% week",
+        first.snap.projects_envelope)
+
+    conn = ns["open_db"]()
+    try:
+        conn.execute(_1050_PROBES["p1_weekly_percent"][0])
+        conn.commit()
+    finally:
+        conn.close()
+    second = _1050_tick(ns, _1050_P_NOW + dt.timedelta(minutes=1))
+    _1050_diagnose("projects-memo", first, second)
+    green = _1050_Green("projects-memo")
+    green.check(second.rebuilt, "the second tick is non-idle")
+    green.check(_1050_projects_week_pct(
+        second.snap.projects_envelope, _1050_P_CURRENT) == 31.0,
+        "the Projects envelope publishes the corrected 31%")
+    green.check(_1050_projects_week_pct(
+        _1050_source(second).data.get("projects"), _1050_P_CURRENT) == 31.0,
+        "the Claude source copy publishes the corrected 31%")
+    green.verify()
+
+
+def _1050_make_untrusted(ns, state):
+    """Leave the kernel objects untrusted: a missing trigger whose repair is
+    refused because another process holds stats.db's write lock (the returned
+    `BEGIN IMMEDIATE` connection; readers proceed), or a deleted singleton
+    (malformed, never repaired)."""
+    import _lib_stats_content_revision as k
+    conn = sqlite3.connect(_1050_stats_path())
+    try:
+        if state == "partial_under_contention":
+            conn.execute(f"DROP TRIGGER {k.KERNEL_TRIGGERS[0]}")
+        else:
+            conn.execute(f"DELETE FROM {k.REVISION_TABLE}")
+        conn.commit()
+    finally:
+        conn.close()
+    if state != "partial_under_contention":
+        return None
+    writer = sqlite3.connect(_1050_stats_path())
+    writer.execute("BEGIN IMMEDIATE")
+    return writer
+
+
+@pytest.mark.parametrize("state", ["partial_under_contention", "malformed"])
+def test_1050_install_contention_ticks_publish_fresh_sources(ns1050, state):
+    """#1050 §8.4 installation states. Detects: an untrusted content revision
+    (a repair refused under install contention, or a malformed store whose
+    identity raises) being treated as an empty identity — the dashboard then
+    idles or reuses a Claude source and serves cached cycle details across
+    corrections it cannot see. Each tick must be non-idle, publish a freshly
+    built Claude source and re-stamp every cycle."""
+    import _lib_stats_content_revision as k
+    ns = ns1050
+    conn = ns["open_db"]()
+    try:
+        _1050_seed_probe(conn)
+    finally:
+        conn.close()
+    first = _1050_tick(ns, _1050_P_NOW)
+    writer = _1050_make_untrusted(ns, state)
+    try:
+        conn = ns["open_db"]()
+        try:
+            expected = (k.STATE_PARTIAL if writer is not None
+                        else k.STATE_MALFORMED)
+            assert k.classify(conn) == expected, "setup: untrusted on open"
+        finally:
+            conn.close()
+        ticks = [first] + [
+            _1050_tick(ns, _1050_P_NOW + dt.timedelta(minutes=m))
+            for m in (1, 2)]
+    finally:
+        if writer is not None:
+            writer.rollback()
+            writer.close()
+    green = _1050_Green(f"untrusted:{state}")
+    for earlier, later in zip(ticks, ticks[1:]):
+        _1050_diagnose(f"untrusted:{state}", earlier, later)
+        green.check(later.rebuilt, "every tick is non-idle")
+        green.check(later.snap.data_version != earlier.snap.data_version,
+                    "data_version changes every tick")
+        green.check(_1050_source(later) is not _1050_source(earlier),
+                    "every tick publishes a freshly built Claude source")
+        before, after = _1050_claude_index(earlier), _1050_claude_index(later)
+        green.check(before and set(before) == set(after) and all(
+            before[key]["detail_stamp"] != after[key]["detail_stamp"]
+            for key in before), "every cycle is re-stamped every tick")
+    green.verify()
+
+
+def test_1050_fresh_store_keeps_data_version_and_claude_version_bytes(ns1050):
+    """#1050 §8.3 fresh store. Detects: a never-mutated, never-published,
+    never-repaired store publishing a content-revision fragment, which would
+    move every install's `data_version` and Claude source version bytes (and
+    every golden) with nothing changed. Appended snapshots are untracked."""
+    ns = ns1050
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots (week_start_date, "
+            "week_end_date, captured_at_utc, week_start_at, week_end_at, "
+            "weekly_percent, payload_json) VALUES ('2026-04-27', "
+            "'2026-05-04', '2026-04-30T11:00:00Z', '2026-04-27T00:00:00Z', "
+            "'2026-05-04T00:00:00Z', 40.0, '{}')")
+        conn.commit()
+        assert tuple(conn.execute(
+            "SELECT seq, domain_generation FROM stats_content_revision"
+        ).fetchone()) == (0, 0), "setup: never mutated"
+    finally:
+        conn.close()
+    tick = _1050_tick(ns, _1050_P_NOW)
+    signature = _1050_signature_of(tick.key)
+    assert signature.claude_content_revision == ""
+    assert tick.snap.data_version == ns["_cctally_tui"]._snapshot_data_version(
+        signature._replace(claude_content_revision="removed")
+    ).rsplit(".cremoved", 1)[0], tick.snap.data_version
+    import re
+    assert not re.search(r":c(\?|[0-9a-f]{16})(:|$)",
+                         _1050_source(tick).data_version), (
+        _1050_source(tick).data_version)
+
+
+# ---- C1: the Codex twin ----------------------------------------------------
+#
+# One Codex weekly cycle and one five-hour block, each with its own ladder,
+# materialized by the production projection (`reconcile_codex_quota_
+# projection`) from raw `quota_window_snapshots` evidence, with
+# `codex_session_entries` placed at the ladder's physical boundaries so a
+# boundary rewrite moves the per-milestone costs the detail publishes.
+
+_1050_C_ROOT = "1050c1" + "0" * 26
+_1050_C_ACCT_A = "a" * 28 + "1050"
+_1050_C_ACCT_B = "b" * 28 + "1050"
+_1050_C_NOW = dt.datetime(2026, 7, 25, 12, 0, tzinfo=dt.timezone.utc)
+_1050_C_WEEK_RESET = dt.datetime(2026, 7, 27, 12, 0, tzinfo=dt.timezone.utc)
+_1050_C_BLOCK_RESET = dt.datetime(2026, 7, 25, 14, 0, tzinfo=dt.timezone.utc)
+_1050_C_WEEK_KEY = (
+    '{"limitId":"codex","observedSlot":"secondary","source":"codex",'
+    f'"sourceRootKey":"{_1050_C_ROOT}","windowMinutes":10080}}')
+_1050_C_BLOCK_KEY = (
+    '{"limitId":"codex","observedSlot":"primary","source":"codex",'
+    f'"sourceRootKey":"{_1050_C_ROOT}","windowMinutes":300}}')
+_1050_C_T = [_1050_C_NOW - dt.timedelta(minutes=m) for m in (60, 40, 20)]
+_1050_C_PATH = "/codex/a.jsonl"
+_1050_C_LATER_PATH = "/codex/z.jsonl"
+_1050_C_ENTRY_PATH = "/codex/m.jsonl"
+
+
+def _1050_c_snapshot(cache, *, captured, window, percent, path=_1050_C_PATH,
+                     offset, account=None, reset=None):
+    weekly = window == 10_080
+    cache.execute(
+        "INSERT INTO quota_window_snapshots "
+        "(source, source_root_key, source_path, line_offset, captured_at_utc, "
+        " observed_slot, logical_limit_key, limit_id, limit_name, "
+        " window_minutes, used_percent, resets_at_utc, account_key) "
+        "VALUES ('codex', ?, ?, ?, ?, ?, ?, 'codex', NULL, ?, ?, ?, ?)",
+        (_1050_C_ROOT, path, offset, captured.isoformat(),
+         "secondary" if weekly else "primary",
+         _1050_C_WEEK_KEY if weekly else _1050_C_BLOCK_KEY, window, percent,
+         (reset or (_1050_C_WEEK_RESET if weekly else _1050_C_BLOCK_RESET)
+          ).isoformat(), account))
+
+
+def _1050_c_entry(cache, *, timestamp, offset, tokens, account=None,
+                  path=_1050_C_ENTRY_PATH):
+    cache.execute(
+        "INSERT INTO codex_session_entries "
+        "(source_path, line_offset, timestamp_utc, session_id, model, "
+        " input_tokens, cached_input_tokens, output_tokens, "
+        " reasoning_output_tokens, total_tokens, source_root_key, "
+        " conversation_key, account_key) "
+        "VALUES (?, ?, ?, 'session-1050', 'gpt-5', ?, 0, ?, 0, ?, ?, NULL, ?)",
+        (path, offset, timestamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), tokens,
+         tokens // 10, tokens + tokens // 10, _1050_C_ROOT, account))
+
+
+def _1050_c_rematerialize(ns, cache, *, force_full=False):
+    """Commit a cache change as an ingest does and re-run the projection."""
+    import _cctally_quota as quota
+    ns["_cctally_cache"]._bump_codex_physical_mutation_seq(cache)
+    cache.commit()
+    quota.reconcile_codex_quota_projection(
+        source_root_keys=(_1050_C_ROOT,), now=_1050_C_NOW,
+        force_full=force_full)
+
+
+def _1050_c_ladder(cache, *, account, path, base_offset, block_final=7.3):
+    t0, t1, t2 = _1050_C_T
+    for window, percents in ((10_080, (10.2, 11.3, 12.4)),
+                             (300, (5.1, 6.2, block_final))):
+        for i, (captured, percent) in enumerate(zip((t0, t1, t2), percents)):
+            _1050_c_snapshot(
+                cache, captured=captured, window=window, percent=percent,
+                path=path, offset=base_offset + 10 * i, account=account)
+
+
+def _1050_seed_codex(ns, cache, variant):
+    t0, t1, t2 = _1050_C_T
+    cache.execute(
+        "INSERT INTO codex_source_roots "
+        "(source_root_key, canonical_root_path, first_seen_utc, last_seen_utc) "
+        "VALUES (?, ?, ?, ?)",
+        (_1050_C_ROOT, os.environ["CODEX_HOME"], t0.isoformat(),
+         t2.isoformat()))
+    if variant == "d_account_swap":
+        _1050_c_ladder(cache, account=_1050_C_ACCT_A, path=_1050_C_PATH,
+                       base_offset=10, block_final=7.3)
+        _1050_c_ladder(cache, account=_1050_C_ACCT_B, path="/codex/b.jsonl",
+                       base_offset=10, block_final=7.8)
+    else:
+        _1050_c_ladder(cache, account=None, path=_1050_C_PATH, base_offset=10)
+    if variant == "c_jitter_repeat":
+        sibling = _1050_C_WEEK_RESET + dt.timedelta(seconds=30)
+        _1050_c_snapshot(cache, captured=t0 + dt.timedelta(seconds=5),
+                         window=10_080, percent=10.0, path="/codex/b.jsonl",
+                         offset=11, reset=sibling)
+        _1050_c_snapshot(cache, captured=t1 + dt.timedelta(seconds=10),
+                         window=10_080, percent=11.6, path="/codex/b.jsonl",
+                         offset=21, reset=sibling)
+    # Y sits on the first boundary's capture second, X on the first crossing's:
+    # a path rewrite of either boundary moves one of them across it.
+    account = _1050_C_ACCT_A if variant == "d_account_swap" else None
+    for offset, timestamp, tokens in (
+            (1, t0, 1000), (2, t0 + dt.timedelta(minutes=10), 2000),
+            (3, t1, 4000), (4, t1 + dt.timedelta(minutes=10), 8000),
+            (6, t2, 16000)):
+        _1050_c_entry(cache, timestamp=timestamp, offset=offset, tokens=tokens,
+                      account=account)
+    _1050_c_rematerialize(ns, cache)
+
+
+def _1050_stats_scalar(ns, sql, params=()):
+    conn = ns["open_db"]()
+    try:
+        return [tuple(r) for r in conn.execute(sql, params)]
+    finally:
+        conn.close()
+
+
+def _1050_c_write(ns, cache, variant):
+    """Apply the variant's writer and return its stored-change readback
+    (before, after)."""
+    t0, t1, t2 = _1050_C_T
+    if variant == "a_block_percent":
+        def read():
+            return _1050_stats_scalar(
+                ns, "SELECT current_percent FROM quota_window_blocks "
+                    "WHERE window_minutes = 300")
+        before = read()
+        _1050_c_snapshot(cache, captured=t2 + dt.timedelta(minutes=5),
+                         window=300, percent=7.6, offset=40)
+        _1050_c_rematerialize(ns, cache)
+        return before, read(), [(7.6,)]
+    if variant in ("b_cycle_boundary", "b_nested_boundary"):
+        window = 10_080 if variant == "b_cycle_boundary" else 300
+        key = _1050_C_WEEK_KEY if window == 10_080 else _1050_C_BLOCK_KEY
+
+        def read():
+            return _1050_stats_scalar(
+                ns, "SELECT percent_threshold, source_path FROM "
+                    "quota_percent_milestones WHERE window_minutes = ? "
+                    "ORDER BY percent_threshold", (window,))
+        before = read()
+        cache.execute(
+            "UPDATE quota_window_snapshots SET source_path = ? "
+            "WHERE logical_limit_key = ? AND line_offset = 20",
+            (_1050_C_LATER_PATH, key))
+        _1050_c_rematerialize(ns, cache)
+        first = before[0][0]
+        expected = [(first, _1050_C_LATER_PATH)] + before[1:]
+        return before, read(), expected
+    if variant == "d_account_swap":
+        def read():
+            return _1050_stats_scalar(
+                ns, "SELECT account_key, current_percent FROM "
+                    "quota_window_blocks WHERE window_minutes = 300 "
+                    "ORDER BY account_key")
+        before = read()
+        for account, percent in ((_1050_C_ACCT_A, 7.8), (_1050_C_ACCT_B, 7.3)):
+            cache.execute(
+                "UPDATE quota_window_snapshots SET used_percent = ? "
+                "WHERE window_minutes = 300 AND account_key = ? "
+                "  AND line_offset = 30", (percent, account))
+        _1050_c_rematerialize(ns, cache)
+        return before, read(), [(_1050_C_ACCT_A, 7.8), (_1050_C_ACCT_B, 7.3)]
+    if variant == "e_late_entry":
+        late = t0 + dt.timedelta(minutes=15)
+
+        def read():
+            return [tuple(r) for r in cache.execute(
+                "SELECT line_offset, timestamp_utc FROM codex_session_entries "
+                "WHERE line_offset = 5")]
+        before = read()
+        _1050_c_entry(cache, timestamp=late, offset=5, tokens=32000)
+        _1050_c_rematerialize(ns, cache)
+        return before, read(), [
+            (5, late.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))]
+    if variant == "g_first_boundary":
+        def read():
+            return [tuple(r) for r in cache.execute(
+                "SELECT captured_at_utc, source_path, line_offset FROM "
+                "quota_window_snapshots WHERE logical_limit_key = ? "
+                "ORDER BY captured_at_utc, source_path, line_offset LIMIT 1",
+                (_1050_C_WEEK_KEY,))]
+        before = read()
+        entries = [tuple(r) for r in cache.execute(
+            "SELECT * FROM codex_session_entries ORDER BY id")]
+        cache.execute(
+            "UPDATE quota_window_snapshots SET source_path = ?, "
+            "line_offset = 15 WHERE logical_limit_key = ? AND line_offset = 10",
+            (_1050_C_LATER_PATH, _1050_C_WEEK_KEY))
+        _1050_c_rematerialize(ns, cache)
+        assert [tuple(r) for r in cache.execute(
+            "SELECT * FROM codex_session_entries ORDER BY id")] == entries, (
+            "the accounting entries are unchanged")
+        return before, read(), [(before[0][0], _1050_C_LATER_PATH, 15)]
+    raise AssertionError(variant)
+
+
+def _1050_codex_current(tick):
+    index = _1050_codex_index(tick)
+    current = [k for k, e in index.items() if e["is_current"]]
+    assert len(current) == 1, index
+    return current[0]
+
+
+def _1050_without_stamp(detail):
+    return {k: v for k, v in detail.items() if k != "detail_stamp"}
+
+
+def _1050_file_state(*paths):
+    out = []
+    for path in paths:
+        for candidate in (path, pathlib.Path(str(path) + "-wal")):
+            if candidate.exists():
+                out.append((candidate.name, candidate.read_bytes()))
+    return out
+
+
+_1050_C_VARIANTS = (
+    "a_block_percent", "b_cycle_boundary", "b_nested_boundary",
+    "c_jitter_repeat", "d_account_swap", "e_late_entry", "f_speed_idle",
+    "g_first_boundary",
+)
+
+
+@pytest.mark.parametrize("variant", _1050_C_VARIANTS)
+def test_1050_codex_cycle_detail_refreshes(tmp_path, monkeypatch, variant):
+    """#1050 §8.1 C1. Detects: a cached Codex cycle detail whose stamp
+    (key, distinct-threshold count, block count, max capture) omits what the
+    detail publishes — a block's `current_percent`, a cycle or nested-block
+    milestone's accounting boundary, an account/value swap, a late cache
+    entry, the resolved service tier, the first physical boundary — so a
+    reopened detail is served from the client cache with stale figures, and
+    a tier change on a quiet dashboard never leaves the idle path. (c) pins
+    the stamp's count as distinct thresholds and its capture leg as the raw
+    maximum across jitter siblings."""
+    monkeypatch.setenv("TZ", "Etc/UTC")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv(
+        "CCTALLY_AS_OF", _1050_C_NOW.isoformat().replace("+00:00", "Z"))
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    _1050_arm(ns, monkeypatch)
+    cache = ns["open_cache_db"]()
+    try:
+        _1050_seed_codex(ns, cache, variant)
+        first = _1050_tick(ns, _1050_C_NOW)
+        key = _1050_codex_current(first)
+        assert _1050_codex_index(first)[key]["block_count"] == 1
+        detail_before = _1050_route(ns, "codex", key)
+        assert detail_before["blocks"] and detail_before["blocks"][0][
+            "milestones"], detail_before
+        green = _1050_Green(f"c1:{variant}")
+
+        if variant == "c_jitter_repeat":
+            raw = _1050_stats_scalar(
+                ns, "SELECT percent_threshold, captured_at_utc FROM "
+                    "quota_percent_milestones WHERE window_minutes = 10080")
+            assert len(raw) > len({r[0] for r in raw}), (
+                "a threshold repeats across the jitter siblings", raw)
+            green.check(
+                _1050_codex_index(first)[key]["milestone_count"]
+                == len({r[0] for r in raw}),
+                "the Codex count is the distinct thresholds")
+            # An identical re-materialization keeps the stamp.
+            _1050_c_rematerialize(ns, cache, force_full=True)
+            same = _1050_tick(ns, _1050_C_NOW + dt.timedelta(seconds=30))
+            green.check(
+                _1050_codex_index(same)[key]["detail_stamp"]
+                == _1050_codex_index(first)[key]["detail_stamp"],
+                "an identical re-materialization keeps the Codex stamp")
+            # Moving only a sibling's repeated crossing later moves the raw
+            # maximum capture and nothing the earliest-crossing detail shows.
+            cache.execute(
+                "UPDATE quota_window_snapshots SET captured_at_utc = ? "
+                "WHERE logical_limit_key = ? AND line_offset = 21",
+                ((_1050_C_T[2] + dt.timedelta(minutes=5)).isoformat(),
+                 _1050_C_WEEK_KEY))
+            _1050_c_rematerialize(ns, cache)
+            moved = _1050_stats_scalar(
+                ns, "SELECT MAX(captured_at_utc) FROM quota_percent_milestones "
+                    "WHERE window_minutes = 10080")
+            assert moved[0][0] > max(r[1] for r in raw), moved
+            rows_before = _1050_store_rows(_1050_stats_path())
+            second = _1050_tick(ns, _1050_C_NOW + dt.timedelta(minutes=1))
+            detail_after = _1050_route(ns, "codex", key)
+            rows_after = _1050_store_rows(_1050_stats_path())
+            _1050_diagnose(f"c1:{variant}", first, second)
+            green.check(
+                _1050_codex_index(second)[key]["detail_stamp"]
+                != _1050_codex_index(first)[key]["detail_stamp"],
+                "a moved raw maximum capture moves the Codex stamp")
+            _1050_check_rows(green, rows_before, rows_after)
+            green.verify()
+            return
+
+        if variant == "f_speed_idle":
+            quiet = _1050_tick(ns, _1050_C_NOW + dt.timedelta(seconds=30))
+            assert not quiet.rebuilt, "the dashboard is genuinely idle"
+            assert ns["_resolve_codex_speed"]("auto") == "standard"
+            files = _1050_file_state(
+                _1050_stats_path(), _1050_cache_path())
+            (codex_home / "config.toml").write_text(
+                'service_tier = "fast"\n', encoding="utf-8")
+            assert ns["_resolve_codex_speed"]("auto") == "fast"
+            assert _1050_file_state(
+                _1050_stats_path(), _1050_cache_path()) == files, (
+                "both database files are unchanged")
+            first = quiet
+        else:
+            before, after, expected = _1050_c_write(ns, cache, variant)
+            assert after == expected and after != before, (before, after)
+        rows_before = _1050_store_rows(_1050_stats_path())
+
+        second = _1050_tick(ns, _1050_C_NOW + dt.timedelta(minutes=1))
+        detail_after = _1050_route(ns, "codex", key)
+        rows_after = _1050_store_rows(_1050_stats_path())
+        _1050_diagnose(f"c1:{variant}", first, second)
+        assert key in _1050_codex_index(second), _1050_codex_index(second)
+
+        if variant == "f_speed_idle":
+            green.check(second.rebuilt, "the second tick is non-idle")
+        _1050_check_stamps(
+            green, ns, "codex", first, second, {key: detail_before},
+            {key: detail_after}, affected={key})
+        if variant in ("b_cycle_boundary", "b_nested_boundary",
+                       "d_account_swap"):
+            green.check(
+                _1050_source(second, "codex").data_version
+                != _1050_source(first, "codex").data_version,
+                "codex_version changed")
+            green.check(
+                _1050_without_stamp(detail_after)
+                != _1050_without_stamp(detail_before),
+                "the route result changed")
+        _1050_check_rows(green, rows_before, rows_after)
+        green.verify()
+    finally:
+        cache.close()
+        _1050_disarm(ns)
+
+
+# ---- C1 controls: the Codex stamp's inputs, read directly -----------------
+#
+# The source build hands `build_codex_cycle_index` a process memo
+# (`_CodexCycleInputsMemo`) so the index does not re-read every cycle's
+# boundaries and entry aggregates on every build; the detail route always
+# reads fresh. These controls drive the index with and without that memo on
+# the same seeds and pin that the two agree with the detail route's stamp.
+
+
+class _1050CBoundary:
+    source_root_keys = (_1050_C_ROOT,)
+    quota_identity = None
+    resets_at = _1050_C_WEEK_RESET
+
+
+def _1050_c_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("TZ", "Etc/UTC")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv(
+        "CCTALLY_AS_OF", _1050_C_NOW.isoformat().replace("+00:00", "Z"))
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    import _cctally_milestone_history as mh
+    mh.reset_codex_cycle_inputs_memo()
+    return ns, codex_home
+
+
+def _1050_c_index(ns, *, account=None, memo=True):
+    """``build_codex_cycle_index`` as the source build calls it (``memo``) or
+    as a caller without a stats digest does (fresh reads)."""
+    import _cctally_milestone_history as mh
+    import _lib_dashboard_sources as lds
+    conn, cache = ns["open_db"](), ns["open_cache_db"]()
+    try:
+        kwargs = {"cache_conn": cache, "speed": "auto"}
+        if memo:
+            kwargs["stats_digest"] = lds.codex_stats_digest(conn)
+        return {e["key"]: e for e in mh.build_codex_cycle_index(
+            conn, identity=_1050CBoundary(), now_utc=_1050_C_NOW,
+            account_key=account, **kwargs)}
+    finally:
+        conn.close()
+        cache.close()
+
+
+def _1050_c_detail_stamp(ns, key, *, account=None):
+    import _cctally_milestone_history as mh
+    conn, cache = ns["open_db"](), ns["open_cache_db"]()
+    try:
+        detail = mh.build_codex_cycle_detail(
+            conn, cache, identity=_1050CBoundary(), key=key, speed="auto",
+            now_utc=_1050_C_NOW, account_key=account)
+    finally:
+        conn.close()
+        cache.close()
+    assert isinstance(detail, dict), detail
+    return detail["detail_stamp"]
+
+
+def _1050_c_assert_coherent(ns, accounts):
+    """The memoized index equals the fresh index, and every entry's stamp is
+    the detail route's own; returns the memoized index per account."""
+    out = {}
+    for account in accounts:
+        memoized = _1050_c_index(ns, account=account)
+        assert memoized, f"no Codex cycles for {account}"
+        assert memoized == _1050_c_index(ns, account=account, memo=False), (
+            f"the memoized index diverges from a fresh read for {account}")
+        for key, entry in memoized.items():
+            assert entry["detail_stamp"] == _1050_c_detail_stamp(
+                ns, key, account=account), (
+                f"index stamp != detail stamp for {key} ({account})")
+        out[account] = memoized
+    return out
+
+
+def _1050_c_current_key(index):
+    current = [k for k, e in index.items() if e["is_current"]]
+    assert len(current) == 1, index
+    return current[0]
+
+
+_1050_C_PRIOR_RESET = _1050_C_WEEK_RESET - dt.timedelta(days=7)
+_1050_C_SHARED_PATH = "/codex/prior.jsonl"
+
+
+def _1050_c_seed_shared_block(ns, cache):
+    """A prior weekly cycle ending at the current cycle's start, and one 5-hour
+    block straddling that boundary, so both cycles select the block and share
+    its entry-aggregate key. The prior cycle's own ladder ends before the
+    boundary, so an entry after it lands in the shared block's range only."""
+    p = _1050_C_PRIOR_RESET
+    for i, (minutes, percent) in enumerate(((120, 10.2), (100, 11.3),
+                                            (80, 12.4))):
+        _1050_c_snapshot(cache, captured=p - dt.timedelta(minutes=minutes),
+                         window=10_080, percent=percent,
+                         path=_1050_C_SHARED_PATH, offset=10 + 10 * i,
+                         reset=p)
+    for i, (minutes, percent) in enumerate(((-120, 5.1), (-60, 6.2),
+                                            (60, 7.3))):
+        _1050_c_snapshot(cache, captured=p + dt.timedelta(minutes=minutes),
+                         window=300, percent=percent,
+                         path=_1050_C_SHARED_PATH, offset=15 + 10 * i,
+                         reset=p + dt.timedelta(hours=2))
+    _1050_c_rematerialize(ns, cache)
+
+
+@pytest.mark.parametrize(
+    "variant", _1050_C_VARIANTS + ("h_shared_block_late_entry",))
+def test_1050_codex_detail_stamp_equals_index_stamp(
+        tmp_path, monkeypatch, variant):
+    """#1050 §4.7. Detects: an index stamp computed from different inputs than
+    the detail route's (the memo serving a stale boundary or aggregate, or a
+    scope mismatch), so the client either refetches forever or never refetches
+    a moved detail. Every C1 seed, before and after its writer, merged and per
+    account. ``h_shared_block_late_entry``: two cycles share a straddling
+    5-hour block's aggregate key and a late entry evicts it; the first cycle
+    recomputes and reinserts the key, and the second must not keep the
+    digest of the old aggregate because the key is merely present again."""
+    ns, codex_home = _1050_c_env(tmp_path, monkeypatch)
+    accounts = ((None, _1050_C_ACCT_A, _1050_C_ACCT_B)
+                if variant == "d_account_swap" else (None,))
+    cache = ns["open_cache_db"]()
+    try:
+        _1050_seed_codex(ns, cache, variant)
+        if variant == "h_shared_block_late_entry":
+            _1050_c_seed_shared_block(ns, cache)
+        before = _1050_c_assert_coherent(ns, accounts)
+        if variant == "h_shared_block_late_entry":
+            assert len(before[None]) >= 2, (
+                "non-vacuity: the prior and current cycles", before[None])
+            _1050_c_entry(cache, timestamp=_1050_C_PRIOR_RESET
+                          + dt.timedelta(minutes=30), offset=1, tokens=32000,
+                          path="/codex/late.jsonl")
+            _1050_c_rematerialize(ns, cache)
+        elif variant == "f_speed_idle":
+            (codex_home / "config.toml").write_text(
+                'service_tier = "fast"\n', encoding="utf-8")
+        elif variant == "c_jitter_repeat":
+            cache.execute(
+                "UPDATE quota_window_snapshots SET captured_at_utc = ? "
+                "WHERE logical_limit_key = ? AND line_offset = 21",
+                ((_1050_C_T[2] + dt.timedelta(minutes=5)).isoformat(),
+                 _1050_C_WEEK_KEY))
+            _1050_c_rematerialize(ns, cache)
+        else:
+            _1050_c_write(ns, cache, variant)
+        after = _1050_c_assert_coherent(ns, accounts)
+        key = _1050_c_current_key(after[None])
+        assert after[None][key]["detail_stamp"] != before[None][key][
+            "detail_stamp"], "the writer moves the current cycle's stamp"
+    finally:
+        cache.close()
+
+
+def test_1050_identical_codex_rematerialization_keeps_stamp_and_digest(
+        tmp_path, monkeypatch):
+    """#1050 §8.3. Detects: churn on unchanged state — a full re-projection
+    that rewrites identical rows moving `codex_stats_digest` (and with it
+    `codex_version` and every Codex stamp), or the stamp itself, so an idle
+    store rebuilds and refetches on every projection pass."""
+    import _lib_dashboard_sources as lds
+    ns, _home = _1050_c_env(tmp_path, monkeypatch)
+    cache = ns["open_cache_db"]()
+    try:
+        _1050_seed_codex(ns, cache, "base")
+
+        def digest():
+            conn = ns["open_db"]()
+            try:
+                return lds.codex_stats_digest(conn)
+            finally:
+                conn.close()
+
+        digest_before = digest()
+        before = _1050_c_assert_coherent(ns, (None,))
+        _1050_c_rematerialize(ns, cache, force_full=True)
+        assert digest() == digest_before
+        assert _1050_c_assert_coherent(ns, (None,)) == before
+    finally:
+        cache.close()
+
+
+def test_1050_window_spend_adoption_moves_the_codex_stamp(
+        tmp_path, monkeypatch):
+    """#1050 §4.7 (G6). Detects: window-scoped spend adoption, which stamps
+    `codex_session_entries.account_key` in place without adding a row,
+    leaving an account-focused Codex stamp unchanged while that account's
+    detail starts pricing the adopted spend."""
+    import _cctally_cache
+    ns, _home = _1050_c_env(tmp_path, monkeypatch)
+    cache = ns["open_cache_db"]()
+    try:
+        t0, t1, t2 = _1050_C_T
+        cache.execute(
+            "INSERT INTO codex_source_roots (source_root_key, "
+            "canonical_root_path, first_seen_utc, last_seen_utc) "
+            "VALUES (?, ?, ?, ?)",
+            (_1050_C_ROOT, os.environ["CODEX_HOME"], t0.isoformat(),
+             t2.isoformat()))
+        _1050_c_ladder(cache, account=_1050_C_ACCT_A, path=_1050_C_PATH,
+                       base_offset=10)
+        for offset, timestamp in ((1, t0), (3, t1), (6, t2)):
+            _1050_c_entry(cache, timestamp=timestamp, offset=offset,
+                          tokens=1000 * offset, account=None)
+        _1050_c_rematerialize(ns, cache)
+        before = _1050_c_assert_coherent(ns, (_1050_C_ACCT_A,))[_1050_C_ACCT_A]
+        unattributed = cache.execute(
+            "SELECT COUNT(*) FROM codex_session_entries "
+            "WHERE account_key IS NULL").fetchone()[0]
+        stamped = _cctally_cache.apply_codex_window_spend_adoption(
+            cache, strict=True)
+        cache.commit()
+        assert stamped > 0 and cache.execute(
+            "SELECT COUNT(*) FROM codex_session_entries "
+            "WHERE account_key = ?", (_1050_C_ACCT_A,)).fetchone()[0] == (
+            unattributed), "adoption stamped the window's spend"
+        after = _1050_c_assert_coherent(ns, (_1050_C_ACCT_A,))[_1050_C_ACCT_A]
+        key = _1050_c_current_key(after)
+        assert after[key]["detail_stamp"] != before[key]["detail_stamp"]
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("change", ("multiplier_only", "alias_only"))
+def test_1050_codex_pricing_identity(change):
+    """#1050 §4.7 (H4). Detects: a Codex pricing identity built from the rate
+    table alone, which keeps every Codex stamp when only a fast multiplier or
+    an alias moves — both reprice the detail at read."""
+    import _cctally_milestone_history as mh
+    import _lib_pricing as lp
+    live = lp.current_pricing_snapshot()
+    fields = {name: getattr(live, name) for name in lp.PricingSnapshot.__slots__}
+    assert lp.codex_pricing_identity(lp.PricingSnapshot(**fields)) == (
+        lp.live_codex_pricing_identity()), "equal semantics hash equally"
+    if change == "multiplier_only":
+        fields["fast_multipliers"] = dict(
+            live.fast_multipliers,
+            codex_fallback=float(live.fast_multipliers["codex_fallback"]) + 1.0)
+    else:
+        fields["aliases"] = dict(live.aliases, **{"gpt-1050-alias": "gpt-5"})
+    moved = lp.codex_pricing_identity(lp.PricingSnapshot(**fields))
+    assert moved != lp.live_codex_pricing_identity()
+    assert mh._codex_content_component("d", 1, "standard", moved) != (
+        mh._codex_content_component(
+            "d", 1, "standard", lp.live_codex_pricing_identity()))
+
+
+def _1050_c_input_change(ns, cache, codex_home, monkeypatch, change):
+    """Move exactly one cost input, leaving stats.db as it is."""
+    t0 = _1050_C_T[0]
+    if change == "first_boundary_append":
+        # An earlier observation of the same weekly reset, below the first
+        # threshold: the breakdown opens from it, and it is a pure append.
+        _1050_c_snapshot(cache, captured=t0 - dt.timedelta(minutes=10),
+                         window=10_080, percent=0.4, offset=5)
+    elif change == "first_boundary_rewrite":
+        cache.execute(
+            "UPDATE quota_window_snapshots SET source_path = ?, "
+            "line_offset = 15 WHERE logical_limit_key = ? AND line_offset = 10",
+            (_1050_C_LATER_PATH, _1050_C_WEEK_KEY))
+    elif change == "entry_selection":
+        _1050_c_entry(cache, timestamp=t0 + dt.timedelta(minutes=15),
+                      offset=5, tokens=32000)
+    elif change == "accounting_counter":
+        # Moves the accounting counter and no selected token or row count.
+        cache.execute(
+            "UPDATE codex_session_entries SET session_id = 'session-1050b' "
+            "WHERE line_offset = 2")
+    elif change == "speed":
+        (codex_home / "config.toml").write_text(
+            'service_tier = "fast"\n', encoding="utf-8")
+    elif change == "pricing":
+        import _lib_pricing as lp
+        monkeypatch.setattr(lp, "live_codex_pricing_identity",
+                            lambda: "1050-new-binary")
+    else:
+        raise AssertionError(change)
+    cache.commit()
+
+
+@pytest.mark.parametrize("change", (
+    "first_boundary_append", "first_boundary_rewrite", "entry_selection",
+    "accounting_counter", "speed", "pricing"))
+def test_1050_codex_reuse_refused_per_input(tmp_path, monkeypatch, change):
+    """#1050 §4.7. Detects: the index memo reusing a cycle's memoized stamp
+    after one of its cost inputs moved with stats.db unchanged — a first
+    boundary (appended or rewritten), an entry selection, the accounting
+    counter, the resolved speed or the pricing identity — so the published
+    stamp stays put while the detail route's moves."""
+    ns, codex_home = _1050_c_env(tmp_path, monkeypatch)
+    cache = ns["open_cache_db"]()
+    try:
+        _1050_seed_codex(ns, cache, "base")
+        before = _1050_c_assert_coherent(ns, (None,))[None]
+        stats_before = _1050_store_rows(_1050_stats_path())
+        _1050_c_input_change(ns, cache, codex_home, monkeypatch, change)
+        assert _1050_store_rows(_1050_stats_path()) == stats_before
+        after = _1050_c_assert_coherent(ns, (None,))[None]
+        key = _1050_c_current_key(after)
+        assert after[key]["detail_stamp"] != before[key]["detail_stamp"], (
+            f"{change} moves the current cycle's stamp")
+    finally:
+        cache.close()
+
+
+_1050_C_COST_INPUT_SITES = (
+    "_cctally_milestone_history._codex_cycle_inputs",
+    "_cctally_milestone_history._CodexCycleInputsMemo.sync",
+)
+
+
+def test_1050_codex_cost_input_reads_stream_without_temp_btrees(
+        tmp_path, monkeypatch):
+    """#1050 §8.4. Detects: a Codex cost-input read (the ladders, the bulk
+    first boundaries, the per-model entry aggregates, the memo's ledger and
+    extent reads) that sorts, groups or materializes a history-sized input
+    through a temp structure on every index build — the #901 I1 rule. Covers
+    the memo's cold build and its incremental sync after an append and a
+    late entry."""
+    import _sql_plan_guard as guard
+    ns, _home = _1050_c_env(tmp_path, monkeypatch)
+    cache = ns["open_cache_db"]()
+    try:
+        _1050_seed_codex(ns, cache, "base")
+        with guard.capture_sql_plans() as recorder:
+            _1050_c_index(ns)
+            _1050_c_snapshot(cache, captured=_1050_C_T[0] - dt.timedelta(
+                minutes=10), window=10_080, percent=0.4, offset=5)
+            _1050_c_entry(cache, timestamp=_1050_C_T[0] + dt.timedelta(
+                minutes=15), offset=5, tokens=32000)
+            cache.commit()
+            _1050_c_index(ns)
+        reads = [s for s in recorder.statements
+                 if any(site in s.call_sites
+                        for site in _1050_C_COST_INPUT_SITES)]
+        assert any("codex_session_entries" in s.sql for s in reads)
+        assert any("quota_window_snapshots" in s.sql for s in reads)
+        offenders = [(s.sql, s.plan) for s in reads
+                     if any(marker in detail for detail in s.plan
+                            for marker in guard.TEMP_MARKERS)]
+        assert offenders == []
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("rewrite", ("milestone_boundary", "block_account_swap"))
+def test_1050_codex_stats_only_rewrite_moves_digest_and_stamp(
+        tmp_path, monkeypatch, rewrite):
+    """#1050 §4.7 (G3). Detects: a stats-side Codex rewrite that no cache leg
+    records — a milestone's accounting boundary moved, or two accounts' block
+    `current_percent` values swapped — leaving `codex_stats_digest` (and with
+    it `codex_version` and `_codex_quota_reuse_identity`) unchanged, so the
+    prior Codex source and every memoized cycle stamp are reused while the
+    detail route prices the new boundary or shows the swapped values."""
+    import _lib_dashboard_sources as lds
+    ns, _home = _1050_c_env(tmp_path, monkeypatch)
+    swap = rewrite == "block_account_swap"
+    accounts = (None, _1050_C_ACCT_A, _1050_C_ACCT_B) if swap else (None,)
+    cache = ns["open_cache_db"]()
+    try:
+        _1050_seed_codex(ns, cache, "d_account_swap" if swap else "base")
+
+        def digest():
+            conn = ns["open_db"]()
+            try:
+                return lds.codex_stats_digest(conn)
+            finally:
+                conn.close()
+
+        digest_before = digest()
+        before = _1050_c_assert_coherent(ns, accounts)
+        conn = ns["open_db"]()
+        try:
+            if swap:
+                cur = conn.execute(
+                    "UPDATE quota_window_blocks SET current_percent = CASE "
+                    "account_key WHEN ? THEN 7.8 WHEN ? THEN 7.3 END "
+                    "WHERE source='codex' AND window_minutes = 300",
+                    (_1050_C_ACCT_A, _1050_C_ACCT_B))
+            else:
+                cur = conn.execute(
+                    "UPDATE quota_percent_milestones SET source_path = ? "
+                    "WHERE source='codex' AND window_minutes = 10080 "
+                    "  AND percent_threshold = (SELECT MIN(percent_threshold) "
+                    "    FROM quota_percent_milestones "
+                    "    WHERE source='codex' AND window_minutes = 10080)",
+                    (_1050_C_LATER_PATH,))
+            assert cur.rowcount >= 1, "the stored rewrite applied"
+            conn.commit()
+        finally:
+            conn.close()
+        assert digest() != digest_before, "the rewrite moves the digest"
+        after = _1050_c_assert_coherent(ns, accounts)
+        assert any(
+            after[a][k]["detail_stamp"] != before[a][k]["detail_stamp"]
+            for a in accounts for k in after[a] if k in before[a]), (
+            "the rewrite moves a Codex stamp")
+    finally:
+        cache.close()

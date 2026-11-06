@@ -1,5 +1,6 @@
 """Dashboard envelope carries current_week.freshness derived from
-TuiCurrentWeek.latest_snapshot_at."""
+TuiCurrentWeek.latest_weekly_reading_at (#1018 twin; it was the stored row's
+latest_snapshot_at, which `last_snapshot_age_sec` keeps)."""
 import datetime as dt
 import pytest
 from conftest import load_script, redirect_paths
@@ -25,7 +26,10 @@ def ns(monkeypatch, tmp_path):
     return _ns
 
 
-def _build_snap(ns, latest_at):
+_UNSET = object()
+
+
+def _build_snap(ns, latest_at, reading_at=_UNSET):
     """Build a minimal DataSnapshot for the test.
 
     Schema verified at bin/cctally:17057 (TuiCurrentWeek) and :17227
@@ -42,6 +46,8 @@ def _build_snap(ns, latest_at):
         spent_usd=10.0,
         dollars_per_percent=0.18,
         latest_snapshot_at=latest_at,
+        latest_weekly_reading_at=(
+            latest_at if reading_at is _UNSET else reading_at),
     )
     return ns["DataSnapshot"](
         current_week=cw,
@@ -86,3 +92,28 @@ def test_envelope_freshness_missing_when_no_snapshot_ts(ns):
     env = ns["snapshot_to_envelope"](snap, now_utc=now)
     # current_week serializes to None when cw is None.
     assert env["current_week"] is None
+
+
+def test_envelope_freshness_follows_the_confirming_reading(ns):
+    """#1018 twin (failure: freshness keeps aging from the stored row while
+    flat readings confirm its value, or the stored-row age starts following
+    the reading)."""
+    now = dt.datetime(2026, 4, 30, 12, 0, 0, tzinfo=dt.timezone.utc)
+    stored = now - dt.timedelta(hours=2)
+    reading = now - dt.timedelta(seconds=10)
+    env = ns["snapshot_to_envelope"](
+        _build_snap(ns, stored, reading), now_utc=now)
+    assert env["current_week"]["freshness"] == {
+        "label": "fresh", "captured_at": "2026-04-30T11:59:50Z",
+        "age_seconds": 10}
+    assert env["current_week"]["last_snapshot_age_sec"] == 7200
+
+
+def test_envelope_freshness_is_null_without_a_confirming_reading(ns):
+    """#1018 twin (failure: a card with no resolvable confirmation falls back
+    to the stored row's capture or to now)."""
+    now = dt.datetime(2026, 4, 30, 12, 0, 0, tzinfo=dt.timezone.utc)
+    env = ns["snapshot_to_envelope"](
+        _build_snap(ns, now - dt.timedelta(seconds=5), None), now_utc=now)
+    assert env["current_week"]["freshness"] is None
+    assert env["current_week"]["last_snapshot_age_sec"] == 5

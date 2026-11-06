@@ -878,14 +878,14 @@ def _stats_digest_db(database=":memory:") -> sqlite3.Connection:
             nominal_start_at_utc TEXT, first_observed_at_utc TEXT,
             last_observed_at_utc TEXT, first_percent REAL, current_percent REAL,
             orphaned_at TEXT, last_source_path TEXT, last_line_offset INTEGER,
-            generation TEXT
+            generation TEXT, account_key TEXT
         );
         CREATE TABLE quota_percent_milestones (
             id INTEGER PRIMARY KEY, source TEXT, source_root_key TEXT,
             logical_limit_key TEXT, observed_slot TEXT, window_minutes INTEGER,
             resets_at_utc TEXT, percent_threshold INTEGER, captured_at_utc TEXT,
             high_water_percent REAL, orphaned_at TEXT, source_path TEXT,
-            line_offset INTEGER, generation TEXT
+            line_offset INTEGER, generation TEXT, account_key TEXT
         );
         CREATE TABLE quota_threshold_events (
             id INTEGER PRIMARY KEY, source TEXT, source_root_key TEXT,
@@ -911,10 +911,10 @@ def _stats_digest_db(database=":memory:") -> sqlite3.Connection:
         "INSERT INTO quota_projection_state VALUES (99, 'root-a', 'physical-a', 'generation-a', '2026-07-16T01:00:00Z')"
     )
     conn.execute(
-        "INSERT INTO quota_window_blocks VALUES (88, 'codex', 'root-a', 'limit-a', 'five_hour', 300, 'id-a', 'Five hour', '2026-07-17T00:00:00Z', '2026-07-16T19:00:00Z', '2026-07-16T20:00:00Z', '2026-07-16T21:00:00Z', 20, 40, NULL, '/private/path.jsonl', 123, 'generation-a')"
+        "INSERT INTO quota_window_blocks VALUES (88, 'codex', 'root-a', 'limit-a', 'five_hour', 300, 'id-a', 'Five hour', '2026-07-17T00:00:00Z', '2026-07-16T19:00:00Z', '2026-07-16T20:00:00Z', '2026-07-16T21:00:00Z', 20, 40, NULL, '/private/path.jsonl', 123, 'generation-a', 'unattributed')"
     )
     conn.execute(
-        "INSERT INTO quota_percent_milestones VALUES (77, 'codex', 'root-a', 'limit-a', 'five_hour', 300, '2026-07-17T00:00:00Z', 40, '2026-07-16T21:00:00Z', 40, NULL, '/private/path.jsonl', 123, 'generation-a')"
+        "INSERT INTO quota_percent_milestones VALUES (77, 'codex', 'root-a', 'limit-a', 'five_hour', 300, '2026-07-17T00:00:00Z', 40, '2026-07-16T21:00:00Z', 40, NULL, '/private/path.jsonl', 123, 'generation-a', 'unattributed')"
     )
     conn.execute(
         "INSERT INTO quota_threshold_events VALUES (66, 'codex', 'root-a', 'limit-a', 'five_hour', 300, '2026-07-17T00:00:00Z', 80, 'actual', 80, NULL, 'warn', '2026-07-16T21:00:00Z', 'alerted', '2026-07-16T21:01:00Z', NULL, NULL)"
@@ -936,7 +936,14 @@ def test_codex_stats_digest_tracks_only_selected_semantic_columns():
 
         conn.execute("UPDATE quota_projection_state SET generation='generation-b', completed_at_utc='2026-07-16T22:00:00Z'")
         conn.execute("UPDATE quota_window_blocks SET id=1, last_source_path='/leak/canary', last_line_offset=999, generation='generation-b'")
-        conn.execute("UPDATE quota_percent_milestones SET id=2, source_path='/leak/canary', line_offset=999, generation='generation-b'")
+        conn.execute("UPDATE quota_percent_milestones SET id=2, generation='generation-b'")
+        assert source_kernel.codex_stats_digest(conn) == baseline
+
+        # #1050 spec 4.7: a milestone's accounting boundary selects the
+        # detail's cost entries, so its provenance is now semantic.
+        conn.execute("UPDATE quota_percent_milestones SET source_path='/leak/canary', line_offset=999")
+        assert source_kernel.codex_stats_digest(conn) != baseline
+        conn.execute("UPDATE quota_percent_milestones SET source_path='/private/path.jsonl', line_offset=123")
         assert source_kernel.codex_stats_digest(conn) == baseline
 
         conn.execute("UPDATE quota_window_blocks SET orphaned_at='2026-07-16T22:00:00Z'")
@@ -959,7 +966,7 @@ def test_codex_stats_digest_is_order_independent_but_detects_semantic_deletes(
         row = second.execute("SELECT * FROM quota_window_blocks").fetchone()
         second.execute("DELETE FROM quota_window_blocks")
         second.execute(
-            "INSERT INTO quota_window_blocks VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO quota_window_blocks VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             row[1:],
         )
         assert source_kernel.codex_stats_digest(first) == source_kernel.codex_stats_digest(second)
@@ -1788,7 +1795,7 @@ def test_source_schema_version_is_eleven():
     key itself is retained with null members so a still-loaded v9 bundle does
     not throw across an in-place `execvp` update.
     """
-    assert SOURCE_SCHEMA_VERSION == 12
+    assert SOURCE_SCHEMA_VERSION == 13
     impact = json.loads(
         (pathlib.Path(__file__).parent / "source-schema-impact.json").read_text()
     )

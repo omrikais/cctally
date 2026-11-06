@@ -115,7 +115,7 @@ These hold regardless of performance work; a change that violates one is a bug e
 
 - **Privacy gate.** The `/api/debug/backend` diagnostic is loopback-only, always — its primary check is the unspoofable loopback TCP peer, with an IP-literal loopback `Host` as anti-DNS-rebinding defense-in-depth. It never consults `dashboard.expose_transcripts`. (The transcript endpoints have their own, deliberately more permissive, gate.)
 - **No transcript text in diagnostics.** The diagnostic surfaces leak only timings, counts, flag names, signature legs, and already-safe cache-table names — never prompt/prose/paths.
-- **Read-only, no-side-effect doctor.** `doctor` gathers and reports; it never heals, migrates, or writes.
+- **Doctor never changes your data.** `doctor` gathers and reports; it never heals or migrates, and it is read-only except its disposable journal-scan cache (`journal/.doctor-scan-index`).
 - **Both derived stores are re-derivable.** `--rebuild` may reconstruct them from JSONL, but code must never unlink a live SQLite main/WAL/SHM family.
 - **Byte-identical CLI stdout.** Instrumentation and diagnostics change no command's stdout or `--json` output. `CCTALLY_PERF_TRACE` writes only to stderr. No golden moves.
 - **`mutation_seq` change-stamp correctness.** An id-stable in-place finalization UPSERT still advances the per-file `mutation_seq` leg, so the dashboard leaves the idle path and recomputes exactly the affected bucket. A signature that fails to move on a real data change silently serves stale rows.

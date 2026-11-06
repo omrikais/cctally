@@ -486,8 +486,8 @@ def _held_only_weekly_row(app, account):
 def _forks(monkeypatch):
     import _cctally_statusline as sl
     forks = []
-    monkeypatch.setattr(sl, "_fork_persist", lambda fd, reservation: (
-        forks.append(fd), sl._release_reservation(reservation)))
+    monkeypatch.setattr(sl, "_dispatch_render_worker", lambda reservation: (
+        forks.append(reservation), sl._release_reservation(reservation)))
     return forks
 
 

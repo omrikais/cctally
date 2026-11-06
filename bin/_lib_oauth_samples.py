@@ -164,6 +164,28 @@ def _percent(value) -> "float | None":
     return value if math.isfinite(value) else None
 
 
+def finite_percent(value) -> "float | None":
+    """A raw payload percent as a finite float, or None (a bool, a string, a
+    missing or non-finite value). The one parse both the samples projection
+    and the weekly observation index (#1018 twin spec 5.1) apply."""
+    return _percent(value)
+
+
+def weekly_reset_identity(resets_at) -> "str | None":
+    """The normalized weekly window identity of a raw payload ``resets_at``
+    (:func:`normalize_weekly_reset`), or None when it is missing, a bool or
+    unparsable. `claude_oauth_samples.weekly_resets_at_utc` and
+    `claude_weekly_observation_index.weekly_resets_at_utc` (#1018 twin spec
+    5.1) are both spelled by this one helper, so window equality holds
+    between them."""
+    if resets_at is None or isinstance(resets_at, bool):
+        return None
+    try:
+        return normalize_weekly_reset(int(resets_at))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
 def _bound_account(payload: dict) -> "str | None":
     binding = payload.get("account_binding")
     if not isinstance(binding, dict):
@@ -200,13 +222,7 @@ def sample_from_observation(payload: dict, *, account_key: str,
         return None
 
     weekly_percent = _percent(payload.get("weekly_percent"))
-    weekly_reset = None
-    resets_at = payload.get("resets_at")
-    if not isinstance(resets_at, bool):
-        try:
-            weekly_reset = normalize_weekly_reset(int(resets_at))
-        except (TypeError, ValueError, OverflowError, OSError):
-            weekly_reset = None
+    weekly_reset = weekly_reset_identity(payload.get("resets_at"))
     if weekly_reset is None:
         weekly_percent = None
 

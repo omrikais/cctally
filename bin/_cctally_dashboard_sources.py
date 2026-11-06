@@ -1490,6 +1490,7 @@ def resolve_dashboard_source_semantics(
     config: Mapping[str, object] | None,
     *,
     display_tz_name: str | None,
+    speed: str | None = None,
 ) -> DashboardSourceSemantics:
     """Resolve dashboard semantics through the shipped CLI kernels.
 
@@ -1497,12 +1498,17 @@ def resolve_dashboard_source_semantics(
     it preserves the CLI's all-$CODEX_HOME fast-service-tier behavior.  The
     weekly index comes from the same ``get_week_start_name``/``WEEKDAY_MAP``
     pair used by the report and budget command surfaces.
+
+    ``speed`` (#1050 spec 4.7) is a tier that resolver already returned this
+    tick — the dashboard captures it beside its dispatch read and keys the idle
+    gate on it — so the build uses that one value; ``None`` resolves here.
     """
     c = sys.modules["cctally"]
     raw_config = dict(config or {})
     week_start_name = get_week_start_name(raw_config)
     week_start_idx = c.WEEKDAY_MAP[week_start_name]
-    speed = c._resolve_codex_speed("auto")
+    if speed is None:
+        speed = c._resolve_codex_speed("auto")
     budget_config = c._get_budget_config(raw_config)
     quota_alerts = c._get_quota_alerts_config(raw_config)
     raw_cache_report = raw_config.get("cache_report")
@@ -5929,6 +5935,20 @@ def reset_codex_account_scope_cache(*, keep_counters: bool = False) -> None:
     _CODEX_DERIVED_COHERENCE.clear()
 
 
+def _codex_cycle_index_cost_inputs(context: "DashboardReadContext") -> dict:
+    """The cost inputs every Codex cycle stamp names (#1050 spec 4.7): this
+    read's cache handle and resolved speed, and — when the build computed it
+    for its own signature — the `codex_stats_digest` that admits the index's
+    process memo."""
+    stats_identity = context.stats_identity
+    return {
+        "cache_conn": context.cache_conn,
+        "speed": context.speed,
+        "stats_digest": (
+            stats_identity[0] if stats_identity is not None else None),
+    }
+
+
 def _codex_account_scopes_wire(
     context: DashboardReadContext,
     *,
@@ -6060,6 +6080,7 @@ def _codex_account_scopes_wire(
                     sys.modules["cctally"].build_codex_cycle_index(
                         context.stats_conn, identity=cycle,
                         now_utc=context.now_utc, account_key=key,
+                        **_codex_cycle_index_cost_inputs(context),
                     )
                 )
             except sqlite3.Error:
@@ -8704,6 +8725,7 @@ def _build_codex_source_state(
             cycle_index = tuple(
                 sys.modules["cctally"].build_codex_cycle_index(
                     context.stats_conn, identity=cycle, now_utc=context.now_utc,
+                    **_codex_cycle_index_cost_inputs(context),
                 )
             )
         except sqlite3.Error:

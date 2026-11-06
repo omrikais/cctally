@@ -126,6 +126,7 @@ cctally cache-sync --source claude
   integrity-clean. If the clean full walk/finalization had not completed, its
   durable provider rebuild marker also keeps the partial store retry-required.
   In every phase, re-run the provider-specific command printed in the diagnostic.
+- An interrupted Codex `--rebuild` (a crash, Ctrl-C or a killed process after it cleared the Codex cache) is finished by the next Codex sync, which reads the rollouts again from the start and keeps the history recorded before cctally tracked accounts unattributed rather than giving it to the account now in `auth.json`. A Codex `--rebuild` whose walk fails a file or defers one on a changing `auth.json` stays pending the same way until that file reads cleanly; until then Codex transcript ingest waits, and `cctally doctor` reports the pending or stalled replay under `data.codex_replay`.
 - Concurrent ingests are serialized by `fcntl.flock` on
   `cache.db.lock` / `cache.db.codex.lock` for accounting and
   `conversations.db.lock` / `conversations.db.codex.lock` for transcripts.

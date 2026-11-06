@@ -316,6 +316,8 @@ from _lib_source_retry import (
     clear_partial_retry,
     plan_partial_retry,
 )
+# #1050: the stats.db Claude content revision (a stdlib-only leaf kernel).
+import _lib_stats_content_revision as _content_revision
 
 
 # === Module-level back-ref shims for helpers that STAY in bin/cctally ======
@@ -927,6 +929,20 @@ class TuiCurrentWeek:
     account_decorated: bool = False
     account_label: "str | None" = None
     cycle_scope: "Any | None" = None
+    # #1018 twin (spec 5.3): the capture instant of the newest genuine reading
+    # that confirms the displayed weekly value, and the server-private scope
+    # it was selected under (`_cctally_oauth_samples.WeeklyReadingScope`,
+    # never serialized), which idle ticks re-run. The freshness label and age
+    # above age from THIS instant; `latest_snapshot_at` stays the stored
+    # row's capture. Both None when the displayed row has no resolvable
+    # originating observation. Trailing defaults, for fixture constructors.
+    latest_weekly_reading_at: "dt.datetime | None" = None
+    weekly_reading_scope: "Any | None" = None
+    # #1018 twin review F1: the scope's inputs (`_TuiWeeklyReadingRequest`,
+    # server-private), set only when the build's scope lookup FAILED, so the
+    # idle refresh retries it instead of serving no freshness until the next
+    # full build. None once a scope is resolved, or when it never failed.
+    weekly_reading_retry: "Any | None" = None
 
 
 # ---- View-model row dataclasses moved to bin/_lib_view_models.py ----
@@ -1145,6 +1161,46 @@ class SyncFailureAttribution:
     # branch; `_tui_capture_sync_failure` is the one normal site that supplies
     # the real value, and it already receives the exception.
     sqlite_busy: bool = False
+    # #932 §4.1. True only where a caught `StatsRebuildDeferred` instance is
+    # turned into a frame (`_tui_deferral_attribution`); never inferred from
+    # text, the corruption flag, hydration or row counts. It is the one signal
+    # a frozen dashboard's settle loop retries on, and the hydration latch
+    # writers respect. `deferral_outcome` is that exception's admission result
+    # (`spawned`, `pending` or `failed`).
+    deferred: bool = False
+    deferral_outcome: "str | None" = None
+
+
+def _tui_deferral_attribution(exc: BaseException) -> SyncFailureAttribution:
+    """The attribution for a caught `StatsRebuildDeferred` (#932 §4.1)."""
+    return SyncFailureAttribution(
+        leg="stats-open",
+        database="stats",
+        corruption=_stats_open_failure_is_corruption(exc),
+        deferred=True,
+        deferral_outcome=getattr(exc, "outcome", None),
+    )
+
+
+def _tui_snapshot_is_stats_deferral(snapshot) -> bool:
+    """True iff the frame states an explicit stats deferral (#932 §4.1).
+
+    Some attribution must carry ``database == "stats"``, ``leg ==
+    "stats-open"`` and ``deferred``. Tolerates a snapshot without the field and
+    dict-shaped items, as the envelope classifier does.
+    """
+    for item in getattr(snapshot, "sync_failures", None) or ():
+        if isinstance(item, dict):
+            database = item.get("database")
+            leg = item.get("leg")
+            deferred = item.get("deferred", False)
+        else:
+            database = getattr(item, "database", None)
+            leg = getattr(item, "leg", None)
+            deferred = getattr(item, "deferred", False)
+        if database == "stats" and leg == "stats-open" and bool(deferred):
+            return True
+    return False
 
 
 class _StatsSnapshotCorruption(Exception):
@@ -1492,6 +1548,9 @@ class DataSnapshot:
             freshness_label="fresh",
             freshness_age=12,
             five_hour_block=None,
+            # #1018 twin: the published freshness ages from the confirming
+            # reading; the synthesized card's reading is its snapshot.
+            latest_weekly_reading_at=as_of,
         )
         # ---- Forecast: WARN, ~98% projected, fits within modal width.
         # The TUI's verdict mapping (`_tui_verdict_of`) reads
@@ -1725,21 +1784,245 @@ class RuntimeState:
         )
 
 
-def _tui_card_freshness(captured, now_utc: dt.datetime):
+def _tui_oauth_usage_cfg(raw_config) -> dict:
+    """The resolved oauth_usage block of ``raw_config`` (the freshness-label
+    thresholds), or the defaults when it does not validate. The one
+    resolution every current-week freshness derivation uses — the card, the
+    source copies and the quota clock, on full and idle ticks alike (#1018
+    twin review F4) — so custom thresholds never flip a label between a full
+    build and the next idle tick."""
+    try:
+        return _get_oauth_usage_config(raw_config)
+    except Exception:
+        return _OAUTH_USAGE_DEFAULTS
+
+
+def _tui_card_freshness(captured, now_utc: dt.datetime,
+                        oauth_usage_cfg: "dict | None" = None):
     """``(freshness_label, freshness_age)`` of the card's displayed sample,
-    against the configured oauth_usage thresholds; ``(None, None)`` when the
-    capture is not a datetime. Mirrors the dashboard envelope's cw_freshness
-    derivation in `snapshot_to_envelope`. Refs spec §3.4."""
+    against the configured oauth_usage thresholds (``oauth_usage_cfg`` when
+    the caller already resolved them, else read from the config file);
+    ``(None, None)`` when the capture is not a datetime. Mirrors the dashboard
+    envelope's cw_freshness derivation in `snapshot_to_envelope`. Refs spec
+    §3.4."""
     if not isinstance(captured, dt.datetime):
         return None, None
     if captured.tzinfo is None:
         captured = captured.replace(tzinfo=dt.timezone.utc)
     age_s = max(0.0, (now_utc - captured).total_seconds())
-    try:
-        _fresh_cfg = _get_oauth_usage_config(load_config())
-    except Exception:
-        _fresh_cfg = _OAUTH_USAGE_DEFAULTS
+    _fresh_cfg = oauth_usage_cfg
+    if _fresh_cfg is None:
+        try:
+            _fresh_cfg = _get_oauth_usage_config(load_config())
+        except Exception:
+            _fresh_cfg = _OAUTH_USAGE_DEFAULTS
     return _freshness_label(age_s, _fresh_cfg), int(age_s)
+
+
+@dataclass(frozen=True)
+class _TuiWeeklyReadingRequest:
+    """The inputs of a card's confirming-reading scope (#1018 twin review
+    F1), the keyword arguments of `_tui_weekly_reading_scope` but ``now_utc``.
+    Kept on a card whose scope lookup failed, so the idle refresh can retry
+    the lookup on a later tick; server-private, never serialized."""
+
+    journal_id: object
+    account_key: object
+    weekly_percent: float
+    segment_start: dt.datetime
+    week_start_date: object
+    nominal_start: dt.datetime
+    week_end_at: dt.datetime
+
+    def scope_fields(self) -> dict:
+        return {f.name: getattr(self, f.name)
+                for f in dataclasses.fields(self)}
+
+
+def _tui_weekly_floor_at_or_before(
+    conn: sqlite3.Connection,
+    *,
+    week_start_date: str,
+    week_start_at: dt.datetime,
+    week_end_at: dt.datetime,
+    account_key: str,
+    now_utc: dt.datetime,
+) -> "dt.datetime | None":
+    """The newest weekly floor the fold applies to ``account_key``'s week
+    that takes effect at or before ``now_utc`` (#1018 twin spec 5.3, review
+    F3), or None.
+
+    The two legs and their predicates are `_cctally_core._reset_aware_floor`'s
+    (a reset event effective in ``[week_start_at, week_end_at)``, a credit
+    floor of ``week_start_date``, both of this account). That helper returns
+    only the newest floor, so an as-of or replay build placed between two
+    floors of one week would see a floor later than now and none at all;
+    this reads the week's floors (a handful) and compares parsed instants in
+    Python, which also keeps the sub-second order exact. It is a separate
+    query rather than an option of the shared helper, which the strict
+    detector path pins (`_lib_detector_access_registry`)."""
+    rows = conn.execute(
+        """
+        SELECT effective_reset_at_utc FROM week_reset_events
+         WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?)
+           AND unixepoch(effective_reset_at_utc) <  unixepoch(?)
+           AND account_key = ?
+        UNION ALL
+        SELECT effective_at_utc FROM weekly_credit_floors
+         WHERE week_start_date = ? AND account_key = ?
+        """,
+        (_iso_z(week_start_at), _iso_z(week_end_at), account_key,
+         week_start_date, account_key),
+    ).fetchall()
+    best = None
+    for (text,) in rows:
+        if not text:
+            continue
+        try:
+            floor_at = parse_iso_datetime(str(text), "weekly floor")
+        except ValueError:
+            continue
+        if floor_at <= now_utc and (best is None or floor_at > best):
+            best = floor_at
+    return best
+
+
+def _tui_weekly_reading_scope(
+    conn: sqlite3.Connection,
+    *,
+    journal_id: object,
+    account_key: object,
+    weekly_percent: float,
+    segment_start: dt.datetime,
+    week_start_date: object,
+    nominal_start: dt.datetime,
+    week_end_at: dt.datetime,
+    now_utc: dt.datetime,
+):
+    """The confirming-reading scope of the displayed weekly sample (#1018 twin
+    spec 5.3), or None when its originating observation does not resolve.
+
+    The window identity is the originating observation's own normalized
+    provider reset (``journal_id`` ``sa:<observation-id>`` -> the index row
+    by primary key), never the stored ``week_end_at``, which can be a
+    first-established boundary. A synthetic credit snapshot, a direct or
+    bootstrap row, or an observation without a window yields None.
+
+    The lower bound is the card's segment start raised to the newest weekly
+    floor the fold applies at or before now (`_tui_weekly_floor_at_or_before`:
+    reset events and credit floors of this account and week), so a
+    pre-credit reading of the same value never confirms a post-credit one.
+    The upper bound is the earlier of the provider reset and the card's
+    window end."""
+    import _cctally_oauth_samples
+    import _lib_oauth_samples
+    if (not isinstance(journal_id, str) or not journal_id.startswith("sa:")
+            or not isinstance(account_key, str) or not account_key):
+        return None
+    row = conn.execute(
+        "SELECT weekly_resets_at_utc FROM claude_weekly_observation_index"
+        " WHERE observation_id = ?", (journal_id[3:],)).fetchone()
+    if row is None or not isinstance(row[0], str):
+        return None
+    try:
+        reset = parse_iso_datetime(row[0], "weekly_resets_at_utc")
+    except ValueError:
+        return None
+    lower = segment_start
+    if isinstance(week_start_date, str) and week_start_date:
+        floor_at = _tui_weekly_floor_at_or_before(
+            conn, week_start_date=week_start_date,
+            week_start_at=nominal_start, week_end_at=week_end_at,
+            account_key=account_key, now_utc=now_utc)
+        if floor_at is not None and lower < floor_at:
+            lower = floor_at
+    return _cctally_oauth_samples.WeeklyReadingScope(
+        account_key=account_key,
+        weekly_resets_at_utc=row[0],
+        weekly_percent=float(weekly_percent),
+        lower_bound_utc=_lib_oauth_samples.canonical_instant(lower),
+        upper_bound_utc=_lib_oauth_samples.canonical_instant(
+            min(reset, week_end_at)),
+    )
+
+
+def _tui_card_reading(conn, *, now_utc: dt.datetime,
+                      reading_errors: "list | None" = None, **scope_fields):
+    """``(weekly_reading_scope, latest_weekly_reading_at,
+    weekly_reading_retry)`` for a card being BUILT.
+
+    A ``sqlite3.Error`` never costs the card (#1018 twin review F1): it is
+    built without freshness, the error is appended to ``reading_errors`` for
+    the caller to record through its own failure handling (which classifies
+    stats corruption and requests the heal, exactly as for the card's other
+    reads), and the card keeps what the idle refresh needs to retry — the
+    resolved scope when only the selector failed, or the scope's inputs
+    (`_TuiWeeklyReadingRequest`) when the scope lookup itself failed. A
+    caller passing no list (a direct builder call with no failure surface)
+    gets the same card and retry state, unrecorded."""
+    try:
+        scope = _tui_weekly_reading_scope(
+            conn, now_utc=now_utc, **scope_fields)
+    except sqlite3.Error as exc:
+        if reading_errors is not None:
+            reading_errors.append(exc)
+        return None, None, _TuiWeeklyReadingRequest(**scope_fields)
+    try:
+        return scope, _tui_weekly_reading_at(conn, scope, now_utc), None
+    except sqlite3.Error as exc:
+        if reading_errors is not None:
+            reading_errors.append(exc)
+        return scope, None, None
+
+
+def _tui_weekly_reading_at(conn, scope, now_utc: dt.datetime):
+    """`latest_weekly_reading_at` for ``scope`` (None skips the query)."""
+    if scope is None:
+        return None
+    import _cctally_oauth_samples
+    return _cctally_oauth_samples.latest_weekly_reading_at(
+        conn, scope, now_utc)
+
+
+def refresh_current_week_reading(cw, conn, now_utc: dt.datetime, *,
+                                 oauth_usage_cfg: "dict | None" = None):
+    """``cw`` with its confirming-reading freshness re-derived at ``now_utc``
+    (#1018 twin spec 5.5), for the idle and reuse ticks that do not rebuild
+    the card.
+
+    Re-runs the selector on the card's own ``weekly_reading_scope`` (a card
+    with no scope skips the query and keeps its instant), then recomputes the
+    whole freshness tuple, because the label and age advance with the clock
+    even when no reading arrives. The instant may move forward, backwards or
+    to None (a later reviewed hold). A card whose build-time scope lookup
+    failed carries ``weekly_reading_retry`` instead: the lookup is retried
+    here first, and once it resolves (to a scope or to None) the retry state
+    is dropped (review F1). ``oauth_usage_cfg`` is the caller's resolved
+    threshold block (review F4/F9), else the config file is read. Returns
+    ``cw`` itself only when nothing changed, else a replaced copy: a
+    published card is never mutated. A ``sqlite3.Error`` propagates; the
+    caller keeps its prior card, retry state included."""
+    if cw is None:
+        return None
+    scope = getattr(cw, "weekly_reading_scope", None)
+    retry = getattr(cw, "weekly_reading_retry", None)
+    if scope is None and retry is not None:
+        scope = _tui_weekly_reading_scope(
+            conn, now_utc=now_utc, **retry.scope_fields())
+        retry = None
+    if scope is None:
+        reading_at = getattr(cw, "latest_weekly_reading_at", None)
+    else:
+        reading_at = _tui_weekly_reading_at(conn, scope, now_utc)
+    label, age = _tui_card_freshness(reading_at, now_utc, oauth_usage_cfg)
+    if (reading_at == getattr(cw, "latest_weekly_reading_at", None)
+            and label == cw.freshness_label and age == cw.freshness_age
+            and retry is getattr(cw, "weekly_reading_retry", None)):
+        return cw
+    return dataclasses.replace(
+        cw, latest_weekly_reading_at=reading_at, freshness_label=label,
+        freshness_age=age, weekly_reading_scope=scope,
+        weekly_reading_retry=retry)
 
 
 def _tui_five_hour_resets_at(five_hour, now_utc: dt.datetime):
@@ -1773,6 +2056,7 @@ def _tui_build_decorated_current_week(
     now_utc: dt.datetime,
     *,
     skip_sync: bool = False,
+    reading_errors: "list | None" = None,
 ) -> TuiCurrentWeek | None:
     """The Current Week card on a decorated store: ONE account (#836,
     spec 5.2).
@@ -1789,35 +2073,47 @@ def _tui_build_decorated_current_week(
     never falls back to the merged population. `_apply_midweek_reset_override`
     is not called here.
     """
-    owner = _claude_select_current_owner(conn, now_utc)
-    if owner is None:
-        return None
-    scope = _claude_current_cycle_scope(conn, now_utc, account_key=owner)
-    if scope is None:
-        return None
-    fetched = _claude_cycle_scope_samples(conn, scope, now_utc)
-    if fetched is None:
-        return None
-    week_start_at, week_end_at, observations, week_scope = fetched
-    week_start_before_override = week_start_at
-    if scope.effective_start_at is not None:
-        # The scope's effective start may also PRECEDE the nominal start (a
-        # same-date early re-anchor, #836 review F7): the card's cycle starts
-        # there either way, as its current index entry does.
-        effective = parse_iso_datetime(
-            scope.effective_start_at, "cycle_scope.effective_start_at")
-        if effective != week_start_at:
-            week_start_at = effective
-            observations = [s for s in observations if s[0] >= effective]
-    weekly_samples = [s for s in observations if not s[3]]
-    if not weekly_samples:
-        return None
-    latest = weekly_samples[-1]
-    used_pct = float(latest[1])
-    five_hour = _current_week_five_hour_reading(
-        conn, now_utc, week_scope, account_key=owner,
-        week_start_at=week_start_at,
-        week_start_before_override=week_start_before_override)
+    import _lib_snapshot_cache
+    # #1018 twin spec 5.3: the card's evidence reads, the confirming-reading
+    # lookup included, share ONE stats snapshot, released before the cost
+    # aggregation below.
+    with _lib_snapshot_cache.one_read_snapshot(conn):
+        owner = _claude_select_current_owner(conn, now_utc)
+        if owner is None:
+            return None
+        scope = _claude_current_cycle_scope(conn, now_utc, account_key=owner)
+        if scope is None:
+            return None
+        fetched = _claude_cycle_scope_samples(
+            conn, scope, now_utc, include_journal_id=True)
+        if fetched is None:
+            return None
+        week_start_at, week_end_at, observations, week_scope = fetched
+        week_start_before_override = week_start_at
+        if scope.effective_start_at is not None:
+            # The scope's effective start may also PRECEDE the nominal start (a
+            # same-date early re-anchor, #836 review F7): the card's cycle
+            # starts there either way, as its current index entry does.
+            effective = parse_iso_datetime(
+                scope.effective_start_at, "cycle_scope.effective_start_at")
+            if effective != week_start_at:
+                week_start_at = effective
+                observations = [s for s in observations if s[0] >= effective]
+        weekly_samples = [s for s in observations if not s[3]]
+        if not weekly_samples:
+            return None
+        latest = weekly_samples[-1]
+        used_pct = float(latest[1])
+        five_hour = _current_week_five_hour_reading(
+            conn, now_utc, week_scope, account_key=owner,
+            week_start_at=week_start_at,
+            week_start_before_override=week_start_before_override)
+        reading_scope, reading_at, reading_retry = _tui_card_reading(
+            conn, reading_errors=reading_errors, journal_id=latest[5], account_key=owner,
+            weekly_percent=latest[1], segment_start=week_start_at,
+            week_start_date=scope.week_start_date,
+            nominal_start=week_start_before_override,
+            week_end_at=week_end_at, now_utc=now_utc)
     spent, total_tokens = _sum_cost_and_tokens_for_range(
         week_start_at, now_utc, mode="auto", skip_sync=skip_sync,
         account_key=owner,
@@ -1826,7 +2122,7 @@ def _tui_build_decorated_current_week(
     used_pct_corrected = corrected_percent_point(used_pct)
     dpp_divisor = used_pct if used_pct_corrected is None else used_pct_corrected
     dpp = (spent / dpp_divisor) if used_pct > 0 else None
-    freshness_label, freshness_age = _tui_card_freshness(latest[0], now_utc)
+    freshness_label, freshness_age = _tui_card_freshness(reading_at, now_utc)
     import _cctally_account
     return TuiCurrentWeek(
         week_start_at=week_start_at,
@@ -1848,6 +2144,9 @@ def _tui_build_decorated_current_week(
         account_decorated=True,
         account_label=_cctally_account.display_account_label(conn, owner),
         cycle_scope=scope,
+        latest_weekly_reading_at=reading_at,
+        weekly_reading_scope=reading_scope,
+        weekly_reading_retry=reading_retry,
     )
 
 
@@ -1862,10 +2161,15 @@ def _tui_build_current_week(
     now_utc: dt.datetime,
     *,
     skip_sync: bool = False,
+    reading_errors: "list | None" = None,
 ) -> TuiCurrentWeek | None:
     """Build the TuiCurrentWeek from the latest snapshot + live cost.
 
     Returns None when no current-week usage snapshot exists.
+
+    ``reading_errors`` (#1018 twin review F1) collects a ``sqlite3.Error``
+    met by the confirming-reading lookup, which never costs the card: the
+    caller records each one through its failure handling (`_tui_card_reading`).
 
     #836: a decorated store (more than one real Claude account, R8) takes
     `_tui_build_decorated_current_week`, the one-account card. Below the
@@ -1874,58 +2178,70 @@ def _tui_build_current_week(
     import _cctally_account
     if _cctally_account.provider_is_decorated(conn, "claude"):
         return _tui_build_decorated_current_week(
-            conn, now_utc, skip_sync=skip_sync)
-    # #769 S11 (#824): ONE read, held-inclusive, split per axis below.
-    # Retain the owner of the exact non-held weekly sample this card displays,
-    # including when one real account coexists with unattributed history. R8
-    # controls decoration, not the physical population used for computation.
-    # Cost and forecast retain their existing merged semantics.
-    fetched = _fetch_current_week_snapshots(
-        conn, now_utc, include_held=True, include_account=True,
-        include_scope=True)
-    if fetched is None:
-        return None
-    week_start_at, week_end_at, observations, week_scope = fetched
-    if not observations:
-        return None
-    week_start_before_override = week_start_at
-    # Mirror the reset override applied by `_load_forecast_inputs` so the
-    # Current Week card's spent_usd and $/1% reflect the post-reset window.
-    week_start_at, observations = _apply_midweek_reset_override(
-        conn, week_start_at, week_end_at, observations, now_utc=now_utc
-    )
-    if not observations:
-        return None
-    # Held-inclusive sample shape: (captured_at_utc, weekly_percent,
-    # five_hour_percent, weekly_observation_held[, account_key]). The optional
-    # account key identifies the displayed weekly sample on a decorated store.
-    # The helper does not surface five_hour_resets_at; the five-hour reading
-    # selected below supplies it, with its percentage.
-    #
-    # #769 S11 (#824). This card publishes BOTH axes, and the dashboard
-    # envelope reads `used_pct` and `latest_snapshot_at` straight off it for
-    # `current_week.freshness` and `snapshot_age_seconds`. A held row carries
-    # an older row's weekly value under this tick's capture instant, so
-    # letting one reach `latest` would present stale weekly evidence as freshly
-    # captured — review finding 5. The five-hour percentage takes the newest
-    # observation of either kind, because a held row is written exactly when
-    # its five-hour reading grew.
-    weekly_samples = [s for s in observations if not s[3]]
-    if not weekly_samples:
-        return None
-    latest = weekly_samples[-1]
-    used_pct = float(latest[1])
-    weekly_account = latest[4]
-    # Five-hour readings may be newer held observations, but must remain on
-    # the account that supplied the displayed weekly reading. The reading is
-    # the newest five-hour READING under this card's own week and as-of scope
-    # (#825/#832 spec 4.7 revision 7, the one shared selection): the newest
-    # sample can be a retired replica or a weekly-only reading, which carries
-    # no five-hour value and used to render as 0 %.
-    five_hour = _current_week_five_hour_reading(
-        conn, now_utc, week_scope, account_key=weekly_account,
-        week_start_at=week_start_at,
-        week_start_before_override=week_start_before_override)
+            conn, now_utc, skip_sync=skip_sync, reading_errors=reading_errors)
+    import _lib_snapshot_cache
+    # #1018 twin spec 5.3: the card's evidence reads, the confirming-reading
+    # lookup included, share ONE stats snapshot, released before the cost
+    # aggregation below.
+    with _lib_snapshot_cache.one_read_snapshot(conn):
+        # #769 S11 (#824): ONE read, held-inclusive, split per axis below.
+        # Retain the owner of the exact non-held weekly sample this card displays,
+        # including when one real account coexists with unattributed history. R8
+        # controls decoration, not the physical population used for computation.
+        # Cost and forecast retain their existing merged semantics.
+        fetched = _fetch_current_week_snapshots(
+            conn, now_utc, include_held=True, include_account=True,
+            include_scope=True, include_journal_id=True)
+        if fetched is None:
+            return None
+        week_start_at, week_end_at, observations, week_scope = fetched
+        if not observations:
+            return None
+        week_start_before_override = week_start_at
+        # Mirror the reset override applied by `_load_forecast_inputs` so the
+        # Current Week card's spent_usd and $/1% reflect the post-reset window.
+        week_start_at, observations = _apply_midweek_reset_override(
+            conn, week_start_at, week_end_at, observations, now_utc=now_utc
+        )
+        if not observations:
+            return None
+        # Held-inclusive sample shape: (captured_at_utc, weekly_percent,
+        # five_hour_percent, weekly_observation_held, account_key, journal_id).
+        # The account key identifies the displayed weekly sample's owner, and
+        # its journal id the originating observation (#1018 twin).
+        # The helper does not surface five_hour_resets_at; the five-hour reading
+        # selected below supplies it, with its percentage.
+        #
+        # #769 S11 (#824). This card publishes BOTH axes, and the dashboard
+        # envelope reads `used_pct` and `latest_snapshot_at` straight off it for
+        # `current_week.freshness` and `snapshot_age_seconds`. A held row carries
+        # an older row's weekly value under this tick's capture instant, so
+        # letting one reach `latest` would present stale weekly evidence as freshly
+        # captured — review finding 5. The five-hour percentage takes the newest
+        # observation of either kind, because a held row is written exactly when
+        # its five-hour reading grew.
+        weekly_samples = [s for s in observations if not s[3]]
+        if not weekly_samples:
+            return None
+        latest = weekly_samples[-1]
+        used_pct = float(latest[1])
+        weekly_account = latest[4]
+        # Five-hour readings may be newer held observations, but must remain on
+        # the account that supplied the displayed weekly reading. The reading is
+        # the newest five-hour READING under this card's own week and as-of scope
+        # (#825/#832 spec 4.7 revision 7, the one shared selection): the newest
+        # sample can be a retired replica or a weekly-only reading, which carries
+        # no five-hour value and used to render as 0 %.
+        five_hour = _current_week_five_hour_reading(
+            conn, now_utc, week_scope, account_key=weekly_account,
+            week_start_at=week_start_at,
+            week_start_before_override=week_start_before_override)
+        reading_scope, reading_at, reading_retry = _tui_card_reading(
+            conn, reading_errors=reading_errors, journal_id=latest[5], account_key=weekly_account,
+            weekly_percent=latest[1], segment_start=week_start_at,
+            week_start_date=week_scope[0],
+            nominal_start=week_start_before_override,
+            week_end_at=week_end_at, now_utc=now_utc)
     five_hr_pct = None if five_hour is None else five_hour.percent
     # #556 S1 §3.3: one walk yields both halves. The range is whatever
     # `spent_usd` already used — taken AFTER `_apply_midweek_reset_override`
@@ -1953,8 +2269,11 @@ def _tui_build_current_week(
     # Suppress stale resets that have already elapsed so renderers don't
     # show "resets 0h 00m" or a negative duration at the boundary.
     five_hr_resets_at = _tui_five_hour_resets_at(five_hour, now_utc)
-    # Freshness — label/age from the displayed sample vs. now.
-    freshness_label, freshness_age = _tui_card_freshness(latest[0], now_utc)
+    # Freshness — label/age from the newest genuine reading confirming the
+    # displayed value (#1018 twin spec 5.3), not the stored row: equal
+    # readings are deduplicated out of `weekly_usage_snapshots`, so a healthy
+    # flat stream leaves that row arbitrarily old.
+    freshness_label, freshness_age = _tui_card_freshness(reading_at, now_utc)
     return TuiCurrentWeek(
         week_start_at=week_start_at,
         week_end_at=week_end_at,
@@ -1971,6 +2290,9 @@ def _tui_build_current_week(
             account_key=weekly_account,
         ),
         total_tokens=total_tokens,
+        latest_weekly_reading_at=reading_at,
+        weekly_reading_scope=reading_scope,
+        weekly_reading_retry=reading_retry,
     )
 
 
@@ -2600,7 +2922,12 @@ def _snapshot_data_version(sig) -> str:
     # with no retired snapshot and no unavailable five-hour join, so it is
     # byte-neutral there.
     retired = getattr(sig, "claude_weekly_retired_digest", "")
-    return out if not retired else f"{out}.r{retired}"
+    out = out if not retired else f"{out}.r{retired}"
+    # #1050 spec 4.5 item 2: the Claude content revision leg, so an in-place
+    # rewrite of a published Claude row revalidates the browser. `""` on a
+    # never-mutated store, so its bytes are unchanged.
+    revision = getattr(sig, "claude_content_revision", "")
+    return out if not revision else f"{out}.c{revision}"
 
 
 def _tui_evidence_eligible_at(conn, as_of_utc: dt.datetime) -> "dt.datetime | None":
@@ -2972,6 +3299,50 @@ def _tui_claude_domain_freshness(
     return {"hero": accounting, "quota": quota, "sessions": "fresh"}
 
 
+def _tui_claude_with_current_week_freshness(
+    state: SourceDashboardState,
+    freshness: "Mapping[str, object] | None",
+) -> SourceDashboardState:
+    """``state`` publishing ``freshness`` as its current-week freshness: both
+    source copies (``hero.current_week.freshness``,
+    ``quota.current_week.freshness``) and the quota domain clock, which is
+    `stale` exactly when that label is (`_tui_claude_domain_freshness`'s
+    rule, None -> `fresh`). For the ticks that keep a Claude state without
+    rebuilding it (#1018 twin spec 5.5): the idle clock and exact-version
+    reuse. Returns ``state`` itself when nothing changes; never mutates it."""
+    if state.source != "claude" or not isinstance(state.data, Mapping):
+        return state
+    value = None if freshness is None else _tui_source_copy(dict(freshness))
+    data = dict(state.data)
+    changed = False
+    for domain in ("hero", "quota"):
+        section = data.get(domain)
+        current_week = (
+            section.get("current_week") if isinstance(section, Mapping)
+            else None)
+        if not isinstance(current_week, Mapping):
+            continue
+        if current_week.get("freshness") == value:
+            continue
+        data[domain] = {
+            **dict(section),
+            "current_week": {**dict(current_week), "freshness": value},
+        }
+        changed = True
+    domain_freshness = dict(state.domain_freshness or {})
+    quota = (
+        "stale" if isinstance(value, dict) and value.get("label") == "stale"
+        else "fresh")
+    if domain_freshness.get("quota") != quota:
+        domain_freshness["quota"] = quota
+        changed = True
+    if not changed:
+        return state
+    refreshed = dataclasses.replace(
+        state, data=data, domain_freshness=domain_freshness)
+    return state if refreshed == state else refreshed
+
+
 def _refresh_claude_budget_clock(
     state: SourceDashboardState,
     *,
@@ -3026,8 +3397,13 @@ def _refresh_claude_source_clock(
     current_week: object,
     now_utc: dt.datetime,
     raw_config: dict[str, object],
+    refresh_current_week: bool = True,
 ) -> SourceDashboardState:
-    """Advance Claude's weekly axes from frozen snapshot evidence only."""
+    """Advance Claude's weekly axes from frozen snapshot evidence only.
+
+    ``refresh_current_week`` False (the idle tick's confirming-reading lookup
+    failed, #1018 twin spec 5.5) keeps the prior current-week freshness
+    copies and quota clock; the accounting and budget legs still run."""
     if state.source != "claude":
         return state
     if now_utc.tzinfo is None or now_utc.utcoffset() is None:
@@ -3047,30 +3423,20 @@ def _refresh_claude_source_clock(
         ).astimezone(dt.timezone.utc)
         else "stale"
     )
-    captured = getattr(current_week, "latest_snapshot_at", None)
-    if isinstance(captured, dt.datetime):
-        if captured.tzinfo is None or captured.utcoffset() is None:
-            captured = captured.replace(tzinfo=dt.timezone.utc)
-        age_seconds = max(
-            0.0,
-            (
-                now_utc.astimezone(dt.timezone.utc)
-                - captured.astimezone(dt.timezone.utc)
-            ).total_seconds(),
-        )
-        try:
-            freshness_config = _get_oauth_usage_config(raw_config)
-        except Exception:
-            freshness_config = _OAUTH_USAGE_DEFAULTS
-        domain_freshness["quota"] = (
-            "stale"
-            if _freshness_label(age_seconds, freshness_config) == "stale"
-            else "fresh"
-        )
-    refreshed = dataclasses.replace(
-        state,
-        domain_freshness=domain_freshness,
-    )
+    # #1018 twin spec 5.4: the quota axis and the source copies of the
+    # current-week freshness follow the card's newest CONFIRMING reading,
+    # recomputed on every tick — including to None, where the quota axis is
+    # `fresh` (a null age is unknown, not old) rather than the value a prior
+    # tick left. The stored row's `latest_snapshot_at` no longer feeds it.
+    freshness_config = _tui_oauth_usage_cfg(raw_config)
+    refreshed = dataclasses.replace(state, domain_freshness=domain_freshness)
+    if refresh_current_week:
+        import _cctally_dashboard_envelope
+        freshness = _cctally_dashboard_envelope.current_week_freshness(
+            getattr(current_week, "latest_weekly_reading_at", None),
+            now_utc=now_utc, oauth_usage_cfg=freshness_config)
+        refreshed = _tui_claude_with_current_week_freshness(
+            refreshed, freshness)
     # #556 S5 §3.7: the budget leg runs on the pure-idle path too. It is the
     # SAME helper the bundle builder calls after every other branch, so the two
     # paths cannot drift.
@@ -4106,8 +4472,29 @@ def _tui_build_source_bundle(
     raw_config: dict[str, object] | None = None,
     attempt: dict[str, bool] | None = None,
     evidence_eligible_at: dt.datetime | None = None,
+    claude_input_identity,
+    codex_speed: str | None = None,
 ) -> SourceDashboardBundle:
     """Build one frozen source bundle after the dashboard's coordinated ingest.
+
+    ``claude_input_identity`` (#1050 spec 4.5 items 3-5), REQUIRED with no
+    default, is ``(SnapshotSignature, ContentRevision)``: the dispatch read
+    under which the supplied Claude inputs (``claude_data``,
+    ``projects_envelope``, the cost and token totals) were assembled — this
+    tick's dispatch read on the full path, the idle tick's on the bounded
+    adapter. An identity certifies only data read after it, so every
+    signature-derived `claude_version` leg comes from it, never from this
+    builder's own later start read. Movement against it alone never rejects
+    the build (spec 4.5 item 5, revision 6): only the start-read-to-post-build
+    bracket does. ``None`` (no dispatch identity could be
+    read this tick) certifies under the start read with a fresh nonce leg,
+    so that source is never reused by exact version.
+
+    ``codex_speed`` (#1050 spec 4.7) is the resolved Codex service tier this
+    tick captured beside its dispatch read (`_tui_resolve_codex_speed`), the
+    fifth element of the dispatch key: Codex construction, ``codex_version``
+    and every Codex cycle stamp use that one value rather than resolving the
+    tier again. ``None`` (a direct caller) resolves it here.
 
     ``evidence_eligible_at`` (#836, spec 5.7 item 2) is the build's
     `DataSnapshot.evidence_eligible_at`; it enters the Claude version only
@@ -4218,6 +4605,7 @@ def _tui_build_source_bundle(
         semantics = resolve_dashboard_source_semantics(
             raw_config if raw_config is not None else c.load_config(),
             display_tz_name=display_tz_name,
+            speed=codex_speed,
         )
         # `codex_stats_digest`'s relation table reads `quota_projection_state`
         # and `quota_window_blocks` from a pure kernel that may not import
@@ -4263,6 +4651,16 @@ def _tui_build_source_bundle(
                 claude_stats_digest=claude_digest,
                 claude_weekly_retired_digest=retired_digest,
             )
+        # #1050 spec 4.5 items 3-4: the identity the supplied Claude inputs
+        # were assembled under. `signature` above stays the builder's own
+        # start read: Codex is built from this builder's reads, and the
+        # Claude carriers below are captured inside this pin.
+        if claude_input_identity is None:
+            input_signature = signature._replace(
+                claude_content_revision=_content_revision.revision_leg(
+                    _TUI_UNREADABLE_CONTENT_REVISION))
+        else:
+            input_signature, _ = claude_input_identity
         # #857: the Codex quota-dependency identity, read on the SAME pinned
         # cache snapshot the Codex capture below reads, so a generation built
         # this tick is stamped with exactly the inputs it saw — never with a
@@ -4321,20 +4719,34 @@ def _tui_build_source_bundle(
             week_start_name=semantics.week_start_name,
         )
         _budget_suffix = f":b{_budget_identity}" if _budget_identity else ""
+        # #1050 spec 4.5 item 4: every signature-derived leg is the INPUT
+        # identity's. On `main` they came from `signature`, read after the
+        # supplied values were assembled, so an append or a correction landing
+        # in between certified the older values under the newer legs and every
+        # later tick reused that source by exact version.
         claude_version = (
-            f"claude:{signature.max_entry_id}:{signature.entry_mutation_seq}:"
-            f"{signature.max_wus_id}:{signature.max_wcs_id}:"
-            f"{signature.reset_sig[0]}:{signature.reset_sig[1]}:"
-            f"{signature.generation}:{semantics.claude_identity}"
+            f"claude:{input_signature.max_entry_id}:"
+            f"{input_signature.entry_mutation_seq}:"
+            f"{input_signature.max_wus_id}:{input_signature.max_wcs_id}:"
+            f"{input_signature.reset_sig[0]}:{input_signature.reset_sig[1]}:"
+            f"{input_signature.generation}:{semantics.claude_identity}"
             f":p{_period_identity}{_budget_suffix}{_acct_suffix}"
-            f"{_aggregate_suffix}:x{claude_digest}"
+            f"{_aggregate_suffix}:x{input_signature.claude_stats_digest}"
         )
         # #836 spec 5.7: exact-version reuse compares this string, so a
         # retirement or restoration (`:r`) and a tick that admits evidence an
         # earlier one excluded (`:e`) both refuse the prior Claude object. Each
         # is appended only when set, so other stores keep their version bytes.
-        if retired_digest:
-            claude_version = f"{claude_version}:r{retired_digest}"
+        if input_signature.claude_weekly_retired_digest:
+            claude_version = (
+                f"{claude_version}:r"
+                f"{input_signature.claude_weekly_retired_digest}")
+        # #1050 spec 4.5 item 4: the content revision leg (`""` on a
+        # never-mutated store, so its version bytes are unchanged; a nonce on
+        # an untrusted one, so that source is never reused).
+        if input_signature.claude_content_revision:
+            claude_version = (
+                f"{claude_version}:c{input_signature.claude_content_revision}")
         if evidence_eligible_at is not None:
             claude_version = f"{claude_version}:e{_iso_z(evidence_eligible_at)}"
         # #836 spec 5.7: the decorated-only fragment. A decorated Claude source
@@ -4404,6 +4816,19 @@ def _tui_build_source_bundle(
             # the life of the process. Gate 1 is the bundle-level idle guard.
             if claude is not None and aggregate_scope_failed(claude):
                 claude = None
+            # #1018 twin spec 5.5: a reused (or retained) Claude state is the
+            # PRIOR object, whose current-week freshness copies and quota
+            # clock were derived at its build instant. The version deliberately
+            # excludes that freshness (it moves with the clock), so republish
+            # it from this build's freshly derived card instead.
+            if claude is not None and claude is prior_claude and (
+                    isinstance(claude_data, Mapping)):
+                _hero = claude_data.get("hero")
+                _cw = (_hero.get("current_week")
+                       if isinstance(_hero, Mapping) else None)
+                if isinstance(_cw, Mapping):
+                    claude = _tui_claude_with_current_week_freshness(
+                        claude, _cw.get("freshness"))
         if codex_ingest_failed:
             warning = SourceDashboardWarning(
                 "source_ingest_failed", "Source ingest failed.", "ingest",
@@ -4854,6 +5279,24 @@ def _tui_build_source_bundle(
         # and the settle window guarantees the next commit a newer timestamp
         # even on a coarse-timestamp filesystem. So these reads rescan and see
         # the new generation (#857; `_stats_relations_digest_signal`).
+        #
+        # #1050 spec 4.5 item 5 (revision 6): only this bracket — the
+        # builder's start read against the post-build read, #857's terms —
+        # rejects a build. A movement only against the Claude INPUT identity
+        # (the dispatch read: a cache leg between it and the pinned start
+        # read, or a stats leg, the retired digest or the content revision
+        # between it and the post-build read) publishes the build, warm or
+        # cold. That is safe because the Claude version names the dispatch
+        # read, which precedes every supplied Claude value, and every such leg
+        # is a dispatch-key leg the next tick reads again: whatever moved
+        # makes the next tick non-idle, so it rebuilds and this source is
+        # never reused by exact version. Rejecting instead would discard the
+        # whole warm build, Codex part included, whenever a hook-tick cache
+        # sync or a status-line ingest committed inside the dispatch-to-start
+        # window — continuously under active use, and never rejected by
+        # `main`, whose bracket starts at the start read. Nothing compares
+        # against the input identity here, so the post-build read re-reads
+        # neither the content revision nor the retired digest.
         with _perf.phase("source.reconciliation"):
             post_stats_digest = codex_stats_digest(stats_conn)
             post_accounts_digest = accounts_identity_digest(stats_conn)
@@ -5427,6 +5870,9 @@ def _tui_build_snapshot_once(
         # The signature is computed AFTER the top-of-rebuild ingest so a fresh
         # tail-ingested row is reflected before the idle decision is made.
         dispatch_key = None
+        # #1050: `(dispatch_sig, its ContentRevision)`, set with the dispatch
+        # read below; `None` when no dispatch identity was established.
+        claude_input_identity = None
         # #300: the change signal surfaced on the dashboard envelope. Empty
         # unless a dispatch signature is computed below (the non-precompute /
         # TUI path never consumes it). The idle short-circuit carries the prior
@@ -5436,6 +5882,9 @@ def _tui_build_snapshot_once(
         _sc = None
         prior_key = None
         prior_snap = None
+        # #1050: this tick's resolved Codex tier, captured with the dispatch
+        # read below (`None` off the dashboard path, which builds no sources).
+        codex_speed = None
         if precompute_envelope:
             # The last published provider generation is independently useful
             # when calculating today's signature fails.  Read it before the
@@ -5455,19 +5904,41 @@ def _tui_build_snapshot_once(
             except Exception as exc:
                 capture_failure("prior-source-bundle", "other", exc)
             dispatch_sig = None
+            # #1050: the content revision read with `dispatch_sig`, or `None`.
+            dispatch_content_revision = None
             # #857: the Codex quota-dependency identity, read on the
             # signature's own cache handle. An unreadable identity is `None`.
             codex_dependency = None
             # #1015 spec 5.4: the calibration dependency, read on this tick's
             # own stats connection (`_tui_read_calibration_dependency`).
             calibration_dependency = None
+            # #1050 spec 4.7 (H5): the resolved Codex service tier, read once
+            # beside the dispatch read. It comes from Codex's own `config.toml`
+            # roots, which neither database nor `raw_config` covers, so it is
+            # the dispatch key's fifth element, and the same value reaches
+            # Codex construction and every Codex cycle stamp below.
             with _perf.phase("signature"):
+                codex_speed = _tui_resolve_codex_speed()
                 try:
+                    _revision_sink: list = []
                     dispatch_sig, codex_dependency = (
                         _tui_compute_dispatch_signature(
                             conn, with_codex_dependency=True,
+                            revision_sink=_revision_sink,
                         )
                     )
+                    # #1050 spec 4.5 items 1 and 3: the content revision this
+                    # dispatch read certified, the second half of the Claude
+                    # input identity every source build below is passed. An
+                    # unreadable one is recorded like any failed dispatch leg,
+                    # and its nonce leg already keeps the tick off the idle path.
+                    if _revision_sink:
+                        dispatch_content_revision, _revision_error = (
+                            _revision_sink[0])
+                        if _revision_error is not None:
+                            capture_failure(
+                                "dispatch-signature", "stats_or_cache",
+                                _revision_error)
                     calibration_dependency = (
                         _tui_read_calibration_dependency(conn))
                 except QuotaProjectionIncomplete as exc:
@@ -5482,6 +5953,15 @@ def _tui_build_snapshot_once(
                     capture_failure("dispatch-signature", "stats_or_cache", exc)
                     dispatch_sig = None
                     codex_dependency = None
+            # #1050 spec 4.5 item 3: the identity under which every Claude
+            # input this tick supplies to a source build is assembled — the
+            # legacy snapshot and Projects envelope below, or on the idle path
+            # the prior snapshot's values, whose stored key equals this read.
+            claude_input_identity = (
+                (dispatch_sig, dispatch_content_revision)
+                if dispatch_sig is not None
+                and dispatch_content_revision is not None else None
+            )
             if dispatch_sig is not None:
                 # The idle decision keys on the DB signature AND a render key
                 # that captures the config-derived inputs the composite
@@ -5511,9 +5991,12 @@ def _tui_build_snapshot_once(
                 # recorded attempt, a completed correction batch or a
                 # supersession leaves the idle path and rebuilds the forecast
                 # and the rate-change array on the next tick.
+                # #1050 spec 4.7: the resolved Codex tier is the fifth element;
+                # whole-key equality is the idle gate and the snapshot memo
+                # treats the key as opaque.
                 dispatch_key = (
                     dispatch_sig, render_key, codex_dependency,
-                    calibration_dependency,
+                    calibration_dependency, codex_speed,
                 )
                 # #300: carry the change signal onto the non-idle snapshot built
                 # below. (The idle path returns `idle_snap`, which inherits the
@@ -5552,6 +6035,8 @@ def _tui_build_snapshot_once(
                             claude_ingest_failed=claude_ingest_failed,
                             errors=errors,
                             codex_dependency=codex_dependency,
+                            claude_input_identity=claude_input_identity,
+                            codex_speed=codex_speed,
                         )
                         assert _sc is not None
                         _sc.store_dispatch_state(dispatch_key, idle_snap)
@@ -5638,10 +6123,19 @@ def _tui_build_snapshot_once(
                 except Exception as exc:
                     capture_failure("snapshot-cache-reconcile", "cache", exc)
         with _perf.phase("build.current_week"):
+            reading_errors: list[Exception] = []
             try:
-                cw = _tui_build_current_week(conn, now_utc, skip_sync=skip_sync)
+                cw = _tui_build_current_week(
+                    conn, now_utc, skip_sync=skip_sync,
+                    reading_errors=reading_errors)
             except Exception as exc:
                 capture_failure("current-week", "stats_or_cache", exc)
+            # #1018 twin review F1: the confirming-reading lookup's failure is
+            # recorded like the card's other reads (stats corruption raises
+            # the heal signal here, outside the builder's own handler) without
+            # costing the card, which keeps what the idle refresh retries.
+            for exc in reading_errors:
+                capture_failure("current-week-reading", "stats_or_cache", exc)
         fc_view = None
         with _perf.phase("build.forecast"):
             try:
@@ -5960,6 +6454,11 @@ def _tui_build_snapshot_once(
                 current_week=cw,
                 weeks_back=12,
                 use_projects_env_cache=use_projects_env_cache,
+                # #1050 spec 4.5 item 7: the dispatch leg, read before the
+                # memo lookup; `None` (no dispatch read, the TUI) reads it.
+                content_revision_leg=(
+                    claude_input_identity[0].claude_content_revision
+                    if claude_input_identity is not None else None),
             )
         except Exception as exc:
             capture_failure("projects-envelope", "stats_or_cache", exc)
@@ -6174,6 +6673,10 @@ def _tui_build_snapshot_once(
                     legacy_envelope = _cctally().snapshot_to_envelope(
                         source_snapshot,
                         now_utc=now_utc,
+                        # #1018 twin review F4: the configured freshness
+                        # thresholds, as the idle clock uses, so the Claude
+                        # source copies never flip label between ticks.
+                        oauth_usage_cfg=_tui_oauth_usage_cfg(raw_config),
                         display_tz_pref_override=display_tz_pref_override,
                         runtime_bind=runtime_bind,
                     )
@@ -6197,6 +6700,8 @@ def _tui_build_snapshot_once(
                         prior_bundle=prior_source_bundle,
                         raw_config=raw_config,
                         evidence_eligible_at=evidence_eligible_at,
+                        claude_input_identity=claude_input_identity,
+                        codex_speed=codex_speed,
                     )
                 if source_bundle is None:
                     raise RuntimeError("source bundle builder returned no bundle")
@@ -6408,7 +6913,62 @@ def _tui_open_observed_cache(c):
     return opened_file, c.open_cache_db()
 
 
-def _tui_compute_dispatch_signature(stats_conn, *, with_codex_dependency=False):
+#: The identity a read records when the Claude content revision cannot be read
+#: at all (`StatsContentRevisionUnreadable`: a malformed store, or more than one
+#: publication stamp). Untrusted exactly like ``absent``: its published leg is
+#: a fresh nonce per read, and a bracket compares it as ``("unreadable",)``.
+_TUI_UNREADABLE_CONTENT_REVISION = _content_revision.ContentRevision(
+    "unreadable", None, None)
+
+
+def _tui_read_content_revision(stats_conn):
+    """``(ContentRevision, error)`` for one read of the Claude content
+    revision (#1050 spec 4.4). An unreadable identity is never an empty one:
+    it is `_TUI_UNREADABLE_CONTENT_REVISION`, and the error is returned so the
+    dispatch read can record it in the tick's failure capture."""
+    try:
+        return _content_revision.read_claude_content_revision(stats_conn), None
+    except _content_revision.StatsContentRevisionUnreadable as exc:
+        return _TUI_UNREADABLE_CONTENT_REVISION, exc
+
+
+def _tui_read_claude_input_identity(stats_conn):
+    """``(SnapshotSignature, ContentRevision)``: the dispatch read on its
+    own, for a caller of `_tui_build_source_bundle` that has no tick (a bench,
+    a test). It must be read BEFORE the Claude inputs it is passed with are
+    assembled, exactly as the tick's dispatch read is (#1050 spec 4.5 item 3).
+    """
+    sink: list = []
+    try:
+        signature = _tui_compute_dispatch_signature(
+            stats_conn, revision_sink=sink)
+    except QuotaProjectionIncomplete:
+        # #496 S5b §4.7: a caller with no tick has no failure capture, so the
+        # typed refusal propagates as itself rather than through a broad
+        # handler that would sanitize its cause and remedy away. The typed
+        # handler is also what satisfies
+        # `tests/test_selector_state_496_s5b.py::test_the_tui_catches_the_refusal_before_its_broad_handlers`,
+        # which counts one at every tick-less caller of the dispatch read.
+        raise
+    return signature, sink[0][0]
+
+
+def _tui_resolve_codex_speed() -> str:
+    """The resolved Codex service tier for this tick (#1050 spec 4.7).
+
+    ``_resolve_codex_speed('auto')`` is the CLI's only tier resolver, and it
+    already treats an absent or unreadable ``config.toml`` as contributing
+    nothing; any other failure takes the same answer, ``standard``, so the
+    dispatch key's fifth element is always a deterministic string.
+    """
+    try:
+        return str(_cctally()._resolve_codex_speed("auto"))
+    except Exception:  # noqa: BLE001 — a tier read must never fail a tick
+        return "standard"
+
+
+def _tui_compute_dispatch_signature(stats_conn, *, with_codex_dependency=False,
+                                    revision_sink=None):
     """Composite data-version signature for the three-path dispatch (#268 M5.1).
 
     Cheap ``MAX(id)`` b-tree descents over cache.db + stats.db, the reset-event
@@ -6427,6 +6987,15 @@ def _tui_compute_dispatch_signature(stats_conn, *, with_codex_dependency=False):
     an older signature with a newer identity in one dispatch key. The tick
     pays no second connection for it. ``None`` when it cannot be established,
     which the idle gate treats as "rebuild".
+
+    #1050 spec 4.5 item 1: the stats.db Claude content revision is read here,
+    beside the other stats legs and before every builder, and its published
+    leg is the signature's ``claude_content_revision``. ``revision_sink``, a
+    list, receives ``(ContentRevision, error)``: the identity the tick passes
+    to `_tui_build_source_bundle` as its Claude input identity, and the
+    `StatsContentRevisionUnreadable` (else ``None``) the tick records in its
+    failure capture. An unreadable revision never idles the tick: its leg is a
+    fresh nonce, like every untrusted state's.
     """
     c = _cctally()
     sc = c._load_sibling("_lib_snapshot_cache")
@@ -6435,6 +7004,9 @@ def _tui_compute_dispatch_signature(stats_conn, *, with_codex_dependency=False):
     # projection tables from a pure kernel (#496 S5b section 4.7).
     from _cctally_quota import assert_projection_readable
     assert_projection_readable(stats_conn)
+    content_revision, revision_error = _tui_read_content_revision(stats_conn)
+    if revision_sink is not None:
+        revision_sink.append((content_revision, revision_error))
     if with_codex_dependency:
         opened_file, cache_conn = _tui_open_observed_cache(c)
     else:
@@ -6454,6 +7026,8 @@ def _tui_compute_dispatch_signature(stats_conn, *, with_codex_dependency=False):
                 claude_stats_digest=claude_stats_digest(stats_conn),
                 claude_weekly_retired_digest=(
                     claude_weekly_retired_digest(stats_conn)),
+                claude_content_revision=_content_revision.revision_leg(
+                    content_revision),
             )
             if not with_codex_dependency:
                 return signature
@@ -6562,7 +7136,9 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                              claude_ingest_failed=False,
                              failures=None,
                              stats_heal_attempted=False,
-                             codex_dependency):
+                             codex_dependency,
+                             claude_input_identity,
+                             codex_speed=None):
     """Fresh snapshot reusing ``prior``'s heavy rows, re-patching only the
     time-derived fields + the doctor payload / envelope precompute on each idle
     tick (spec §3 idle path).
@@ -6593,6 +7169,13 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
     ``codex_dependency`` (#857) is this tick's Codex quota-dependency identity,
     REQUIRED with no default for the reason `_tui_source_bundle_can_idle`
     states: ``None`` idles no Codex generation.
+
+    ``claude_input_identity`` (#1050 spec 4.5 item 3) is this idle tick's
+    dispatch read, ``(SnapshotSignature, ContentRevision)``, REQUIRED with no
+    default: the bounded source adapter below supplies ``prior``'s Claude
+    values, which were built under the stored key this read equals, so this
+    read is the identity that certifies them — never the adapter's own later
+    start read.
     """
     import time
     doctor_payload = prior.doctor_payload
@@ -6607,6 +7190,32 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
         except Exception as exc:  # noqa: BLE001 — never crash the rebuild
             errors.append(f"envelope-precompute: {exc}")
     idle_failures = failures if failures is not None else []
+    # #1018 twin spec 5.5: the idle tick re-runs the card's confirming-reading
+    # lookup and re-derives its freshness at this instant, because a flat
+    # reading adds an index row but no stored row and leaves the dispatch
+    # signature unchanged. The card is replaced, never mutated; on a stats
+    # error the prior card (and below, the prior source copies) is kept and
+    # the failure is captured like the source adapter's own.
+    current_week = prior.current_week
+    current_week_refresh_failed = False
+    if current_week is not None and source_stats_conn is not None:
+        try:
+            current_week = refresh_current_week_reading(
+                current_week, source_stats_conn, now_utc,
+                oauth_usage_cfg=_tui_oauth_usage_cfg(raw_config))
+        except sqlite3.Error as exc:
+            current_week = prior.current_week
+            current_week_refresh_failed = True
+            _tui_capture_sync_failure(
+                source_stats_conn,
+                errors,
+                idle_failures,
+                leg="current-week-refresh",
+                database="stats_or_cache",
+                exc=exc,
+                stats_heal_attempted=stats_heal_attempted,
+            )
+    current_week_refreshed = current_week is not prior.current_week
     source_bundle = prior.source_bundle
     # #857: whether the bounded source adapter below scheduled the Codex pass.
     source_attempt: dict[str, bool] = {}
@@ -6637,9 +7246,10 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
             ):
                 claude = _refresh_claude_source_clock(
                     prior_claude,
-                    current_week=prior.current_week,
+                    current_week=current_week,
                     now_utc=now_utc,
                     raw_config=raw_config,
+                    refresh_current_week=not current_week_refresh_failed,
                 )
                 codex = refresh_codex_source_clock(prior_codex, now_utc=now_utc)
                 if claude is not prior_claude or codex is not prior_codex:
@@ -6658,7 +7268,10 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                 # data signature (notably after its post-projection certificate
                 # is written). Re-run only the bounded source adapter while
                 # preserving the already-idle legacy snapshot rows.
-                source_snapshot = prior
+                source_snapshot = (
+                    dataclasses.replace(prior, current_week=current_week)
+                    if current_week_refreshed else prior
+                )
                 if source_snapshot.doctor_payload is None:
                     source_snapshot = dataclasses.replace(
                         source_snapshot,
@@ -6672,6 +7285,10 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                 legacy_envelope = _cctally().snapshot_to_envelope(
                     source_snapshot,
                     now_utc=now_utc,
+                    # #1018 twin review F4: the configured freshness
+                    # thresholds, as the idle clock uses, so the Claude
+                    # source copies never flip label between ticks.
+                    oauth_usage_cfg=_tui_oauth_usage_cfg(raw_config),
                     display_tz_pref_override=display_tz_pref_override,
                     runtime_bind=runtime_bind,
                 )
@@ -6697,6 +7314,8 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                     attempt=source_attempt,
                     evidence_eligible_at=getattr(
                         prior, "evidence_eligible_at", None),
+                    claude_input_identity=claude_input_identity,
+                    codex_speed=codex_speed,
                 )
         except _StatsSnapshotCorruption:
             raise
@@ -6748,6 +7367,7 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
             )
     return dataclasses.replace(
         prior,
+        current_week=current_week,
         generated_at=now_utc,
         # #583 S2 §6.1: `last_sync_at` means "last SUCCESSFUL validation". A
         # clean idle tick IS one — it re-verified through four independent
@@ -6794,8 +7414,18 @@ def _tui_stats_retry_degraded_snapshot(
     precompute_envelope: bool,
     runtime_bind: "str | None",
 ) -> DataSnapshot:
-    """Return a stable typed frame when the one fresh retry cannot open."""
+    """Return a stable typed frame when the one fresh retry cannot open.
 
+    Two cases share this helper and must stay distinguishable (#932 §4.1): a
+    heal that DEFERRED (``exc`` is a `StatsRebuildDeferred`) builds the same
+    explicit deferral frame the thrown path builds — hydrating, the hydrating
+    source bundle, and the doctor placeholder plus the rebuild-worker
+    aggregate, never the full doctor gather, which opens the index the
+    detached heal owns. An exhausted corruption retry keeps the terminal frame
+    (full doctor, ``hydrating=False``, ``deferred`` false).
+    """
+
+    deferral = isinstance(exc, _cctally().StatsRebuildDeferred)
     errors = [f"stats-open: {exc}"]
     doctor_payload = None
     envelope_precompute = None
@@ -6804,26 +7434,53 @@ def _tui_stats_retry_degraded_snapshot(
             envelope_precompute = _tui_precompute_envelope_config(load_config())
         except Exception as precompute_exc:  # noqa: BLE001
             errors.append(f"envelope-precompute: {precompute_exc}")
-        try:
-            doctor_payload = _tui_precompute_doctor_payload(now_utc, runtime_bind)
-        except Exception as doctor_exc:  # noqa: BLE001
-            errors.append(f"doctor-precompute: {doctor_exc}")
-    return dataclasses.replace(
-        _tui_empty_snapshot(now_utc),
+        if deferral:
+            doctor_payload = _deferred_doctor_placeholder(now_utc)
+            doctor_payload["rebuild_worker"] = _tui_rebuild_worker_value(now_utc)
+        else:
+            try:
+                doctor_payload = _tui_precompute_doctor_payload(
+                    now_utc, runtime_bind)
+            except Exception as doctor_exc:  # noqa: BLE001
+                errors.append(f"doctor-precompute: {doctor_exc}")
+    replacements = {
         # #583 S2 §6.1: this produced no successful snapshot, and it builds
         # from the empty snapshot, so there is no earlier success to preserve.
-        last_sync_at=None,
-        last_sync_error="; ".join(errors),
-        sync_failures=(
-            SyncFailureAttribution(
+        "last_sync_at": None,
+        "last_sync_error": "; ".join(errors),
+        "sync_failures": (
+            _tui_deferral_attribution(exc) if deferral
+            else SyncFailureAttribution(
                 leg="stats-open",
                 database="stats",
                 corruption=_stats_open_failure_is_corruption(exc),
             ),
         ),
-        doctor_payload=doctor_payload,
-        envelope_precompute=envelope_precompute,
-        hydrating=False,
+        "doctor_payload": doctor_payload,
+        "envelope_precompute": envelope_precompute,
+        "hydrating": deferral,
+    }
+    if deferral:
+        replacements["source_bundle"] = _tui_hydrating_source_bundle()
+    return dataclasses.replace(_tui_empty_snapshot(now_utc), **replacements)
+
+
+def _tui_is_hydrating_source_bundle(bundle) -> bool:
+    """True iff ``bundle`` is the bootstrap shape `_tui_hydrating_source_bundle`
+    builds: both PROVIDER states' ``data_version`` starts ``hydrating:``.
+
+    The ``all`` state is a composition of the two (`compose_all_state`), with a
+    hashed version of its own, so it is not part of the test.
+    """
+    if bundle is None:
+        return False
+    try:
+        states = [bundle.sources[name] for name in ("claude", "codex")]
+    except Exception:  # noqa: BLE001 — an unexpected shape is not bootstrap
+        return False
+    return all(
+        str(getattr(state, "data_version", "")).startswith("hydrating:")
+        for state in states
     )
 
 
@@ -7208,8 +7865,12 @@ class _TuiSyncThread:
                     display_tz_pref_override=self._display_tz_pref_override,
                 )
                 self._ref.set(snap)
-            except Exception as exc:
+            except (Exception, _cctally().StatsRebuildDeferred) as exc:
                 # Don't crash the thread on unexpected errors — surface in UI.
+                # #932 §4.5: a stats deferral is a `BaseException`, and one
+                # raised by a later rebuild used to end this thread, leaving
+                # the TUI on its last frame forever; it is carried like any
+                # other error and the next interval retries.
                 # Carry every additive view-model scalar through verbatim so
                 # the prior frame's panel rows and their envelope totals stay
                 # consistent. Bundle 1 / #56 / #57 / #59 each added envelope
@@ -7227,7 +7888,10 @@ class _TuiSyncThread:
                     trend=prev.trend,
                     sessions=prev.sessions,
                     last_sync_at=prev.last_sync_at,
-                    last_sync_error=f"sync crashed: {exc}",
+                    last_sync_error=(
+                        f"stats-open: {exc}"
+                        if isinstance(exc, _cctally().StatsRebuildDeferred)
+                        else f"sync crashed: {exc}"),
                     generated_at=dt.datetime.now(dt.timezone.utc),
                     percent_milestones=prev.percent_milestones,
                     # Carry the navigation index forward on a sync crash so the
@@ -7357,9 +8021,13 @@ def _tui_panel_current_week(
     # Freshness chip (Task C6 / spec §3.4). Hidden when label is None or
     # 'fresh'; rendered dim for 'aging', warn (amber) for 'stale'. Mirrors
     # the dashboard CurrentWeekPanel chip in dashboard/web/src/panels/.
-    if cw.freshness_label and cw.freshness_label != "fresh":
+    # #1018 twin spec 5.4: the time names the confirming weekly reading the
+    # label ages from, not the stored row (`last snapshot:` above keeps that).
+    reading_at = getattr(cw, "latest_weekly_reading_at", None)
+    if (cw.freshness_label and cw.freshness_label != "fresh"
+            and isinstance(reading_at, dt.datetime)):
         captured_hms = format_display_dt(
-            cw.latest_snapshot_at, runtime.display_tz,
+            reading_at, runtime.display_tz,
             fmt="%H:%M:%S", suffix=False,
         )
         chip_style = "warn" if cw.freshness_label == "stale" else "dim"
@@ -9275,6 +9943,45 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 data_version="dashboard-publisher")
         return snapshot
 
+    def _publish_stats_deferral(tick, exc) -> None:
+        """Publish the pending deferral frame for ``exc`` (#453, #932).
+
+        The one construction both deferral entry points share: a thrown
+        `StatsRebuildDeferred`, and a maintenance-busy open while a detached
+        recovery holds maintenance over a held deferral frame. The prior frame
+        is kept; only the rebuild-worker aggregate, the explicit attribution,
+        the latch and the clock change.
+        """
+        prev = ref.get()
+        # #997 D10: the doctor gather cannot run during the deferral, so
+        # refresh only the rebuild-worker aggregate the chip leads with.
+        # #932 G1: the pinned clock when there is one, as every pinned build
+        # is stamped; a wall-clock stamp would be "newer" than every later
+        # pinned frame, and the client's time-order guard would drop them all.
+        deferred_now = pinned_now or dt.datetime.now(dt.timezone.utc)
+        prev_doctor = getattr(prev, "doctor_payload", None)
+        base_doctor = (prev_doctor if isinstance(prev_doctor, dict)
+                       else _deferred_doctor_placeholder(deferred_now))
+        doctor_payload = {
+            **base_doctor,
+            "rebuild_worker": _tui_rebuild_worker_value(
+                deferred_now,
+                fallback=base_doctor.get("rebuild_worker")),
+        }
+        pending = dataclasses.replace(
+            prev,
+            doctor_payload=doctor_payload,
+            last_sync_error=f"stats-open: {exc}",
+            # #932 §4.1: explicit, so a frozen dashboard's settle loop
+            # knows this retry deferred again and keeps going.
+            sync_failures=(_tui_deferral_attribution(exc),),
+            generated_at=deferred_now,
+            hydrating=True,
+        )
+        pending = ref.set(pending)   # #583 S2 §6.2: publish what is held
+        tick.mark_degraded()
+        _tui_publish_final(tick, hub, pending, publication="degraded")
+
     def _locked(skip_sync: bool) -> None:
         # #279 S5 F6.3 (gate P1-1): arm the snapshot-cache owner-thread tripwire
         # for whichever thread holds sync_lock for THIS rebuild — the periodic
@@ -9287,6 +9994,9 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
         # all inside it. The A1 pre-bind seed is deliberately outside, because
         # it bypasses `_tui_build_snapshot` and writes no dispatch state.
         tick = _tick_stats.begin_tick()
+        # #932 F1: the frame held before this tick, which decides whether a
+        # maintenance-busy failure below is a recovery still running.
+        held = ref.get()
         try:
             if not skip_sync:
                 # ── Decoupled ingest + build (§2.1) ─────────────────────────
@@ -9639,7 +10349,13 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
             # chip. #278 §1.4.1: force the hydration latch clear (default False
             # from _tui_build_snapshot, restated here since this is a replace()
             # clone site).
-            snap = dataclasses.replace(snap, last_sync_at=None, hydrating=False)
+            #
+            # #932 §4.2: except on an explicit stats deferral (a heal deferral
+            # the builder RETURNED as a frame), whose latch must hold until a
+            # build the recovery permits replaces it.
+            snap = dataclasses.replace(
+                snap, last_sync_at=None,
+                hydrating=_tui_snapshot_is_stats_deferral(snap))
             # Terminal for this branch too, for the same reason: POST
             # /api/settings brackets its rebuild with the same flag pair.
             snap = ref.set_final(snap)
@@ -9655,46 +10371,41 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
             # EPOCH is a readable index (`corruption=False`); a deferred heal is
             # an index that could not be read, and reporting that as
             # non-corruption makes the envelope name the wrong fault.
-            prev = ref.get()
-            # #997 D10: the doctor gather cannot run during the deferral, so
-            # refresh only the rebuild-worker aggregate the chip leads with.
-            deferred_now = pinned_now or dt.datetime.now(dt.timezone.utc)
-            prev_doctor = getattr(prev, "doctor_payload", None)
-            base_doctor = (prev_doctor if isinstance(prev_doctor, dict)
-                           else _deferred_doctor_placeholder(deferred_now))
-            doctor_payload = {
-                **base_doctor,
-                "rebuild_worker": _tui_rebuild_worker_value(
-                    deferred_now,
-                    fallback=base_doctor.get("rebuild_worker")),
-            }
-            pending = dataclasses.replace(
-                prev,
-                doctor_payload=doctor_payload,
-                last_sync_error=f"stats-open: {exc}",
-                sync_failures=(
-                    SyncFailureAttribution(
-                        leg="stats-open",
-                        database="stats",
-                        corruption=_stats_open_failure_is_corruption(exc),
-                    ),
-                ),
-                generated_at=dt.datetime.now(dt.timezone.utc),
-                hydrating=True,
-            )
-            pending = ref.set(pending)   # #583 S2 §6.2: publish what is held
-            tick.mark_degraded()
-            _tui_publish_final(tick, hub, pending, publication="degraded")
+            _publish_stats_deferral(tick, exc)
         except Exception as exc:
+            # #932 F1: a detached recovery holds maintenance EXCLUSIVE for its
+            # whole rebuild, so a retry over a held deferral frame times out
+            # with a plain maintenance-busy error. While that recovery runs it
+            # is the same deferral, not a crash: a crash frame would end a
+            # frozen dashboard's settle loop for good. Over any other held
+            # frame, or with no recovery running, the crash path below is
+            # unchanged.
+            recovery = None
+            if (isinstance(exc, _cctally().StatsDbMaintenanceError)
+                    and _tui_snapshot_is_stats_deferral(held)):
+                recovery = _cctally().active_stats_recovery_deferral()
+            if recovery is not None:
+                _publish_stats_deferral(tick, recovery)
+                return
             prev = ref.get()
+            # #932 §4.2: a crash after a deferral must not keep the hydrating
+            # BOOTSTRAP bundle, or the cleared latch below still leaves the
+            # client in loading skeletons forever. `None` serializes as
+            # unavailable with a warning; a genuine prior bundle is kept.
+            prev_bundle = getattr(prev, "source_bundle", None)
             crashed = dataclasses.replace(
                 prev,
+                source_bundle=(
+                    None if _tui_is_hydrating_source_bundle(prev_bundle)
+                    else prev_bundle),
                 last_sync_error=f"sync crashed: {exc}",
                 # The new crash supersedes the prior typed leg failures. Keeping
                 # them would let a stale stats attribution win this unrelated
                 # failure in the privacy-safe envelope classifier.
                 sync_failures=(),
-                generated_at=dt.datetime.now(dt.timezone.utc),
+                # #932 G1: the pinned clock when there is one (see
+                # `_publish_stats_deferral`).
+                generated_at=pinned_now or dt.datetime.now(dt.timezone.utc),
                 # #278 §1.4.1: a crash-carry snapshot is stable (not mid-
                 # assembly); clear the latch even if ``prev`` was a hydrating
                 # seed/partial, so the client doesn't stay stuck in skeletons.

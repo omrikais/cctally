@@ -8,6 +8,8 @@ projection files, provider state, and alert dispatcher are never mutated.
 
 from __future__ import annotations
 
+import bisect
+import collections.abc
 import contextlib
 import copy
 import dataclasses
@@ -22,8 +24,10 @@ import signal
 import sqlite3
 import sys
 import tempfile
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 
 import _cctally_core
 import _cctally_journal as _journal
@@ -34,6 +38,7 @@ import _lib_journal
 import _lib_json_envelope
 import _lib_rebuild_progress
 import _lib_rederive
+import _lib_retained_records
 import _cctally_store
 from _cctally_store import StatsIndexNotCurrent
 
@@ -64,9 +69,9 @@ class RederiveObligationNotDurable(RederiveApplyError):
 @dataclass(frozen=True)
 class RederivePreview:
     plan: _lib_rederive.RederivePlan
-    records: tuple[dict, ...]
+    records: "Sequence[dict]"  # #1004: a RetainedRecords, or a tuple
     journal_high_water: "tuple[str, int] | None"
-    record_ends: tuple[tuple[str, int], ...]
+    record_ends: "Sequence[tuple[str, int]]"  # its ends view, or a tuple
     generated_at: str
     batch_id: "str | None"
     incomplete_batch: bool
@@ -518,29 +523,349 @@ def _joined_entries(cache_conn, range_start, range_end, *,
             sql += " AND se.account_key = ?"
             params.append(account_key)
     sql += " ORDER BY se.timestamp_utc ASC, se.id ASC"
-    out = []
-    for row in cache_conn.execute(sql, params):
-        entry = cache._JoinedClaudeEntry(
-            timestamp=dt.datetime.fromisoformat(row[0]),
-            model=row[1],
-            input_tokens=int(row[2] or 0),
-            output_tokens=int(row[3] or 0),
-            cache_creation_tokens=int(row[4] or 0),
-            cache_read_tokens=int(row[5] or 0),
-            source_path=row[6],
-            session_id=row[7],
-            project_path=row[8],
-            cost_usd=row[9],
-            usage_extra=({"speed": row[10]} if row[10] else None),
-            cache_1h_tokens=(None if row[11] is None else int(row[11])),
+    return [_joined_entry_from_row(cache, row)
+            for row in cache_conn.execute(sql, params)]
+
+
+#: The columns `_joined_entry_from_row` reads, in its row order.
+_JOINED_ENTRY_COLUMNS = (
+    "se.timestamp_utc, se.model, se.input_tokens, se.output_tokens, "
+    "se.cache_create_tokens, se.cache_read_tokens, se.source_path, "
+    "sf.session_id, sf.project_path, se.cost_usd_raw, se.speed, "
+    "se.cache_create_1h_tokens, se.line_offset, se.account_key"
+)
+
+
+def _joined_entry_from_row(cache, row):
+    """One `_JoinedClaudeEntry` from a `_JOINED_ENTRY_COLUMNS` row: the one
+    row-to-entry construction `_joined_entries` and `BlockTotalsEngine`
+    share, so an engine entry equals a fresh query's field for field."""
+    entry = cache._JoinedClaudeEntry(
+        timestamp=dt.datetime.fromisoformat(row[0]),
+        model=row[1],
+        input_tokens=int(row[2] or 0),
+        output_tokens=int(row[3] or 0),
+        cache_creation_tokens=int(row[4] or 0),
+        cache_read_tokens=int(row[5] or 0),
+        source_path=row[6],
+        session_id=row[7],
+        project_path=row[8],
+        cost_usd=row[9],
+        usage_extra=({"speed": row[10]} if row[10] else None),
+        cache_1h_tokens=(None if row[11] is None else int(row[11])),
+    )
+    # #869: the retained source identity and account of the entry. The
+    # cost path never reads these; the historical-close proof fingerprints
+    # the exact population and requires every entry to be the close's.
+    entry.source_line_offset = row[12]
+    entry.source_account_key = row[13]
+    return entry
+
+
+#: The engine's memo marker for an entry it has not priced yet.
+_UNPRICED = object()
+
+
+class _EntryRun:
+    """The cached entries of one load range start (spec D1 *Entry cache*):
+    the entries in SQL order, their raw `timestamp_utc` texts, each entry's
+    memoized cost, and ``through``, the largest end text fetched."""
+
+    __slots__ = ("entries", "texts", "costs", "through", "state_keys")
+
+    def __init__(self, through: str) -> None:
+        self.entries: list = []
+        self.texts: list = []
+        self.costs: list = []
+        self.through = through
+        self.state_keys: set = set()
+
+
+class _FoldState:
+    """One fold over a run's prefix for one owner and window set (spec D1
+    *Fold states*): the prefix length consumed, the totals, the evidence
+    sets and the run indexes of the owned entries, in order."""
+
+    __slots__ = ("consumed", "totals", "missing_without_raw", "observed_raw",
+                 "owned")
+
+    def __init__(self, totals) -> None:
+        self.consumed = 0
+        self.totals = totals
+        self.missing_without_raw: set = set()
+        self.observed_raw: set = set()
+        self.owned: list = []
+
+
+def _typed(value):
+    """A hashable spelling of one key or window field that keeps values
+    equal under ``==`` but different in type or offset apart (``1`` and
+    ``True``; two instants spelled with different offsets)."""
+    if isinstance(value, dt.datetime):
+        return ("datetime", value.isoformat())
+    return (type(value).__qualname__, value)
+
+
+class BlockTotalsEngine:
+    """#1003 D1: exact incremental `_compute_block_totals` for one scratch
+    replay over a stable cache snapshot.
+
+    The full re-price re-reads, re-partitions and re-prices every entry an
+    open block owns on every tick, so a replay's cost grows with each block's
+    age. The engine caches each load range's entries and extends them with a
+    delta fetch, keeps one fold per (range start, owner, window set) that it
+    extends by the new entries only, and prices each cached entry once. Its
+    answer equals the full re-price's: the same entries in the same order
+    (text comparisons and the delta predicate reproduce SQLite's byte order),
+    the same pure ownership rule, and the same `BlockTotals.add_priced`
+    additions in the same order.
+
+    Only `_scratch_read_adapters` installs one, so the cache connection holds
+    one read snapshot for the engine's whole life.
+    """
+
+    #: Shadow verification: every call also runs the full re-price and
+    #: raises on any difference. Set only by tests and the acceptance driver.
+    verify: ClassVar[bool] = False
+    #: Spec D1 *Bounds*: cached entries across all runs, runs, fold states.
+    ENTRY_BUDGET = 65536
+    MAX_RUNS = 64
+    MAX_STATES = 64
+
+    def __init__(self, cache_conn: sqlite3.Connection) -> None:
+        import collections
+        self._conn = cache_conn
+        self._cache = sys.modules["_cctally_cache"]
+        self._runs: "collections.OrderedDict[str, _EntryRun]" = (
+            collections.OrderedDict())
+        self._states: "collections.OrderedDict[tuple, _FoldState]" = (
+            collections.OrderedDict())
+        self._cached_entries = 0
+        self._pricing_missing: dict = {}
+        self.counts = collections.Counter()
+
+    # -- entry cache ---------------------------------------------------------
+
+    def _fetch(self, start_iso: str, end_iso: str, through: "str | None"):
+        sql = (
+            f"SELECT {_JOINED_ENTRY_COLUMNS} FROM session_entries se "
+            "LEFT JOIN session_files sf ON sf.path = se.source_path "
+            "WHERE se.timestamp_utc >= ?"
         )
-        # #869: the retained source identity and account of the entry. The
-        # cost path never reads these; the historical-close proof fingerprints
-        # the exact population and requires every entry to be the close's.
-        entry.source_line_offset = row[12]
-        entry.source_account_key = row[13]
-        out.append(entry)
-    return out
+        params = [start_iso]
+        if through is not None:
+            sql += " AND se.timestamp_utc > ?"
+            params.append(through)
+        sql += (" AND se.timestamp_utc <= ?"
+                " ORDER BY se.timestamp_utc ASC, se.id ASC")
+        params.append(end_iso)
+        return self._conn.execute(sql, params).fetchall()
+
+    def _drop_run(self, start_iso: str) -> None:
+        run = self._runs.pop(start_iso)
+        self._cached_entries -= len(run.entries)
+        for key in run.state_keys:
+            self._states.pop(key, None)
+
+    def _run_for(self, start_iso: str, end_iso: str) -> "_EntryRun | None":
+        """The run holding every entry of ``[start_iso, end_iso]`` (by text),
+        or None when that run alone would exceed the entry budget."""
+        run = self._runs.get(start_iso)
+        if run is not None:
+            self._runs.move_to_end(start_iso)
+            if end_iso <= run.through:
+                return run
+            rows = self._fetch(start_iso, end_iso, run.through)
+            self.counts["delta_fetches"] += 1
+        else:
+            rows = self._fetch(start_iso, end_iso, None)
+            self.counts["fetches"] += 1
+        held = 0 if run is None else len(run.entries)
+        if held + len(rows) > self.ENTRY_BUDGET:
+            if run is not None:
+                self._drop_run(start_iso)
+            return None
+        if run is None:
+            run = _EntryRun(end_iso)
+            self._runs[start_iso] = run
+        for row in rows:
+            run.entries.append(_joined_entry_from_row(self._cache, row))
+            run.texts.append(row[0])
+            run.costs.append(_UNPRICED)
+        run.through = end_iso
+        self._cached_entries += len(rows)
+        while (self._cached_entries > self.ENTRY_BUDGET
+               or len(self._runs) > self.MAX_RUNS):
+            oldest = next(iter(self._runs))
+            if oldest == start_iso:
+                break
+            self._drop_run(oldest)
+            self.counts["runs_evicted"] += 1
+        return run
+
+    # -- fold states ---------------------------------------------------------
+
+    def _missing_pricing(self, model) -> bool:
+        missing = self._pricing_missing.get(model)
+        if missing is None:
+            import _lib_pricing
+            missing = _lib_pricing._resolve_model_pricing(
+                model, warn=False) is None
+            self._pricing_missing[model] = missing
+        return missing
+
+    def _cost(self, run: _EntryRun, index: int) -> float:
+        cost = run.costs[index]
+        if cost is _UNPRICED:
+            entry = run.entries[index]
+            usage = _record.claude_usage_dict(   # #195 chokepoint
+                input_tokens=entry.input_tokens,
+                output_tokens=entry.output_tokens,
+                cache_creation_tokens=entry.cache_creation_tokens,
+                cache_read_tokens=entry.cache_read_tokens,
+                cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+                speed=getattr(entry, "speed", None),
+            )
+            cost = _record._calculate_entry_cost(
+                entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
+            )
+            run.costs[index] = cost
+        return cost
+
+    def _extend(self, state: _FoldState, run: _EntryRun, n: int, owner_key,
+                windows, owned_entries) -> None:
+        """Fold ``run.entries[state.consumed:n]``: each owned entry, in order,
+        is appended to ``owned_entries``, records its evidence, is priced
+        (once per run) and is folded, exactly as the full re-price does."""
+        import _lib_blocks
+        start = state.consumed
+        new = run.entries[start:n]
+        position = {id(entry): start + i for i, entry in enumerate(new)}
+        owned, _unowned = _lib_blocks.partition_entries_by_owner(new, windows)
+        for entry in owned[owner_key]:
+            index = position[id(entry)]
+            if owned_entries is not None:
+                owned_entries.append(entry)
+            if (entry.input_tokens or entry.output_tokens
+                    or entry.cache_creation_tokens or entry.cache_read_tokens):
+                if entry.cost_usd is not None:
+                    state.observed_raw.add(entry.model)
+                elif self._missing_pricing(entry.model):
+                    state.missing_without_raw.add(entry.model)
+            state.totals.add_priced(
+                entry.model, entry.project_path, entry.input_tokens,
+                entry.output_tokens, entry.cache_creation_tokens,
+                entry.cache_read_tokens, self._cost(run, index),
+            )
+            state.owned.append(index)
+        state.consumed = n
+
+    def _state_key(self, start_iso: str, owner_key, windows) -> "tuple | None":
+        signature = []
+        for window in windows:
+            if not dataclasses.is_dataclass(window):
+                return None
+            signature.append(tuple(
+                _typed(getattr(window, field.name))
+                for field in dataclasses.fields(window)))
+        return (start_iso, _typed(owner_key), tuple(signature))
+
+    # -- the answer ----------------------------------------------------------
+
+    def totals(self, block_start_at, range_end, *, owner_key, windows: list,
+               pricing_evidence: "dict | None",
+               owned_entries: "list | None") -> dict:
+        """`_compute_block_totals`' answer for this call, with the same
+        side effects on ``pricing_evidence`` and ``owned_entries``."""
+        if not self.verify:
+            return self._totals(block_start_at, range_end, owner_key,
+                                windows, pricing_evidence, owned_entries)
+        evidence: dict = {}
+        owned: list = []
+        result = self._totals(block_start_at, range_end, owner_key, windows,
+                              evidence, owned)
+        shadow_evidence: dict = {}
+        shadow_owned: list = []
+        shadow = _record._block_totals_reprice(
+            block_start_at, range_end, owner_key=owner_key,
+            ownership_windows=windows, pricing_evidence=shadow_evidence,
+            owned_entries=shadow_owned)
+        if (_float_exact(result) != _float_exact(shadow)
+                or evidence != shadow_evidence
+                or [vars(e) for e in owned]
+                != [vars(e) for e in shadow_owned]):
+            raise AssertionError(
+                "BlockTotalsEngine differs from the full re-price for "
+                f"{block_start_at!r}..{range_end!r} owner {owner_key!r}")
+        if pricing_evidence is not None:
+            pricing_evidence.update(evidence)
+        if owned_entries is not None:
+            owned_entries.extend(owned)
+        return result
+
+    def _totals(self, block_start_at, range_end, owner_key, windows,
+                pricing_evidence, owned_entries) -> dict:
+        start_iso = block_start_at.astimezone(dt.timezone.utc).isoformat()
+        end_iso = range_end.astimezone(dt.timezone.utc).isoformat()
+        key = self._state_key(start_iso, owner_key, windows)
+        run = None if key is None else self._run_for(start_iso, end_iso)
+        if run is None:
+            self.counts["uncached"] += 1
+            return _record._block_totals_reprice(
+                block_start_at, range_end, owner_key=owner_key,
+                ownership_windows=windows, pricing_evidence=pricing_evidence,
+                owned_entries=owned_entries)
+        n = bisect.bisect_right(run.texts, end_iso)
+        state = self._states.get(key)
+        if state is not None and n < state.consumed:
+            self._states.pop(key)
+            state = None
+            self.counts["rebuilt"] += 1
+        if state is None:
+            state = _FoldState(_record.BlockTotals())
+            self._states[key] = state
+            run.state_keys.add(key)
+            while len(self._states) > self.MAX_STATES:
+                old_key, _old = self._states.popitem(last=False)
+                run_of_old = self._runs.get(old_key[0])
+                if run_of_old is not None:
+                    run_of_old.state_keys.discard(old_key)
+                self.counts["states_evicted"] += 1
+        else:
+            self._states.move_to_end(key)
+        if owned_entries is not None:
+            owned_entries.extend(run.entries[i] for i in state.owned)
+        if n > state.consumed:
+            try:
+                self._extend(state, run, n, owner_key, windows, owned_entries)
+            except BaseException:
+                # A half-folded state must never answer a later call.
+                self._states.pop(key, None)
+                run.state_keys.discard(key)
+                raise
+            self.counts["extended"] += 1
+        else:
+            self.counts["cached"] += 1
+        result = state.totals.as_legacy_dict()
+        if pricing_evidence is not None:
+            pricing_evidence["unpricedModels"] = sorted(
+                state.missing_without_raw - state.observed_raw)
+            ambiguous = sorted(state.missing_without_raw & state.observed_raw)
+            if ambiguous:
+                pricing_evidence["uncertainModels"] = ambiguous
+        return result
+
+
+def _float_exact(value):
+    """``value`` with every float spelled by its exact bits and every dict
+    by its items in order, for the engine's shadow comparison."""
+    if isinstance(value, float):
+        return ("float", value.hex())
+    if isinstance(value, dict):
+        return ("dict", tuple((k, _float_exact(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return ("seq", tuple(_float_exact(v) for v in value))
+    return value
 
 
 @contextlib.contextmanager
@@ -562,6 +887,10 @@ def _scratch_read_adapters(cache_conn: sqlite3.Connection):
         "load_config": lambda *args, **kwargs: {},
     }
     prior = {name: getattr(cctally, name) for name in replacements}
+    # #1003 D1: the replay's block totals come from an incremental engine over
+    # this context's stable cache snapshot, one fresh engine per context.
+    prior_engine = _record.swap_block_totals_engine(
+        BlockTotalsEngine(cache_conn))
     try:
         for name, value in replacements.items():
             setattr(cctally, name, value)
@@ -569,6 +898,7 @@ def _scratch_read_adapters(cache_conn: sqlite3.Connection):
     finally:
         for name, value in prior.items():
             setattr(cctally, name, value)
+        _record.swap_block_totals_engine(prior_engine)
 
 
 #: Op kinds the scratch replay runs through the pipeline hooks.
@@ -593,8 +923,24 @@ def _is_rederivable_raw(record: dict) -> bool:
     return kind in _REDERIVABLE_OP_KINDS or kind in _REVIEWED_WEEKLY_KINDS
 
 
-def _rederivable_raw_records(records: list[dict]) -> list[dict]:
-    return [record for record in records if _is_rederivable_raw(record)]
+def _rederivable_raw_records(records):
+    """The rederivable raw inputs of ``records``, in journal order: a
+    position-subset view of a coordinate-backed sequence (#1004 D4), else a
+    list."""
+    subset = getattr(records, "subset", None)
+    if subset is None:
+        return [record for record in records if _is_rederivable_raw(record)]
+    return subset(_positions_where(records, _is_rederivable_raw))
+
+
+def _positions_where(records, predicate) -> "array":
+    """The positions of ``records`` whose record satisfies ``predicate``,
+    as an unsigned array (8 bytes a position, no record kept)."""
+    positions = array("Q")
+    for index, record in enumerate(records):
+        if predicate(record):
+            positions.append(index)
+    return positions
 
 
 #: #825/#832 spec 5.1: the previous release validates a reviewed weekly
@@ -1058,7 +1404,95 @@ def _normalize_legacy_accounts(records: list[dict]) -> None:
         _journal._normalize_legacy_account_stamp(record, cutover_claude)
 
 
-def _normalized_planning_view(records, cutover_claude=None) -> list:
+class _PlanningView(collections.abc.Sequence):
+    """#1004 spec D4: the planner's normalized view of a coordinate-backed
+    sequence (a `RetainedRecords` or one of its views).
+
+    A streamed position's decode is private, so it is normalized in place and
+    returned; it never enters the `id()` memo, whose key a freed decode's
+    address could later repeat for another position. A retained object (a D4
+    stub, a placeholder, an appended reviewed op) takes `_normalized_planning_
+    view`'s copy-on-write path, memoized by identity: those objects live as
+    long as the source, so their ids cannot be reused while the view is.
+    Views derived from this one (slices, subsets) share the memo, so a shared
+    stub normalizes once for the whole planning call."""
+
+    __slots__ = ("_source", "_cutover", "_changed", "_shared")
+
+    def __init__(self, source, cutover_claude, *, changed=None, shared=None):
+        self._source = source
+        self._cutover = cutover_claude
+        #: id(retained source object) -> its normalized copy.
+        self._changed = {} if changed is None else changed
+        #: ids of every retained object this view returned (shared with the
+        #: caller or memoized), which a replay must copy before mutating.
+        self._shared = set() if shared is None else shared
+
+    def _derived(self, source):
+        return _PlanningView(source, self._cutover, changed=self._changed,
+                             shared=self._shared)
+
+    def _fresh(self, record):
+        _journal._normalize_legacy_account_stamp(record, self._cutover)
+        return record
+
+    def _retained(self, record):
+        if not isinstance(record, dict):
+            return record
+        hit = self._changed.get(id(record))
+        if hit is not None:
+            return hit
+        probe = dict(record)
+        if isinstance(record.get("payload"), dict):
+            probe["payload"] = dict(record["payload"])
+        _journal._normalize_legacy_account_stamp(probe, self._cutover)
+        if probe == record:
+            self._shared.add(id(record))
+            return record
+        normalized = copy.deepcopy(record)
+        _journal._normalize_legacy_account_stamp(normalized, self._cutover)
+        self._changed[id(record)] = normalized
+        self._shared.add(id(normalized))
+        return normalized
+
+    def __len__(self) -> int:
+        return len(self._source)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            part = self._source[index]
+            if isinstance(part, list):
+                return [self[i] for i in range(len(self))[index]]
+            return self._derived(part)
+        record = self._source[index]
+        if self._source.is_streamed(index):
+            return self._fresh(record)
+        return self._retained(record)
+
+    def __iter__(self):
+        for fresh, record in self._source.iter_marked():
+            yield self._fresh(record) if fresh else self._retained(record)
+
+    def iter_marked(self):
+        for fresh, record in self._source.iter_marked():
+            yield ((True, self._fresh(record)) if fresh
+                   else (False, self._retained(record)))
+
+    def is_streamed(self, index) -> bool:
+        return self._source.is_streamed(index)
+
+    def subset(self, positions):
+        return self._derived(self._source.subset(positions))
+
+    def prepare_for_replay(self, record):
+        """The replay's private copy of a record this view returned (#997
+        D5): a fresh decode is already private; a retained one is copied."""
+        if id(record) in self._shared:
+            return copy.deepcopy(record)
+        return record
+
+
+def _normalized_planning_view(records, cutover_claude=None):
     """#997 spec D5: the planner's normalized records, copy-on-write.
 
     The same global pass as `_normalize_legacy_accounts` (every cutover value
@@ -1071,6 +1505,8 @@ def _normalized_planning_view(records, cutover_claude=None) -> list:
     the up-front deep copy of every record normalization leaves alone."""
     if cutover_claude is None:
         cutover_claude = _planner_cutover_claude(records)
+    if hasattr(records, "iter_marked"):
+        return _PlanningView(records, cutover_claude)
     changed: dict = {}
     view = []
     for record in records:
@@ -1121,15 +1557,17 @@ def _derive_desired_events_into(
     held_weekly_observation_ids=frozenset(),
     block_sources: "dict | None" = None,
 ) -> list[dict]:
-    raw_records = _rederivable_raw_records(records)
     held_ids = frozenset(held_weekly_observation_ids)
-    valid_ids = {
-        record.get("id") for record in raw_records
+    # #1004 D4: only the held ids found, not one id per raw observation,
+    # which the frame would otherwise keep through the whole replay.
+    valid_held_ids = {
+        record.get("id") for record in _rederivable_raw_records(records)
         if record.get("t") == "obs"
+        and record.get("id") in held_ids
         and "weekly_percent" in (record.get("payload") or {})
         and "resets_at" in (record.get("payload") or {})
     }
-    unknown_ids = held_ids - valid_ids
+    unknown_ids = held_ids - valid_held_ids
     if unknown_ids:
         raise _lib_rederive.RederiveConflict(
             "reviewed weekly hold names no Claude raw observation: "
@@ -1147,9 +1585,12 @@ def _derive_desired_events_into(
     try:
         # #997 spec D5: the planner's view shares unchanged records with the
         # caller, so the replay prepares a private copy of each record.
+        # #1004 D4: a streamed record's decode is already private, so the
+        # coordinate-backed view copies only the retained ones.
         return replay_scratch_records(
             conn, records, cache_conn, fold=fold, held_ids=held_ids,
-            block_sources=block_sources, prepare=copy.deepcopy)
+            block_sources=block_sources,
+            prepare=getattr(records, "prepare_for_replay", copy.deepcopy))
     finally:
         conn.close()
 
@@ -1335,8 +1776,10 @@ def plan_claude_usage(
     replay and comparison contract.
     """
     # #997 spec D5: a copy-on-write normalized view, not a whole-list deep
-    # copy. Every planner consumer below reads this view.
-    records = _normalized_planning_view(list(records))
+    # copy. Every planner consumer below reads this view. #1004 D4: a
+    # coordinate-backed sequence is viewed as it is, never listed.
+    records = _normalized_planning_view(
+        records if hasattr(records, "iter_marked") else list(records))
     report = _lib_rederive.validate_family_registry(
         evt_kinds=set(_journal._EVT_SPECS),
         op_kinds=_planner_op_kinds(),
@@ -1575,14 +2018,21 @@ def read_rederive_journal_prefix(
     keeps only the decision records and substitutes `None` placeholders for
     everything else; the planner here reads every observation for cache
     validation, desired-event derivation and preservation decisions, and walks
-    `records` in parallel with `record_ends`. Both lists stay complete and
-    aligned, so the win in this file is the removed double materialization and
-    the removed hash traversals, not reduced retention.
+    `records` in parallel with `record_ends`. Both stay complete and aligned.
 
     #997 spec D4: positions are kept, but an admitted Codex quota observation
     is retained as an interned read-only stub (`_inert_codex_stub`) rather
     than decoded in full; no consumer on this path reads its quota payload,
     `id` or `at`.
+
+    #1004 spec D3/D4: `records` is a `RetainedRecords` and `record_ends` its
+    `LineCoordinates.ends()` view. Every other record (each one retained
+    compacted before) is a streamed slot: its coordinates and the digest of
+    its line, re-read, digest-checked and decoded (then compacted) on each
+    access, so a pass sees a fresh record equal to the one retained before.
+    The D4 stubs and the admission placeholders stay retained objects. With
+    `_lib_retained_records.MATERIALIZE_FOR_TESTS` set, the reader returns
+    today's two lists instead (a test switch).
     """
     if high_water is None:
         high_water = _journal.journal_high_water()
@@ -1593,8 +2043,11 @@ def read_rederive_journal_prefix(
         raise OSError(
             f"journal high-water segment is unavailable: {high_water[0]}"
         )
-    records: list[dict] = []
-    record_ends: list[tuple[str, int]] = []
+    materialize = _lib_retained_records.MATERIALIZE_FOR_TESTS
+    coordinates = _lib_retained_records.LineCoordinates()
+    records = _lib_retained_records.RetainedRecords(
+        coordinates, _RederiveLineReader, _decode_retained_line,
+        error=_journal_changed_error)
     evidence: list = []
     evidence_owners: list = []
     malformed = 0
@@ -1605,7 +2058,6 @@ def read_rederive_journal_prefix(
     # at its own position, so the digest is taken inline and the validation
     # runs after the pass, for admitted decisions only.
     pass_boundary = _journal._PassBoundary()
-    coordinates: list = []
     pending_reviewed: list = []
     inert_stubs: dict = {}
     lines = 0
@@ -1651,17 +2103,20 @@ def read_rederive_journal_prefix(
                 evidence_owners.append(len(records))
         elif inert:
             record = _inert_codex_stub(record, inert_stubs)
-        records.append(record)
-        record_ends.append(record_end)
-        coordinates.append((segment, offset))
+        if inert or materialize:
+            records.append_retained(record, segment, offset, len(raw))
+        else:
+            records.append_streamed(raw, segment, offset, len(raw))
         prior_high_water = record_end
+    starts = coordinates.starts()
     # An inert placeholder keeps every position and sequence number; an
     # excluded correction, reviewed decision or Claude record is never planning
-    # input (case F7).
-    originals = list(records)
+    # input (case F7). The snapshot shares the coordinates and digests, so an
+    # excluded position still decodes its original below.
+    originals = records.slot_snapshot()
     placeholder = _lib_account_protocol.excluded_placeholder()
     _journal._apply_pass_admission(
-        records, coordinates, pass_boundary.resolve(high_water),
+        records, starts, pass_boundary.resolve(high_water),
         placeholder=placeholder)
     # #825/#832 fix round C (CD2-005): an excluded acknowledgement takes its
     # raw-prefix evidence with it, so selection reads it as absent.
@@ -1671,18 +2126,24 @@ def read_rederive_journal_prefix(
     # coordinate for the outcome-quarantine fold of the scratch replay (a
     # trigger whose readings widen the every-account envelope). Nothing else
     # reads a placeholder's fields.
-    for index, slot in enumerate(records):
-        if slot is placeholder:
+    for index in range(len(records)):
+        if records.slot(index) is placeholder:
+            segment, offset = starts[index]
             records[index] = {
                 **placeholder,
                 "quarantine": {
                     "record": originals[index],
-                    "segment": coordinates[index][0],
-                    "offset": coordinates[index][1],
+                    "segment": segment,
+                    "offset": offset,
                 },
             }
+    originals.close()
+    originals = None
     for index, record, prior, digest in pending_reviewed:
-        if records[index] is record:
+        # #1004 D4: a position check. The slot still holds the op (a
+        # retained form) or is still streamed, so admission kept it.
+        slot = records.slot(index)
+        if slot is record or slot is _lib_retained_records.STREAMED:
             _validate_retained_reviewed_op(
                 record, prior, _PinnedPrefixDigest(prior, digest),
             )
@@ -1697,7 +2158,62 @@ def read_rederive_journal_prefix(
         raise _lib_rederive.RederiveConflict(
             f"journal prefix contains {malformed} malformed line(s)"
         )
-    return records, high_water, record_ends, tuple(evidence)
+    if materialize:
+        # Every slot is a retained object here, so this decodes nothing.
+        listed = list(records)
+        records.close()
+        return listed, high_water, list(coordinates.ends()), tuple(evidence)
+    return records, high_water, coordinates.ends(), tuple(evidence)
+
+
+def _decode_retained_line(line: bytes):
+    """#1004 D4: a streamed slot's record, exactly as the reader retained
+    it before: the strict decode, then #997 D15's compaction."""
+    record = _lib_journal.decode_line(line)
+    if record is None:
+        return None
+    return _lib_journal.compact_retained(record)
+
+
+def _journal_changed_error(message: str) -> Exception:
+    """The reader's integrity error for a line that changed under it: the
+    `RederiveConflict` a malformed prefix raises."""
+    return _lib_rederive.RederiveConflict(
+        f"journal prefix changed since it was read: {message}")
+
+
+class _RederiveLineReader:
+    """`LineReader` for the rederive reader's streamed records: the framed
+    read `QuotaLineSource` uses (#997 D7), through the one physical segment
+    read boundary, with one open handle (the current segment's), so an
+    in-order pass opens each segment once."""
+
+    __slots__ = ("_segment", "_fh", "__weakref__")
+
+    def __init__(self) -> None:
+        self._segment = None
+        self._fh = None
+
+    def read(self, segment: str, start: int, length: int) -> bytes:
+        if segment != self._segment:
+            self.close()
+            try:
+                self._fh = _journal._open_segment_for_read(
+                    _cctally_core.JOURNAL_DIR / segment)
+            except OSError as exc:
+                raise _journal_changed_error(
+                    f"{segment}: {type(exc).__name__}: {exc}") from exc
+            self._segment = segment
+        try:
+            return _journal._read_framed_line(self._fh, segment, start, length)
+        except (_journal.QuotaLineSourceError, OSError) as exc:
+            raise _journal_changed_error(str(exc)) from exc
+
+    def close(self) -> None:
+        fh, self._fh = self._fh, None
+        self._segment = None
+        if fh is not None:
+            fh.close()
 
 
 def _read_only_journal_high_water() -> "tuple[str, int] | None":
@@ -1937,16 +2453,34 @@ def _fresh_manifest_baseline(records, completed_batches, family, *,
     idempotence stated on `_decision_batch_completed`: the op's actions
     re-enter the delta and apply idempotently over anything the torn batch
     already wrote."""
-    return [
-        record for index, record in enumerate(records)
+    kept = [] if getattr(records, "subset", None) is None else None
+    positions = array("Q")
+    for index, record in enumerate(records):
         if index != exclude_index and not (
             record.get("t") == "op"
             and (record.get("payload") or {}).get("kind")
             in _REVIEWED_WEEKLY_KINDS
             and not _decision_batch_completed(
                 records, index, completed_batches, family)
-        )
-    ]
+        ):
+            if kept is None:
+                positions.append(index)
+            else:
+                kept.append(record)
+    # #1004 D4: a position-subset view of a coordinate-backed sequence.
+    return kept if kept is not None else records.subset(positions)
+
+
+def correction_only_suffix(records, start) -> bool:
+    """Whether every non-review-neutral record from ``start`` on is a
+    correction or a correction-batch marker (#1004 D4: a streaming predicate
+    that keeps no record)."""
+    for record in records[start:]:
+        if _is_review_neutral(record):
+            continue
+        if record.get("t") not in {"correction", "correction_batch"}:
+            return False
+    return True
 
 
 def _preview_from_snapshot(
@@ -1987,7 +2521,10 @@ def _preview_from_snapshot(
             raise _lib_rederive.RederiveConflict(
                 "reviewed weekly decision journalPrefixHash drifted"
             )
-        planning_records = [*records, reviewed_op]
+        with_extra = getattr(records, "with_extra", None)
+        planning_records = (
+            [*records, reviewed_op] if with_extra is None
+            else with_extra(reviewed_op))
         baseline_records = None    # #1015 R8: resolved after the selection
     else:
         decision_indexes = [
@@ -2008,18 +2545,10 @@ def _preview_from_snapshot(
         baseline_records = _fresh_manifest_baseline(
             records, selection.completed_batches, family)
     if retained_decision is not None:
-        suffix = [
-            record for record in records[retained_decision_index + 1:]
-            if not _is_review_neutral(record)
-        ]
         completed_decision_batch = _decision_batch_completed(
             records, retained_decision_index, selection.completed_batches,
             family)
-        correction_only_suffix = all(
-            record.get("t") in {"correction", "correction_batch"}
-            for record in suffix
-        )
-        if correction_only_suffix:
+        if correction_only_suffix(records, retained_decision_index + 1):
             decision_op = retained_decision
             decision_from_journal = not completed_decision_batch
             decision_batch_completed = completed_decision_batch
@@ -2134,9 +2663,11 @@ def _preview_from_snapshot(
     preview = RederivePreview(
         journal_conflicts=journal_conflicts,
         plan=plan,
-        records=tuple(records),
+        # #1004 D3/D4: a coordinate-backed sequence and its ends view are
+        # stored as they are; `tuple(...)` would decode every record back.
+        records=_preview_sequence(records),
         journal_high_water=high_water,
-        record_ends=tuple(record_ends),
+        record_ends=_preview_sequence(record_ends),
         generated_at=generated_at,
         batch_id=batch_id,
         incomplete_batch=incomplete,
@@ -2533,7 +3064,16 @@ def _compact_preview(preview: RederivePreview) -> RederivePreview:
     renderers and every error read what they read before. The one release
     seam: T18 disables the release by patching it to the identity.
     """
+    close = getattr(preview.records, "close", None)
+    if close is not None:
+        close()
     return dataclasses.replace(preview, records=(), record_ends=())
+
+
+def _preview_sequence(sequence):
+    """A preview's `records`/`record_ends`: today's tuple for a list, the
+    coordinate-backed sequence or view itself otherwise (#1004 D4)."""
+    return tuple(sequence) if isinstance(sequence, list) else sequence
 
 
 def _release_preview_records(*previews):

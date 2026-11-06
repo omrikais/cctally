@@ -18,6 +18,8 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import datetime as dt
 import math
 import re
@@ -81,9 +83,11 @@ def _chip_for_model(name: str) -> str:
     return "other"
 
 
-# Date the embedded pricing snapshots below were last verified against
-# vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
-# is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
+# Date of the latest pricing sync of the embedded tables below. Bump whenever
+# CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING is synced. A targeted sync
+# re-verifies only the cards it names (each table's header log says which);
+# it does not re-verify every card. Read by `pricing-check` + the release
+# pre-flight staleness nudge.
 #
 # CONTRACT (#705): a pricing revision must always ADVANCE this date. A second
 # revision within one UTC day therefore takes the NEXT day's date rather than
@@ -97,7 +101,7 @@ def _chip_for_model(name: str) -> str:
 # pinned in `bin/_lib_detector_access_registry.py`, so its registry test fails
 # until the affected pins are re-pinned through the reviewed procedure in that
 # module's docstring. Bulk regeneration of the pins alone is not acceptance.
-PRICING_SNAPSHOT_DATE = "2026-10-14"
+PRICING_SNAPSHOT_DATE = "2026-11-05"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 
@@ -324,6 +328,16 @@ LITELLM_PRICES_URL = (
 # `diff_pricing` keys on raw table membership and is deliberately NOT
 # alias-aware, so the omission needs this entry. It is self-policing: it goes
 # stale automatically if upstream drops `gpt-5.6` or we restore a direct card.
+#
+# gpt-5.5-cyber-preview (#989): also model-only. OpenAI publishes no row, model
+# page or alias statement for this identifier, which third-party press ties
+# to GPT-5.5-Cyber's May 2026 limited preview. LiteLLM prices it with cost
+# fields identical to
+# `gpt-5.5-cyber`, whose card OpenAI's pricing page does list, so
+# CODEX_MODEL_ALIASES maps it there as an INFERRED pricing equivalence rather
+# than a vendor-declared alias. This entry polices membership only: it goes
+# stale if upstream drops the identifier or a direct card is added, but a
+# preview-specific repricing upstream would NOT surface here.
 PRICING_DRIFT_ALLOWLIST: list[dict] = [
     {
         "model": "claude-mythos-preview",
@@ -372,6 +386,17 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
             "carries no duplicate entry. `diff_pricing` is deliberately not "
             "alias-aware, so the intentional omission is suppressed here "
             "(#643)."
+        ),
+    },
+    {
+        "model": "gpt-5.5-cyber-preview",
+        "reason": (
+            "OpenAI publishes no price or alias for gpt-5.5-cyber-preview. "
+            "LiteLLM's cost fields for it equal gpt-5.5-cyber's (observed "
+            "2026-11-05), whose card OpenAI lists, so CODEX_MODEL_ALIASES "
+            "maps it there as an inferred equivalence and this table carries "
+            "no duplicate card. This entry polices membership only; a "
+            "preview-specific repricing upstream would not surface (#989)."
         ),
     },
 ]
@@ -748,13 +773,14 @@ _unknown_model_warnings: set[str] = set()
 # Codex (OpenAI) API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 # - Captured: 2026-07-19 — the last FULL Codex sync. PRICING_SNAPSHOT_DATE has
-#   since moved for six targeted syncs (2026-07-24, the Claude-side opus-5
-#   sync; 2026-07-31, the gpt-5.6-terra/-luna correction logged below;
-#   2026-08-13, the Claude-side Sonnet/Mythos sync above; 2026-08-25, the
-#   gpt-5.6-cyber addition logged below; 2026-09-05, the gpt-6-astra
-#   addition; and 2026-09-22, the gpt-6-sol addition logged below). Codex
-#   values outside those four Codex corrections were NOT re-verified on those
-#   days.
+#   since moved for many targeted syncs, Claude-side ones included (the git
+#   history of the constant is authoritative). The Codex-side ones are logged
+#   below: 2026-07-31 (gpt-5.6-terra/-luna correction), 2026-08-25
+#   (gpt-5.6-cyber), 2026-09-05 (gpt-6-astra), 2026-09-22 (gpt-6-sol,
+#   gpt-6-luna), 2026-09-23 (gpt-5.5-cyber), 2026-09-30 (gpt-6.1-sol) and
+#   2026-11-05 (gpt-6.1-terra / gpt-6-rosalind / gpt-6-astra-law and the
+#   gpt-5.5-cyber-preview alias). Codex values outside the cards each of
+#   those syncs names were NOT re-verified on those days.
 # - As of the 2026-07-19 sync this carries every openai-provider
 #   gpt-5* model the LiteLLM snapshot lists, so `pricing-check`'s scope finds
 #   nothing missing. Models absent from this table still fall back to `gpt-5`
@@ -809,13 +835,32 @@ _unknown_model_warnings: set[str] = set()
 #   existing gpt-5.6-cyber card.
 #   2026-09-23: adopted LiteLLM's historical gpt-5.5-cyber OpenAI-provider
 #   card at $12.50 input / $1.25 cached input / $75.00 output per MTok.
-#   The current OpenAI table lists its 5.6 successor instead. LiteLLM does
-#   not publish an above-272K rate for 5.5 Cyber, so do not infer that tier.
+#   At that capture the OpenAI table listed only its 5.6 successor. LiteLLM
+#   does not publish an above-272K rate for 5.5 Cyber, so do not infer that
+#   tier. (2026-11-05: OpenAI's pricing page now lists gpt-5.5-cyber at the
+#   same $12.50 / $1.25 / $75.00 with dashes in the long-context columns, so
+#   the card is vendor-confirmed; values unchanged.)
 #   2026-09-29: added gpt-6.1-sol from OpenAI's model and pricing pages:
 #   Standard $2.00 input / $0.10 cached input / $10.00 output per MTok;
 #   above 272K, $4.00 / $0.20 / $15.00. Fast mode is 2x. LiteLLM does not
 #   yet carry this identifier. The snapshot date advances to 2026-09-30
 #   because the Sonnet 5.5 sync already used 2026-09-29 (#705).
+#   2026-11-05 (#989): `pricing-check` reported four OpenAI-provider
+#   identifiers missing; each was checked against OpenAI's pricing page
+#   (https://developers.openai.com/api/docs/pricing) and LiteLLM, which agree.
+#   Added gpt-6.1-terra (Standard $1.00 input / $0.05 cached / $5.00 output
+#   from the pricing page; its model page states the above-272K rule, 2x
+#   input/cache and 1.5x output for the full request, giving $2.00 / $0.10 /
+#   $7.50, and 2x for Fast),
+#   gpt-6-rosalind (trusted-access life-sciences model, $15.00 / $1.50 /
+#   $75.00; above 272K $30.00 / $3.00 / $112.50) and gpt-6-astra-law ($10.00
+#   / $1.00 / $50.00, no long-context column; OpenAI marks this rate
+#   promotional "at least through December 31, 2026" and publishes no
+#   successor, so the only published rate is adopted and a later LiteLLM
+#   change will surface as value drift). gpt-5.5-cyber-preview has no vendor
+#   row and is aliased to gpt-5.5-cyber (see CODEX_MODEL_ALIASES). The fast
+#   multiplier of all three resolves to CODEX_FAST_MULTIPLIER_FALLBACK; the
+#   vendor publishes no Fast tier for Rosalind or Astra for Law.
 #
 # Billing rules:
 # - reasoning_output_tokens is billed at the *output* rate (matches
@@ -945,8 +990,10 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
     # No cache_creation field: the Codex cost kernel never reads one, so
     # carrying LiteLLM's would only give `diff_pricing` a value to compare.
     "gpt-5.5-cyber": {
-        # Historical OpenAI-provider card retained by LiteLLM; unlike the
-        # 5.6 successor, no long-context fields are published for this ID.
+        # Adopted from LiteLLM's OpenAI-provider card; since confirmed by
+        # OpenAI's pricing page (2026-11-05, #989). Neither source publishes
+        # long-context rates for this ID, unlike LiteLLM's 5.6 successor card
+        # (OpenAI's page shows dashes for both).
         "input_cost_per_token": 1.25e-05,
         "cache_read_input_token_cost": 1.25e-06,
         "output_cost_per_token": 7.5e-05,
@@ -1000,6 +1047,41 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "input_cost_per_token_above_272k_tokens": 2e-07,
         "cache_read_input_token_cost_above_272k_tokens": 2e-08,
         "output_cost_per_token_above_272k_tokens": 7.5e-07,
+    },
+    "gpt-6.1-terra": {
+        # Source: https://developers.openai.com/api/docs/models/gpt-6.1-terra
+        # and /api/docs/pricing (#989). Standard $1.00/M input, $0.05/M cached
+        # input (5% of input), $5.00/M output; above 272K input, 2x
+        # input/cache and 1.5x output for the full request.
+        "input_cost_per_token": 1e-06,
+        "cache_read_input_token_cost": 5e-08,
+        "output_cost_per_token": 5e-06,
+        "input_cost_per_token_above_272k_tokens": 2e-06,
+        "cache_read_input_token_cost_above_272k_tokens": 1e-07,
+        "output_cost_per_token_above_272k_tokens": 7.5e-06,
+    },
+    "gpt-6-rosalind": {
+        # Source: https://developers.openai.com/api/docs/pricing (#989), the
+        # life-sciences table; access is limited to OpenAI's trusted-access
+        # program. $15.00/M input, $1.50/M cached input, $75.00/M output;
+        # long context $30.00 / $3.00 / $112.50.
+        "input_cost_per_token": 1.5e-05,
+        "cache_read_input_token_cost": 1.5e-06,
+        "output_cost_per_token": 7.5e-05,
+        "input_cost_per_token_above_272k_tokens": 3e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 3e-06,
+        "output_cost_per_token_above_272k_tokens": 1.125e-04,
+    },
+    "gpt-6-astra-law": {
+        # Source: https://developers.openai.com/api/docs/pricing (#989), the
+        # legal table: $10.00/M input, $1.00/M cached input, $50.00/M output,
+        # marked promotional "at least through December 31, 2026" with no
+        # successor published. No long-context column is published (nor a
+        # LiteLLM tier), so none is inferred and long requests price at these
+        # base rates.
+        "input_cost_per_token": 1e-05,
+        "cache_read_input_token_cost": 1e-06,
+        "output_cost_per_token": 5e-05,
     },
     # ── Issue #123: full gpt-5.x LiteLLM sync (2026-05-30 snapshot) ──
     # Exact model_prices_and_context_window.json values for every
@@ -1192,9 +1274,15 @@ CODEX_LEGACY_FALLBACK_MODEL = "gpt-5"
 # covered by a model-only PRICING_DRIFT_ALLOWLIST entry.
 # ``codex-auto-review`` is the hidden Guardian model and maps to the model
 # current when it appeared, covering every retained event observed for issue
-# #535.
+# #535. ``gpt-5.5-cyber-preview`` (#989) is an INFERRED pricing equivalence,
+# not a vendor-declared alias: OpenAI publishes nothing for the identifier
+# (third-party press ties it to GPT-5.5-Cyber's limited preview), LiteLLM
+# prices it with cost fields
+# identical to ``gpt-5.5-cyber`` (observed 2026-11-05), and OpenAI lists that
+# card. Its model-only PRICING_DRIFT_ALLOWLIST entry covers the omission.
 CODEX_MODEL_ALIASES: dict[str, str] = {
     "codex-auto-review": "gpt-5.5",
+    "gpt-5.5-cyber-preview": "gpt-5.5-cyber",
     "gpt-5.6": "gpt-5.6-sol",
     "gpt-daybreak-blue-latest": "gpt-5.6-sol",
     "gpt-daybreak-red-latest": "gpt-5.6-cyber",
@@ -1744,3 +1832,45 @@ def current_pricing_snapshot() -> PricingSnapshot:
     """The snapshot every cost kernel prices from; it never changes after
     import."""
     return _LIVE_PRICING_SNAPSHOT
+
+
+def codex_pricing_identity(snapshot: PricingSnapshot) -> str:
+    """A hash of every Codex pricing semantic in ``snapshot`` (#1050 spec 4.7).
+
+    The Codex cycle-detail stamp carries it, because the detail prices each
+    milestone at read time: the rate table alone is not every input — an alias
+    re-points a runtime name at another card, the fallback model prices every
+    unknown name, the tier threshold switches a row onto the long-context
+    rates, and the fast multipliers scale the whole row. Claude's semantics are
+    excluded so a Claude-only pricing edit leaves every Codex stamp alone.
+
+    Canonical JSON (sorted keys, no NaN): equal semantics hash equally whatever
+    the dict insertion order.
+    """
+    payload = {
+        "codex_pricing": snapshot.codex_pricing,
+        "aliases": snapshot.aliases,
+        "fallback_model": snapshot.fallback_model,
+        "tier_threshold": snapshot.tier_thresholds.get("codex"),
+        "fast_multipliers": {
+            "codex": snapshot.fast_multipliers.get("codex"),
+            "codex_fallback": snapshot.fast_multipliers.get("codex_fallback"),
+        },
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()[:16]
+
+
+_LIVE_CODEX_PRICING_IDENTITY: "str | None" = None
+
+
+def live_codex_pricing_identity() -> str:
+    """``codex_pricing_identity`` of the live snapshot, computed once per
+    process: the snapshot never changes after import, and a newer binary is a
+    new process (#868)."""
+    global _LIVE_CODEX_PRICING_IDENTITY
+    if _LIVE_CODEX_PRICING_IDENTITY is None:
+        _LIVE_CODEX_PRICING_IDENTITY = codex_pricing_identity(
+            current_pricing_snapshot())
+    return _LIVE_CODEX_PRICING_IDENTITY

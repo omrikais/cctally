@@ -31,7 +31,7 @@ Database
   ✓ Rebuild worker           no stats.db upgrade rebuild has run; no stats.db auto-heal has run
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
-  ⚠ Pending migrations       63 pending
+  ⚠ Pending migrations       64 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit

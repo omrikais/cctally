@@ -365,8 +365,8 @@ def test_f2_render_path_does_no_journal_cutover_or_index_work(app, monkeypatch):
         "accountUuid": "render-A", "emailAddress": "a@example.test"}}))
     core._ACTIVE_CLAUDE_ACCOUNT_CACHE.update(sig=None, identity=None)
     forks = []
-    monkeypatch.setattr(sl, "_fork_persist", lambda fd, reservation: (
-        forks.append(fd), sl._release_reservation(reservation)))
+    monkeypatch.setattr(sl, "_dispatch_render_worker", lambda reservation: (
+        forks.append(reservation), sl._release_reservation(reservation)))
     monkeypatch.setattr(app, "_statusline_oauth_tick", lambda: None)
     forbidden = []
     for name in ("ensure_account_bound_cutover", "find_account_bound_cutover",

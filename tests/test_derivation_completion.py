@@ -2560,3 +2560,156 @@ def test_an_unreadable_obligation_directory_never_hides_owed_work(
     assert C.run_owed_residual_derivation().disposition == "discharged"
     assert not C.residual_derivation_owed()
     assert not C._unreadable_backoff_path().exists()
+
+
+# --------------------------------------------------------------------------
+# #1004 T5 / T7 — completion's window and slots stream from coordinates
+# --------------------------------------------------------------------------
+
+#: The real Claude account a previous release's `accounts_cutover` op maps
+#: its unstamped Claude history to.
+_CUTOVER_REAL = "claude:acct-1004"
+
+
+def _legacy_cutover_history(J):
+    """A previous release's history: a legacy reading, the accounts cutover
+    op naming a REAL account, and the reading's legacy `snapshot_accept`
+    (no `account_key`, so only the cutover normalization stamps one)."""
+    import _cctally_journal as jr
+    reading = _legacy(_obs(J, "2026-01-04T08:00:00Z", 5.0))
+    cutover = J.legacy_writer_view().make_op(
+        at="2026-01-04T07:00:00Z", src="accounts-cutover",
+        payload={"kind": "accounts_cutover",
+                 "claude_legacy_account": _CUTOVER_REAL})
+    cutover["id"] = jr.CUTOVER_OP_ID
+    accept = _legacy_snapshot_accept(J, reading)
+    assert "account_key" not in accept["payload"]
+    return reading, cutover, accept
+
+
+def _completion_capture(ns, monkeypatch, tmp_path, *, materialize):
+    """A whole-history completion (the index is corrupt, so the window is
+    the whole retained journal) over the legacy history above, the
+    account-bound boundary, an ingested current reading, an excluded legacy
+    reading past the boundary and an interrupted current reading. Captures
+    the first replay's prefix as plain data; returns it with the appended
+    journal bytes."""
+    import copy
+    import _cctally_completion
+    import _lib_retained_records as RR
+    redirect_paths(ns, monkeypatch, tmp_path)
+    jr, J, core = _mods()
+    monkeypatch.setattr(RR, "MATERIALIZE_FOR_TESTS", materialize)
+    # Every wall clock that reaches the journal is pinned, so the two runs
+    # write identical bytes (the account-bound cutover op is stamped `at`
+    # the wall clock, and appends go to the wall clock's segment).
+    monkeypatch.setattr(_cctally_completion, "_iso_now",
+                        lambda: "2026-01-05T00:00:00Z")
+    monkeypatch.setattr(jr, "_utc_now", lambda: dt.datetime(
+        2026, 2, 1, 12, tzinfo=dt.timezone.utc))
+    monkeypatch.setattr(jr, "_now_iso", lambda: "2026-02-01T12:00:00Z")
+    reading, cutover, accept = _legacy_cutover_history(J)
+    core.JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    (core.JOURNAL_DIR / "observations-2026-01.jsonl").write_bytes(
+        J.encode_line(reading) + J.encode_line(cutover)
+        + J.encode_line(accept))
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    jr.ensure_account_bound_cutover()
+    jr.append_record(_obs(J, "2026-01-04T09:00:00Z", 7.0))
+    jr.run_stats_ingest(mode="authoritative")
+    _raw_append_tail([_legacy(_obs(J, "2026-01-04T09:30:00Z", 8.0))])
+    jr.append_record(_obs(J, "2026-01-04T10:00:00Z", 9.0))
+    captured: list = []
+    real = _cctally_completion._replay
+
+    def capturing(base, tmp, name, prefix, *args, **kwargs):
+        if not captured:
+            captured.append({
+                "types": (type(prefix.slots), type(prefix.window)),
+                "slots": [copy.deepcopy(r) for r in prefix.slots],
+                "window": [copy.deepcopy(r) for r in prefix.window],
+                "coordinates": list(prefix.coordinates),
+                "cutover": prefix.cutover_claude,
+            })
+        return real(base, tmp, name, prefix, *args, **kwargs)
+
+    monkeypatch.setattr(_cctally_completion, "_replay", capturing)
+    with open(core.DB_PATH, "r+b") as handle:
+        handle.write(b"not a database " * 200)
+    before = _journal_bytes()
+    assert _rebuild(ns) == 0
+    after = _journal_bytes()
+    assert after.startswith(before)
+    return captured, after[len(before):], _percents()
+
+
+def test_completion_window_streams_records_equal_to_list(
+        ns, monkeypatch, tmp_path, capsys):
+    """#1004 T5 and T7 (`_complete_window`): completion's `slots` and
+    `window` are coordinate-backed, its coordinates are the window's
+    `LineCoordinates` view, and at the first replay all three equal today's
+    lists (the `MATERIALIZE_FOR_TESTS` switch), with identical appended
+    journal bytes and index. The previous release's `snapshot_accept`
+    reaches the selection and the window under the cutover's real account.
+    Detects a completion that replays a record other than the one it read,
+    or folds a legacy decision under `unattributed` because the window's
+    re-decoded records were never normalized."""
+    import _lib_retained_records as RR
+    streamed, s_bytes, s_index = _completion_capture(
+        ns, monkeypatch, tmp_path / "streamed", materialize=False)
+    listed, l_bytes, l_index = _completion_capture(
+        ns, monkeypatch, tmp_path / "listed", materialize=True)
+    capsys.readouterr()
+    assert streamed and listed, "no completion replay ran"
+    [streamed], [listed] = streamed, listed
+    assert streamed["types"] == (RR.RetainedRecords, RR.RetainedRecords)
+    assert listed["types"] == (list, list)
+    for key in ("slots", "window", "coordinates", "cutover"):
+        assert streamed[key] == listed[key], key
+    assert s_bytes == l_bytes and s_bytes, "non-vacuity: completion appended"
+    assert s_index == l_index
+    assert streamed["cutover"] == _CUTOVER_REAL
+    for key in ("slots", "window"):
+        accepts = [r for r in streamed[key] if isinstance(r, dict)
+                   and r.get("t") == "evt" and r.get("rev", 0) == 0
+                   and "wpg" not in r]
+        assert accepts, f"non-vacuity: the legacy decision is in {key}"
+        assert all(r["payload"]["account_key"] == _CUTOVER_REAL
+                   for r in accepts), (key, accepts)
+    # A window obs is normalized only in each replay's private copy, as it
+    # was: the window itself keeps the record exactly as journaled.
+    assert any(r.get("t") == "obs" and "account" not in r
+               for r in streamed["window"])
+
+
+def test_owed_legacy_decision_folds_under_the_cutover_account(ns):
+    """#1004 T7 (`_apply_owed_outputs`): a previous release's owed
+    `snapshot_accept`, under an accounts cutover naming a real account,
+    folds into the predecessor under that account. Detects an owed-outputs
+    pass whose selection reads re-decoded records the normalization never
+    reached: the decision then folds under `unattributed`."""
+    import sqlite3
+    import _cctally_completion
+    jr, J, core = _mods()
+    reading, cutover, accept = _legacy_cutover_history(J)
+    core.JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    head = J.encode_line(reading) + J.encode_line(cutover)
+    segment = "observations-2026-01.jsonl"
+    (core.JOURNAL_DIR / segment).write_bytes(head + J.encode_line(accept))
+    start = (segment, len(head))
+    output_end = (segment, len(head) + len(J.encode_line(accept)))
+    base = core.APP_DIR / "predecessor-1004.db"
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(base), high_water=start, update_quota_cache=False)
+    owed = _cctally_completion._apply_owed_outputs(
+        base, start, output_end, None)
+    assert owed == frozenset({accept["id"]})
+    conn = sqlite3.connect(base)
+    try:
+        rows = conn.execute(
+            "SELECT account_key, weekly_percent FROM weekly_usage_snapshots"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [(_CUTOVER_REAL, 5.0)], rows

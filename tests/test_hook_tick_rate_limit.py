@@ -1,5 +1,13 @@
 """Hook-tick throttle, skip-if-fresh, and 429 fallback tests."""
+import argparse
 import datetime as dt
+import fcntl
+import io
+import os
+import sys
+import threading
+import time
+import types
 
 import pytest
 from conftest import load_script
@@ -163,3 +171,90 @@ def test_hook_tick_rate_limit_arms_backoff(ns, monkeypatch, tmp_path):
     status, _ = ns["_hook_tick_oauth_refresh"](throttle_seconds=0)
     assert status == "err(rate-limit)"
     assert ns["_oauth_backoff_remaining_seconds"]() > 0
+
+
+def _run_hook_tick(ns, args, timeout):
+    """Run `cmd_hook_tick` on a daemon thread; return its exit code, or
+    "blocked" when it has not finished within ``timeout`` (the convoy)."""
+    result = {}
+
+    def body():
+        result["rc"] = ns["cmd_hook_tick"](args)
+
+    worker = threading.Thread(target=body, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return result.get("rc", "blocked")
+
+
+def test_throttle_lock_contention_skips_without_fetch(
+        ns, monkeypatch, tmp_path, capsys):
+    """#1064 spec section 7 test 6. Detects the hook-tick convoy: a Claude
+    hook-tick blocked on `hook-tick.last-fetch.lock` behind another holder
+    (one held it for up to an hour behind a reducer pass, with 18 hooks
+    queued). While another process holds the lock, a `--foreground` run (via
+    `--mock-oauth-response`) and an `--explain` run each finish, log
+    `oauth=throttled(inflight)`, fetch nothing and leave the throttle marker
+    untouched; `--explain` exits 0 and names the contention as its decision.
+    Once the lock is free, the next run fetches exactly once."""
+    from conftest import redirect_paths
+    redirect_paths(ns, monkeypatch, tmp_path)
+    monkeypatch.setitem(ns, "load_config", lambda: {})
+    fetches = []
+
+    def counted(timeout_seconds=5.0, throttle_seconds=None):
+        fetches.append(throttle_seconds)
+        return "ok(7d=22)", {"seven_day": {"utilization": 22.0}}
+
+    monkeypatch.setitem(ns, "_hook_tick_oauth_refresh", counted)
+    monkeypatch.setitem(ns, "_hook_tick_make_mock_refresh", lambda payload: counted)
+    app_dir = ns["APP_DIR"]
+    app_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = app_dir / "hook-tick.last-fetch.lock"
+    marker = app_dir / "hook-tick.last-fetch"
+    marker.touch()
+    old = time.time() - 3600
+    os.utime(marker, (old, old))
+    log = app_dir / "logs" / "hook-tick.log"
+
+    def args(**extra):
+        values = dict(source="claude", explain=False, foreground=True,
+                      no_oauth=False, throttle_seconds=15, event=None,
+                      mock_oauth_response=None)
+        values.update(extra)
+        return argparse.Namespace(**values)
+
+    def stdin():
+        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(
+            b'{"hook_event_name": "Stop", "session_id": "s", "cwd": "/x"}')))
+
+    # Another holder of the lock: a second open file description in this
+    # process conflicts with the hook's own `flock` exactly as another
+    # process's would (flock locks belong to the open file description).
+    holder = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o644)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        stdin()
+        # timing-budget: a skipped OAuth leg leaves only an empty local sync
+        assert _run_hook_tick(ns, args(mock_oauth_response='{"seven_day": {}}'),
+                              30.0) == 0, "the --foreground run queued on the lock"
+        capsys.readouterr()
+        assert _run_hook_tick(ns, args(explain=True, foreground=False), 30.0) == 0, (
+            "the --explain run queued on the lock or did not exit 0")
+        explained = capsys.readouterr().out
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+
+    assert fetches == []
+    assert os.stat(marker).st_mtime == old
+    lines = log.read_text().splitlines()
+    assert len(lines) == 2 and all("oauth=throttled(inflight)" in l for l in lines), lines
+    assert "→ threshold: 15s → throttled(inflight)" in explained, explained
+    assert "→ status: throttled(inflight)" in explained, explained
+
+    stdin()
+    assert _run_hook_tick(ns, args(), 30.0) == 0
+    assert len(fetches) == 1, "the run after the holder released did not fetch"
+    assert os.stat(marker).st_mtime > old
+    assert "oauth=ok(7d=22)" in log.read_text().splitlines()[-1]

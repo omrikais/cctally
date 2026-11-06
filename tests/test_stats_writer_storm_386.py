@@ -1794,6 +1794,7 @@ def test_dashboard_source_reader_releases_rollback_snapshot(
     try:
         storm_started = time.monotonic()
         bundle = tui._tui_build_source_bundle(
+            claude_input_identity=tui._tui_read_claude_input_identity(stats_conn),
             stats_conn=stats_conn,
             now_utc=ns["dt"].datetime.now(ns["dt"].timezone.utc),
             display_tz_name="UTC",
@@ -1815,6 +1816,7 @@ def test_dashboard_source_reader_releases_rollback_snapshot(
         )
         baseline_started = time.monotonic()
         baseline_bundle = tui._tui_build_source_bundle(
+            claude_input_identity=tui._tui_read_claude_input_identity(stats_conn),
             stats_conn=stats_conn,
             now_utc=ns["dt"].datetime.now(ns["dt"].timezone.utc),
             display_tz_name="UTC",

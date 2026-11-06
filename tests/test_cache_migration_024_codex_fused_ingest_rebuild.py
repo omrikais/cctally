@@ -1,19 +1,20 @@
-"""Stage-B regression coverage for cache migration 024 (#294 S1).
+"""Regression coverage for cache migration 024 (#294 S1, #983).
 
-The migration has one job: invalidate old Codex-only cache state so the fused
-walker can truthfully rederive it from rollouts. It must never manufacture S1
-metadata or disturb Claude-derived state, and its Codex flock must defer before
-SQLite mutation when a Codex sync is active.
+024 originally cleared the pre-S1 Codex cache state out of band so the fused
+walker could rederive provider-root identity, conversation linkage, quota
+observations and event payloads from the rollouts. Since #983 the handler only
+arms ``CODEX_REPLAY_FROM_ZERO_KEY``: the clear runs inside ``sync_codex_cache``
+behind the identity snapshot, the root-evidence partition and the compressed
+preflight, so a decoder-less upgrade keeps its retained history (recoverable)
+instead of losing it. The handler must therefore leave every row, both
+certificates and the physical mutation sequence byte-identical.
 """
 from __future__ import annotations
 
-import fcntl
 import pathlib
 import shutil
 import sqlite3
 import sys
-
-import pytest
 
 from conftest import load_script, redirect_paths
 
@@ -32,6 +33,16 @@ POST_DB = FIXTURE_DIR / "post.sqlite"
 # rerun assertion below drives the handler's post-commit/pre-stamp contract.
 IDEMPOTENCY_COVERED = True
 
+REPLAY_MARKER = "codex_replay_from_zero_pending"
+#: cache_meta rows the handler must not touch (the pre-#983 handler deleted or
+#: bumped each of them).
+CODEX_META = (
+    ("codex_physical_mutation_seq", "7"),
+    ("codex_quota_projection_certificate", "stale"),
+    ("codex_journal_coverage_certificate", '{"sequence":7}'),
+    ("codex_journal_coverage_progress", '{"cursor":1}'),
+)
+
 
 def _db_module():
     return sys.modules["_cctally_db"]
@@ -41,8 +52,9 @@ def _seed_existing_cache(tmp_path, monkeypatch):
     """Create a populated cache at the shipped 023 head.
 
     The old Codex rows deliberately omit every S1 linkage value. The migration
-    must clear rather than guess those values; the Claude rows and the Claude
-    quota observation are sentinels for the narrow destructive scope.
+    must neither guess those values nor clear the rows (the guarded replay
+    rederives them); the Claude rows and the Claude quota observation are
+    sentinels that nothing else moves either.
     """
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
@@ -144,6 +156,12 @@ def _seed_existing_cache(tmp_path, monkeypatch):
                (source_path, line_offset, source_root_key, payload_json)
                VALUES ('/codex/source.jsonl', 2, 'root-a', '{"legacy":true}')"""
         )
+        # The state main's handler destroyed: both certificates, the coverage
+        # progress record and the physical mutation sequence.
+        conn.executemany(
+            "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+            CODEX_META,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -204,35 +222,30 @@ def _cache_head() -> int:
     return len(db._CACHE_MIGRATIONS)
 
 
-def _assert_codex_cleared_claude_unchanged(
-    conn: sqlite3.Connection, *, legacy_claude_messages: bool = True,
-) -> None:
-    assert _counts(conn) == {
+def _populated(*, legacy_transcripts: bool = True) -> dict[str, int]:
+    """The seeded counts; 028 later drops both legacy transcript tables."""
+    return {
         "claude_entries": 1,
-        "claude_messages": 1 if legacy_claude_messages else 0,
-        "claude_quota": 1,
-        "codex_entries": 0,
-        "codex_files": 0,
-        "codex_roots": 0,
-        "codex_threads": 0,
-        "codex_quota": 0,
-        "codex_events": 0,
-    }
-
-
-def _assert_pre_migration_scope_unchanged(conn: sqlite3.Connection) -> None:
-    """A held Codex flock must defer before changing *any* 024-owned row."""
-    assert _counts(conn) == {
-        "claude_entries": 1,
-        "claude_messages": 1,
+        "claude_messages": 1 if legacy_transcripts else 0,
         "claude_quota": 1,
         "codex_entries": 1,
         "codex_files": 1,
         "codex_roots": 1,
         "codex_threads": 1,
         "codex_quota": 1,
-        "codex_events": 1,
+        "codex_events": 1 if legacy_transcripts else 0,
     }
+
+
+def _replay_marker(conn: sqlite3.Connection):
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key = ?", (REPLAY_MARKER,)
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def _dump_without_replay_marker(conn: sqlite3.Connection) -> list[str]:
+    return [line for line in conn.iterdump() if REPLAY_MARKER not in line]
 
 
 def test_cache_registry_024_is_contiguous_after_023(tmp_path, monkeypatch):
@@ -247,25 +260,44 @@ def test_cache_registry_024_is_contiguous_after_023(tmp_path, monkeypatch):
     assert db._CACHE_MIGRATIONS[idx].seq == 24
 
 
-def test_024_handler_clears_only_codex_and_is_idempotent_before_central_stamp(
+def test_the_marker_name_matches_the_constant_the_sync_consumes(tmp_path, monkeypatch):
+    """A drifted literal would arm a marker nothing reads."""
+    _seed_existing_cache(tmp_path, monkeypatch)
+    assert sys.modules["_cctally_cache"].CODEX_REPLAY_FROM_ZERO_KEY == REPLAY_MARKER
+
+
+def test_024_handler_only_arms_the_replay_and_is_idempotent_before_central_stamp(
     tmp_path, monkeypatch
 ):
+    """#983: an out-of-band clear here destroyed retained history on a
+    decoder-less upgrade and emptied the D1 identity snapshot. The handler may
+    write the replay marker and nothing else: every Codex family, both
+    certificates and the physical mutation sequence stay byte-identical."""
     _ns, db, core = _seed_existing_cache(tmp_path, monkeypatch)
     conn = sqlite3.connect(core.CACHE_DB_PATH)
     try:
+        before = list(conn.iterdump())
+        assert _replay_marker(conn) is None
         handler = _handler(db)
         handler(conn)
-        _assert_codex_cleared_claude_unchanged(conn)
+        assert _replay_marker(conn) == "1"
+        assert _dump_without_replay_marker(conn) == before
+        assert _counts(conn) == _populated()
+        for key, value in CODEX_META:
+            assert conn.execute(
+                "SELECT value FROM cache_meta WHERE key = ?", (key,)
+            ).fetchone() == (value,), key
         assert _marker(conn) == 0, "handler must never self-stamp"
         assert _version(conn) == 23, "only the dispatcher advances user_version"
 
-        before = list(conn.iterdump())
+        armed = list(conn.iterdump())
         handler(conn)
-        assert list(conn.iterdump()) == before, (
-            "the retry after a handler/data commit but before central stamping "
+        assert list(conn.iterdump()) == armed, (
+            "the retry after a handler commit but before central stamping "
             "must be byte-idempotent"
         )
-        _assert_codex_cleared_claude_unchanged(conn)
+        db._stamp_applied(conn, MIGRATION, "2026-07-15T12:00:00Z")
+        assert _marker(conn) == 1
     finally:
         conn.close()
 
@@ -282,123 +314,19 @@ def test_024_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
 
     conn = ns["open_cache_db"]()
     try:
-        _assert_codex_cleared_claude_unchanged(
-            conn, legacy_claude_messages=False
-        )
+        # The retained Codex rows survive the whole chain; the replay is the
+        # sync's job and stays armed until a sync performs it.
+        assert _counts(conn) == _populated(legacy_transcripts=False)
+        assert _replay_marker(conn) == "1"
         assert _marker(conn) == 1
-        # Head is 34 after the window-scoped spend adoption repair; the
-        # seeded unattributed cutover op lets 029 resolve so the chain reaches
-        # head (rather than gate-deferring on the legacy Claude sentinel row).
         assert _version(conn) == _cache_head()
     finally:
         conn.close()
 
 
-def test_024_open_cache_db_defers_without_mutation_while_codex_lock_is_held(
-    tmp_path, monkeypatch
-):
-    ns, _db, core = _seed_existing_cache(tmp_path, monkeypatch)
-    expected_lock = pathlib.Path(str(core.CACHE_DB_PATH) + ".codex.lock")
-    assert core.CACHE_LOCK_CODEX_PATH == expected_lock
-    lock_fh = open(expected_lock, "w")
-    fcntl.flock(lock_fh, fcntl.LOCK_EX)
-    try:
-        conn = ns["open_cache_db"]()
-        try:
-            _assert_pre_migration_scope_unchanged(conn)
-            assert _marker(conn) == 0
-            assert _version(conn) == 23
-        finally:
-            conn.close()
-    finally:
-        fcntl.flock(lock_fh, fcntl.LOCK_UN)
-        lock_fh.close()
-
-    conn = ns["open_cache_db"]()
-    try:
-        _assert_codex_cleared_claude_unchanged(
-            conn, legacy_claude_messages=False
-        )
-        assert _marker(conn) == 1
-        # Head is 34 after the window-scoped spend adoption repair; the
-        # seeded unattributed cutover op lets 029 resolve so the chain reaches
-        # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == _cache_head()
-    finally:
-        conn.close()
-
-
-def test_024_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(
-    tmp_path, monkeypatch
-):
-    _ns, db, core = _seed_existing_cache(tmp_path, monkeypatch)
-    expected_lock = pathlib.Path(str(core.CACHE_DB_PATH) + ".codex.lock")
-    lock_fh = open(expected_lock, "w")
-    fcntl.flock(lock_fh, fcntl.LOCK_EX)
-    try:
-        db._eagerly_apply_cache_migrations()
-        conn = sqlite3.connect(core.CACHE_DB_PATH)
-        try:
-            _assert_pre_migration_scope_unchanged(conn)
-            assert _marker(conn) == 0
-            assert _version(conn) == 23
-        finally:
-            conn.close()
-    finally:
-        fcntl.flock(lock_fh, fcntl.LOCK_UN)
-        lock_fh.close()
-
-    db._eagerly_apply_cache_migrations()
-    conn = sqlite3.connect(core.CACHE_DB_PATH)
-    try:
-        _assert_codex_cleared_claude_unchanged(
-            conn, legacy_claude_messages=False
-        )
-        assert _marker(conn) == 1
-        # Head is 34 after the window-scoped spend adoption repair; the
-        # seeded unattributed cutover op lets 029 resolve so the chain reaches
-        # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == _cache_head()
-    finally:
-        conn.close()
-
-
-def test_024_handler_invalidates_stored_quota_projection_certificate(
-    tmp_path, monkeypatch
-):
-    """F3: 024 clears Codex quota state, so a stale-valid certificate that would
-    let the reconcile short-circuit must be deleted in the same transaction."""
-    _ns, db, core = _seed_existing_cache(tmp_path, monkeypatch)
-    conn = sqlite3.connect(core.CACHE_DB_PATH)
-    try:
-        conn.execute(
-            "INSERT INTO cache_meta(key, value) VALUES "
-            "('codex_quota_projection_certificate', ?)",
-            ('{"sequence":7,"signatures":{"root-a":"' + "a" * 64 + '"}}',),
-        )
-        conn.commit()
-        assert conn.execute(
-            "SELECT COUNT(*) FROM cache_meta "
-            "WHERE key='codex_quota_projection_certificate'"
-        ).fetchone()[0] == 1
-
-        _handler(db)(conn)
-
-        assert conn.execute(
-            "SELECT COUNT(*) FROM cache_meta "
-            "WHERE key='codex_quota_projection_certificate'"
-        ).fetchone()[0] == 0
-    finally:
-        conn.close()
-
-
-def test_024_per_migration_goldens_pin_the_existing_cache_clear():
-    """The pre/post artifacts carry an actual populated Codex-only reset.
-
-    This is deliberately more than a marker check: Claude and Codex sentinels
-    make a too-broad DELETE or a no-op handler observable in the committed
-    migration fixture.
-    """
+def test_024_per_migration_goldens_pin_the_replay_arm():
+    """The pre/post artifacts carry a populated Codex store that the migration
+    keeps: post is pre plus the replay marker plus the central stamp."""
     assert PRE_DB.exists(), f"missing 024 pre fixture: {PRE_DB}"
     assert POST_DB.exists(), f"missing 024 post fixture: {POST_DB}"
     pre = sqlite3.connect(PRE_DB)
@@ -410,13 +338,15 @@ def test_024_per_migration_goldens_pin_the_existing_cache_clear():
         assert pre.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE name = ?", (MIGRATION,)
         ).fetchone()[0] == 0
+        assert _replay_marker(pre) is None
         assert _counts(pre)["codex_entries"] == 1
         assert _counts(pre)["claude_entries"] == 1
 
         assert post.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE name = ?", (MIGRATION,)
         ).fetchone()[0] == 1
-        _assert_codex_cleared_claude_unchanged(post)
+        assert _replay_marker(post) == "1"
+        assert _counts(post) == _counts(pre)
     finally:
         pre.close()
         post.close()

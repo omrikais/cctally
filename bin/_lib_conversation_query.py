@@ -12,6 +12,7 @@ deduped session_entries row (idx_entries_dedup), via the shared pricing helper
 """
 from __future__ import annotations
 import base64 as _base64
+import contextlib
 import json as _json
 import os
 import re
@@ -3246,12 +3247,20 @@ def _scoped_codex_anon_paths(conn, account_key: str):
     retained proof for its payload CWD and source root. A path/root seen under
     another session_meta account is ambiguous and is never offered as a
     client-side token.
+
+    Returns ``(owned, ambiguous, undecodable)``: ``owned`` maps each admitted
+    path to the conversation keys whose raw thread ``cwd`` is exactly that
+    path (#972 O6 + §5.8 rule 6: only those conversations' scoped rollup
+    labels join the path's scrub vocabulary, because a rollup label derives
+    from the thread cwd, not from whichever session_meta event this account
+    stamped); a path no thread names maps to an empty set.
     """
     from _lib_codex_metadata import (
         decode_codex_project_metadata, resolve_codex_threads_table,
     )
 
     observations: dict[str, set[str]] = {}
+    owned_keys: dict[str, set[str]] = {}
     root_owners: dict[str, set[str]] = {}
     # Only session_meta carries the CWD/root provenance needed here. Keep this
     # read narrow: selecting and decoding every response/tool event made each
@@ -3293,7 +3302,7 @@ def _scoped_codex_anon_paths(conn, account_key: str):
             # Messages without their raw thread metadata leave project-path
             # coverage unknown. Refuse rather than offer a partial scrub plan.
             raise RuntimeError("Codex raw threads table missing for scoped anonymization")
-        return set(), 0, 0
+        return {}, 0, 0
     ambiguous = 0
     # Threads can live in the last-good TEMP view, whose schema says nothing
     # about the physical accounting roots. Resolve roots independently and
@@ -3341,11 +3350,14 @@ def _scoped_codex_anon_paths(conn, account_key: str):
         if isinstance(cwd, str) and cwd and os.path.isabs(cwd):
             if cwd not in owned:
                 ambiguous += 1
+            elif key:
+                owned_keys.setdefault(cwd, set()).add(key)
         if source_root_key and source_root_key in root_paths:
             if (source_root_key not in owned_roots
                     or root_paths[source_root_key] not in owned):
                 ambiguous += 1
-    return owned, ambiguous, undecodable
+    return ({path: frozenset(owned_keys.get(path, ())) for path in owned},
+            ambiguous, undecodable)
 
 
 def _count_undecodable_codex_cwd(conn) -> int:
@@ -3414,7 +3426,9 @@ def build_anon_plan_for_sources(conn, *, home_dir, sources):
     from _lib_conversation_anon import build_anon_plan
     want = set(sources or ())
     scoped_account = _anon_scope_account(conn)
-    project_roots: dict = {}
+    # #972 O6: each root carries a SET of labels, accumulated across legs and
+    # conversations, so the vocabulary does not depend on row order.
+    project_roots: dict[str, set[str]] = {}
     paths: set = set()
     if "claude" in want:
         cwds: set = set()
@@ -3435,7 +3449,7 @@ def build_anon_plan_for_sources(conn, *, home_dir, sources):
         except sqlite3.OperationalError:
             pass
         for c in cwds:
-            project_roots[c] = _project_label(c)
+            project_roots.setdefault(c, set()).add(_project_label(c))
             paths.add(c)
     undecodable_cwd_rows = 0
     ambiguous_cwd_rows = 0
@@ -3446,8 +3460,20 @@ def build_anon_plan_for_sources(conn, *, home_dir, sources):
                 ambiguous_cwd_rows,
                 undecodable_cwd_rows,
             ) = _scoped_codex_anon_paths(conn, scoped_account)
-            for cwd in owned:
-                project_roots[cwd] = _project_label(cwd)
+            # A scoped label is a bare word this account's view already shows:
+            # the TEMP rollup copy, whose label the scope admitted for display.
+            scoped_labels: dict = {}
+            if owned:
+                for ck, pl in conn.execute(
+                        "SELECT conversation_key, project_label "
+                        "FROM temp.codex_conversation_rollups "
+                        "WHERE project_label IS NOT NULL AND project_label != ''"):
+                    scoped_labels[ck] = pl
+            for cwd, owning in owned.items():
+                labels = project_roots.setdefault(cwd, set())
+                labels.add(_project_label(cwd))
+                labels.update(scoped_labels[ck] for ck in owning
+                              if ck in scoped_labels)
                 paths.add(cwd)
         else:
             labels: dict = {}
@@ -3465,7 +3491,10 @@ def build_anon_plan_for_sources(conn, *, home_dir, sources):
                         "WHERE cwd IS NOT NULL AND cwd != ''"):
                     cwd = decode_codex_project_metadata(cwd_blob, None).cwd
                     if isinstance(cwd, str) and cwd and os.path.isabs(cwd):
-                        project_roots[cwd] = labels.get(ck) or _project_label(cwd)
+                        root_labels = project_roots.setdefault(cwd, set())
+                        root_labels.add(_project_label(cwd))
+                        if labels.get(ck):
+                            root_labels.add(labels[ck])
                         paths.add(cwd)
             except sqlite3.OperationalError:
                 pass
@@ -3476,7 +3505,8 @@ def build_anon_plan_for_sources(conn, *, home_dir, sources):
                         "SELECT canonical_root_path FROM codex_source_roots "
                         "WHERE canonical_root_path IS NOT NULL AND canonical_root_path != ''"):
                     if isinstance(root_path, str) and root_path and os.path.isabs(root_path):
-                        project_roots.setdefault(root_path, _project_label(root_path))
+                        project_roots.setdefault(
+                            root_path, {_project_label(root_path)})
                         paths.add(root_path)
             except sqlite3.OperationalError:
                 pass
@@ -3842,17 +3872,23 @@ def search_conversations(conn, query, *, limit=50, offset=0,
     return _finish(out)
 
 
-def _row_to_hit(uuid_, sid, ts, cwd, snippet, msg_id, req_id, match_kinds=None):
+def _row_to_hit(uuid_, sid, ts, cwd, snippet, msg_id, req_id, match_kinds=None,
+                snippet_parts=None):
     """Build one hit WITHOUT cost — cost is batched onto the FINAL page in
     _attach_costs (I1: no per-hit _turn_cost_map round-trip). The turn key rides
     on the private `_turn_key` field until the batch maps it to `cost_usd`.
-    #177 S6: ``match_kinds`` (sorted non-prose badges) is attached per hit."""
+    #177 S6: ``match_kinds`` (sorted non-prose badges) is attached per hit.
+    #1036: ``snippet_parts`` is the structured excerpt the viewer renders; the
+    FTS paths pass the parts their markers produced, every other path (LIKE,
+    title LIKE, files) gets one unmatched part via ``plain_snippet_parts``."""
     return {
         "session_id": sid,
         "uuid": uuid_,
         "project_label": _project_label(cwd),
         "ts": ts,
         "snippet": snippet,
+        "snippet_parts": (snippet_parts if snippet_parts is not None
+                          else plain_snippet_parts(snippet)),
         "match_kinds": match_kinds or [],
         "_turn_key": (msg_id, req_id) if msg_id is not None and req_id is not None
                      else None,
@@ -3920,24 +3956,169 @@ def _like_pattern(q):
     return "%" + _like_escape(q) + "%"
 
 
+# #1036: structured search snippets. snippet() decorates matches with markers
+# bound as parameters; a row's output is parsed only when its own source column
+# contains neither marker (checked in the SAME statement, so the check sees the
+# exact text snippet() decorated), else the row retries with the next candidate.
+# The legacy bracket `snippet` (the CLI's form, frozen by O2) is rebuilt from
+# the parts and equals snippet(…,'[',']',' … ',12) byte for byte: the markers
+# change only the inserted decorations, never FTS5's fragment selection.
+SNIPPET_MAX_CANDIDATES = 64
+_SNIPPET_ELLIPSIS = " … "
+_SNIPPET_TOKENS = 12
+_SNIPPET_ID_CHUNK = 300   # rowids per IN-list, well under SQLite's variable cap
+# FTS-column index → external-content source column of conversation_fts.
+_CONVERSATION_FTS_SOURCE_COLS = ("text", "search_tool", "search_thinking")
+
+
+def _snippet_markers(n: int) -> tuple:
+    """(OPEN(n), CLOSE(n)): each holds U+E000 only at index 0, neither is a
+    prefix of the other, and neither contains whitespace or the ellipsis — so
+    an occurrence in snippet() output lies wholly inside copied source text or
+    wholly inside one inserted marker."""
+    return ("\ue000cctally:" + str(n) + ":open\ue001",
+            "\ue000cctally:" + str(n) + ":close\ue001")
+
+
+def _split_marked_snippet(text: str, open_m: str, close_m: str):
+    """Split marker-decorated snippet() output into ``[{text, match}]`` parts.
+    An unmatched part runs up to the next OPEN, a matched part from there to the
+    next CLOSE. Empty unmatched parts are dropped; adjacent matched parts stay
+    separate. A sequence that does not alternate OPEN … CLOSE returns None (the
+    caller treats it as a collision)."""
+    parts = []
+    pos = 0
+    while True:
+        o = text.find(open_m, pos)
+        c = text.find(close_m, pos)
+        if o < 0:
+            if c >= 0:
+                return None              # a CLOSE with no OPEN
+            if pos < len(text):
+                parts.append({"text": text[pos:], "match": False})
+            return parts
+        if 0 <= c < o:
+            return None                  # a CLOSE before the next OPEN
+        if o > pos:
+            parts.append({"text": text[pos:o], "match": False})
+        start = o + len(open_m)
+        end = text.find(close_m, start)
+        if end < 0 or open_m in text[start:end]:
+            return None                  # unterminated or nested OPEN
+        parts.append({"text": text[start:end], "match": True})
+        pos = end + len(close_m)
+
+
+def _legacy_from_parts(parts: list) -> str:
+    """The legacy bracket form: matched parts wrapped in ``[``/``]``."""
+    return "".join("[" + p["text"] + "]" if p["match"] else p["text"]
+                   for p in parts)
+
+
+def plain_snippet_parts(text) -> list:
+    """Parts for a snippet that carries no FTS markers (LIKE, title LIKE, file
+    and every Codex hit): one unmatched part, or ``[]`` when empty or NULL."""
+    return [{"text": text, "match": False}] if text else []
+
+
+@contextlib.contextmanager
+def _read_snapshot(conn):
+    """One read snapshot for a search's page selection and its extraction
+    (#1036). Begins a DEFERRED transaction only when the connection holds none,
+    and ends only the transaction it began: COMMIT on success (TEMP objects the
+    caller created stay), ROLLBACK if an exception escapes. A caller-held
+    transaction already pins one snapshot, so it is left untouched. Valid on the
+    dashboard's read-only reader (``mode=ro``, default isolation level)."""
+    if conn.in_transaction:
+        yield
+        return
+    conn.execute("BEGIN")
+    try:
+        yield
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    if conn.in_transaction:
+        conn.execute("COMMIT")
+
+
+def _extract_fts_snippets(conn, *, fts_table: str, content_table: str,
+                          content_rowid: str, source_col: str, col: int,
+                          match_expr: str, rowids) -> dict:
+    """{rowid: (legacy snippet, parts)} for the given rowids that ``match_expr``
+    matches. Per candidate ``n`` one statement per rowid chunk selects
+    snippet() decorated with OPEN(n)/CLOSE(n) and the row's collision flag;
+    only collided (or non-alternating) rows retry at ``n + 1``. Rows still
+    pending after the last candidate get SQLite's empty-marker excerpt as one
+    unmatched part and the literal-bracket legacy string. Identifiers are
+    module constants, never user input."""
+    out = {}
+    pending = list(dict.fromkeys(rowids))
+    select_from = (
+        f"FROM {fts_table} JOIN {content_table} src "
+        f"ON src.{content_rowid} = {fts_table}.rowid "
+        f"WHERE {fts_table} MATCH ? AND src.{content_rowid} IN ")
+    for n in range(SNIPPET_MAX_CANDIDATES):
+        if not pending:
+            break
+        open_m, close_m = _snippet_markers(n)
+        retry = []
+        for i in range(0, len(pending), _SNIPPET_ID_CHUNK):
+            chunk = pending[i:i + _SNIPPET_ID_CHUNK]
+            ph = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT src.{content_rowid}, "
+                f"snippet({fts_table}, {int(col)}, ?, ?, ?, {_SNIPPET_TOKENS}), "
+                f"instr(src.{source_col}, ?) > 0 OR instr(src.{source_col}, ?) > 0 "
+                f"{select_from}({ph})",
+                (open_m, close_m, _SNIPPET_ELLIPSIS, open_m, close_m,
+                 match_expr, *chunk),
+            ).fetchall()
+            for rid, snip, collided in rows:
+                if collided:
+                    retry.append(rid)
+                    continue
+                if snip is None:
+                    out[rid] = (None, [])
+                    continue
+                parts = _split_marked_snippet(snip, open_m, close_m)
+                if parts is None:
+                    retry.append(rid)
+                    continue
+                out[rid] = (_legacy_from_parts(parts), parts)
+        pending = retry
+    for i in range(0, len(pending), _SNIPPET_ID_CHUNK):
+        chunk = pending[i:i + _SNIPPET_ID_CHUNK]
+        ph = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT src.{content_rowid}, "
+            f"snippet({fts_table}, {int(col)}, ?, ?, ?, {_SNIPPET_TOKENS}), "
+            f"snippet({fts_table}, {int(col)}, ?, ?, ?, {_SNIPPET_TOKENS}) "
+            f"{select_from}({ph})",
+            ("", "", _SNIPPET_ELLIPSIS, "[", "]", _SNIPPET_ELLIPSIS,
+             match_expr, *chunk),
+        ).fetchall()
+        for rid, plain, legacy in rows:
+            out[rid] = (legacy, plain_snippet_parts(plain))
+    return out
+
+
 def _fts_snippets(conn, fts_q, ids, col=0):
-    """{rowid: snippet} for the page rowids ONLY (#149). snippet() needs an
-    active MATCH, so it can't be deferred to an outer query over the page CTE;
-    a second bounded MATCH restricted to the page rowids generates snippets for
-    at most one page of hits instead of every corpus match. #177 S6: ``col``
-    selects which FTS column the snippet is drawn from (0=text, 1=search_tool,
-    2=search_thinking) so a tool/thinking hit shows its matching content."""
+    """{rowid: (legacy snippet, parts)} for the page rowids ONLY (#149).
+    snippet() needs an active MATCH, so it can't be deferred to an outer query
+    over the page CTE; a second bounded MATCH restricted to the page rowids
+    generates snippets for at most one page of hits instead of every corpus
+    match. #177 S6: ``col`` selects which FTS column the snippet is drawn from
+    (0=text, 1=search_tool, 2=search_thinking) so a tool/thinking hit shows its
+    matching content. #1036: extraction runs through the collision-checked
+    marker helper; the legacy single-column (prose-only) table is column 0."""
     if not ids:
         return {}
-    ph = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"SELECT cm.id, snippet(conversation_fts, {int(col)}, '[', ']', ' … ', 12) "
-        "FROM conversation_fts "
-        "JOIN conversation_messages cm ON cm.id = conversation_fts.rowid "
-        f"WHERE conversation_fts MATCH ? AND cm.id IN ({ph})",
-        (fts_q, *ids),
-    ).fetchall()
-    return {r[0]: r[1] for r in rows}
+    return _extract_fts_snippets(
+        conn, fts_table="conversation_fts", content_table="conversation_messages",
+        content_rowid="id", source_col=_CONVERSATION_FTS_SOURCE_COLS[int(col)],
+        col=int(col), match_expr=fts_q, rowids=ids)
 
 
 def _texts_for_ids(conn, ids):
@@ -4008,6 +4189,31 @@ def _search_fts(conn, q, limit, offset, kind, depth,
     # message column.
     fpred = _session_filter_pred("cm.session_id", filt_sql)
     fargs = tuple(filt_params)
+    # #1036: the count, the page selection, the badges and every snippet
+    # statement share one read snapshot, so extraction sees exactly the rows the
+    # page selected (a concurrent rewrite or delete cannot drop or change a hit).
+    with _read_snapshot(conn):
+        total, page, badges, snips = _search_fts_snapshot(
+            conn, fts_q, match_expr, legacy, et_pred, et_args, fpred, fargs,
+            limit, offset)
+    hits = []
+    for (rid, sid, uuid, ts, cwd, mid, rqd) in page:
+        # A selected row primary extraction did not return keeps its position
+        # with a NULL snippet; a hit is never dropped (page length and
+        # offset-based pagination stay exact).
+        snippet, parts = snips.get(rid, (None, []))
+        hits.append(_row_to_hit(uuid, sid, ts, cwd, snippet, mid, rqd,
+                                match_kinds=badges.get((sid, uuid), []),
+                                snippet_parts=parts))
+    return {"query": q, "mode": "fts",
+            "hits": _attach_search_meta(conn, hits),
+            "total": total}
+
+
+def _search_fts_snapshot(conn, fts_q, match_expr, legacy, et_pred, et_args,
+                         fpred, fargs, limit, offset):
+    """The snapshot-bound half of ``_search_fts``: (total, page, badges,
+    {rowid: (legacy snippet, parts)})."""
     # Exact post-dedup logical total — counted in C with no snippet generation
     # and no Python row materialization.
     total = conn.execute(
@@ -4057,17 +4263,14 @@ def _search_fts(conn, q, limit, offset, kind, depth,
         rids_by_group = _all_matched_rids_by_group(
             conn, et_pred, et_args, list(page_groups))
         badges = _match_kinds(conn, fts_q, rids_by_group)
+    # Primary extraction: the page's own MATCH re-matches every selected rowid
+    # in this snapshot.
     snips = _fts_snippets(conn, match_expr, [r[0] for r in page], col=0)
     # For hits badged tool/thinking but with no prose match, draw the snippet
     # from the matched column instead (prose → tool → thinking preference).
     if not legacy:
         snips = _prefer_snippet_columns(conn, fts_q, page, page_groups, badges, snips)
-    hits = [_row_to_hit(uuid, sid, ts, cwd, snips.get(rid, ""), mid, rqd,
-                        match_kinds=badges.get((sid, uuid), []))
-            for (rid, sid, uuid, ts, cwd, mid, rqd) in page]
-    return {"query": q, "mode": "fts",
-            "hits": _attach_search_meta(conn, hits),
-            "total": total}
+    return total, page, badges, snips
 
 
 def _all_matched_rids_by_group(conn, et_pred, et_args, groups):
@@ -4151,6 +4354,9 @@ def _prefer_snippet_columns(conn, fts_q, page, page_groups, badges, snips):
     for col, rids in by_col.items():
         col_fts = _kind_match_expr(
             "tools" if col == 1 else "thinking", fts_q)
+        # Update-only (#1036 R3-P2): the column-filtered MATCH can miss a
+        # selected row whose badge came from a sibling row of its group; that
+        # row keeps its primary (snippet, parts), never a NULL replacement.
         alt = _fts_snippets(conn, col_fts, rids, col=col)
         snips.update(alt)
     return snips
@@ -4252,50 +4458,63 @@ def _search_title(conn, q, limit, offset, fts_available, filt_sql="", filt_param
         "  ) WHERE rn = 1)")
 
     if fts_available:
-        # matched titles: rowid → session_id + snippet, INNER-joined to the
-        # anchor so only anchorable sessions survive (P2-9).
+        # matched titles: rowid → session_id, INNER-joined to the anchor so only
+        # anchorable sessions survive (P2-9). #1036: the page selects the title
+        # rowid and the snippet comes from the collision-checked extraction,
+        # inside the same read snapshot as the count and the page.
         fts_q = _fts_query(q, prefix_last=True)
-        total = conn.execute(
-            "WITH " + anchor_cte + " "
-            "SELECT COUNT(*) FROM conversation_title_fts f "
-            "JOIN conversation_ai_titles t ON t.rowid = f.rowid "
-            "JOIN anchor a ON a.session_id = t.session_id "
-            f"WHERE f.conversation_title_fts MATCH ?{fpred}",
-            (fts_q, *fargs)).fetchone()[0]
-        rows = conn.execute(
-            "WITH " + anchor_cte + " "
-            "SELECT t.session_id, a.auuid, a.ats, a.acwd, a.amid, a.arqd, "
-            "       snippet(conversation_title_fts, 0, '[', ']', ' … ', 12) AS snip "
-            "FROM conversation_title_fts f "
-            "JOIN conversation_ai_titles t ON t.rowid = f.rowid "
-            "JOIN anchor a ON a.session_id = t.session_id "
-            f"WHERE f.conversation_title_fts MATCH ?{fpred} "
-            "ORDER BY a.ats DESC, t.session_id DESC LIMIT ? OFFSET ?",
-            (fts_q, *fargs, limit, offset)).fetchall()
-        mode = "fts"
-    else:
-        like = _like_pattern(q)
-        total = conn.execute(
-            "WITH " + anchor_cte + " "
-            "SELECT COUNT(*) FROM conversation_ai_titles t "
-            "JOIN anchor a ON a.session_id = t.session_id "
-            f"WHERE t.ai_title LIKE ? ESCAPE '\\'{fpred}",
-            (like, *fargs)).fetchone()[0]
-        rows = conn.execute(
-            "WITH " + anchor_cte + " "
-            "SELECT t.session_id, a.auuid, a.ats, a.acwd, a.amid, a.arqd, "
-            "       t.ai_title AS snip "
-            "FROM conversation_ai_titles t "
-            "JOIN anchor a ON a.session_id = t.session_id "
-            f"WHERE t.ai_title LIKE ? ESCAPE '\\'{fpred} "
-            "ORDER BY a.ats DESC, t.session_id DESC LIMIT ? OFFSET ?",
-            (like, *fargs, limit, offset)).fetchall()
-        mode = "like"
+        with _read_snapshot(conn):
+            total = conn.execute(
+                "WITH " + anchor_cte + " "
+                "SELECT COUNT(*) FROM conversation_title_fts f "
+                "JOIN conversation_ai_titles t ON t.rowid = f.rowid "
+                "JOIN anchor a ON a.session_id = t.session_id "
+                f"WHERE f.conversation_title_fts MATCH ?{fpred}",
+                (fts_q, *fargs)).fetchone()[0]
+            page = conn.execute(
+                "WITH " + anchor_cte + " "
+                "SELECT t.session_id, a.auuid, a.ats, a.acwd, a.amid, a.arqd, "
+                "       t.rowid AS trid "
+                "FROM conversation_title_fts f "
+                "JOIN conversation_ai_titles t ON t.rowid = f.rowid "
+                "JOIN anchor a ON a.session_id = t.session_id "
+                f"WHERE f.conversation_title_fts MATCH ?{fpred} "
+                "ORDER BY a.ats DESC, t.session_id DESC LIMIT ? OFFSET ?",
+                (fts_q, *fargs, limit, offset)).fetchall()
+            snips = (_extract_fts_snippets(
+                conn, fts_table="conversation_title_fts",
+                content_table="conversation_ai_titles", content_rowid="rowid",
+                source_col="ai_title", col=0, match_expr=fts_q,
+                rowids=[r[6] for r in page]) if page else {})
+        hits = []
+        for (sid, auuid, ats, acwd, amid, arqd, trid) in page:
+            snip, parts = snips.get(trid, (None, []))
+            hits.append(_row_to_hit(auuid, sid, ats, acwd, snip, amid, arqd,
+                                    match_kinds=["title"], snippet_parts=parts))
+        return {"query": q, "mode": "fts",
+                "hits": _attach_search_meta(conn, hits),
+                "total": total}
+    like = _like_pattern(q)
+    total = conn.execute(
+        "WITH " + anchor_cte + " "
+        "SELECT COUNT(*) FROM conversation_ai_titles t "
+        "JOIN anchor a ON a.session_id = t.session_id "
+        f"WHERE t.ai_title LIKE ? ESCAPE '\\'{fpred}",
+        (like, *fargs)).fetchone()[0]
+    rows = conn.execute(
+        "WITH " + anchor_cte + " "
+        "SELECT t.session_id, a.auuid, a.ats, a.acwd, a.amid, a.arqd, "
+        "       t.ai_title AS snip "
+        "FROM conversation_ai_titles t "
+        "JOIN anchor a ON a.session_id = t.session_id "
+        f"WHERE t.ai_title LIKE ? ESCAPE '\\'{fpred} "
+        "ORDER BY a.ats DESC, t.session_id DESC LIMIT ? OFFSET ?",
+        (like, *fargs, limit, offset)).fetchall()
 
     hits = [_row_to_hit(auuid, sid, ats, acwd, snip, amid, arqd,
                         match_kinds=["title"])
             for (sid, auuid, ats, acwd, amid, arqd, snip) in rows]
-    return {"query": q, "mode": mode,
+    return {"query": q, "mode": "like",
             "hits": _attach_search_meta(conn, hits),
             "total": total}
 

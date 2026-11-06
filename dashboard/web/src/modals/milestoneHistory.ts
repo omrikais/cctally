@@ -7,7 +7,33 @@ import type { WeekDetailPayload, WeekIndexEntry } from '../types/envelope';
 // key: `${source}|${key}|${detail_stamp}` — a moved stamp (Claude recompute /
 // Codex projection rebuild / current-week growth) invalidates the entry, which
 // is exactly the gap the envelope's data_version legs don't track.
+//
+// #1050 spec 4.6 (G2): bounded, least recently used. A stamp-keyed entry is
+// never reused once its stamp moves, and two streams move often — an untrusted
+// store re-stamps every cycle on every index, and a busy current cycle on every
+// crossing — so an unbounded Map grew for the life of the tab. A `Map` keeps
+// insertion order: a hit is re-inserted at the newest end, and an insert past
+// the cap drops the oldest key.
+const CACHE_CAPACITY = 32;
 const cache = new Map<string, WeekDetailPayload>();
+
+function cacheGet(key: string): WeekDetailPayload | undefined {
+  const hit = cache.get(key);
+  if (hit !== undefined) {
+    cache.delete(key);
+    cache.set(key, hit);
+  }
+  return hit;
+}
+
+function cacheSet(key: string, payload: WeekDetailPayload): void {
+  cache.delete(key);
+  cache.set(key, payload);
+  while (cache.size > CACHE_CAPACITY) {
+    const oldest = cache.keys().next().value as string;
+    cache.delete(oldest);
+  }
+}
 
 /**
  * Step from `currentKey` to an older (dir=+1) or newer (dir=-1) navigable
@@ -73,7 +99,7 @@ export async function fetchWeekDetail(
   accountKey: string | null = null,
 ): Promise<WeekDetailPayload> {
   const ck = `${source}|${accountKey ?? ''}|${entry.key}|${entry.detail_stamp}`;
-  const hit = cache.get(ck);
+  const hit = cacheGet(ck);
   if (hit) return hit;
   const qs = accountKey == null ? '' : `?account=${encodeURIComponent(accountKey)}`;
   const res = await fetch(`/api/milestones/${source}/week/${encodeURIComponent(entry.key)}${qs}`);
@@ -86,10 +112,14 @@ export async function fetchWeekDetail(
     });
   }
   const payload = (await res.json()) as WeekDetailPayload;
-  cache.set(ck, payload);
+  cacheSet(ck, payload);
   return payload;
 }
 
 export function clearMilestoneHistoryCacheForTests(): void {
   cache.clear();
+}
+
+export function milestoneHistoryCacheSizeForTests(): number {
+  return cache.size;
 }

@@ -75,7 +75,10 @@ capture  One freeze per measurement session, bound to EVERY store copy it
          existing directory's `.git` recorded from the live tree - present
          (`class: probe`: its lstat, and for a link its stored target and
          `followed` stat) or a recorded absence (`probe-absent`) - metadata
-         only, nothing copied; every `--probe PATH` too (its components, no
+         only, nothing copied; a probed `.git` the product treats as a
+         directory (a link to one included) also gets its `HEAD`, `objects`
+         and `refs` recorded the same way, which the marker rule stats (#976);
+         every `--probe PATH` too (its components, no
          `.git`). The namespace presents lstat/stat/access from them and
          refuses an open or listing (`unmapped-open`). The product's git-root
          walk-up from a Codex worktree cwd under ~/.codex reads them. A cwd
@@ -220,6 +223,10 @@ CHUNK = 1 << 20
 #: logical rollout as `X.jsonl` (spec 5.1/5.2), so the walk captures it whole
 #: as class `container`: a compressed stream is never appended to.
 CONTAINER_SUFFIX = ".jsonl.zst"
+# What the product's repository-marker rule stats inside a `.git` directory
+# (`_is_repository_marker` in bin/_cctally_cache.py, #976): probed for every
+# probed `.git` the product classifies as a directory.
+GIT_MARKER_CHILDREN = ("HEAD", "objects", "refs")
 
 
 def _container_leaf():
@@ -1813,6 +1820,31 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
         probe_count["targetEntries"] += "deniedTarget" in scope
         return stat_mod.S_ISDIR(st.st_mode)
 
+    def git_directory(marker: str) -> bool:
+        """The product's classification of a probed `.git` (#976): its walk
+        tests `os.path.isdir`, which FOLLOWS a link, so a `.git` link whose
+        followed metadata is a directory takes the directory branch."""
+        known = entries.get(marker)
+        if known is None:
+            return False
+        if known["kind"] == "dir":
+            return True
+        if known["kind"] != "probe":
+            return False
+        followed = known.get("followed") or {}
+        return known["type"] == "dir" or (known["type"] == "symlink"
+                                          and followed.get("type") == "dir")
+
+    def probe_git(floor: str, scope: dict, marker: str) -> None:
+        """Probe one `.git`, and for a directory the three entries the
+        product's marker rule stats (`_is_repository_marker`: `HEAD`,
+        `objects`, `refs`), each a probe entry or a recorded absence. A `.git`
+        file needs nothing more: the rule never opens it."""
+        probe_path(floor, scope, marker, "git")
+        if git_directory(marker):
+            for child in GIT_MARKER_CHILDREN:
+                probe_path(floor, scope, os.path.join(marker, child), "git")
+
     def probe_walk(path: str, *, git: bool, origin: str) -> "str | None":
         """Probe every component of `path` below its directory root, or below
         the denied target it lies at or under (and, with `git`, the floor's
@@ -1830,14 +1862,14 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
             scope, kind = {"root": None, "deniedTarget": floor}, "target"
         cur = floor
         if git:
-            probe_path(floor, scope, os.path.join(cur, ".git"), "git")
+            probe_git(floor, scope, os.path.join(cur, ".git"))
         rel = os.path.relpath(path, floor)
         for part in ([] if rel == "." else rel.split(os.sep)):
             cur = os.path.join(cur, part)
             if not probe_path(floor, scope, cur, origin):
                 break
             if git:
-                probe_path(floor, scope, os.path.join(cur, ".git"), "git")
+                probe_git(floor, scope, os.path.join(cur, ".git"))
         return kind
 
     transcripts = sorted(str(freeze / e["physical"]) for e in entries.values()

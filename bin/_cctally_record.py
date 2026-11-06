@@ -2345,6 +2345,42 @@ class BlockTotals:
     by_model: dict[str, BlockBucket] = field(default_factory=dict)
     by_project: dict[str, BlockBucket] = field(default_factory=dict)
 
+    def add_priced(
+        self,
+        model: str,
+        project_path: str | None,
+        input_tokens: int,
+        output_tokens: int,
+        cache_creation_tokens: int,
+        cache_read_tokens: int,
+        cost_usd: float,
+    ) -> None:
+        """Fold one priced entry: THE per-entry step of `fold_block_totals`.
+
+        #1003 D1: the scratch replays' incremental engine
+        (`_cctally_rederive.BlockTotalsEngine`) folds through this same
+        method, so both paths perform the identical float additions in the
+        identical order and create buckets in the identical order.
+        """
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+        self.cache_create_tokens += cache_creation_tokens
+        self.cache_read_tokens += cache_read_tokens
+        self.cost_usd += cost_usd
+        self.entry_count += 1
+
+        for key, bucket_dict in (
+            (model, self.by_model),
+            (project_path or "(unknown)", self.by_project),
+        ):
+            b = bucket_dict.setdefault(key, BlockBucket())
+            b.input_tokens += input_tokens
+            b.output_tokens += output_tokens
+            b.cache_create_tokens += cache_creation_tokens
+            b.cache_read_tokens += cache_read_tokens
+            b.cost_usd += cost_usd
+            b.entry_count += 1
+
     def as_legacy_dict(self) -> dict[str, Any]:
         """The exact dict `_compute_block_totals` has always returned.
 
@@ -2379,24 +2415,11 @@ def fold_block_totals(entries: "Iterable[PricedEntry]") -> BlockTotals:
     """
     totals = BlockTotals()
     for entry in entries:
-        totals.input_tokens += entry.input_tokens
-        totals.output_tokens += entry.output_tokens
-        totals.cache_create_tokens += entry.cache_creation_tokens
-        totals.cache_read_tokens += entry.cache_read_tokens
-        totals.cost_usd += entry.cost_usd
-        totals.entry_count += 1
-
-        for key, bucket_dict in (
-            (entry.model, totals.by_model),
-            (entry.project_path or "(unknown)", totals.by_project),
-        ):
-            b = bucket_dict.setdefault(key, BlockBucket())
-            b.input_tokens += entry.input_tokens
-            b.output_tokens += entry.output_tokens
-            b.cache_create_tokens += entry.cache_creation_tokens
-            b.cache_read_tokens += entry.cache_read_tokens
-            b.cost_usd += entry.cost_usd
-            b.entry_count += 1
+        totals.add_priced(
+            entry.model, entry.project_path, entry.input_tokens,
+            entry.output_tokens, entry.cache_creation_tokens,
+            entry.cache_read_tokens, entry.cost_usd,
+        )
     return totals
 
 
@@ -2464,6 +2487,23 @@ def _five_hour_ownership_windows(
     return windows
 
 
+#: #1003 D1: the block-totals engine `_compute_block_totals` defers to, or
+#: None. Only `_cctally_rederive._scratch_read_adapters` installs one, for the
+#: duration of a scratch replay over a stable cache snapshot; every live path
+#: (record-usage, hook-tick, the rebuild's open-block projection, the
+#: backfills) runs with the slot empty.
+_BLOCK_TOTALS_ENGINE = None
+
+
+def swap_block_totals_engine(engine):
+    """Install ``engine`` (or None) in the block-totals slot and return the
+    engine it replaces, so the caller can restore it."""
+    global _BLOCK_TOTALS_ENGINE
+    previous = _BLOCK_TOTALS_ENGINE
+    _BLOCK_TOTALS_ENGINE = engine
+    return previous
+
+
 def _compute_block_totals(
     block_start_at: dt.datetime,
     range_end: dt.datetime,
@@ -2515,7 +2555,36 @@ def _compute_block_totals(
             f"_compute_block_totals: owner_key {owner_key!r} is absent from "
             f"the competing-window context"
         )
+    if _BLOCK_TOTALS_ENGINE is not None:
+        # #1003 D1: inside a scratch replay the engine answers exactly as the
+        # body below would. It ignores ``skip_sync``, as the replay's
+        # `_joined_entries` adapter does.
+        return _BLOCK_TOTALS_ENGINE.totals(
+            block_start_at, range_end, owner_key=owner_key,
+            windows=ownership_windows, pricing_evidence=pricing_evidence,
+            owned_entries=owned_entries,
+        )
+    return _block_totals_reprice(
+        block_start_at, range_end, owner_key=owner_key,
+        ownership_windows=ownership_windows, skip_sync=skip_sync,
+        pricing_evidence=pricing_evidence, owned_entries=owned_entries,
+    )
 
+
+def _block_totals_reprice(
+    block_start_at: dt.datetime,
+    range_end: dt.datetime,
+    *,
+    owner_key: Any,
+    ownership_windows: "list[Any]",
+    skip_sync: bool = False,
+    pricing_evidence: "dict | None" = None,
+    owned_entries: "list | None" = None,
+) -> dict[str, Any]:
+    """`_compute_block_totals`' full re-price: load every entry of the range,
+    partition by owner, price and fold each owned one. The engine-free path,
+    and the engine's own answer for a range too large to cache and its
+    shadow check (#1003 D1)."""
     missing_without_raw = set()
     observed_raw = set()
 
@@ -6664,8 +6733,8 @@ def _record_usage_bound_locked(
     section stalls every other process contending on the same lock. There are
     two such locks and both supply a sink: ``_selected_state_lock`` (the OAuth
     refresh and the authoritative statusline publication) and the statusline
-    persist flock (``_statusline_reduce_and_publish``, reached from the forked
-    persist child and from the ``sync_for_test`` foreground path)."""
+    persist flock (``_statusline_reduce_and_publish``, reached from the exec'd
+    continuation worker and from the ``sync_for_test`` foreground path)."""
 
     # ULP-noise sanitization is applied at the cmd_record_usage ingress
     # boundary so every downstream consumer (HWM files, DB rows,
@@ -7539,6 +7608,16 @@ def _cmd_hook_tick_codex(
                     )
                 finally:
                     cache.close()
+                if stats.lock_contended and getattr(stats, "replay_refill", False):
+                    # #982 spec 4.4: a replay refill holds the locks. Every
+                    # budgeted tick declines until it ends, so a waiting
+                    # request would only make the refill units idle for its
+                    # 60 s lifetime. Request the worker instead, as the
+                    # declining tick does, and publish nothing.
+                    cache_mod._defer_codex_replay_drain()
+                    log_outcome(sync="contended", result="noop",
+                                reason="replay_pending")
+                    return 0
                 if stats.lock_contended:
                     # #968 spec 5.7: publish this hook's own waiting request so
                     # drain workers yield once their admitted work commits. The
@@ -7551,6 +7630,20 @@ def _cmd_hook_tick_codex(
                         drain_request="published" if request_id else "failed")
                     return 0
                 walk_deferral = getattr(stats, "deferred_reason", None)
+                if (walk_deferral == "replay_pending"
+                        and getattr(stats, "replay_refill", False)):
+                    # #982 spec 4.4: a byte-zero replay's store is cleared and
+                    # only partly refilled by the heal executor, so neither the
+                    # quota projection nor the budget leg may read it. The tick
+                    # declines like today's replay-pending tick (the sync
+                    # recorded the deferral) and requests the worker, which
+                    # resumes the executor from the replay record.
+                    cache_mod._defer_codex_replay_drain()
+                    log_outcome(
+                        sync="deferred", result="noop",
+                        reason="replay_pending",
+                        backlog=int(getattr(stats, "backlog_files", 0) or 0))
+                    return 0
                 if walk_deferral in ("quota_index_pending", "inventory_pending"):
                     # #977 C5 / #927 B4: the walk stopped before ingesting
                     # (the quota natural-key index or the retained-identity
@@ -7858,11 +7951,25 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
             cache_conn = open_cache_db()
             try:
                 cache_mod = _cctally()._load_sibling("_cctally_cache")
+                # #1055 spec 4.5: at most one drain wait per hook process.
+                # Only the operation's first invocation may wait behind an
+                # admitted Codex drain unit; a rerun after cache recovery
+                # makes today's single attempt.
+                claude_sync_calls = {"n": 0}
+
+                def _claude_sync(active_conn):
+                    claude_sync_calls["n"] += 1
+                    if claude_sync_calls["n"] > 1:
+                        return sync_cache(active_conn)
+                    import _lib_codex_drain_admission as _drain_adm
+                    return sync_cache(
+                        active_conn,
+                        drain_wait_seconds=(
+                            _drain_adm.CLAUDE_HOOK_DRAIN_WAIT_SECONDS))
+
                 stats, cache_conn = (
                     cache_mod._run_cache_operation_with_recovery(
-                        cache_conn,
-                        lambda active_conn: sync_cache(active_conn),
-                        origin="hook.claude.sync",
+                        cache_conn, _claude_sync, origin="hook.claude.sync",
                     )
                 )
                 ingested = int(stats.rows_changed)
@@ -7893,11 +8000,27 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
                 )
             except OSError:
                 lock_fd = -1
+            contended = False
             try:
                 if lock_fd >= 0:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                    # #1064 spec 5.4: admission is non-blocking. Another
+                    # usage refresh holding the lock (a hook-tick or the
+                    # statusline's OAuth child) is already fetching, or waits
+                    # for a reducer pass on the selected state, so this one
+                    # skips the OAuth leg rather than queue behind it:
+                    # no fetch, no throttle-marker touch, no retry. Any other
+                    # OSError keeps the internal-error handling below.
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        contended = True
+                # The marker's age needs no lock; read on contention too so
+                # --explain prints it.
                 pre_age = _hook_tick_throttle_age_seconds()
-                if pre_age >= throttle_seconds:
+                if contended:
+                    decision = "throttled(inflight)"
+                    oauth_status = "throttled(inflight)"
+                elif pre_age >= throttle_seconds:
                     decision = "fetch"
                     oauth_status, _ = _hook_tick_oauth_refresh(throttle_seconds=throttle_seconds)
                     if oauth_status.startswith("ok"):
@@ -7906,10 +8029,11 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
                     oauth_status = f"throttled(age={int(pre_age)}s)"
             finally:
                 if lock_fd >= 0:
-                    try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
+                    if not contended:
+                        try:
+                            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                        except OSError:
+                            pass
                     try:
                         os.close(lock_fd)
                     except OSError:

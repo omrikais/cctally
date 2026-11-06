@@ -684,22 +684,13 @@ def _reset_file_batch(core, conn):
     _batch(core, conn, "/tmp/codex/x.jsonl", reset_file=True)
 
 
-def _fused_ingest_rebuild(core, conn):
-    """Migration 024. It owns its own `BEGIN IMMEDIATE` and commit."""
-    importlib.import_module("_cctally_db")._024_codex_fused_ingest_rebuild(conn)
-
-
-@pytest.mark.parametrize("key,invoke,owns_transaction", [
-    ("_cctally_cache._clear_codex_derived_rows", _clear, False),
-    ("_cctally_cache._delete_codex_file_derived_rows", _delete_file, False),
+@pytest.mark.parametrize("key,invoke", [
+    ("_cctally_cache._clear_codex_derived_rows", _clear),
+    ("_cctally_cache._delete_codex_file_derived_rows", _delete_file),
     ("_cctally_cache._write_codex_file_batch(reset_file=True)",
-     _reset_file_batch, False),
-    ("_cctally_db._024_codex_fused_ingest_rebuild",
-     _fused_ingest_rebuild, True),
+     _reset_file_batch),
 ])
-def test_a_path_labelled_invalidate_actually_invalidates(
-    core, key, invoke, owns_transaction,
-):
+def test_a_path_labelled_invalidate_actually_invalidates(core, key, invoke):
     """The inventory guard checks the KEY SET, never the behaviour behind it.
 
     Migration 024 was labelled `invalidate` and deleted nothing: it runs
@@ -707,18 +698,17 @@ def test_a_path_labelled_invalidate_actually_invalidates(
     bump `codex_physical_mutation_seq`, so a stored certificate stayed
     stale-VALID over a cache holding zero Codex quota rows — reachable through
     `db skip 024` then `db unskip 024`. This test is what turns the label into a
-    claim about what the code does.
+    claim about what the code does. (Since #983 024 only arms the guarded
+    replay, writes no covered family and has left the inventory.)
     """
     cache = _cache()
     assert cache.COVERAGE_WRITER_ACTIONS[key] == "invalidate"
     conn = _open_cache(core)
     try:
         assert _prime(core, conn) is not None
-        if not owns_transaction:
-            conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN IMMEDIATE")
         invoke(core, conn)
-        if not owns_transaction:
-            conn.commit()
+        conn.commit()
         assert cache.load_codex_journal_coverage_certificate(conn) is None
     finally:
         conn.close()

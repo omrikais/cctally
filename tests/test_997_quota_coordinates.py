@@ -434,3 +434,152 @@ def test_quota_lock_max_hold_recorded(tmp_path, monkeypatch):
     assert calls["n"] == 3, calls
     assert longest >= 0.3, record
     assert total > longest, record
+
+
+# --------------------------------------------------------------------------
+# #1004 T5 / T7 — the rebuild's retained records stream from coordinates
+# --------------------------------------------------------------------------
+
+#: The legacy (pre-#341) decisions the journal's own accounts cutover maps
+#: to a real account: their payloads carry no `account_key`, so the rebuild
+#: must normalize them before any consumer reads them.
+LEGACY_IDS = ("sa:1004-legacy-a", "sa:1004-legacy-b")
+
+
+def _mixed_rebuild_journal(jr, J, monkeypatch):
+    """Legacy history under an accounts cutover (two legacy evts, a Codex
+    quota observation and a malformed line), the account-bound boundary,
+    current records, an admitted current correction batch, and an excluded
+    legacy observation and legacy correction batch past the boundary."""
+    import test_journal_admission as A
+    jd = _journal_dir()
+    earlier = "observations-2026-09.jsonl"
+    F._append(jd, earlier, [
+        F._legacy_evt(LEGACY_IDS[0], 20.0),
+        F._cutover_op(F.CUTOVER_ACCOUNT),
+        F._legacy_evt(LEGACY_IDS[1], 30.0),
+        F.quota_obs(F.AT, 1),
+    ])
+    with open(jd / earlier, "ab") as handle:
+        handle.write(b'{"t":"obs","not json\n')
+    monkeypatch.setattr(jr, "_utc_now", lambda: A.FIXED)
+    A._seed_with_cutover()
+    legacy_obs = J.unstamped_record(
+        A._usage_obs(J, 70.0, "2026-10-09T11:00:00Z"))
+    legacy_batch = J.legacy_writer_view().make_correction_batch(
+        batch_id="rederive:claude-usage:1004-legacy", family="claude-usage",
+        at="2026-10-09T11:00:00Z",
+        actions=[{"action": "tombstone", "id": LEGACY_IDS[1], "rev": 1,
+                  "at": "2026-10-09T11:00:00Z", "payload": None}])
+    current_batch = J.make_correction_batch(
+        batch_id="rederive:claude-usage:1004-current", family="claude-usage",
+        at="2026-10-09T11:30:00Z",
+        actions=[{"action": "tombstone", "id": LEGACY_IDS[0], "rev": 1,
+                  "at": "2026-10-09T11:30:00Z", "payload": None}])
+    F._append(jd, A.SEGMENT, [legacy_obs, *legacy_batch, *current_batch,
+                              F.quota_obs("2026-10-09T11:45:00Z", 2)])
+
+
+def _capture_rebuild_records(jr, monkeypatch, real, sink, check=None):
+    """Record the rebuild's retained records at the quota leg's entry (after
+    normalization, before any fold): their type, a deep copy of every
+    position and which positions are streamed. ``check(decoded)`` runs on
+    the live sequence there; ``real`` is the unpatched leg."""
+    import copy
+    import _lib_retained_records as RR
+
+    def capturing(quota_raw, decoded, *args, **kwargs):
+        streamed = None
+        if isinstance(decoded, RR.RetainedRecords):
+            streamed = [decoded.is_streamed(i) for i in range(len(decoded))]
+        sink.append({"type": type(decoded),
+                     "records": [copy.deepcopy(r) for r in decoded],
+                     "streamed": streamed})
+        if check is not None:
+            check(decoded)
+        return real(quota_raw, decoded, *args, **kwargs)
+
+    monkeypatch.setattr(jr, "_rebuild_quota_cache_leg_raw", capturing)
+
+
+def _rewrite_same_length(position_line, old: bytes, new: bytes):
+    segment, start, length = position_line
+    path = _journal_dir() / segment
+    data = path.read_bytes()
+    line = data[start:start + length]
+    assert old in line and len(old) == len(new)
+    path.write_bytes(data[:start] + line.replace(old, new, 1)
+                     + data[start + length:])
+    return path, data
+
+
+def test_rebuild_retained_records_stream_equal_to_list(tmp_path, monkeypatch):
+    """#1004 T5 and T7 (the rebuild reader): every `RETAINED_RECORD_TYPES`
+    record is a streamed slot and every other position keeps its `None`
+    slot; at the quota leg's entry the sequence equals today's list (the
+    `MATERIALIZE_FOR_TESTS` switch) element for element, in iteration,
+    indexing, slices and a second pass, including the legacy decisions the
+    journal's accounts cutover normalizes to its real account. A same-length
+    rewrite of a streamed line after the read pass raises the rebuild's
+    `JournalError`, which framing alone would let through. Detects a
+    rebuild that folds a record other than the one it read, or that folds a
+    legacy decision under `unattributed` because normalization stopped
+    reaching re-decoded records."""
+    import _lib_retained_records as RR
+    _ns, jr, J = _load(tmp_path, monkeypatch)
+    _mixed_rebuild_journal(jr, J, monkeypatch)
+    checked = {}
+
+    def check(decoded):
+        listed = list(decoded)
+        assert list(decoded) == listed, "a second pass differs"
+        assert [decoded[i] for i in range(len(decoded))] == listed
+        for cut in (slice(2, None), slice(None, 5), slice(1, 12, 3),
+                    slice(-4, None)):
+            assert list(decoded[cut]) == listed[cut], cut
+        legacy = [i for i, record in enumerate(listed)
+                  if isinstance(record, dict)
+                  and record.get("id") == LEGACY_IDS[1]
+                  and record.get("t") == "evt"]
+        assert len(legacy) == 1, legacy
+        [index] = legacy
+        assert decoded.is_streamed(index)
+        path, data = _rewrite_same_length(
+            decoded.coordinates.line(index), b'"weekly_percent":30.0',
+            b'"weekly_percent":90.0')
+        try:
+            with pytest.raises(jr.JournalError, match="changed"):
+                decoded[index]
+        finally:
+            path.write_bytes(data)
+        checked["rewrite"] = True
+
+    seen: list = []
+    real = jr._rebuild_quota_cache_leg_raw
+    _capture_rebuild_records(jr, monkeypatch, real, seen, check)
+    _rebuild(jr)
+    with monkeypatch.context() as patch:
+        patch.setattr(RR, "MATERIALIZE_FOR_TESTS", True)
+        _capture_rebuild_records(jr, patch, real, seen)
+        _rebuild(jr)
+    streamed, listed = seen
+    assert checked == {"rewrite": True}
+    assert streamed["type"] is RR.RetainedRecords, streamed["type"]
+    assert listed["type"] is list, listed["type"]
+    assert streamed["records"] == listed["records"]
+    retained = jr._lib_journal_router.RETAINED_RECORD_TYPES
+    assert streamed["streamed"] == [
+        isinstance(record, dict) and record.get("t") in retained
+        for record in listed["records"]]
+    assert all(record is None for record, is_streamed in zip(
+        streamed["records"], streamed["streamed"]) if not is_streamed)
+    # T7 non-vacuity: both legacy decisions reach the consumers under the
+    # cutover's real account, not unstamped.
+    by_id = {record["id"]: record for record in streamed["records"]
+             if isinstance(record, dict) and record.get("t") == "evt"}
+    for event_id in LEGACY_IDS:
+        assert by_id[event_id]["payload"]["account_key"] == (
+            F.CUTOVER_ACCOUNT), by_id[event_id]
+    assert sum(1 for record in streamed["records"]
+               if isinstance(record, dict)
+               and record.get("t") == "correction") >= 1

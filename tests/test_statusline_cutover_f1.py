@@ -140,8 +140,8 @@ def test_render_never_establishes_the_cutover(app, monkeypatch):
     app.open_db().close()
     _identity("A")
     forks = []
-    monkeypatch.setattr(sl, "_fork_persist", lambda fd, reservation: (
-        forks.append(fd), sl._release_reservation(reservation)))
+    monkeypatch.setattr(sl, "_dispatch_render_worker", lambda reservation: (
+        forks.append(reservation), sl._release_reservation(reservation)))
     sl._statusline_persist(_parsed(app, "peer"))
     assert forks
     assert _cctally_journal.find_account_bound_cutover() is None

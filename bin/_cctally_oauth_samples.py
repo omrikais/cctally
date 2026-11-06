@@ -41,9 +41,24 @@ window (spec D9) and an unavailable projection raises
 * `claude_weekly_correction_ops`, the op's journal coordinate, written by
   :func:`record_correction_op` on the published paths only (live ingest and
   the rebuild). A scratch replay never writes it.
+
+#1018 twin (spec 5.1, stats epoch 1024) enriches each observation-index row
+with the record's raw weekly value, its normalized provider window, whether
+it is a genuine weekly reading for the account the row receives (the
+detector mask's weekly element, :func:`weekly_reading_genuine`) and whether it
+may confirm a displayed weekly value (`weekly_freshness_eligible`: genuine,
+both values present, captured strictly before the reset, and not held by the
+effective reviewed decision). Every path computes them through
+:func:`weekly_observation_facts`; the decision applier keeps eligibility
+current, and an insert consults the decisions already folded, so the fold
+order cannot change the final row. :func:`latest_weekly_reading_at` (spec
+5.2) is the one read: the newest eligible confirmation of one displayed
+value.
 """
 from __future__ import annotations
 
+import dataclasses
+import datetime as dt
 import sqlite3
 from typing import Literal
 
@@ -86,21 +101,75 @@ _READ_FIVE_HOUR = (
     "       < MIN(unixepoch(s.five_hour_resets_at_utc), s.five_hour_window_key)"
     " ORDER BY s.requested_at_utc"
 )
+#: #1018 twin spec 5.1: the eligibility bound on insert is the caller's
+#: account-specific value AND no effective `hold` already folded, so a
+#: decision folded before its observation still applies.
 _INSERT_OBSERVATION = (
     "INSERT OR IGNORE INTO claude_weekly_observation_index (observation_id,"
-    " account_key, captured_at_utc) VALUES (?, ?, ?)"
+    " account_key, captured_at_utc, weekly_percent, weekly_resets_at_utc,"
+    " weekly_reading_genuine, weekly_freshness_eligible)"
+    " VALUES (?, ?, ?, ?, ?, ?, ? AND NOT EXISTS (SELECT 1"
+    " FROM claude_weekly_observation_decisions AS d"
+    " WHERE d.observation_id = ? AND d.disposition = 'hold'))"
+)
+#: The apply-only rebuild's insert. Its read pass flushes every queued row
+#: before the Phase 1 fold applies any reviewed decision op, and the applier
+#: then maintains eligibility on the indexed row, so the rebuild binds the
+#: account-specific value directly: no statement of the pass reads a projected
+#: table before the final flush (#1003 D7), and the batch size cannot change
+#: a published row.
+_INSERT_OBSERVATION_REBUILD = (
+    "INSERT OR IGNORE INTO claude_weekly_observation_index (observation_id,"
+    " account_key, captured_at_utc, weekly_percent, weekly_resets_at_utc,"
+    " weekly_reading_genuine, weekly_freshness_eligible)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?)"
 )
 #: The rebuild's staging table for observations whose account is the cutover
 #: op's (known only after the read pass). Scratch-index only; dropped by
-#: :func:`attribute_staged_observations` before the inventory check.
+#: :func:`attribute_staged_observations` before the inventory check. #1018
+#: twin: it carries the account-independent facts, so genuineness and
+#: eligibility are computed against the cutover account when the row moves.
+#: `pre_reset` is 1 exactly when both values are present and parseable and
+#: the capture is strictly before the reset (parsed instants).
 STAGING_TABLE = "rebuild_weekly_observation_unstamped"
 _CREATE_STAGING = (
     "CREATE TABLE IF NOT EXISTS rebuild_weekly_observation_unstamped ("
-    " observation_id TEXT PRIMARY KEY, captured_at_utc TEXT NOT NULL)"
+    " observation_id TEXT PRIMARY KEY, captured_at_utc TEXT NOT NULL,"
+    " weekly_percent REAL, weekly_resets_at_utc TEXT,"
+    " base_genuine INTEGER NOT NULL, required_account TEXT,"
+    " pre_reset INTEGER NOT NULL)"
 )
 _INSERT_STAGED = (
     "INSERT OR IGNORE INTO rebuild_weekly_observation_unstamped"
-    " (observation_id, captured_at_utc) VALUES (?, ?)"
+    " (observation_id, captured_at_utc, weekly_percent, weekly_resets_at_utc,"
+    " base_genuine, required_account, pre_reset) VALUES (?, ?, ?, ?, ?, ?, ?)"
+)
+_ATTRIBUTE_STAGED = (
+    "INSERT OR IGNORE INTO claude_weekly_observation_index"
+    " (observation_id, account_key, captured_at_utc, weekly_percent,"
+    " weekly_resets_at_utc, weekly_reading_genuine, weekly_freshness_eligible)"
+    " SELECT s.observation_id, ?, s.captured_at_utc, s.weekly_percent,"
+    " s.weekly_resets_at_utc,"
+    " s.base_genuine AND (s.required_account IS NULL OR s.required_account = ?),"
+    " s.base_genuine AND (s.required_account IS NULL OR s.required_account = ?)"
+    " AND s.pre_reset AND NOT EXISTS (SELECT 1"
+    " FROM claude_weekly_observation_decisions AS d"
+    " WHERE d.observation_id = s.observation_id AND d.disposition = 'hold')"
+    " FROM rebuild_weekly_observation_unstamped AS s"
+)
+#: #1018 twin spec 5.1: the decision applier's eligibility maintenance.
+_HOLD_ELIGIBILITY = (
+    "UPDATE claude_weekly_observation_index SET weekly_freshness_eligible = 0"
+    " WHERE observation_id = ?"
+)
+_READ_ELIGIBILITY_FACTS = (
+    "SELECT weekly_reading_genuine, weekly_percent, weekly_resets_at_utc,"
+    " captured_at_utc FROM claude_weekly_observation_index"
+    " WHERE observation_id = ?"
+)
+_SET_ELIGIBILITY = (
+    "UPDATE claude_weekly_observation_index SET weekly_freshness_eligible = ?"
+    " WHERE observation_id = ?"
 )
 _INSERT_HISTORY = (
     "INSERT OR IGNORE INTO claude_weekly_correction_history (decision_op_id,"
@@ -206,6 +275,116 @@ def _weekly_observation_key(rec) -> "tuple[str, str] | None":
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class WeeklyObservationFacts:
+    """The account-independent weekly facts of one indexed observation
+    (#1018 twin spec 5.1). ``required_account`` is the one account a v2
+    publication's provenance names (None for a historical-policy or direct
+    record); ``base_genuine`` is False for a withheld or unclassifiable
+    detector step and for a `projection` (store-filled) weekly axis."""
+
+    weekly_percent: "float | None"
+    weekly_resets_at_utc: "str | None"
+    base_genuine: bool
+    required_account: "str | None"
+
+
+#: The publication provenance kinds `_detector_observation_mask` classifies.
+_PROVENANCE_KINDS = ("candidate", "projection", "retained_low")
+
+
+def _weekly_genuineness(payload) -> "tuple[bool, str | None]":
+    """``(base_genuine, required_account)`` of one raw payload: the weekly
+    element of `_cctally_record._detector_observation_mask` with its account
+    comparison factored out, so a staged row can apply it once its account is
+    known. Reads only the payload."""
+    import _cctally_journal
+    policy = _cctally_journal.detector_policy_of(payload)
+    if policy == "unsupported":
+        return False, None
+    if policy == "historical" or "publication_id" not in payload:
+        return True, None
+    provenance = payload.get("publication")
+    if not isinstance(provenance, dict):
+        return False, None
+    accounts = set()
+    for axis, present in (("sevenDay", True),
+                          ("fiveHour",
+                           payload.get("five_hour_percent") is not None)):
+        if not present:
+            continue
+        source = provenance.get(axis)
+        if (not isinstance(source, dict)
+                or source.get("kind") not in _PROVENANCE_KINDS):
+            return False, None
+        account = source.get("account")
+        if not isinstance(account, str) or not account:
+            return False, None
+        accounts.add(account)
+    if len(accounts) != 1:
+        # The axes name different accounts: no row account matches both.
+        return False, None
+    return provenance["sevenDay"]["kind"] != "projection", accounts.pop()
+
+
+def weekly_observation_facts(rec) -> "WeeklyObservationFacts | None":
+    """The enriched facts of one record, or None exactly when
+    :func:`_weekly_observation_key` projects no index row for it."""
+    if _weekly_observation_key(rec) is None:
+        return None
+    payload = rec["payload"]
+    base_genuine, required_account = _weekly_genuineness(payload)
+    return WeeklyObservationFacts(
+        weekly_percent=_lib_oauth_samples.finite_percent(
+            payload.get("weekly_percent")),
+        weekly_resets_at_utc=_lib_oauth_samples.weekly_reset_identity(
+            payload.get("resets_at")),
+        base_genuine=base_genuine,
+        required_account=required_account,
+    )
+
+
+def weekly_reading_genuine(facts: WeeklyObservationFacts,
+                           account_key: str) -> bool:
+    """Whether the observation is a genuine weekly reading for the row's
+    ``account_key``: `_detector_observation_mask`'s weekly element for that
+    account (spec 5.1)."""
+    return bool(facts.base_genuine and (
+        facts.required_account is None
+        or facts.required_account == account_key))
+
+
+def _before_reset(captured_at_utc, weekly_resets_at_utc) -> bool:
+    """Both instants parse and the capture is strictly before the reset,
+    compared as parsed instants: the two columns are spelled at different
+    precisions, so a text comparison would admit a capture at the reset."""
+    if weekly_resets_at_utc is None:
+        return False
+    try:
+        captured = _lib_oauth_samples.canonical_instant(captured_at_utc)
+        reset = _lib_oauth_samples.canonical_instant(weekly_resets_at_utc)
+    except (TypeError, ValueError):
+        return False
+    # Both are now the same full-precision spelling, so text order is
+    # chronological.
+    return captured < reset
+
+
+def _pre_reset(facts: WeeklyObservationFacts, captured_at_utc) -> bool:
+    """Eligibility's account- and decision-independent half."""
+    return (facts.weekly_percent is not None
+            and _before_reset(captured_at_utc, facts.weekly_resets_at_utc))
+
+
+def _observation_params(observation_id, account, captured_at_utc,
+                        facts: WeeklyObservationFacts) -> tuple:
+    genuine = weekly_reading_genuine(facts, account)
+    return (observation_id, account, captured_at_utc, facts.weekly_percent,
+            facts.weekly_resets_at_utc, int(genuine),
+            int(genuine and _pre_reset(facts, captured_at_utc)),
+            observation_id)
+
+
 def project_observation(conn, rec, *, cutover_account=None) -> None:
     """#1015 spec 5.1: project ``rec`` into `claude_weekly_observation_index`
     on live ingest and the scratch replays, under the one attribution rule:
@@ -226,7 +405,8 @@ def project_observation(conn, rec, *, cutover_account=None) -> None:
     if (cutover_account is not None
             and _cctally_journal.needs_cutover_attribution(rec)):
         account = cutover_account()
-    conn.execute(_INSERT_OBSERVATION, (key[0], account, key[1]))
+    conn.execute(_INSERT_OBSERVATION, _observation_params(
+        key[0], account, key[1], weekly_observation_facts(rec)))
 
 
 def attribute_staged_observations(conn, claude_account: str) -> int:
@@ -242,11 +422,8 @@ def attribute_staged_observations(conn, claude_account: str) -> int:
     conn.execute("BEGIN IMMEDIATE")
     try:
         moved = conn.execute(
-            "INSERT OR IGNORE INTO claude_weekly_observation_index"
-            " (observation_id, account_key, captured_at_utc)"
-            " SELECT observation_id, ?, captured_at_utc"
-            " FROM rebuild_weekly_observation_unstamped",
-            (claude_account,)).rowcount
+            _ATTRIBUTE_STAGED,
+            (claude_account, claude_account, claude_account)).rowcount
         conn.execute("DROP TABLE rebuild_weekly_observation_unstamped")
         conn.commit()
     except BaseException:
@@ -261,7 +438,13 @@ class RebuildProjector:
     index in bounded batches (one transaction each), so the pass never holds
     the whole sample population in memory."""
 
-    BATCH = 2048
+    #: #1003 D7: queued items (samples plus observation-index rows) per flush.
+    #: Each flush is a `BEGIN IMMEDIATE … COMMIT` on the rebuild scratch, which
+    #: keeps the store policy (a synced rollback journal per transaction), so
+    #: 2,048 cost ≈ 1.8 GB of physical writes per rebuild. Every reader of the
+    #: projected tables runs after the pass's final flush, so the batch moves
+    #: only when rows are written, never what is read.
+    BATCH = 65536
 
     def __init__(self, conn) -> None:
         self._conn = conn
@@ -283,14 +466,20 @@ class RebuildProjector:
             # the end of the pass knows, so it is staged; every other record
             # keeps its stamp or `unattributed` (spec 5.1's three cases).
             import _cctally_journal
+            facts = weekly_observation_facts(rec)
             if _cctally_journal.needs_cutover_attribution(rec):
-                self._observations.append((_INSERT_STAGED, key))
+                self._observations.append((_INSERT_STAGED, (
+                    key[0], key[1], facts.weekly_percent,
+                    facts.weekly_resets_at_utc, int(facts.base_genuine),
+                    facts.required_account,
+                    int(_pre_reset(facts, key[1])))))
             else:
                 import _lib_accounts
                 self._observations.append(
-                    (_INSERT_OBSERVATION,
-                     (key[0], rec.get("account") or _lib_accounts.UNATTRIBUTED,
-                      key[1])))
+                    (_INSERT_OBSERVATION_REBUILD, _observation_params(
+                        key[0],
+                        rec.get("account") or _lib_accounts.UNATTRIBUTED,
+                        key[1], facts)[:-1]))
         if len(self._pending) + len(self._observations) >= self.BATCH:
             self.flush()
 
@@ -347,11 +536,32 @@ def apply_weekly_observation_decision_op(conn, record) -> None:
                 and disposition in _DISPOSITIONS):
             conn.execute(_UPSERT_DECISION,
                          (observation_id, disposition, op_id))
+            _maintain_freshness_eligibility(conn, observation_id, disposition)
             conn.execute(_INSERT_HISTORY, (
                 op_id, observation_id,
                 "retract" if (disposition == "hold"
                               and observation_id in retracted)
                 else disposition))
+
+
+def _maintain_freshness_eligibility(conn, observation_id: str,
+                                    disposition: str) -> None:
+    """#1018 twin spec 5.1: the decided observation's freshness eligibility,
+    in the applier's transaction. A `hold` (a schema-3 retraction is one)
+    clears it; an `accept` recomputes it from the stored genuine flag and the
+    parsed pre-reset condition. An observation not yet indexed (a decision
+    folded before it, or still staged in a rebuild) is covered by the insert,
+    which consults the decisions table."""
+    if disposition == "hold":
+        conn.execute(_HOLD_ELIGIBILITY, (observation_id,))
+        return
+    row = conn.execute(_READ_ELIGIBILITY_FACTS, (observation_id,)).fetchone()
+    if row is None:
+        return
+    genuine, weekly_percent, weekly_resets_at_utc, captured_at_utc = row
+    eligible = bool(genuine) and weekly_percent is not None and _before_reset(
+        captured_at_utc, weekly_resets_at_utc)
+    conn.execute(_SET_ELIGIBILITY, (int(eligible), observation_id))
 
 
 def record_correction_op(conn, record, coordinate) -> None:
@@ -456,3 +666,64 @@ def projection_covered(conn, *, account_key: str) -> bool:
     except sqlite3.Error:
         return False
     return names == {SAMPLES_TABLE, DECISIONS_TABLE}
+
+
+@dataclasses.dataclass(frozen=True)
+class WeeklyReadingScope:
+    """The displayed weekly value a confirming reading must repeat (#1018
+    twin spec 5.2). Built by the current-week card from its displayed row's
+    originating observation; server-private, never serialized."""
+
+    account_key: str
+    #: The window identity, in the samples' second-precision spelling, read
+    #: from the displayed row's originating observation (never the stored
+    #: `week_end_at`, which may be a first-established boundary).
+    weekly_resets_at_utc: str
+    #: The displayed `used_pct` as stored: matched by exact float equality.
+    weekly_percent: float
+    #: Canonical full-precision text, inclusive: the card's segment start.
+    lower_bound_utc: str
+    #: Canonical full-precision text, exclusive: the earlier of the provider
+    #: reset and the displayed window's end.
+    upper_bound_utc: str
+
+
+_LATEST_WEEKLY_READING = (
+    "SELECT captured_at_utc FROM claude_weekly_observation_index"
+    " WHERE account_key = ? AND weekly_resets_at_utc = ? AND weekly_percent = ?"
+    " AND weekly_freshness_eligible = 1"
+    " AND captured_at_utc >= ? AND captured_at_utc < ?"
+    " ORDER BY captured_at_utc DESC LIMIT 1"
+)
+
+
+def latest_weekly_reading_at(conn, scope: WeeklyReadingScope,
+                             now_utc: dt.datetime) -> "dt.datetime | None":
+    """The capture instant of the newest eligible observation-index row that
+    confirms ``scope``'s displayed value (same account, window and exact
+    value; captured in ``[lower, upper)`` and at or before ``now_utc``), or
+    None when none does. One statement on the freshness partial index, so it
+    needs no transaction. Raises ``sqlite3.Error`` to the caller, which keeps
+    its prior value rather than publishing a guess.
+
+    The two upper limits (``< upper`` and ``<= now``) are bound as ONE
+    exclusive bound, the earlier of ``upper`` and ``now`` + 1 µs: captures
+    are canonical microsecond text, so ``<= now`` is exactly ``< now + 1 µs``.
+    With both written as separate terms SQLite seeks on one and filters the
+    other, so a suffix of readings captured after now (a clock step, a
+    replayed future capture) would be walked on every tick; one bound keeps
+    the lookup a single index seek."""
+    upper = _lib_oauth_samples.canonical_instant(scope.upper_bound_utc)
+    not_after_now = _lib_oauth_samples.canonical_instant(
+        now_utc + dt.timedelta(microseconds=1))
+    row = conn.execute(_LATEST_WEEKLY_READING, (
+        scope.account_key, scope.weekly_resets_at_utc,
+        float(scope.weekly_percent),
+        _lib_oauth_samples.canonical_instant(scope.lower_bound_utc),
+        min(upper, not_after_now))).fetchone()
+    if row is None:
+        return None
+    text = str(row[0])
+    return dt.datetime.fromisoformat(
+        text[:-1] + "+00:00" if text.endswith("Z") else text
+    ).astimezone(dt.timezone.utc)

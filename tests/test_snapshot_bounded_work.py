@@ -3185,8 +3185,14 @@ def test_the_enumerated_folds_are_all_reachable_as_patch_targets(source_env):
     )
 
 
-def _build_source_bundle(ns, stats):
+def _build_source_bundle(ns, stats, identity=None):
+    """``identity``: the #1050 Claude input identity. A caller that counts
+    cache pins reads it BEFORE installing its counter — the dispatch read
+    opens its own cache connection, as the tick's does before the build."""
+    if identity is None:
+        identity = ns["_cctally_tui"]._tui_read_claude_input_identity(stats)
     return ns["_cctally_tui"]._tui_build_source_bundle(
+        claude_input_identity=identity,
         projects_envelope={},
         stats_conn=stats,
         now_utc=NOW,
@@ -3222,6 +3228,7 @@ def test_which_enumerated_folds_run_inside_the_pinned_transaction(
         opened.append(conn)
         return conn
 
+    identity = ns["_cctally_tui"]._tui_read_claude_input_identity(stats)
     monkeypatch.setattr(cctally_module, "open_cache_db", open_counted_cache)
 
     for mod_name, name in IN_TRANSACTION_FORBIDDEN:
@@ -3238,7 +3245,7 @@ def test_which_enumerated_folds_run_inside_the_pinned_transaction(
 
         monkeypatch.setattr(owner, name, guard)
 
-    _build_source_bundle(ns, stats)
+    _build_source_bundle(ns, stats, identity)
 
     assert counter["begins"] == 1, (
         "non-vacuity: the whole source build must open exactly one cache pin")
@@ -3356,10 +3363,11 @@ def test_the_rows_materialised_inside_the_pin_scale_with_the_population(
             return _counting_cache_connection(
                 ns, counter, open_cache=real_open_cache)
 
+        identity = ns["_cctally_tui"]._tui_read_claude_input_identity(stats)
         with monkeypatch.context() as patcher:
             patcher.setattr(
                 cctally_module, "open_cache_db", open_counted_cache)
-            _build_source_bundle(ns, stats)
+            _build_source_bundle(ns, stats, identity)
         assert counter["begins"] == 1
         return counter["rows"]
 

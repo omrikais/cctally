@@ -61,9 +61,12 @@ def _cursor():
         conn.close()
 
 
-def test_epoch_is_current():
-    # #797/#823/#840 (spec 4.6 B6) moved the epoch from 1018 to 1019, and #1019/#1014 (spec 4.7 C6) to 1020, then #943 to 1021, then #1015 to 1022, then #948 to 1023.
-    assert _cctally_core.STATS_INDEX_EPOCH == 1023
+def test_the_legacy_stats_head_stays_frozen():
+    # This module's subject arrived at epoch 1018 (#825/#832); the epoch value
+    # is pinned once, in tests/test_stats_index_epoch_pin.py, and its history
+    # is the comment above `STATS_INDEX_EPOCH` in `bin/_cctally_core.py`.
+    # Detects a stats schema change shipped as a stats migration instead of an
+    # epoch bump, which would move the frozen legacy head.
     assert _cctally_core.LEGACY_STATS_HEAD == 13
 
 
@@ -146,7 +149,8 @@ def test_rebuild_never_requires_a_valid_live_index(ns):
     jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     conn = sqlite3.connect(str(_cctally_core.DB_PATH))
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1023
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == (
+            _cctally_core.STATS_INDEX_EPOCH)
         assert conn.execute(
             "SELECT name FROM sqlite_schema WHERE name = "
             "'journal_admission_summary'").fetchone() is not None

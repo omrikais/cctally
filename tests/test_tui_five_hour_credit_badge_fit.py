@@ -106,3 +106,42 @@ def test_every_boxed_row_is_exactly_the_column_width(mods, width, credits,
     assert not wrong, (width, wrong)
     badge = ", ".join(f"{d['delta_pp']:+.0f}pp" for d in deltas)
     assert any(badge in row.plain for row in rows), [r.plain for r in rows]
+
+
+def _freshness_lines(ns, tui, *, reading_at, label, age):
+    cw = ns["TuiCurrentWeek"](
+        week_start_at=NOW - dt.timedelta(days=3),
+        week_end_at=NOW + dt.timedelta(days=4),
+        used_pct=21.0, five_hour_pct=20.0,
+        five_hour_resets_at=NOW + dt.timedelta(hours=3),
+        spent_usd=10.0, dollars_per_percent=0.5,
+        latest_snapshot_at=NOW - dt.timedelta(hours=2),
+        freshness_label=label, freshness_age=age,
+        latest_weekly_reading_at=reading_at,
+    )
+    snap = dataclasses.replace(tui._tui_empty_snapshot(NOW), current_week=cw)
+    runtime = ns["RuntimeState"](
+        variant="conventional", focus_index=0, session_scroll=0,
+        show_help=False, toast=None, color_enabled=False, tz="utc",
+    )
+    return tui._tui_lines_to_text(
+        tui._tui_panel_current_week(snap, runtime, 80, focused=True)).plain
+
+
+@pytest.mark.parametrize("label", ["aging", "stale"])
+def test_the_freshness_chip_names_the_confirming_reading(mods, label):
+    """#1018 twin spec 5.4 (failure: the chip prints the old stored row's
+    time beside the confirming reading's age, or the stored-row line starts
+    following the reading)."""
+    ns, tui = mods
+    text = _freshness_lines(ns, tui, reading_at=NOW - dt.timedelta(seconds=200),
+                            label=label, age=200)
+    assert "⏱ as of 04:56:40 · 200s ago" in text, text
+    assert "last snapshot: 120m 00s ago" in text, text
+
+
+def test_no_confirming_reading_hides_the_freshness_chip(mods):
+    ns, tui = mods
+    text = _freshness_lines(ns, tui, reading_at=None, label=None, age=None)
+    assert "as of" not in text, text
+    assert "last snapshot: 120m 00s ago" in text, text

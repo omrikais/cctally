@@ -2317,8 +2317,10 @@ def test_resolve_project_key_raw_fast_path_dedups_realpath(monkeypatch, tmp_path
     import os
     import _cctally_cache
 
+    from _fixture_builders import make_git_repository_marker
+
     repo = tmp_path / "repo"
-    (repo / ".git").mkdir(parents=True)
+    make_git_repository_marker(repo)
     raw = str(repo / "sub" / "dir")
     (repo / "sub" / "dir").mkdir(parents=True)
 
@@ -2347,8 +2349,10 @@ def test_resolve_project_key_raw_fast_path_dedups_realpath(monkeypatch, tmp_path
 def test_resolve_project_key_parity_across_modes(tmp_path):
     import _cctally_cache
 
+    from _fixture_builders import make_git_repository_marker
+
     repo = tmp_path / "gitrepo"
-    (repo / ".git").mkdir(parents=True)
+    make_git_repository_marker(repo)
     nogit = tmp_path / "plain"
     nogit.mkdir()
 
@@ -2395,6 +2399,72 @@ def test_resolve_project_key_fullpath_alias_collapse_preserved(tmp_path):
         "the second alias must collapse to the FIRST spelling's display_key"
     )
     assert k_phys is k_alias  # returned via the normalized cache, not a new key
+
+
+# #976 T3: a `.git` entry counts as a repository marker only the way Git counts
+# it. The failure detected: a stray non-repository `.git/` in a worktree
+# container (`.worktrees/.git/` holding only a commit-message file) became the
+# "repository" of every removed worktree, which then displayed as `.worktrees`.
+def _git_marker_tree(base):
+    import os
+    from _fixture_builders import make_git_repository_marker
+
+    main = base / "main"
+    make_git_repository_marker(main)
+    stray = main / ".worktrees" / ".git" / "worktrees" / "x"
+    stray.mkdir(parents=True)
+    (stray / "CCTALLY_COMMIT_MSG").write_text("msg\n")
+    live = main / ".worktrees" / "live"
+    live.mkdir()
+    (live / ".git").write_text("gitdir: /nonexistent-elsewhere/worktrees/live\n")
+    (base / "plain" / "a").mkdir(parents=True)
+    make_git_repository_marker(base / "anc")
+    (base / "anc" / "x" / "y").mkdir(parents=True)
+    half = base / "half" / ".git"
+    half.mkdir(parents=True)
+    (half / "HEAD").write_text("ref: refs/heads/main\n")
+    (half / "refs").mkdir()
+    (base / "half" / "x").mkdir()
+    make_git_repository_marker(base / "target")
+    (base / "link").mkdir()
+    os.symlink(base / "target" / ".git", base / "link" / ".git")
+    (base / "dangling").mkdir()
+    os.symlink(base / "missing-gitdir", base / "dangling" / ".git")
+
+
+@pytest.mark.parametrize("cwd, mode, expected", [
+    pytest.param("main/.worktrees/gone", "git-root",
+                 ("main", "main", "main"), id="removed-worktree-skips-stray"),
+    pytest.param("main/.worktrees/gone/sub/dir", "git-root",
+                 ("main", "main", "main"), id="removed-worktree-subdir"),
+    pytest.param("main/.worktrees/live/src", "git-root",
+                 ("main/.worktrees/live", "live", "main/.worktrees/live"),
+                 id="live-worktree-gitdir-file"),
+    pytest.param("plain/a", "git-root", ("plain/a", "a", None), id="no-marker"),
+    pytest.param("anc/x/y", "git-root", ("anc", "anc", "anc"),
+                 id="ancestor-complete-repository"),
+    pytest.param("half/x", "git-root", ("half/x", "x", None),
+                 id="head-without-objects-skipped"),
+    pytest.param("link", "git-root", ("link", "link", "link"),
+                 id="symlink-to-repository-dir"),
+    pytest.param("dangling", "git-root", ("dangling", "dangling", None),
+                 id="dangling-symlink-skipped"),
+    pytest.param("main/.worktrees/gone", "full-path",
+                 ("main/.worktrees/gone", "<raw>", None), id="full-path-unchanged"),
+])
+def test_resolve_project_key_git_marker_rule(tmp_path, cwd, mode, expected):
+    import os
+    import _cctally_cache
+
+    _git_marker_tree(tmp_path)
+    base = os.path.realpath(tmp_path)
+    raw = str(tmp_path / cwd)
+    bucket, display, root = expected
+    key = _cctally_cache._resolve_project_key(raw, mode, {})
+    assert key.bucket_path == os.path.join(base, bucket)
+    assert key.display_key == (raw if display == "<raw>" else display)
+    assert key.git_root == (None if root is None else os.path.join(base, root))
+    assert key.is_no_git is (mode == "git-root" and root is None)
 
 
 # ===========================================================================

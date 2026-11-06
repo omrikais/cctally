@@ -3799,8 +3799,9 @@ def build_per_migration_024_codex_fused_ingest_rebuild(scenario_dir: Path) -> No
     ``pre.sqlite`` is an existing cache at the 023 head with both Claude
     sentinels and every stale/partial Codex surface populated. ``post.sqlite``
     runs the production handler and reproduces only the dispatcher's central
-    marker stamp. The contrast makes the migration's narrow destructive scope,
-    no-fabrication posture, and post-handler/pre-version-stamp state explicit.
+    marker stamp. Since #983 the handler only arms the guarded byte-zero Codex
+    replay, so post is pre plus ``codex_replay_from_zero_pending`` plus the
+    stamp: every populated row surviving is what the contrast pins.
     """
     scenario_dir.mkdir(parents=True, exist_ok=True)
     pre = scenario_dir / "pre.sqlite"
@@ -4123,8 +4124,10 @@ def build_per_migration_026_codex_conversation_key_backfill(
 
     Reuse 024's current-schema physical-Codex corpus, then make it a 025-head
     cache by adding the normalized families, physical mutation sequence, and
-    quota projection certificate.  The production 026 handler must clear every
-    Codex-derived fact and only the dispatcher stamps its marker.
+    quota projection certificate.  Since #983 the production 026 handler only
+    arms the guarded byte-zero Codex replay, so post is pre plus the replay
+    marker plus the dispatcher's stamp; every Codex fact, the sequence and the
+    certificate survive.
     """
     import shutil
     import tempfile
@@ -4193,15 +4196,17 @@ def build_per_migration_026_codex_conversation_key_backfill(
         db._stamp_applied(conn, migration, "2026-07-18T12:00:00Z")
     finally:
         conn.close()
-    lock = Path(str(post) + ".codex.lock")
-    if lock.exists():
-        lock.unlink()
 
 
 def build_per_migration_027_codex_fork_preamble_rebuild(
     scenario_dir: Path,
 ) -> None:
-    """Build deterministic replay-arm goldens for cache migration 027."""
+    """Build deterministic replay-arm goldens for cache migration 027.
+
+    Since #983 the handler only arms the guarded byte-zero Codex replay, so
+    post is 026's populated pre-state stamped through 026, plus the replay
+    marker and the 027 stamp. The 028 builder seeds from this post.
+    """
     import shutil
     import tempfile
 
@@ -4250,9 +4255,6 @@ def build_per_migration_027_codex_fork_preamble_rebuild(
         db._stamp_applied(conn, migration, "2026-07-19T12:00:00Z")
     finally:
         conn.close()
-    lock = Path(str(post) + ".codex.lock")
-    if lock.exists():
-        lock.unlink()
 
 
 def build_per_migration_028_split_conversation_store(
@@ -5547,9 +5549,8 @@ def build_per_migration_034_codex_window_spend_adoption(
             conn.commit()
         finally:
             conn.close()
-        # The handler takes the Codex provider flock (handlers 024-027 do too),
-        # which creates a sibling lock file next to the golden. Same cleanup the
-        # 024 builder does.
+        # The handler takes the Codex provider flock (handler 025 does too),
+        # which creates a sibling lock file next to the golden.
         lock = Path(str(dst) + ".codex.lock")
         if lock.exists():
             lock.unlink()
@@ -6514,7 +6515,7 @@ def build_per_migration_043_codex_window_attributions(
             core.JOURNAL_DIR = saved_journal_dir
             scratch.cleanup()
             conn.close()
-        # The handler takes the Codex provider flock (024-027, 034 do too),
+        # The handler takes the Codex provider flock (025, 034 do too),
         # which creates a sibling lock file next to the golden.
         lock = Path(str(dst) + ".codex.lock")
         if lock.exists():
@@ -8160,6 +8161,429 @@ def build_per_migration_051_codex_retained_identities(scenario_dir: Path) -> Non
     _build_pre(pre)
     _build_post(pre, post)
 
+
+#: #971: the twelve trigger bodies a head-51 store carries, frozen from the
+#: 051 golden as SQLite stored them. The 052 pre fixture installs them in
+#: place of the current bodies; never regenerate them from the schema apply.
+_HEAD_51_CODEX_TRIGGER_SQL: "dict[str, str]" = {
+    "trg_codex_accounting_del": """CREATE TRIGGER trg_codex_accounting_del
+        AFTER DELETE ON codex_session_entries
+        WHEN NOT EXISTS (
+            SELECT 1 FROM cache_meta
+             WHERE key='codex_accounting_bulk_clear'
+        )
+        BEGIN
+            UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 WHERE key='codex_accounting_mutation_seq';
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(OLD.source_root_key, ''), OLD.source_path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq';
+        END""",
+    "trg_codex_accounting_file_del": """CREATE TRIGGER trg_codex_accounting_file_del
+        AFTER DELETE ON codex_session_files
+        WHEN EXISTS (
+            SELECT 1 FROM codex_session_entries AS entries
+             WHERE entries.source_root_key = OLD.source_root_key
+               AND entries.source_path = OLD.path
+        )
+        BEGIN
+            UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 WHERE key='codex_accounting_mutation_seq';
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(OLD.source_root_key, ''), OLD.path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq';
+        END""",
+    "trg_codex_accounting_file_ins": """CREATE TRIGGER trg_codex_accounting_file_ins
+        AFTER INSERT ON codex_session_files
+        WHEN EXISTS (
+            SELECT 1 FROM codex_session_entries AS entries
+             WHERE entries.source_root_key = NEW.source_root_key
+               AND entries.source_path = NEW.path
+        )
+        BEGIN
+            UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 WHERE key='codex_accounting_mutation_seq';
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(NEW.source_root_key, ''), NEW.path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq';
+        END""",
+    "trg_codex_accounting_file_upd": """CREATE TRIGGER trg_codex_accounting_file_upd
+        AFTER UPDATE OF path, source_root_key, last_native_thread_id
+          ON codex_session_files
+        WHEN (OLD.path IS NOT NEW.path OR OLD.source_root_key IS NOT NEW.source_root_key OR OLD.last_native_thread_id IS NOT NEW.last_native_thread_id)
+         AND (EXISTS (
+            SELECT 1 FROM codex_session_entries AS entries
+             WHERE entries.source_root_key = OLD.source_root_key
+               AND entries.source_path = OLD.path
+        ) OR EXISTS (
+            SELECT 1 FROM codex_session_entries AS entries
+             WHERE entries.source_root_key = NEW.source_root_key
+               AND entries.source_path = NEW.path
+        ))
+        BEGIN
+            UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 WHERE key='codex_accounting_mutation_seq';
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(meta.value AS INTEGER), 'path',
+                   COALESCE(OLD.source_root_key, ''), OLD.path
+              FROM cache_meta AS meta
+             WHERE meta.key='codex_accounting_mutation_seq'
+               AND EXISTS (
+            SELECT 1 FROM codex_session_entries AS entries
+             WHERE entries.source_root_key = OLD.source_root_key
+               AND entries.source_path = OLD.path
+        )
+            UNION
+            SELECT CAST(meta.value AS INTEGER), 'path',
+                   COALESCE(NEW.source_root_key, ''), NEW.path
+              FROM cache_meta AS meta
+             WHERE meta.key='codex_accounting_mutation_seq'
+               AND EXISTS (
+            SELECT 1 FROM codex_session_entries AS entries
+             WHERE entries.source_root_key = NEW.source_root_key
+               AND entries.source_path = NEW.path
+        );
+        END""",
+    "trg_codex_accounting_ins": """CREATE TRIGGER trg_codex_accounting_ins
+        AFTER INSERT ON codex_session_entries
+        WHEN NOT EXISTS (
+            SELECT 1 FROM cache_meta
+             WHERE key='codex_accounting_bulk_clear'
+        )
+        BEGIN
+            UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 WHERE key='codex_accounting_mutation_seq';
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(NEW.source_root_key, ''), NEW.source_path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq';
+        END""",
+    "trg_codex_accounting_thread_del": """CREATE TRIGGER trg_codex_accounting_thread_del
+        AFTER DELETE ON codex_conversation_threads
+        WHEN EXISTS (
+            SELECT DISTINCT entries.source_root_key, entries.source_path
+              FROM codex_session_entries AS entries
+              LEFT JOIN codex_session_files AS files
+                ON files.source_root_key = entries.source_root_key
+               AND files.path = entries.source_path
+             WHERE (
+                    entries.source_root_key = OLD.source_root_key
+                AND entries.conversation_key = OLD.conversation_key
+             ) OR (
+                    files.source_root_key = OLD.source_root_key
+                AND files.last_native_thread_id = OLD.native_thread_id
+             )
+        )
+        BEGIN
+            UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 WHERE key='codex_accounting_mutation_seq';
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(meta.value AS INTEGER), 'path', paths.source_root_key,
+                   paths.source_path
+              FROM (
+            SELECT DISTINCT entries.source_root_key, entries.source_path
+              FROM codex_session_entries AS entries
+              LEFT JOIN codex_session_files AS files
+                ON files.source_root_key = entries.source_root_key
+               AND files.path = entries.source_path
+             WHERE (
+                    entries.source_root_key = OLD.source_root_key
+                AND entries.conversation_key = OLD.conversation_key
+             ) OR (
+                    files.source_root_key = OLD.source_root_key
+                AND files.last_native_thread_id = OLD.native_thread_id
+             )
+        ) AS paths
+              JOIN cache_meta AS meta
+                ON meta.key='codex_accounting_mutation_seq';
+        END""",
+    "trg_codex_accounting_thread_ins": """CREATE TRIGGER trg_codex_accounting_thread_ins
+        AFTER INSERT ON codex_conversation_threads
+        WHEN EXISTS (
+            SELECT DISTINCT entries.source_root_key, entries.source_path
+              FROM codex_session_entries AS entries
+              LEFT JOIN codex_session_files AS files
+                ON files.source_root_key = entries.source_root_key
+               AND files.path = entries.source_path
+             WHERE (
+                    entries.source_root_key = NEW.source_root_key
+                AND entries.conversation_key = NEW.conversation_key
+             ) OR (
+                    files.source_root_key = NEW.source_root_key
+                AND files.last_native_thread_id = NEW.native_thread_id
+             )
+        )
+        BEGIN
+            UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 WHERE key='codex_accounting_mutation_seq';
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(meta.value AS INTEGER), 'path', paths.source_root_key,
+                   paths.source_path
+              FROM (
+            SELECT DISTINCT entries.source_root_key, entries.source_path
+              FROM codex_session_entries AS entries
+              LEFT JOIN codex_session_files AS files
+                ON files.source_root_key = entries.source_root_key
+               AND files.path = entries.source_path
+             WHERE (
+                    entries.source_root_key = NEW.source_root_key
+                AND entries.conversation_key = NEW.conversation_key
+             ) OR (
+                    files.source_root_key = NEW.source_root_key
+                AND files.last_native_thread_id = NEW.native_thread_id
+             )
+        ) AS paths
+              JOIN cache_meta AS meta
+                ON meta.key='codex_accounting_mutation_seq';
+        END""",
+    "trg_codex_accounting_thread_upd": """CREATE TRIGGER trg_codex_accounting_thread_upd
+        AFTER UPDATE OF conversation_key, source_root_key, native_thread_id,
+                        cwd, git_json, last_seen_utc
+          ON codex_conversation_threads
+        WHEN (OLD.conversation_key IS NOT NEW.conversation_key OR OLD.source_root_key IS NOT NEW.source_root_key OR OLD.native_thread_id IS NOT NEW.native_thread_id OR OLD.cwd IS NOT NEW.cwd OR OLD.git_json IS NOT NEW.git_json OR OLD.last_seen_utc IS NOT NEW.last_seen_utc)
+         AND (EXISTS (
+            SELECT DISTINCT entries.source_root_key, entries.source_path
+              FROM codex_session_entries AS entries
+              LEFT JOIN codex_session_files AS files
+                ON files.source_root_key = entries.source_root_key
+               AND files.path = entries.source_path
+             WHERE (
+                    entries.source_root_key = OLD.source_root_key
+                AND entries.conversation_key = OLD.conversation_key
+             ) OR (
+                    files.source_root_key = OLD.source_root_key
+                AND files.last_native_thread_id = OLD.native_thread_id
+             )
+        ) OR EXISTS (
+            SELECT DISTINCT entries.source_root_key, entries.source_path
+              FROM codex_session_entries AS entries
+              LEFT JOIN codex_session_files AS files
+                ON files.source_root_key = entries.source_root_key
+               AND files.path = entries.source_path
+             WHERE (
+                    entries.source_root_key = NEW.source_root_key
+                AND entries.conversation_key = NEW.conversation_key
+             ) OR (
+                    files.source_root_key = NEW.source_root_key
+                AND files.last_native_thread_id = NEW.native_thread_id
+             )
+        ))
+        BEGIN
+            UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 WHERE key='codex_accounting_mutation_seq';
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(meta.value AS INTEGER), 'path', paths.source_root_key,
+                   paths.source_path
+              FROM (
+            SELECT DISTINCT entries.source_root_key, entries.source_path
+              FROM codex_session_entries AS entries
+              LEFT JOIN codex_session_files AS files
+                ON files.source_root_key = entries.source_root_key
+               AND files.path = entries.source_path
+             WHERE (
+                    entries.source_root_key = OLD.source_root_key
+                AND entries.conversation_key = OLD.conversation_key
+             ) OR (
+                    files.source_root_key = OLD.source_root_key
+                AND files.last_native_thread_id = OLD.native_thread_id
+             )
+        ) AS paths
+              JOIN cache_meta AS meta
+                ON meta.key='codex_accounting_mutation_seq'
+            UNION
+            SELECT CAST(meta.value AS INTEGER), 'path', paths.source_root_key,
+                   paths.source_path
+              FROM (
+            SELECT DISTINCT entries.source_root_key, entries.source_path
+              FROM codex_session_entries AS entries
+              LEFT JOIN codex_session_files AS files
+                ON files.source_root_key = entries.source_root_key
+               AND files.path = entries.source_path
+             WHERE (
+                    entries.source_root_key = NEW.source_root_key
+                AND entries.conversation_key = NEW.conversation_key
+             ) OR (
+                    files.source_root_key = NEW.source_root_key
+                AND files.last_native_thread_id = NEW.native_thread_id
+             )
+        ) AS paths
+              JOIN cache_meta AS meta
+                ON meta.key='codex_accounting_mutation_seq';
+        END""",
+    "trg_codex_accounting_upd": """CREATE TRIGGER trg_codex_accounting_upd
+        AFTER UPDATE OF source_path, source_root_key, timestamp_utc, session_id, model, input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens, account_key, conversation_key ON codex_session_entries
+        WHEN (OLD.source_path IS NOT NEW.source_path OR OLD.source_root_key IS NOT NEW.source_root_key OR OLD.timestamp_utc IS NOT NEW.timestamp_utc OR OLD.session_id IS NOT NEW.session_id OR OLD.model IS NOT NEW.model OR OLD.input_tokens IS NOT NEW.input_tokens OR OLD.cached_input_tokens IS NOT NEW.cached_input_tokens OR OLD.output_tokens IS NOT NEW.output_tokens OR OLD.reasoning_output_tokens IS NOT NEW.reasoning_output_tokens OR OLD.total_tokens IS NOT NEW.total_tokens OR OLD.account_key IS NOT NEW.account_key OR OLD.conversation_key IS NOT NEW.conversation_key) AND NOT EXISTS (
+            SELECT 1 FROM cache_meta
+             WHERE key='codex_accounting_bulk_clear'
+        )
+        BEGIN
+            UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 WHERE key='codex_accounting_mutation_seq';
+            INSERT OR IGNORE INTO codex_accounting_change_log
+                (mutation_seq, change_kind, source_root_key, source_path)
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(OLD.source_root_key, ''), OLD.source_path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq'
+            UNION
+            SELECT CAST(value AS INTEGER), 'path',
+                   COALESCE(NEW.source_root_key, ''), NEW.source_path
+              FROM cache_meta
+             WHERE key='codex_accounting_mutation_seq';
+        END""",
+    "trg_qws_latest_del": """CREATE TRIGGER trg_qws_latest_del
+        AFTER DELETE ON quota_window_snapshots
+        WHEN OLD.source='codex' AND OLD.source_root_key IS NOT NULL AND trim(coalesce(OLD.source, '')) <> '' AND trim(coalesce(OLD.source_root_key, '')) <> '' AND trim(coalesce(OLD.source_path, '')) <> '' AND trim(coalesce(OLD.captured_at_utc, '')) <> '' AND trim(coalesce(OLD.observed_slot, '')) <> '' AND trim(coalesce(OLD.logical_limit_key, '')) <> '' AND trim(coalesce(OLD.resets_at_utc, '')) <> '' AND unixepoch(OLD.captured_at_utc) IS NOT NULL AND unixepoch(OLD.resets_at_utc) IS NOT NULL
+        BEGIN
+            DELETE FROM codex_quota_partition_latest WHERE k_source_root_key = quote(OLD.source_root_key) AND k_logical_limit_key = quote(OLD.logical_limit_key) AND k_observed_slot = quote(OLD.observed_slot) AND k_window_minutes = quote(OLD.window_minutes) AND k_limit_id = quote(OLD.limit_id) AND k_limit_name = quote(OLD.limit_name) AND k_observed_model = quote(OLD.observed_model) AND k_account_key = quote(OLD.account_key) AND k_reset_anchor = quote(COALESCE(OLD.canonical_resets_at_utc, OLD.resets_at_utc)) AND latest_capture_epoch = unixepoch(OLD.captured_at_utc);
+            INSERT INTO codex_quota_partition_latest (k_source_root_key, k_logical_limit_key, k_observed_slot, k_window_minutes, k_limit_id, k_limit_name, k_observed_model, k_account_key, k_reset_anchor, latest_capture_epoch) SELECT quote(OLD.source_root_key), quote(OLD.logical_limit_key), quote(OLD.observed_slot), quote(OLD.window_minutes), quote(OLD.limit_id), quote(OLD.limit_name), quote(OLD.observed_model), quote(OLD.account_key), quote(COALESCE(OLD.canonical_resets_at_utc, OLD.resets_at_utc)), latest FROM (SELECT MAX(unixepoch(captured_at_utc)) AS latest FROM quota_window_snapshots WHERE source='codex' AND source_root_key IS NOT NULL AND trim(coalesce(source, '')) <> '' AND trim(coalesce(source_root_key, '')) <> '' AND trim(coalesce(source_path, '')) <> '' AND trim(coalesce(captured_at_utc, '')) <> '' AND trim(coalesce(observed_slot, '')) <> '' AND trim(coalesce(logical_limit_key, '')) <> '' AND trim(coalesce(resets_at_utc, '')) <> '' AND unixepoch(captured_at_utc) IS NOT NULL AND unixepoch(resets_at_utc) IS NOT NULL AND quote(source_root_key) = quote(OLD.source_root_key) AND quote(logical_limit_key) = quote(OLD.logical_limit_key) AND quote(observed_slot) = quote(OLD.observed_slot) AND quote(window_minutes) = quote(OLD.window_minutes) AND quote(limit_id) = quote(OLD.limit_id) AND quote(limit_name) = quote(OLD.limit_name) AND quote(observed_model) = quote(OLD.observed_model) AND quote(account_key) = quote(OLD.account_key) AND quote(COALESCE(canonical_resets_at_utc, resets_at_utc)) = quote(COALESCE(OLD.canonical_resets_at_utc, OLD.resets_at_utc))) WHERE latest IS NOT NULL AND NOT EXISTS (SELECT 1 FROM codex_quota_partition_latest WHERE k_source_root_key = quote(OLD.source_root_key) AND k_logical_limit_key = quote(OLD.logical_limit_key) AND k_observed_slot = quote(OLD.observed_slot) AND k_window_minutes = quote(OLD.window_minutes) AND k_limit_id = quote(OLD.limit_id) AND k_limit_name = quote(OLD.limit_name) AND k_observed_model = quote(OLD.observed_model) AND k_account_key = quote(OLD.account_key) AND k_reset_anchor = quote(COALESCE(OLD.canonical_resets_at_utc, OLD.resets_at_utc)));
+        END""",
+    "trg_qws_latest_ins": """CREATE TRIGGER trg_qws_latest_ins
+        AFTER INSERT ON quota_window_snapshots
+        WHEN NEW.source='codex' AND NEW.source_root_key IS NOT NULL AND trim(coalesce(NEW.source, '')) <> '' AND trim(coalesce(NEW.source_root_key, '')) <> '' AND trim(coalesce(NEW.source_path, '')) <> '' AND trim(coalesce(NEW.captured_at_utc, '')) <> '' AND trim(coalesce(NEW.observed_slot, '')) <> '' AND trim(coalesce(NEW.logical_limit_key, '')) <> '' AND trim(coalesce(NEW.resets_at_utc, '')) <> '' AND unixepoch(NEW.captured_at_utc) IS NOT NULL AND unixepoch(NEW.resets_at_utc) IS NOT NULL
+        BEGIN
+            DELETE FROM codex_quota_partition_latest WHERE k_source_root_key = quote(NEW.source_root_key) AND k_logical_limit_key = quote(NEW.logical_limit_key) AND k_observed_slot = quote(NEW.observed_slot) AND k_window_minutes = quote(NEW.window_minutes) AND k_limit_id = quote(NEW.limit_id) AND k_limit_name = quote(NEW.limit_name) AND k_observed_model = quote(NEW.observed_model) AND k_account_key = quote(NEW.account_key) AND k_reset_anchor = quote(COALESCE(NEW.canonical_resets_at_utc, NEW.resets_at_utc)) AND latest_capture_epoch < unixepoch(NEW.captured_at_utc);
+            INSERT INTO codex_quota_partition_latest (k_source_root_key, k_logical_limit_key, k_observed_slot, k_window_minutes, k_limit_id, k_limit_name, k_observed_model, k_account_key, k_reset_anchor, latest_capture_epoch) SELECT quote(NEW.source_root_key), quote(NEW.logical_limit_key), quote(NEW.observed_slot), quote(NEW.window_minutes), quote(NEW.limit_id), quote(NEW.limit_name), quote(NEW.observed_model), quote(NEW.account_key), quote(COALESCE(NEW.canonical_resets_at_utc, NEW.resets_at_utc)), unixepoch(NEW.captured_at_utc) WHERE NOT EXISTS (SELECT 1 FROM codex_quota_partition_latest WHERE k_source_root_key = quote(NEW.source_root_key) AND k_logical_limit_key = quote(NEW.logical_limit_key) AND k_observed_slot = quote(NEW.observed_slot) AND k_window_minutes = quote(NEW.window_minutes) AND k_limit_id = quote(NEW.limit_id) AND k_limit_name = quote(NEW.limit_name) AND k_observed_model = quote(NEW.observed_model) AND k_account_key = quote(NEW.account_key) AND k_reset_anchor = quote(COALESCE(NEW.canonical_resets_at_utc, NEW.resets_at_utc)));
+        END""",
+    "trg_qws_latest_upd": """CREATE TRIGGER trg_qws_latest_upd
+        AFTER UPDATE OF source, source_root_key, source_path, captured_at_utc, observed_slot, logical_limit_key, resets_at_utc, canonical_resets_at_utc, window_minutes, limit_id, limit_name, observed_model, account_key ON quota_window_snapshots
+        WHEN OLD.source = 'codex' OR NEW.source = 'codex'
+        BEGIN
+            DELETE FROM codex_quota_partition_latest WHERE k_source_root_key = quote(OLD.source_root_key) AND k_logical_limit_key = quote(OLD.logical_limit_key) AND k_observed_slot = quote(OLD.observed_slot) AND k_window_minutes = quote(OLD.window_minutes) AND k_limit_id = quote(OLD.limit_id) AND k_limit_name = quote(OLD.limit_name) AND k_observed_model = quote(OLD.observed_model) AND k_account_key = quote(OLD.account_key) AND k_reset_anchor = quote(COALESCE(OLD.canonical_resets_at_utc, OLD.resets_at_utc));
+            INSERT INTO codex_quota_partition_latest (k_source_root_key, k_logical_limit_key, k_observed_slot, k_window_minutes, k_limit_id, k_limit_name, k_observed_model, k_account_key, k_reset_anchor, latest_capture_epoch) SELECT quote(OLD.source_root_key), quote(OLD.logical_limit_key), quote(OLD.observed_slot), quote(OLD.window_minutes), quote(OLD.limit_id), quote(OLD.limit_name), quote(OLD.observed_model), quote(OLD.account_key), quote(COALESCE(OLD.canonical_resets_at_utc, OLD.resets_at_utc)), latest FROM (SELECT MAX(unixepoch(captured_at_utc)) AS latest FROM quota_window_snapshots WHERE source='codex' AND source_root_key IS NOT NULL AND trim(coalesce(source, '')) <> '' AND trim(coalesce(source_root_key, '')) <> '' AND trim(coalesce(source_path, '')) <> '' AND trim(coalesce(captured_at_utc, '')) <> '' AND trim(coalesce(observed_slot, '')) <> '' AND trim(coalesce(logical_limit_key, '')) <> '' AND trim(coalesce(resets_at_utc, '')) <> '' AND unixepoch(captured_at_utc) IS NOT NULL AND unixepoch(resets_at_utc) IS NOT NULL AND quote(source_root_key) = quote(OLD.source_root_key) AND quote(logical_limit_key) = quote(OLD.logical_limit_key) AND quote(observed_slot) = quote(OLD.observed_slot) AND quote(window_minutes) = quote(OLD.window_minutes) AND quote(limit_id) = quote(OLD.limit_id) AND quote(limit_name) = quote(OLD.limit_name) AND quote(observed_model) = quote(OLD.observed_model) AND quote(account_key) = quote(OLD.account_key) AND quote(COALESCE(canonical_resets_at_utc, resets_at_utc)) = quote(COALESCE(OLD.canonical_resets_at_utc, OLD.resets_at_utc))) WHERE latest IS NOT NULL;
+            DELETE FROM codex_quota_partition_latest WHERE k_source_root_key = quote(NEW.source_root_key) AND k_logical_limit_key = quote(NEW.logical_limit_key) AND k_observed_slot = quote(NEW.observed_slot) AND k_window_minutes = quote(NEW.window_minutes) AND k_limit_id = quote(NEW.limit_id) AND k_limit_name = quote(NEW.limit_name) AND k_observed_model = quote(NEW.observed_model) AND k_account_key = quote(NEW.account_key) AND k_reset_anchor = quote(COALESCE(NEW.canonical_resets_at_utc, NEW.resets_at_utc));
+            INSERT INTO codex_quota_partition_latest (k_source_root_key, k_logical_limit_key, k_observed_slot, k_window_minutes, k_limit_id, k_limit_name, k_observed_model, k_account_key, k_reset_anchor, latest_capture_epoch) SELECT quote(NEW.source_root_key), quote(NEW.logical_limit_key), quote(NEW.observed_slot), quote(NEW.window_minutes), quote(NEW.limit_id), quote(NEW.limit_name), quote(NEW.observed_model), quote(NEW.account_key), quote(COALESCE(NEW.canonical_resets_at_utc, NEW.resets_at_utc)), latest FROM (SELECT MAX(unixepoch(captured_at_utc)) AS latest FROM quota_window_snapshots WHERE source='codex' AND source_root_key IS NOT NULL AND trim(coalesce(source, '')) <> '' AND trim(coalesce(source_root_key, '')) <> '' AND trim(coalesce(source_path, '')) <> '' AND trim(coalesce(captured_at_utc, '')) <> '' AND trim(coalesce(observed_slot, '')) <> '' AND trim(coalesce(logical_limit_key, '')) <> '' AND trim(coalesce(resets_at_utc, '')) <> '' AND unixepoch(captured_at_utc) IS NOT NULL AND unixepoch(resets_at_utc) IS NOT NULL AND quote(source_root_key) = quote(NEW.source_root_key) AND quote(logical_limit_key) = quote(NEW.logical_limit_key) AND quote(observed_slot) = quote(NEW.observed_slot) AND quote(window_minutes) = quote(NEW.window_minutes) AND quote(limit_id) = quote(NEW.limit_id) AND quote(limit_name) = quote(NEW.limit_name) AND quote(observed_model) = quote(NEW.observed_model) AND quote(account_key) = quote(NEW.account_key) AND quote(COALESCE(canonical_resets_at_utc, resets_at_utc)) = quote(COALESCE(NEW.canonical_resets_at_utc, NEW.resets_at_utc))) WHERE latest IS NOT NULL;
+        END""",
+}
+
+
+def build_per_migration_052_codex_delete_trigger_plans(scenario_dir: Path) -> None:
+    """Per-migration goldens for #971's bounded delete-trigger plans.
+
+    ``pre.sqlite`` is a 051-head install: the current schema apply creates the
+    rewritten trigger bodies and ``idx_codex_files_root_thread``, so the index
+    is dropped and the twelve accounting-ledger and partition-latest triggers
+    are replaced by their frozen head-51 bodies BEFORE any row is written, so
+    every seeded row went through the shipped triggers. It holds one entry,
+    one thread whose alias file carries that entry, and one quota partition of
+    three rows; ``post.sqlite`` is the handler's result, with the same rows.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "052_codex_delete_trigger_plans"
+    rollout = "/fixtures/codex/sessions/2026/11/05/rollout.jsonl"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index",
+                         "043_codex_window_attributions",
+                         "044_codex_accounting_change_ledger",
+                         "045_conversation_render_revision_columns",
+                         "046_codex_source_file_identity",
+                         "047_spill_free_read_paths",
+                         "048_codex_quota_physical_group_order",
+                         "049_codex_rollout_containers",
+                         "050_preserve_claude_cost_attribution",
+                         "051_codex_retained_identities"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            conn.execute("DROP INDEX IF EXISTS idx_codex_files_root_thread")
+            for name, sql in _HEAD_51_CODEX_TRIGGER_SQL.items():
+                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+                conn.execute(sql)
+            conn.execute(
+                "INSERT INTO codex_session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, "
+                " last_ingested_at, last_native_thread_id, source_root_key) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (rollout, 512, 1700000000000000000, 512, _TS_PUBLIC_5,
+                 "native-fixture", "rk-fixture"),
+            )
+            conn.execute(
+                "INSERT INTO codex_session_entries "
+                "(source_path, line_offset, timestamp_utc, session_id, model, "
+                " source_root_key, conversation_key) VALUES (?,?,?,?,?,?,?)",
+                (rollout, 0, "2026-11-05T10:00:00+00:00", "session-fixture",
+                 "gpt-5.3-codex", "rk-fixture", "conversation-fixture"),
+            )
+            conn.execute(
+                "INSERT INTO codex_conversation_threads "
+                "(conversation_key, source_root_key, native_thread_id, "
+                " root_thread_id, source_path, cwd, git_json) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("conversation-fixture", "rk-fixture", "native-fixture",
+                 "native-fixture", rollout, "/fixtures/project", "{}"),
+            )
+            for offset, minute in ((0, 0), (1, 5), (2, 10)):
+                conn.execute(
+                    "INSERT INTO quota_window_snapshots (source, "
+                    " source_root_key, source_path, line_offset, "
+                    " captured_at_utc, observed_slot, logical_limit_key, "
+                    " limit_id, window_minutes, used_percent, resets_at_utc) "
+                    "VALUES ('codex', 'rk-fixture', ?, ?, ?, 'primary', "
+                    " 'codex:primary', 'codex', 300, ?, "
+                    " '2026-11-05T15:00:00Z')",
+                    (rollout, offset, f"2026-11-05T10:{minute:02d}:00Z",
+                     10.0 + offset),
+                )
+            conn.execute("PRAGMA user_version=51")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=52")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_conversations_010_codex_conversation_source_file_identity(
     scenario_dir: Path,
 ) -> None:
@@ -9189,6 +9613,9 @@ def main() -> int:
     )
     build_per_migration_051_codex_retained_identities(
         FIXTURES_ROOT / "per-migration" / "051_codex_retained_identities"
+    )
+    build_per_migration_052_codex_delete_trigger_plans(
+        FIXTURES_ROOT / "per-migration" / "052_codex_delete_trigger_plans"
     )
     build_per_migration_conversations_010_codex_conversation_source_file_identity(
         FIXTURES_ROOT / "per-migration"

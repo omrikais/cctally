@@ -1841,6 +1841,49 @@ def _claude_context_window(model: object) -> int | None:
     return statusline._resolve_context_window(model, lambda *_a, **_k: None)
 
 
+# #1022: prior-generation ids whose bare transcript id may have run in a 200K
+# or a 1M window. No retained field states which, so only a request's own size
+# can prove it, and only for itself. This set states an AMBIGUITY, not a
+# default capacity, which is why it lives here and not in the status line's
+# tables; the two windows are named here for the same reason, so an edit of
+# the status line's family defaults cannot move this rule.
+_CLAUDE_TWO_WINDOW_MODEL_IDS = frozenset({
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+    "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
+    "claude-sonnet-4",
+})
+_CLAUDE_TWO_WINDOW_SMALL = 200_000
+_CLAUDE_TWO_WINDOW_LARGE = 1_000_000
+
+
+def _classify_claude_context_request(model: object, used: int
+                                     ) -> tuple[str, float | None]:
+    """One associated Claude request's context-window outcome.
+
+    `("decided", fraction)` at a known or proven capacity, or for a
+    two-window request whose fraction under the small window is already below
+    the floor (an upper bound that cannot qualify, stating no capacity);
+    `("undecidable", None)` for a two-window request that the small window
+    would qualify and the large one would not; `("unknown", None)` when the
+    model publishes no window at all.
+    """
+    lowered = str(model or "").lower()
+    normalized = re.sub(r"-\d{8}$", "", lowered)
+    if (lowered.endswith("[1m]")
+            or normalized not in _CLAUDE_TWO_WINDOW_MODEL_IDS):
+        capacity = _claude_context_window(model)
+        if not capacity:
+            return ("unknown", None)
+        return ("decided", used / capacity)
+    if used > _CLAUDE_TWO_WINDOW_SMALL:
+        # Only the large window can hold it.
+        return ("decided", used / _CLAUDE_TWO_WINDOW_LARGE)
+    small = used / _CLAUDE_TWO_WINDOW_SMALL
+    if _large_enough(small):
+        return ("undecidable", None)
+    return ("decided", small)
+
+
 # --- the reads the evaluators run (#620 S3 §4.2) ------------------------
 #
 # Every statement below is SET-WISE and chunked. A per-session or per-file
@@ -2705,28 +2748,41 @@ def _evaluate_claude_short_high_context(scope: DiagnosisScope,
                 for reply in association.replies
                 for uuid in [str(reply["anchor"]["uuid"])]
                 if key_of_uuid.get(uuid, (None,))[0] is not None]
+        # #1022: each request is classified on its OWN model id and size,
+        # never on a sibling's, an out-of-window request's or a `/model`
+        # marker's — only a request's own size proves a prior-generation
+        # window, and only for itself. `best` folds DECIDED fractions alone,
+        # so an undecidable request neither qualifies a conversation nor
+        # inflates the published maximum.
         best: float | None = None
         saw_request = False
+        undecidable = False
         for key in dict.fromkeys(keys):
             for entry in by_turn.get(key, ()):
                 saw_request = True
-                capacity = _claude_context_window(entry.model)
-                if not capacity:
-                    continue
                 # The Claude numerator, matching the statusline's own context
                 # segment: input plus BOTH cache legs.
                 used = (entry.input_tokens + entry.cache_read_tokens
                         + entry.cache_create_tokens)
-                fraction = used / capacity
+                state, fraction = _classify_claude_context_request(
+                    entry.model, used)
+                if state == "undecidable":
+                    undecidable = True
+                    continue
+                if fraction is None:
+                    continue                # no published window
                 best = fraction if best is None else max(best, fraction)
-        if saw_request and best is None:
-            unevaluable[session] = kernel.GAP_UNKNOWN_CONTEXT_WINDOW
-            continue
         # With several replies the LARGEST single request fraction is used,
         # never their sum: two replies at 0.45 do not make a full window.
+        # Qualification is decided FIRST: a decided request at the floor
+        # qualifies the conversation under either window of its undecidable
+        # siblings.
         if best is not None and _large_enough(best):
             qualifying.append(session)
             fractions[session] = best
+            continue
+        if undecidable or (saw_request and best is None):
+            unevaluable[session] = kernel.GAP_UNKNOWN_CONTEXT_WINDOW
     return _short_context_evaluation(
         facts, known=sessions, unevaluable=unevaluable, qualifying=qualifying,
         turn_counts=turn_counts, fractions=fractions,

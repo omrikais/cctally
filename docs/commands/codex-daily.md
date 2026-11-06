@@ -122,6 +122,8 @@ rendered table's Input column shows non-cached (`input - cached`).
 
 `gpt-6.1-sol` uses its own [OpenAI Standard rate card](https://developers.openai.com/api/docs/models/gpt-6.1-sol): $2 input, $0.10 cached input and $10 output per million tokens. Prompts above 272,000 cache-inclusive input tokens use $4 / $0.20 / $15 for the full request; `--speed fast` doubles the applicable rates. `gpt-6-sol` retains its separate $0.20 cached-input rate.
 
+`gpt-6.1-terra`, `gpt-6-rosalind` and `gpt-6-astra-law` use their own rate cards from [OpenAI's pricing page](https://developers.openai.com/api/docs/pricing): $1 / $0.05 / $5, $15 / $1.50 / $75 and $10 / $1 / $50 per million input / cached input / output tokens. Above 272,000 cache-inclusive input tokens, Terra uses $2 / $0.10 / $7.50 and Rosalind $30 / $3 / $112.50 for the full request; Astra for Law has no published long-context rate. `gpt-5.5-cyber-preview` prices through the `gpt-5.5-cyber` card.
+
 Unknown Codex model names fall back to
 `CODEX_LEGACY_FALLBACK_MODEL = "gpt-5"` pricing with `isFallback: true`
 in JSON output. One stderr warning per unknown name per process.

@@ -281,7 +281,7 @@ class DoctorState:
     conversations_db_quick_check: Optional[str] = None
     # #279 S2 (F5c): non-blocking flock probes on the two sync lock files
     # (name -> True held / False free / None unreadable). Probe never
-    # creates files (doctor read-only contract). None = probe errored.
+    # creates files (doctor never changes your data). None = probe errored.
     locks_held: Optional[dict] = None
     # #297: size in bytes of cache.db-wal, gathered read-only in
     # doctor_gather_state (getsize, OSError/absent -> None). Warns above
@@ -485,6 +485,14 @@ class DoctorState:
     # launch ledger, process identities probed before a re-read, pending
     # marker). None = not gathered; the check then reads both as never run.
     rebuild_workers: Optional[dict] = None
+    # #1018: the newest admitted Claude weekly reading (the observation
+    # index), no later than `now_utc`. `latest_snapshot_at` keeps its
+    # held-inclusive materialized meaning; `data.latest_snapshot_age` takes
+    # the newer of the two.
+    latest_reading_at: Optional[dt.datetime] = None
+    # #1018 C6: why freshness evidence could not be read — None,
+    # "stats_maintenance" or "stats_unreadable".
+    freshness_unavailable_reason: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1059,7 +1067,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1023
+            epoch = 1024
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -1376,29 +1384,86 @@ def rebuild_worker_check(rebuild_workers, now_utc) -> CheckResult:
     )
 
 
+_FRESHNESS_UNAVAILABLE = {
+    "stats_maintenance": (
+        "unavailable (stats.db maintenance in progress)",
+        "Retry after the stats.db maintenance finishes.",
+    ),
+    "stats_unreadable": (
+        "unavailable (stats.db could not be read)",
+        "See the stats.db check.",
+    ),
+}
+
+
 def _check_data_latest_snapshot_age(s: DoctorState) -> CheckResult:
-    if s.latest_snapshot_at is None:
-        return CheckResult(
-            id="data.latest_snapshot_age", title="Latest snapshot",
-            severity="fail", summary="never",
-            remediation="Check hooks are installed and Claude Code is running",
-            details={"latest_snapshot_at": None},
-        )
-    age_s = int((s.now_utc - s.latest_snapshot_at).total_seconds())
-    if age_s <= 300:
-        sev, rem = "ok", None
-    elif age_s <= 3600:
+    """Is the usage write path alive? (#1018, spec 5.4.)
+
+    The evidence is the newer of the held-inclusive materialized snapshot and
+    the newest admitted reading, each counted only when no later than now.
+    Fresh positive evidence decides even when a source failed; stale or absent
+    evidence with a failed source is "unavailable", never silence.
+    """
+    now = s.now_utc
+
+    def _valid(moment):
+        return moment if moment is not None and moment <= now else None
+
+    def _age(moment):
+        return int((now - moment).total_seconds())
+
+    snapshot = _valid(s.latest_snapshot_at)
+    reading = _valid(s.latest_reading_at)
+    valid = [moment for moment in (snapshot, reading) if moment is not None]
+    candidate = max(valid) if valid else None
+    cand_age = _age(candidate) if candidate is not None else None
+    reason = s.freshness_unavailable_reason
+
+    effective = candidate
+    if candidate is not None and cand_age <= 300:
+        sev, summary, rem = "ok", f"{cand_age}s ago", None
+    elif reason:
         sev = "warn"
+        summary, rem = _FRESHNESS_UNAVAILABLE.get(
+            reason, _FRESHNESS_UNAVAILABLE["stats_unreadable"])
+        effective = None
+    elif candidate is not None and cand_age <= 3600:
+        sev, summary = "warn", f"{cand_age}s ago"
         rem = "Recent but not current. Check Claude Code session is active."
-    else:
-        sev = "fail"
+    elif candidate is not None:
+        sev, summary = "fail", f"{cand_age}s ago"
         rem = "No snapshot in >1h. Hooks may be broken — check `cctally setup --status`."
+    else:
+        sev, summary = "fail", "never"
+        rem = "Check hooks are installed and Claude Code is running"
+
+    details: dict = {
+        "latest_snapshot_at": (
+            s.latest_snapshot_at.isoformat()
+            if s.latest_snapshot_at is not None else None
+        ),
+    }
+    if s.latest_snapshot_at is not None:
+        details["latest_snapshot_age_s"] = (
+            _age(snapshot) if snapshot is not None else None
+        )
+    details.update({
+        "latest_reading_at": (
+            s.latest_reading_at.isoformat()
+            if s.latest_reading_at is not None else None
+        ),
+        "latest_reading_age_s": _age(reading) if reading is not None else None,
+        "effective_freshness_at": (
+            effective.isoformat() if effective is not None else None
+        ),
+        "effective_freshness_age_s": (
+            _age(effective) if effective is not None else None
+        ),
+        "freshness_unavailable_reason": reason,
+    })
     return CheckResult(
         id="data.latest_snapshot_age", title="Latest snapshot",
-        severity=sev, summary=f"{age_s}s ago",
-        remediation=rem,
-        details={"latest_snapshot_at": s.latest_snapshot_at.isoformat(),
-                 "latest_snapshot_age_s": age_s},
+        severity=sev, summary=summary, remediation=rem, details=details,
     )
 
 
@@ -2386,7 +2451,7 @@ def _check_data_conversation_sessions_rollup(s: DoctorState) -> CheckResult:
     ``doctor_gather_state`` from a NON-BLOCKING ``conversations.db.lock`` flock probe
     (lock held ⇒ a writer is mid-flight) AND the presence of any pending
     ``cache_meta`` reingest/split/backfill flag; if either says in-progress, this
-    stays OK. Doctor remains read-only and never blocks on the lock.
+    stays OK. Doctor never changes your data and never blocks on the lock.
 
     Informational only (no remediation): the next conversation sync re-derives
     the rollup via its incremental DELETE+INSERT.

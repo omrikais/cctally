@@ -3064,3 +3064,166 @@ def test_1040_completion_is_idempotent_under_interruption_and_later_gap(
     assert _1040_five_hour_ids(later, window_key) == [], later
     assert _1040_block_records(_1040_selected(mod), window_key) == settled
     assert _1040_rebuild(mod, capsys) == []
+
+
+# ── #1050 W3: a five-hour milestone cost restoration republishes ────────────
+
+
+def _1050_tick(ns, calls, now):
+    """One real dashboard tick through the dispatch memo; ``rebuilt`` is
+    whether the full (non-idle) path ran."""
+    import _lib_snapshot_cache as sc
+    from types import SimpleNamespace
+
+    before = calls["rebuild"]
+    snap = ns["_tui_build_snapshot"](
+        now_utc=now, skip_sync=True, precompute_envelope=True,
+        runtime_bind="127.0.0.1", display_tz_pref_override="utc")
+    key, _published = sc.dispatch_state()
+    return SimpleNamespace(snap=snap, key=key, rebuilt=calls["rebuild"] > before)
+
+
+def _1050_route(ns, key):
+    """The dashboard's own Claude cycle-detail route handler."""
+    import urllib.parse
+    from types import SimpleNamespace
+
+    path = "/api/milestones/claude/week/" + urllib.parse.quote(key, safe="")
+    sent = []
+    handler = SimpleNamespace(
+        path=path,
+        _send_milestones_json=lambda status, body: sent.append((status, body)),
+        log_error=lambda *args: sent.append(("log_error", args)),
+        send_error=lambda *args: sent.append(("send_error", args)),
+    )
+    ns["DashboardHTTPHandler"]._handle_get_milestones_week(handler, path)
+    assert len(sent) == 1 and sent[0][0] == 200, sent
+    return sent[0][1]
+
+
+def _1050_rows(db_path):
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return {
+            table: repr(conn.execute(
+                f"SELECT * FROM {table} ORDER BY rowid").fetchall())
+            for table in (
+                "weekly_usage_snapshots", "weekly_cost_snapshots",
+                "percent_milestones", "five_hour_milestones",
+                "five_hour_blocks", "five_hour_block_models",
+                "five_hour_block_projects", "five_hour_reset_events",
+                "week_reset_events", "weekly_credit_floors")
+        }
+    finally:
+        conn.close()
+
+
+def _1050_five_hour_milestones(mod):
+    conn = mod.open_db()
+    try:
+        return [tuple(row) for row in conn.execute(
+            "SELECT five_hour_window_key, percent_threshold, reset_event_id, "
+            "       block_cost_usd FROM five_hour_milestones "
+            "ORDER BY five_hour_window_key, percent_threshold, reset_event_id")]
+    finally:
+        conn.close()
+
+
+def test_1050_five_hour_milestone_cost_restoration_republishes(
+    tmp_path, monkeypatch,
+):
+    """#1050 §8.1 W3, on the #884 real-CLI restoration fixture. Detects: the
+    real `cctally db rederive --yes` restores a repriced five-hour milestone's
+    `block_cost_usd` in place (membership unchanged), yet the running
+    dashboard reuses the Claude source and keeps every cycle's history stamp,
+    so a cached past-cycle detail keeps the repriced cost."""
+    import datetime as _dt
+    import _lib_snapshot_cache as sc
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TZ", "Etc/UTC")
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+    ns = vars(mod)
+    tui = ns["_cctally_tui"]
+    calls = {"rebuild": 0}
+    original = tui._tui_build_forecast_view
+
+    def counted(*args, **kwargs):
+        calls["rebuild"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tui, "_tui_build_forecast_view", counted)
+    sc.reset_dispatch_state()
+    try:
+        closed_key, _close_id, _lower, _upper = _seed_repriced_block_884(
+            mod, divergent=False)
+        _cli_884(tmp_path, "db", "rebuild", "--db", "stats", "--json")
+        damaged = _1050_five_hour_milestones(mod)
+        assert [r[3] for r in damaged if r[0] == closed_key] == [
+            pytest.approx(4.5), pytest.approx(6.0)], damaged
+
+        now = _dt.datetime(2026, 7, 25, 16, 30, tzinfo=_dt.timezone.utc)
+        first = _1050_tick(ns, calls, now)
+        index = {e["key"]: e for e in (first.snap.week_index or [])}
+        assert index
+        details_before = {key: _1050_route(ns, key) for key in index}
+
+        applied = json.loads(_cli_884(
+            tmp_path, "db", "rederive", "--family", "claude-usage", "--yes",
+            "--json"))
+        assert applied["status"] == "applied", applied
+        restored = _1050_five_hour_milestones(mod)
+        assert [r[:3] for r in restored] == [r[:3] for r in damaged], (
+            "five-hour milestone membership unchanged")
+        assert [r[3] for r in restored if r[0] == closed_key] == [
+            pytest.approx(3.0), pytest.approx(6.0)], restored
+        rows_before = _1050_rows(mod.DB_PATH)
+
+        second = _1050_tick(ns, calls, now + _dt.timedelta(minutes=1))
+        details_after = {key: _1050_route(ns, key) for key in index}
+        rows_after = _1050_rows(mod.DB_PATH)
+        sig = [next((x for x in (t.key or ())
+                     if isinstance(x, sc.SnapshotSignature)), None)
+               for t in (first, second)]
+        moved = (sorted(k for k, v in sig[0]._asdict().items()
+                        if sig[1]._asdict().get(k) != v)
+                 if None not in sig else None)
+        print(f"[#1050 legs] w3: rebuilt={second.rebuilt} "
+              f"signature_legs_moved={moved} data_version_moved="
+              f"{first.snap.data_version != second.snap.data_version}")
+        block_costs = [
+            m["block_cost_usd"]
+            for detail in details_after.values()
+            for block in detail.get("blocks") or ()
+            if block["five_hour_window_key"] == closed_key
+            for m in block["milestones"]
+        ]
+        assert block_costs and block_costs[0] == pytest.approx(3.0), (
+            "non-vacuity: the fetched detail publishes the restored cost")
+
+        failed = []
+        for ok, label in (
+            (second.rebuilt, "the second tick is non-idle"),
+            (second.snap.data_version != first.snap.data_version,
+             "data_version changed"),
+            (second.snap.source_bundle.sources["claude"]
+             is not first.snap.source_bundle.sources["claude"],
+             "the Claude source object is new"),
+            (rows_before == rows_after,
+             "the corrected store's rows are byte-equal across the ticks"),
+        ):
+            if not ok:
+                failed.append(label)
+        after_index = {e["key"]: e for e in (second.snap.week_index or [])}
+        for key in sorted(set(index) & set(after_index)):
+            if index[key]["detail_stamp"] == after_index[key]["detail_stamp"]:
+                failed.append(f"claude index detail_stamp changed for {key}")
+            if (details_before[key]["detail_stamp"]
+                    == details_after[key]["detail_stamp"]):
+                failed.append(f"claude detail echoed stamp changed for {key}")
+        assert not failed, f"#1050 w3: GREEN assertions failed: {failed}"
+    finally:
+        sc.reset_dispatch_state()
+        tui._tui_reset_partial_retry_state()

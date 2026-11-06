@@ -515,3 +515,71 @@ def test_absent_uningested_tracked_row_does_not_withhold_marker(isolated_cache):
         "a size_bytes=0 tracked row holds no entries; its absence from disk "
         "must NOT withhold the marker"
     )
+
+
+# ── #916: the residual token goes with the marker at every wipe ─────────────
+
+_TOKEN = "claude_ingest_walk_orphan_residual"
+
+
+@pytest.mark.parametrize("mutant", [False, True],
+                         ids=["as-built", "mutant-keeps-the-token"])
+@pytest.mark.parametrize("wipe", ["rebuild", "truncation"])
+def test_wipe_deletes_the_residual_token_atomically(
+        isolated_cache, monkeypatch, wipe, mutant):
+    """#916 A9 (review R1-P2-2). Detects: a crash between a destructive wipe's
+    commit and the end of its walk leaving the residual token vouching for a
+    wiped store, so the next dashboard plan would certify an empty cache.
+
+    The hook fires on the first call after the wipe commits (the per-file
+    walker, as in the marker test above), reads ``cache_meta`` on an
+    INDEPENDENT connection, then dies. The ``mutant`` case replaces the
+    wipes' verdict delete with the pre-#916 marker-only delete and must make
+    the hook's assertion fire, which proves the assertion can see a token.
+    """
+    ns, conn, file_a, file_b, sync = isolated_cache
+    gone = file_a.parent / "gone.jsonl"
+    file_a.write_text(_assistant_line("m1", "r1", out_tokens=100)
+                      + _assistant_line("m1x", "r1x", out_tokens=110))
+    file_b.write_text(_assistant_line("m2", "r2", out_tokens=200))
+    gone.write_text(_assistant_line("m3", "r3", out_tokens=300))
+    sync()
+    gone.unlink()
+    sync()
+    assert conn.execute("SELECT 1 FROM cache_meta WHERE key=?",
+                        (_TOKEN,)).fetchone() is not None, (
+        "precondition: a residual-only walk writes the token")
+
+    cache_mod = sys.modules["_cctally_cache"]
+    if mutant:
+        monkeypatch.setattr(
+            cache_mod, "_clear_claude_walk_verdicts",
+            lambda c: c.execute("DELETE FROM cache_meta WHERE key=?", (_MARKER,)))
+    db_path = str(cache_mod._cctally_core.CACHE_DB_PATH)
+
+    class _SimulatedCrash(Exception):
+        pass
+
+    def observe_then_die(*_args, **_kwargs):
+        probe = sqlite3.connect(db_path)
+        try:
+            vouching = sorted(row[0] for row in probe.execute(
+                "SELECT key FROM cache_meta WHERE key IN (?, ?)",
+                (_MARKER, _TOKEN)))
+        finally:
+            probe.close()
+        assert not vouching, (
+            f"the {wipe} wipe committed while {vouching} still vouched for it")
+        raise _SimulatedCrash("simulated kill -9 after the wipe commit")
+        yield  # pragma: no cover  (unreachable; makes this a generator)
+
+    monkeypatch.setattr(cache_mod, "_iter_sync_entries", observe_then_die)
+    if wipe == "truncation":
+        file_a.write_text(_assistant_line("m1b", "r1b", out_tokens=150))
+    expected, match = ((AssertionError, "still vouched") if mutant
+                       else (_SimulatedCrash, "simulated kill"))
+    with pytest.raises(expected, match=match):
+        if wipe == "rebuild":
+            ns["sync_cache"](conn, rebuild=True)
+        else:
+            sync()

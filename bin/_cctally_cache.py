@@ -105,6 +105,7 @@ import contextvars
 import datetime as dt
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
@@ -117,6 +118,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass, field, replace as _dc_replace
 from typing import Any, Callable, Iterable, Iterator, NamedTuple
 
@@ -708,6 +710,14 @@ CODEX_REPLAY_DRAIN_MARKER_NAME = "codex-replay-drain.last-attempt"
 #: far more often than the `doctor` WARN it produces is actionable.
 CODEX_REPLAY_DRAIN_SPAWN_THROTTLE_SECONDS = 3600
 
+#: #982 spec 4.5a: the same spawn's spacing while a well-formed heal record
+#: exists. A pass that ended `contended` or `degraded` leaves the record (in
+#: phase `units`, a global fence over the population and every one-way stamp),
+#: and the executor resumes it per file, so the retry costs one unit's work,
+#: not a whole-tree re-read; waiting the hourly slot would keep the fence up
+#: for an hour after any stall.
+CODEX_HEAL_RETRY_THROTTLE_SECONDS = 300
+
 #: How long the drain worker waits for the cache writer flocks. The default
 #: ``None`` is a single non-blocking attempt, which spends the whole hourly slot
 #: on whichever ordinary sync happened to hold the lock at that instant. Nobody
@@ -868,6 +878,22 @@ def _set_cache_meta_if_changed(
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value "
         "WHERE cache_meta.value IS NOT excluded.value",
         (key, value),
+    )
+
+
+def _clear_claude_walk_verdicts(conn: sqlite3.Connection) -> None:
+    """Delete both Claude walk verdicts inside a destructive wipe's transaction.
+
+    The walk-complete marker and #916's residual token each vouch for the
+    cache's contents, so a rebuild or truncation wipe drops them in the same
+    transaction as the rows: a crash between the wipe's commit and the end of
+    its walk must not leave either one vouching for an emptied store. The
+    caller commits.
+    """
+    conn.execute(
+        "DELETE FROM cache_meta WHERE key IN (?, ?)",
+        ("claude_ingest_walk_complete",
+         _ingest_frontier.CLAUDE_WALK_ORPHAN_RESIDUAL_KEY),
     )
 
 
@@ -1076,6 +1102,29 @@ class ProjectKey:
     is_no_git: bool = field(default=False, compare=False)
 
 
+def _is_repository_marker(marker: str) -> bool:
+    """Whether a `.git` entry marks a repository for the project walk (#976).
+
+    A bounded structural filter, not a Git validity check: an absent entry (or
+    a dangling symlink) is no marker; a `.git` DIRECTORY (a symlink to one
+    included) counts only when it holds ``HEAD`` and the ``objects/`` and
+    ``refs/`` directories, so a stray non-repository `.git/` in a worktree
+    container is skipped; anything else (a worktree or submodule `gitdir:`
+    file) counts by presence. Metadata calls only: nothing is opened and no
+    `gitdir:` or `commondir` is followed, which keeps the walk inside the
+    frozen-roots stat contract (`bench/write-attribution/frozen_roots.py`).
+    Only the `git-root` walk uses this; `_is_dev_checkout()` and the other
+    `.git` presence predicates keep their own installation-safety contract.
+    """
+    if not os.path.exists(marker):
+        return False
+    if os.path.isdir(marker):
+        return (os.path.exists(os.path.join(marker, "HEAD"))
+                and os.path.isdir(os.path.join(marker, "objects"))
+                and os.path.isdir(os.path.join(marker, "refs")))
+    return True
+
+
 def _resolve_project_key(
     project_path: str | None,
     mode: str,                      # "git-root" | "full-path"
@@ -1083,8 +1132,9 @@ def _resolve_project_key(
 ) -> ProjectKey:
     """Resolve a raw project_path to its ProjectKey.
 
-    Walks parents looking for `.git` (file or dir) to find the canonical
-    git-root. Non-git paths fall back to the normalized path. NULL input
+    Walks parents looking for a repository marker (`_is_repository_marker`: a
+    `.git` file, or a `.git` directory holding HEAD, objects/ and refs/) to
+    find the canonical git-root. Non-git paths fall back to the normalized path. NULL input
     becomes a literal `(unknown)` bucket.
     """
     if project_path is None:
@@ -1136,7 +1186,7 @@ def _resolve_project_key(
     while True:
         if cur == home or cur == "/" or os.path.dirname(cur) == cur:
             break
-        if os.path.exists(os.path.join(cur, ".git")):
+        if _is_repository_marker(os.path.join(cur, ".git")):
             key = ProjectKey(
                 bucket_path=cur,
                 display_key=os.path.basename(cur) or cur,
@@ -1708,12 +1758,18 @@ class CodexResetAnchorResolver:
     """
 
     def __init__(self, conn: sqlite3.Connection, *,
-                 deadline: "float | None" = None, clock=None):
+                 deadline: "float | None" = None, clock=None,
+                 seed_source: "Callable[[tuple[str, str, str, object], str], _lib_quota.ResetAnchorComponents | None] | None" = None):
         self._conn = conn
         # #980 F3: a budgeted walk passes its walk deadline and clock, which
         # bound the group seed read; unbudgeted callers pass neither.
         self._deadline = deadline
         self._clock = clock if clock is not None else time.monotonic
+        # #975 (spec 4.2): `seed_source(group, logical_limit_key)` supplies a
+        # group's committed evidence in place of the seed SELECT whenever it
+        # returns components (the provenance drain hands out a private copy of
+        # its committed-evidence base); `None` falls back to the SELECT.
+        self._seed_source = seed_source
         self._groups: "dict[tuple[str, str, str, object], _lib_quota.ResetAnchorComponents]" = {}
         self._pending_merges: list[
             tuple[tuple[str, str, str, object], str, dt.datetime,
@@ -1744,6 +1800,11 @@ class CodexResetAnchorResolver:
         components = self._groups.get(group)
         if components is not None:
             return components
+        if self._seed_source is not None:
+            components = self._seed_source(group, logical_limit_key)
+            if components is not None:
+                self._groups[group] = components
+                return components
         components = _lib_quota.ResetAnchorComponents()
         if not self._seed_failed:
             candidates = _lib_jsonl.codex_snap_equivalent_limit_keys(
@@ -1920,6 +1981,219 @@ class CodexResetAnchorResolver:
 
 def _codex_anchor_iso(value: dt.datetime) -> str:
     return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class _CodexWalkShare:
+    """History-sized state shared across the admitted units of one pass.
+
+    #982 / #975 spec 4.2. One in-process object per heal-executor or
+    provenance pass, never persisted. Every reuse is guarded by a token read
+    under the writer locks: ``(st_dev, st_ino)`` of cache.db, ``PRAGMA
+    schema_version``, ``quota_window_change_log``'s ``sqlite_sequence`` value
+    and ``codex_physical_mutation_seq``. The ledger's three triggers record
+    every insert, delete and seeded-column update of a Codex quota row, so any
+    other writer's quota mutation between two units changes the token; while
+    the ledger table or a trigger is missing the token is ``None`` and nothing
+    is reused. A bind consumes the seal, so a unit that never sealed (an
+    exception, a rollback, a refusal) leaves the next unit seeding afresh.
+
+    - ``bind_walk`` / ``seal``: the walk memo, one ``CodexResetAnchorResolver``
+      shared across population units, i.e. the single walk's own resolver.
+    - ``identity_resolver`` / ``absorb_identity`` / ``seal``: the provenance
+      committed-evidence seed. Each identity resolves against copies of a
+      per-group base equal to a fresh seed of the committed rows; after the
+      identity commits, the base gains exactly that identity's stored rows.
+      Components and anchors do not depend on insertion order, so base plus
+      absorbed rows equals a fresh seed, and evidence an identity resolved but
+      did not store dies with its copy, exactly as a new resolver per call.
+    - ``ledger_paths``: the accounting ledger's path set, read in full once
+      and then only past the last ``seq`` seen. A positive signal only (I7),
+      so a path whose rows a prune later removed may stay in the set.
+    - ``heal_payload``: the heal record's population and D1 set, parsed once
+      per pass and reused while the fence key keeps the same ``gen`` (a
+      payload is only ever written with a new ``gen``).
+    """
+
+    _LEDGER_TRIGGERS = (
+        "trg_qws_ledger_ins", "trg_qws_ledger_del", "trg_qws_ledger_upd")
+
+    def __init__(self) -> None:
+        self._sealed: "tuple | None" = None
+        self._walk: "CodexResetAnchorResolver | None" = None
+        self._base: "CodexResetAnchorResolver | None" = None
+        self._ledger: "set[str] | None" = None
+        self._ledger_seq = 0
+        self._ledger_identity: "tuple | None" = None
+        self._heal_payload: "CodexHealPayload | None" = None
+
+    def heal_payload(self, conn: sqlite3.Connection,
+                     record: "dict | None") -> "CodexHealPayload | None":
+        """The record's parsed payload: the one this pass already parsed
+        while ``record`` keeps its ``gen``, otherwise parsed once now."""
+        if record is None or record.get("malformed"):
+            return None
+        cached = self._heal_payload
+        if cached is not None and cached.gen == record.get("gen"):
+            return cached
+        payload = load_codex_heal_payload(conn, record)
+        if payload is not None:
+            self._heal_payload = payload
+        return payload
+
+    def remember_heal_payload(self, payload: "CodexHealPayload") -> None:
+        """A payload this pass wrote itself (the history start unit)."""
+        self._heal_payload = payload
+
+    def forget_heal_payload(self) -> None:
+        """A pass that ended ``restart`` (spec 4.5a) keeps no payload."""
+        self._heal_payload = None
+
+    @classmethod
+    def token(cls, conn: sqlite3.Connection) -> "tuple | None":
+        """The reuse token, or ``None`` when no reuse may be trusted."""
+        from _cctally_quota import codex_physical_mutation_seq
+        try:
+            main = next((row[2] for row in conn.execute("PRAGMA database_list")
+                         if row[1] == "main"), None)
+            if not main:
+                return None
+            st = os.stat(main)
+            present = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE (type='table' AND name='quota_window_change_log') "
+                "   OR (type='trigger' AND name IN (?,?,?))",
+                cls._LEDGER_TRIGGERS)}
+            if len(present) != 1 + len(cls._LEDGER_TRIGGERS):
+                return None
+            schema_version = int(
+                conn.execute("PRAGMA schema_version").fetchone()[0])
+            row = conn.execute(
+                "SELECT seq FROM sqlite_sequence "
+                "WHERE name='quota_window_change_log'").fetchone()
+            ledger_seq = 0 if row is None else int(row[0])
+        except (sqlite3.Error, OSError, TypeError, ValueError):
+            return None
+        return (st.st_dev, st.st_ino, schema_version, ledger_seq,
+                codex_physical_mutation_seq(conn))
+
+    def _validate(self, conn: sqlite3.Connection) -> None:
+        token = self.token(conn)
+        if token is None or self._sealed is None or token != self._sealed:
+            self._walk = None
+            self._base = None
+        self._sealed = None
+
+    def bind_walk(self, conn: sqlite3.Connection) -> CodexResetAnchorResolver:
+        """The shared walk resolver rebound to ``conn`` (new on a token change)."""
+        self._validate(conn)
+        if self._walk is None:
+            self._walk = CodexResetAnchorResolver(conn)
+        else:
+            self._walk._conn = conn
+            self._walk._pending_merges.clear()
+        return self._walk
+
+    def seal(self, conn: sqlite3.Connection) -> None:
+        """Record the token after this unit's last commit, under its locks."""
+        self._sealed = self.token(conn)
+
+    def invalidate(self) -> None:
+        """Drop everything: the next unit seeds from the committed store."""
+        self._sealed = None
+        self._walk = None
+        self._base = None
+        self._ledger = None
+        self._ledger_seq = 0
+        self._ledger_identity = None
+
+    def identity_resolver(
+            self, conn: sqlite3.Connection) -> CodexResetAnchorResolver:
+        """A resolver for one provenance identity over copies of the base."""
+        self._validate(conn)
+        if self._base is None:
+            self._base = CodexResetAnchorResolver(conn)
+        else:
+            self._base._conn = conn
+        return CodexResetAnchorResolver(conn, seed_source=self._seed_copy)
+
+    def _seed_copy(self, group, logical_limit_key: str):
+        base = self._base
+        if base is None:
+            return None
+        components = base._components_for(group, logical_limit_key)
+        if base._seed_failed:
+            # Never remember a degraded seed; the identity's own resolver
+            # then degrades exactly as a new resolver per call does.
+            self._base = None
+            return None
+        return components.copy()
+
+    def absorb_identity(
+            self, conn: sqlite3.Connection, source_path: str) -> None:
+        """Add one committed identity's stored quota rows to the base.
+
+        Mirrors the seed SELECT's membership exactly: a row belongs to every
+        seeded group with its root and slot whose snap-equivalent limit keys
+        include the row's key (the seed does not filter on the window), with
+        its real order key ``(source_path, line_offset, id)``. A group not yet
+        seeded is skipped: its first seed reads these rows anyway.
+        """
+        base = self._base
+        if base is None or not base._groups:
+            return
+        by_scope: "dict[tuple[str, str], list]" = {}
+        for group in base._groups:
+            by_scope.setdefault((group[0], group[1]), []).append(group)
+        limit_keys: "dict[tuple, frozenset[str]]" = {}
+        for (slot, limit_key, _window, root, path, offset, row_id,
+             raw_text) in conn.execute(
+                "SELECT observed_slot, logical_limit_key, window_minutes, "
+                "source_root_key, source_path, line_offset, id, resets_at_utc "
+                "FROM quota_window_snapshots "
+                "WHERE source='codex' AND source_path=?", (str(source_path),)):
+            groups = by_scope.get((root, slot))
+            if not groups:
+                continue
+            raw = _parse_anchor_iso(raw_text)
+            if raw is None:
+                continue
+            for group in groups:
+                keys = limit_keys.get(group)
+                if keys is None:
+                    keys = limit_keys[group] = frozenset(
+                        _lib_jsonl.codex_snap_equivalent_limit_keys(
+                            str(group[2])))
+                if limit_key in keys:
+                    base._groups[group].add(
+                        raw, order_key=(str(path), int(offset), int(row_id)))
+
+    def ledger_paths(self, conn: sqlite3.Connection) -> "frozenset[str]":
+        """``_codex_ledger_paths`` across units: one full read per pass, then
+        only the ledger rows past the last ``seq`` seen. A cache.db file or
+        ``schema_version`` change (or an unusable token) forces a full read."""
+        token = self.token(conn)
+        identity = None if token is None else token[:3]
+        if (identity is None or self._ledger is None
+                or identity != self._ledger_identity):
+            rows = conn.execute(
+                "SELECT seq, source_path FROM codex_accounting_change_log "
+                "WHERE change_kind='path'").fetchall()
+            self._ledger, self._ledger_seq = set(), 0
+            self._ledger_identity = identity
+        else:
+            rows = conn.execute(
+                "SELECT seq, source_path FROM codex_accounting_change_log "
+                "WHERE change_kind='path' AND seq > ?",
+                (self._ledger_seq,)).fetchall()
+        for seq, path in rows:
+            if path:
+                self._ledger.add(path)
+            if seq > self._ledger_seq:
+                self._ledger_seq = seq
+        paths = frozenset(self._ledger)
+        if identity is None:
+            self._ledger = None
+        return paths
 
 
 def _codex_provider_roots() -> list[CodexProviderRoot]:
@@ -4258,13 +4532,25 @@ def _codex_barrier_seal_pending(conn, *, priority=(), max_keys=None,
 
     The caller holds the cache writer locks and has committed its own work.
     Reads only cache.db (no stat, no decode) and commits once.
-    """
-    if allow_init:
-        _codex_barrier_init_targets(conn)
 
+    #982 spec 4.3 (seal fence): while a heal fence holds, nothing is sealed
+    (census ``heal-fenced``, no scan needed, so no caller requests the worker
+    for it): a per-file unit could otherwise seal a conversation whose
+    cursorless population contributor is still unread, under a census set
+    before the fence. Sealing resumes after the transition, whose piece sets
+    the census from the whole walk's counters.
+    """
     def remaining() -> int:
         return int(conn.execute(
             "SELECT COUNT(*) FROM codex_barrier_repairs").fetchone()[0])
+
+    if _codex_heal_fence_active(conn):
+        if conn.in_transaction:
+            conn.commit()
+        return BarrierSealResult(0, 0, remaining(), "heal-fenced", False,
+                                 start_after)
+    if allow_init:
+        _codex_barrier_init_targets(conn)
 
     if not _codex_barrier_census_proven(conn):
         if conn.in_transaction:
@@ -4334,7 +4620,10 @@ def _codex_barrier_after_walk(conn, stats, *, targeted: bool, deadline,
             set(stats.drain_requested) | {CODEX_REPLAY_DRAIN_COMMAND}))
 
 
-def _codex_admitted_cache_write(fn, *, wait_for_requests: bool):
+def _codex_admitted_cache_write(
+        fn, *, wait_for_requests: bool,
+        after_commit: "Callable[[sqlite3.Connection], None] | None" = None,
+        contention_bound: "float | None" = None):
     """Run ``fn(conn)`` through the drain gate under the cache lock domain.
 
     The store is opened BEFORE admission takes the cache flocks (review N5;
@@ -4347,10 +4636,20 @@ def _codex_admitted_cache_write(fn, *, wait_for_requests: bool):
     is busy". A connection opened for a refused admission is closed before
     the backoff, and the next attempt opens a fresh one.
 
+    ``after_commit(conn)`` runs after ``fn``'s transaction committed and
+    before ``adm.finish``, so it still holds both store locks: the provenance
+    drain (#975, spec 4.2) refreshes its committed-evidence seed there, where
+    no other writer can have interleaved. It does not run when ``fn`` raises.
+
+    ``contention_bound`` (a heal unit's, #982): store locks another writer
+    holds continuously (no fresh hook request in between) for that many
+    seconds raise ``_CodexHealContended``, as every other heal unit gives up.
+
     Returns ``(True, result)``, or ``(False, None)`` when a fresh hook request
     made the caller yield and it may not wait.
     """
     import _lib_codex_drain_admission as adm
+    contended_since: "float | None" = None
     while True:
         conn = open_cache_db()
         try:
@@ -4364,12 +4663,23 @@ def _codex_admitted_cache_write(fn, *, wait_for_requests: bool):
         conn.close()
         if not wait_for_requests:
             return False, None
+        if contention_bound is not None:
+            if adm.fresh_requests(_cctally_core.APP_DIR):
+                contended_since = None
+            else:
+                now = time.monotonic()
+                if contended_since is None:
+                    contended_since = now
+                if now - contended_since >= contention_bound:
+                    raise _CodexHealContended()
         _drain_backoff(adm)
     try:
         try:
             result = fn(conn)
             if conn.in_transaction:
                 conn.commit()
+            if after_commit is not None:
+                after_commit(conn)
             return True, result
         except BaseException:
             conn.rollback()
@@ -4608,9 +4918,14 @@ def _delete_codex_file_derived_rows(
         "DELETE FROM codex_session_entries WHERE source_path = ?" + root_clause,
         params,
     )
+    # #971 spec D3: ``+`` keeps the root term out of index selection, so the
+    # statement seeks the UNIQUE (source, source_path, ...) autoindex instead
+    # of walking every quota row of the root through idx_qws_codex_load_order.
+    quota_root_clause = (
+        " AND +source_root_key IS ?" if match_source_root else "")
     conn.execute(
         "DELETE FROM quota_window_snapshots WHERE source = 'codex' "
-        "AND source_path = ?" + root_clause,
+        "AND source_path = ?" + quota_root_clause,
         params,
     )
     conn.execute(
@@ -4697,6 +5012,10 @@ def _prune_codex_accounting_change_log(
     if retain_sequences < 1:
         raise ValueError("retain_sequences must be positive")
     try:
+        if _codex_heal_fence_active(conn):
+            # #982 spec 4.3: the heal's shared ledger path set reads these
+            # rows; a due prune stays owed for the executor after the fence.
+            return 0
         cutoff = _codex_change_log_prune_cutoff(conn, retain_sequences)
         if cutoff is None:
             return 0
@@ -4970,16 +5289,14 @@ COVERAGE_WRITER_ACTIONS: "dict[str, str]" = {
     "_cctally_journal.rehydrate_codex_journal_families": "preserve",
     # Spec §4.3's migrations row, enumerated rather than named — and enumerated
     # by the action each one TAKES, not by the action the spec's one-line row
-    # assumed. Only `_024` deletes rows the journal still retains, and it is the
-    # only one that invalidates. `_038_codex_session_files_ingest_complete` is
-    # deliberately ABSENT: the review that asked for this row listed it, but it
-    # adds a column to `codex_session_files`, which is not a covered family —
-    # which is why the guard scans rather than trusts a hand list.
+    # assumed. No migration deletes rows the journal still retains: since #983
+    # 024 only arms the guarded byte-zero replay, whose clear is the
+    # `_clear_codex_derived_rows` entry above, so it writes no covered family
+    # and is absent. `_038_codex_session_files_ingest_complete` is deliberately
+    # ABSENT too: the review that asked for this row listed it, but it adds a
+    # column to `codex_session_files`, which is not a covered family — which is
+    # why the guard scans rather than trusts a hand list.
     #
-    # `DELETE FROM quota_window_snapshots WHERE source = 'codex'` with NO
-    # sequence bump. Left standing, the certificate would be stale-VALID over a
-    # cache holding zero Codex quota rows.
-    "_cctally_db._024_codex_fused_ingest_rebuild": "invalidate",
     # `UPDATE quota_window_snapshots SET observed_model = ?`, and it bumps
     # `codex_physical_mutation_seq` in the same transaction whenever it changes
     # a row. The certificate is left standing and goes invalid on the SEQUENCE
@@ -5222,6 +5539,11 @@ def _codex_conversation_project_attribution(
     label, else git identity, else unassigned) so the browse live-recompute
     fallback matches the stored rollup. Degrades to (None, None) when the S3
     kernel or a valid source root is unavailable — never guesses.
+
+    Each call resolves with a fresh `_resolve_project_key` memo, so the answer
+    never depends on which conversation resolved first: the no-git fallback
+    memoizes the first raw spelling's label under the normalized path, which
+    would hand one symlink alias's basename to another (#972 §5.8).
     """
     if not source_root_key:
         return None, None
@@ -5323,12 +5645,115 @@ def _next_conversation_render_revision(conn: sqlite3.Connection) -> int:
     return revision
 
 
+def _codex_first_row_root(
+    conn: sqlite3.Connection, conversation_key: str,
+) -> "str | None":
+    """The source root of a conversation's first normalized row, in the
+    writer's order (#972 §5.3), without loading any message body.
+
+    Reads ``(timestamp_utc, id)`` index order and stops at the end of the
+    first timestamp tie run, which `in_physical_order` then orders exactly as
+    `_load_codex_normalized_rows` orders it. None when there is no row."""
+    run: list = []
+    cursor = conn.execute(
+        "SELECT source_root_key, timestamp_utc, source_path, line_offset "
+        "FROM codex_conversation_messages WHERE conversation_key=? "
+        "ORDER BY timestamp_utc, id",
+        (conversation_key,),
+    )
+    try:
+        for row in cursor:
+            if run and row[1] != run[0][1]:
+                break
+            run.append(row)
+    finally:
+        cursor.close()
+    if not run:
+        return None
+    return _lib_codex_conversation.in_physical_order(
+        run, timestamp=lambda row: row[1],
+        position=lambda row: (row[2], row[3]))[0][0]
+
+
+def _codex_rollup_thread_fields(
+    conn: sqlite3.Connection,
+    conversation_key: str,
+    *,
+    first_row_root: "Callable[[], str | None]",
+    attribution_cache: "dict | None" = None,
+    require_thread: bool = False,
+) -> "tuple[str | None, str | None, str | None, str | None] | None":
+    """``(source_root_key, parent_thread_id, project_key, project_label)`` of
+    one conversation's rollup, from its thread row (#972 §5.3).
+
+    The one derivation the rollup writer and the per-pass reconcile share, so
+    the reconcile detects exactly what the writer would write. The thread
+    root wins when non-empty; otherwise ``first_row_root()`` supplies the
+    first normalized row's root (called lazily, only then).
+
+    ``attribution_cache`` (#972 §5.8 rule 3) memoizes the project attribution
+    per exact ``(source_root_key, cwd, git_json)`` input; each entry is still
+    computed with a fresh resolver memo, so sharing it across conversations
+    never makes one answer depend on another. With ``require_thread`` a
+    conversation with no thread row answers None instead (rule 2: a missing
+    thread row is no evidence for the reconcile)."""
+    # #845 §4.7. The two columns are read as BLOBs and decoded field by
+    # field, so one undecodable byte no longer raises here and no longer
+    # fails the whole recompute. The table name stays UNQUALIFIED, because
+    # this writer must honor account scoping: under
+    # `scope_conversations_db_to_account` it sees the empty TEMP view on
+    # purpose, and under #968's barrier the last-good view.
+    thread = conn.execute(
+        "SELECT CAST(cwd AS BLOB) AS cwd_blob, "
+        "CAST(git_json AS BLOB) AS git_json_blob, parent_thread_id, "
+        "source_root_key "
+        "FROM codex_conversation_threads WHERE conversation_key = ?",
+        (conversation_key,),
+    ).fetchone()
+    if thread is None and require_thread:
+        return None
+    cwd = git_json = parent_thread_id = thread_root = None
+    thread_malformed = False
+    if thread is not None:
+        cwd_blob, git_json_blob, parent_thread_id, thread_root = thread
+        decoded = _lib_codex_metadata.decode_codex_project_metadata(
+            cwd_blob, git_json_blob)
+        cwd, git_json = decoded.cwd, decoded.git_json
+        # The DIRECT-ONLY predicate: this writer resolves the thread's own
+        # fields through `_codex_conversation_project_attribution`, which
+        # stops at a usable `cwd`, so a valid `cwd` beside an undecodable
+        # `git_json` is still attributed.
+        thread_malformed = _lib_codex_metadata.codex_metadata_is_malformed(
+            decoded, None)
+    source_root_key = thread_root if thread_root else first_row_root()
+    if thread_malformed:
+        # `(unassigned)` is a real answer for a thread with no metadata.
+        # Persisting it for a thread whose metadata could not be READ would
+        # stamp a wrong answer that every later read prefers, which is the
+        # failure class `docs/codex-gotchas.md` records for the materialized
+        # `"(unassigned)"`. NULL is the absence every reader already
+        # handles.
+        return source_root_key, parent_thread_id, None, None
+    if attribution_cache is None:
+        project_key, project_label = _codex_conversation_project_attribution(
+            source_root_key, cwd, git_json)
+    else:
+        inputs = (source_root_key, cwd, git_json)
+        attribution = attribution_cache.get(inputs)
+        if attribution is None:
+            attribution = _codex_conversation_project_attribution(*inputs)
+            attribution_cache[inputs] = attribution
+        project_key, project_label = attribution
+    return source_root_key, parent_thread_id, project_key, project_label
+
+
 def _recompute_codex_rollups(
     conn: sqlite3.Connection,
     conversation_keys,
     *,
     advance_render_revision: bool = True,
     inputs_changed: "bool | set[str] | frozenset[str]" = True,
+    attribution_cache: "dict | None" = None,
 ) -> None:
     """Recompute-affected-or-delete the rollup for each conversation (§3.2).
 
@@ -5346,9 +5771,16 @@ def _recompute_codex_rollups(
     outline memo keyed on it is never stale. Any other conversation's row is
     written only when one of its stored values would change, so a true no-op
     writes nothing (and reserves no revision).
+
+    #972: the thread-derived fields come from `_codex_rollup_thread_fields`,
+    the derivation the per-pass reconcile shares; ``attribution_cache`` is the
+    caller's per-pass attribution memo (none by default: every conversation
+    resolves afresh). §5.8 rule 5: every key's outcome is derived before the
+    first write, because the first write takes the conversations write lock
+    and a key's derivation reads only its own rows and stored rollup.
     """
     kern = _lib_codex_conversation
-    keys = {key for key in conversation_keys if key}
+    keys = sorted({key for key in conversation_keys if key})
     if not keys:
         return
     reserved_revision: "int | None" = None
@@ -5361,13 +5793,12 @@ def _recompute_codex_rollups(
             reserved_revision = _next_conversation_render_revision(conn)
         return reserved_revision
 
+    # (conversation_key, None) deletes; (conversation_key, values) upserts.
+    outcomes: list = []
     for conversation_key in keys:
         rows = _load_codex_normalized_rows(conn, conversation_key)
         if not rows:
-            conn.execute(
-                "DELETE FROM codex_conversation_rollups WHERE conversation_key = ?",
-                (conversation_key,),
-            )
+            outcomes.append((conversation_key, None))
             continue
         item_count = kern.rollup_item_count(rows)
         title = kern.derive_title(rows)
@@ -5376,46 +5807,11 @@ def _recompute_codex_rollups(
         last_activity = max(timestamps) if timestamps else None
         models = sorted({r.model for r in rows if r.model})
         models_json = json.dumps(models) if models else None
-        source_root_key = rows[0].source_root_key
-        # #845 §4.7. The two columns are read as BLOBs and decoded field by
-        # field, so one undecodable byte no longer raises here and no longer
-        # fails the whole recompute. The table name stays UNQUALIFIED, because
-        # this writer must honor account scoping: under
-        # `scope_conversations_db_to_account` it sees the empty TEMP view on
-        # purpose.
-        thread = conn.execute(
-            "SELECT CAST(cwd AS BLOB) AS cwd_blob, "
-            "CAST(git_json AS BLOB) AS git_json_blob, parent_thread_id, "
-            "source_root_key "
-            "FROM codex_conversation_threads WHERE conversation_key = ?",
-            (conversation_key,),
-        ).fetchone()
-        cwd = git_json = parent_thread_id = None
-        thread_malformed = False
-        if thread is not None:
-            cwd_blob, git_json_blob, parent_thread_id, thread_root = thread
-            decoded = _lib_codex_metadata.decode_codex_project_metadata(
-                cwd_blob, git_json_blob)
-            cwd, git_json = decoded.cwd, decoded.git_json
-            # The DIRECT-ONLY predicate: this writer resolves the thread's own
-            # fields through `_codex_conversation_project_attribution`, which
-            # stops at a usable `cwd`, so a valid `cwd` beside an undecodable
-            # `git_json` is still attributed.
-            thread_malformed = _lib_codex_metadata.codex_metadata_is_malformed(
-                decoded, None)
-            if thread_root:
-                source_root_key = thread_root
-        if thread_malformed:
-            # `(unassigned)` is a real answer for a thread with no metadata.
-            # Persisting it for a thread whose metadata could not be READ would
-            # stamp a wrong answer that every later read prefers, which is the
-            # failure class `docs/codex-gotchas.md` records for the materialized
-            # `"(unassigned)"`. NULL is the absence every reader already
-            # handles.
-            project_key = project_label = None
-        else:
-            project_key, project_label = _codex_conversation_project_attribution(
-                source_root_key, cwd, git_json)
+        first_root = rows[0].source_root_key
+        source_root_key, parent_thread_id, project_key, project_label = (
+            _codex_rollup_thread_fields(
+                conn, conversation_key, first_row_root=lambda: first_root,
+                attribution_cache=attribution_cache))
         values = (source_root_key, parent_thread_id, item_count, started,
                   last_activity, project_key, project_label, models_json, title)
         if inputs_changed is not True and conversation_key not in (
@@ -5429,6 +5825,14 @@ def _recompute_codex_rollups(
             ).fetchone()
             if stored is not None and tuple(stored) == values:
                 continue
+        outcomes.append((conversation_key, values))
+    for conversation_key, values in outcomes:
+        if values is None:
+            conn.execute(
+                "DELETE FROM codex_conversation_rollups WHERE conversation_key = ?",
+                (conversation_key,),
+            )
+            continue
         conn.execute(
             "INSERT INTO codex_conversation_rollups "
             "(conversation_key, source_root_key, parent_thread_id, item_count, "
@@ -5444,6 +5848,254 @@ def _recompute_codex_rollups(
             " render_revision=excluded.render_revision",
             (conversation_key, *values, render_revision()),
         )
+
+
+#: #972 §5.4: the most conversations one reconcile transaction rewrites.
+CODEX_ROLLUP_RECONCILE_BATCH = 64
+
+
+def _reconcile_codex_rollup_attribution(
+    conn: sqlite3.Connection, stats: "CodexIngestStats",
+) -> int:
+    """Rewrite every rollup whose thread-derived fields drifted (#972 §5.4).
+
+    A rollup is materialized when the conversation pass writes it, from the
+    thread metadata and filesystem of that moment. Neither a metadata-only
+    contributor that accounting accepts later (the R4 interleave) nor a
+    worktree removed later rewrites it, so every full pass compares each
+    persisted rollup with what `_codex_rollup_thread_fields` derives now and
+    rewrites the ones that differ through the writer itself.
+
+    Detection runs with no transaction open over a materialized list of
+    `main.codex_conversation_rollups`; repair runs the sorted drifted keys in
+    batches of at most `CODEX_ROLLUP_RECONCILE_BATCH` through
+    `_reconcile_codex_rollup_batch`, each in its own explicit transaction
+    (one snapshot of both stores per batch, one render revision per written
+    batch). A database error rolls back its batch and propagates; earlier
+    batches stay committed and the next pass detects the rest. Never on an
+    account-scoped connection, whose TEMP rollups are a view of the
+    persisted ones. Returns the conversations written, which it also adds to
+    ``stats.rollups_reattributed``.
+
+    Admission (§5.8, revisions 5 and 6) is per conversation and shared by
+    detection and every batch (`_admit_codex_rollup_reconcile`): a
+    conversation is compared only once accounting covers, from the same file
+    generation, every `session_meta` line the conversation pass consumed for
+    it (rule 1; a stale cursor of a replaced or truncated file is not
+    coverage, `_codex_rollup_reconcile_uncovered`), never when it has no thread
+    row (rule 2), and a non-database error deriving one rollup skips it
+    (``stats.rollups_reconcile_skipped``, rule 4). No global condition, such
+    as unrelated prune debt or a pending verification, gates the pass. One
+    attribution cache keyed by the raw thread inputs serves the whole pass,
+    and detection reads the rollups in key order (rule 3).
+    """
+    if conn.execute(
+            "SELECT 1 FROM sqlite_temp_master "
+            "WHERE type='table' AND name='_conversation_account_scope'"
+    ).fetchone() is not None:
+        raise RuntimeError(
+            "the rollup reconcile never runs on an account-scoped connection")
+    if conn.in_transaction:
+        raise RuntimeError("the rollup reconcile needs no open transaction")
+    cursor = conn.execute(
+        "SELECT conversation_key, source_root_key, parent_thread_id, "
+        "project_key, project_label FROM main.codex_conversation_rollups "
+        "ORDER BY conversation_key")
+    try:
+        stored = cursor.fetchall()
+    finally:
+        cursor.close()
+    attributions: dict = {}
+    drifted = _admit_codex_rollup_reconcile(conn, stored, stats, attributions)
+    drifted.sort()
+    written = 0
+    for start in range(0, len(drifted), CODEX_ROLLUP_RECONCILE_BATCH):
+        changed = _reconcile_codex_rollup_batch(
+            conn, drifted[start:start + CODEX_ROLLUP_RECONCILE_BATCH],
+            stats, attributions)
+        written += changed
+        stats.rollups_reattributed += changed
+    return written
+
+
+def _codex_rollup_reconcile_uncovered(
+    conn: sqlite3.Connection, keys: "list[str] | None" = None,
+) -> "set[str]":
+    """Conversations whose consumed `session_meta` accounting has not yet
+    processed from the same file generation (#972 §5.8 rule 1, revision 7).
+
+    A conversation is covered when, for every `(source_path, line_offset)`
+    of its `session_meta` events, (a) `cache_db.codex_session_files` holds
+    that path with `last_byte_offset` beyond that line, and (b) that
+    accounting cursor and the conversation cursor for the same path
+    (`main.codex_conversation_source_files`) agree on `size_bytes` and, when
+    both describe the same physical container (equal `container_kind` and
+    `container_path`), show no inode disagreement under
+    `_lib_ingest_frontier.source_identity_replaced` (the inode decides; a
+    missing or non-integer inode on either side is no evidence).
+
+    A path and an offset are coordinates, not generation evidence (VC-1):
+    the conversation walk resets its cursor and the file's retained events
+    when a different file now occupies the pathname, or when the file
+    shrank, while an accounting walk that has not reached the file yet still
+    holds the earlier incarnation's larger offset; comparing coordinates
+    alone let the reconcile write the other contributor's project from a
+    thread row that never saw the new metadata.
+
+    Only legs both walks converge on for every quiet file are compared, so
+    the rule delays a repair while one walk lags and never withholds a
+    settled conversation forever. Each walk adopts a verified container into
+    its own cursor on its own schedule, so one cursor can describe the
+    adopted `.zst` (its inode) for days while the other still describes the
+    plain file it replaced (26 rows of 9 compressed conversations on a real
+    store, 2026-11-05): inodes of different containers are not compared.
+    Content anchors are not compared at all: after a partial read followed
+    by an in-place shrink the two walks settle at one size on one inode with
+    different anchors. The residual (spec §8, R9): a same-size in-place
+    rewrite, or a same-size replacement under a cursor with no inode, while
+    accounting has not re-read the file can write a project from the earlier
+    generation, which the next full pass after accounting reads the file
+    corrects. Decoded sizes, the logical identity (`_codex_identity_path`)
+    and decoded offsets are shared by both walks for plain, compressed and
+    archived rollouts alike. A conversation with no `session_meta` event is
+    covered: there is nothing for accounting to lag behind.
+
+    One set-based read over the `session_meta` partial index
+    (`idx_codex_events_session_meta_provenance`) joined to both cursors by
+    path: never one query per conversation through the conversation-key
+    index, which loads every event of each conversation (89.6 s for 1,251
+    conversations on a real store, against 0.014 s for this read). For the
+    same reason the statement constrains `conversation_key` only through a
+    unary ``+`` and leaves de-duplication and NULL keys to Python: a
+    ``DISTINCT`` or an ``IS NOT NULL`` there makes SQLite prefer a scan of
+    every event through that index. The statement returns only the rows
+    that fail a leg SQL decides exactly (``hard``) or whose same-container
+    inodes SQL sees as different; the inode verdict itself is the shared
+    Python rule, so this read cannot drift from the walks' replacement test.
+    """
+    hard = (
+        "f.path IS NULL OR c.path IS NULL "
+        "OR f.last_byte_offset <= e.line_offset "
+        "OR f.size_bytes IS NOT c.size_bytes")
+    same_container = (
+        "f.container_kind IS c.container_kind "
+        "AND f.container_path IS c.container_path")
+    sql = (
+        f"SELECT e.conversation_key, CASE WHEN {hard} THEN 1 ELSE 0 END, "
+        "f.device_id, f.inode, c.device_id, c.inode "
+        "FROM main.codex_conversation_events AS e "
+        "LEFT JOIN cache_db.codex_session_files AS f ON f.path = e.source_path "
+        # A conversation cursor exists beside its retained events: the walk
+        # writes a file's events and its cursor in one savepoint, and the
+        # prune drain deletes them together. Should one be missing anyway,
+        # there is no generation to compare, so the line is uncovered.
+        "LEFT JOIN main.codex_conversation_source_files AS c "
+        "ON c.path = e.source_path "
+        f"WHERE e.record_type = 'session_meta' AND ({hard} "
+        f"OR ({same_container} AND f.inode IS NOT NULL "
+        "AND c.inode IS NOT NULL AND f.inode IS NOT c.inode))")
+    params: "tuple | list" = ()
+    if keys is not None:
+        if not keys:
+            return set()
+        sql += (" AND +e.conversation_key IN ("
+                + ",".join("?" * len(keys)) + ")")
+        params = keys
+    uncovered: "set[str]" = set()
+    for key, is_hard, f_device, f_inode, c_device, c_inode in conn.execute(
+            sql, params):
+        if key is None or key in uncovered:
+            continue
+        if is_hard or _ingest_frontier.source_identity_replaced(
+                f_device, f_inode, c_device, c_inode):
+            uncovered.add(key)
+    return uncovered
+
+
+def _admit_codex_rollup_reconcile(
+    conn: sqlite3.Connection, stored: list,
+    stats: "CodexIngestStats", attributions: dict,
+    *, keys: "list[str] | None" = None,
+) -> "list[str]":
+    """The drifted, admitted keys among ``stored`` rows (#972 §5.8 rules 1,
+    2, 4 and the drift comparison), read on the caller's snapshot.
+
+    ``stored`` holds ``(conversation_key, source_root_key,
+    parent_thread_id, project_key, project_label)`` rows; ``keys`` limits
+    the coverage read to a batch's keys (None: every conversation), which
+    compares both stores' cursors for the generation inside the caller's
+    snapshot. The one admission detection and every repair batch share, so
+    they cannot diverge. Fills ``attributions`` for each admitted
+    derivation."""
+    uncovered = _codex_rollup_reconcile_uncovered(conn, keys)
+    drifted = []
+    for conversation_key, *values in stored:
+        if conversation_key in uncovered:
+            continue
+        try:
+            expected = _codex_rollup_thread_fields(
+                conn, conversation_key,
+                first_row_root=lambda key=conversation_key: (
+                    _codex_first_row_root(conn, key)),
+                attribution_cache=attributions, require_thread=True)
+        except (ValueError, OSError, UnicodeError):
+            # e.g. a cwd with an embedded NUL, which `realpath` refuses: this
+            # rollup keeps its stored fields for the pass.
+            stats.rollups_reconcile_skipped += 1
+            continue
+        if expected is not None and expected != tuple(values):
+            drifted.append(conversation_key)
+    return drifted
+
+
+def _reconcile_codex_rollup_batch(
+    conn: sqlite3.Connection, batch: "list[str]",
+    stats: "CodexIngestStats", attributions: dict,
+) -> int:
+    """Repair one batch of detected keys in one transaction (#972 §5.4,
+    §5.8 rule 8); returns the conversations written.
+
+    Accounting writes under its own locks, so a thread row or cursor can
+    change between detection and this batch. After ``BEGIN`` the batch
+    re-admits its keys on the transaction's snapshot of both stores, which
+    fills ``attributions``, and hands only the admitted, still-drifted keys to
+    the writer; the writer reads the same snapshot and takes each attribution
+    from the cache, so it writes nothing the admission did not see and makes
+    no new filesystem call for those keys. A batch with no surviving key
+    ends its read-only transaction and reserves no render revision."""
+    if conn.in_transaction:
+        raise RuntimeError("the rollup reconcile needs no open transaction")
+    marks = ",".join("?" * len(batch))
+    conn.execute("BEGIN")
+    try:
+        rows = conn.execute(
+            "SELECT conversation_key, source_root_key, parent_thread_id, "
+            "project_key, project_label, render_revision "
+            "FROM main.codex_conversation_rollups "
+            f"WHERE conversation_key IN ({marks}) ORDER BY conversation_key",
+            batch).fetchall()
+        before = {row[0]: row[5] for row in rows}
+        admitted = _admit_codex_rollup_reconcile(
+            conn, [row[:5] for row in rows], stats, attributions,
+            keys=list(batch))
+        if not admitted:
+            conn.rollback()
+            return 0
+        _recompute_codex_rollups(
+            conn, admitted, inputs_changed=set(),
+            attribution_cache=attributions)
+        after = dict(conn.execute(
+            "SELECT conversation_key, render_revision "
+            "FROM main.codex_conversation_rollups "
+            f"WHERE conversation_key IN ({','.join('?' * len(admitted))})",
+            admitted).fetchall())
+        conn.commit()
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    _wal_checkpoint.after_commit(conn)
+    return sum(1 for key in admitted if before.get(key) != after.get(key))
 
 
 def _replay_codex_normalization(
@@ -5715,8 +6367,11 @@ def _codex_identity_has_rows(
         "WHERE path = ? AND source_root_key IS ? LIMIT 1",
         "SELECT 1 FROM codex_session_entries "
         "WHERE source_path = ? AND source_root_key IS ? LIMIT 1",
+        # #971: ``+`` pins the quota probe to the UNIQUE (source, source_path,
+        # ...) autoindex, as in _delete_codex_file_derived_rows; on the root
+        # index an absent identity walked every quota row of the root.
         "SELECT 1 FROM quota_window_snapshots WHERE source = 'codex' "
-        "AND source_path = ? AND source_root_key IS ? LIMIT 1",
+        "AND source_path = ? AND +source_root_key IS ? LIMIT 1",
         "SELECT 1 FROM codex_conversation_threads "
         "WHERE source_path = ? AND source_root_key IS ? LIMIT 1",
     )
@@ -6350,9 +7005,14 @@ def _release_cache_store_locks(token) -> None:
 def _drain_backoff(adm) -> None:
     """After a refused admission: wait out every fresh request; when none was
     fresh (the gate or a store lock was busy), sleep one poll step so a
-    waiting worker never spins on the gate."""
+    waiting worker never spins on the gate. The step is short when this
+    process observed a fresh Claude waiter within the last
+    ``CLAUDE_WAITER_RECENT_SECONDS`` (#1055 spec 4.3: the waiter can vanish
+    between the refusal and this check); the hint selects the interval only."""
     if adm.fresh_requests(_cctally_core.APP_DIR):
         adm.wait_until_no_fresh_requests(_cctally_core.APP_DIR)
+    elif adm.claude_waiter_recently_observed(_cctally_core.APP_DIR):
+        adm._sleep(adm.SHORT_POLL_SECONDS)
     else:
         adm._sleep(adm.POLL_SECONDS)
 
@@ -7479,6 +8139,10 @@ _CODEX_W11_EAGER_PREPARE_FOR_TESTS = False
 _CODEX_W11_TRACE = None
 #: Test seam: called immediately before each W11 commit (crash injection).
 _CODEX_BATCH_PRECOMMIT_HOOK = None
+#: Test seam (#982 R1): called inside the locked Codex sync immediately before
+#: its own store-lock acquisition, i.e. after a heal unit's ``admit()`` has
+#: returned and before the sync's ``_after_locks`` recheck.
+_CODEX_PRE_STORE_LOCK_HOOK = None
 _CODEX_W11_FILE_SAVEPOINT = "SAVEPOINT codex_w11_file"
 _CODEX_W11_FILE_RELEASE = "RELEASE SAVEPOINT codex_w11_file"
 _CODEX_W11_FILE_ROLLBACK_TO = "ROLLBACK TO SAVEPOINT codex_w11_file"
@@ -7646,8 +8310,13 @@ def _write_codex_file_batch(
     container: "CodexContainerAcceptance | None" = None,
     barrier: "CodexBarrierRead | None" = None,
     commit: bool = True,
+    thread_guard: "frozenset[str]" = frozenset(),
 ) -> int:
     """Write one fully-buffered Codex file atomically and return entry changes.
+
+    ``thread_guard`` (#982 spec 4.3) is the fenced heal population, passed by
+    a sync without the heal executor's share: a thread row whose current
+    ``source_path`` is a population file is left for the executor's walk.
 
     ``commit=False`` (#901 W11) leaves the caller's transaction open: an
     unbudgeted sync applies each file inside its own savepoint and commits the
@@ -7732,6 +8401,19 @@ def _write_codex_file_batch(
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             quota_rows,
         )
+    if thread_rows and thread_guard:
+        # The upsert overwrites every metadata column, so a conversation's row
+        # is its last ingested contributor's. While the heal holds its
+        # population, a row a population file owns is the single walk's to
+        # replace (the timeline in which this write came before the walk).
+        kept = []
+        for row in thread_rows:
+            current = conn.execute(
+                "SELECT source_path FROM codex_conversation_threads "
+                "WHERE conversation_key=?", (row[0],)).fetchone()
+            if current is None or current[0] not in thread_guard:
+                kept.append(row)
+        thread_rows = kept
     if thread_rows:
         conn.executemany(
             """INSERT INTO codex_conversation_threads
@@ -7929,6 +8611,13 @@ class IngestStats:
     assistant_lines_skipped: int = 0
     skip_reasons: dict = field(default_factory=dict)
     full_walk_complete: bool = False
+    # #916: an exhaustive walk that visited every on-disk source cleanly and
+    # whose only defect was orphan rows (tracked transcripts no longer on
+    # disk). It wrote the residual token instead of the walk-complete marker,
+    # so ``full_walk_complete`` stays False; the accounting frontier accepts
+    # either (`_lib_ingest_frontier.provider_sync_certifiable`).
+    full_walk_residual_only: bool = False
+    orphan_residual_count: int = 0
     maintenance_failed: bool = False
     # #944 spec 5.5 step 5: files whose descriptor no longer matched the
     # frozen stat (replaced between stat and open); retried next sync.
@@ -8172,18 +8861,38 @@ def _targeted_has_pending_global_work(conn) -> bool:
     return row is not None
 
 
-def _acquire_cache_flock(lock_fh, *, timeout):
+def _acquire_cache_flock(lock_fh, *, timeout, poll: float = 0.2,
+                         deadline: "float | None" = None):
     """Acquire the exclusive cache flock on ``lock_fh``.
 
-    ``timeout is None`` -> a single non-blocking attempt (today's behavior
-    for routine auto-syncs): returns False immediately on contention.
-    ``timeout > 0`` -> retry ``LOCK_NB`` every ~0.2s until acquired or the
-    deadline elapses. Returns True iff the lock is held on return.
+    ``timeout is None`` (or ``0``) -> a single non-blocking attempt (today's
+    behavior for routine auto-syncs): returns False immediately on
+    contention. ``timeout > 0`` -> retry ``LOCK_NB`` every ``poll`` seconds
+    until acquired or the deadline elapses; the first attempt always happens.
+    Returns True iff the lock is held on return.
+
+    An explicit absolute ``deadline`` (``time.monotonic()`` seconds; #1055
+    spec 4.5) replaces ``timeout`` and has its own rule: an attempt is made
+    only while ``monotonic() < deadline``, and each sleep is clamped to the
+    time remaining, so an expired deadline makes no attempt at all.
 
     A retry-with-sleep loop, NOT a SIGALRM-based blocking LOCK_EX: the
     dashboard runs its sync on a background thread, where Python signals
     never fire, so an alarm timeout would silently never trip.
     """
+    if deadline is not None:
+        while True:
+            if deadline - time.monotonic() <= 0:
+                return False
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(poll, remaining))
     deadline = None if timeout is None else (time.monotonic() + timeout)
     while True:
         try:
@@ -8192,7 +8901,38 @@ def _acquire_cache_flock(lock_fh, *, timeout):
         except BlockingIOError:
             if deadline is None or time.monotonic() >= deadline:
                 return False
-            time.sleep(0.2)
+            time.sleep(poll)
+
+
+def _wait_behind_drain_unit(lock_fh, wait_seconds: float, owner: dict) -> str:
+    """The Claude hook's waiting path after its first refusal (#1055 4.4).
+
+    Waits only when both the Codex provider lock and the drain gate are busy
+    (best-effort evidence of an admitted drain unit), as the one registered
+    Claude waiter, until one absolute deadline. Puts the waiter in
+    ``owner["waiter"]`` as soon as it exists, so the caller's cleanup
+    releases it on every path. Returns the ``drain_wait`` outcome; the lock
+    is held iff it is ``acquired``.
+    """
+    import _lib_codex_drain_admission as adm
+    deadline = time.monotonic() + wait_seconds
+    if not adm.lock_busy(_cctally_core.CACHE_LOCK_CODEX_PATH):
+        return "not_drain"          # Claude against Claude, or another writer
+    if not adm.lock_busy(_cctally_core.APP_DIR / adm.GATE_FILE_NAME):
+        return "not_drain"          # a Codex hook or an unadmitted Codex sync
+    waiter = adm.ClaudeWaiter.register(
+        _cctally_core.APP_DIR,
+        deadline_ns=adm._monotonic_ns()
+        + round((deadline - time.monotonic()) * 1e9))
+    if waiter is None:
+        return "busy_waiter"
+    owner["waiter"] = waiter
+    if not _acquire_cache_flock(
+            lock_fh, timeout=None, poll=adm.CLAUDE_HOOK_DRAIN_POLL_SECONDS,
+            deadline=deadline):
+        return "timeout"
+    waiter.mark_holding()
+    return "acquired"
 
 
 def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
@@ -8679,10 +9419,20 @@ def sync_cache(
     rebuild: bool = False,
     only_paths: "set[str] | None" = None,
     lock_timeout: "float | None" = None,
+    drain_wait_seconds: "float | None" = None,
 ) -> IngestStats:
     """Read-through delta ingest. Acquires an exclusive fcntl.flock; if
     another process holds it, returns immediately with lock_contended=True
     and the caller should proceed with whatever data is already cached.
+
+    ``drain_wait_seconds`` (#1055; only the hook-tick Claude leg passes it,
+    and only on its first invocation) applies when ``lock_timeout`` is None:
+    after the first refusal, a hook that sees an admitted Codex drain unit
+    may wait that long as the one Claude waiter the drain workers yield to.
+    It must not exceed ``max(T, CLAUDE_WAITER_HOLD_ALLOWANCE_SECONDS)``: the
+    drains treat a record ending further out as not fresh, so a larger
+    allowance would poll while the drains never yield. Only the hook leg
+    passes it, with ``CLAUDE_HOOK_DRAIN_WAIT_SECONDS``.
 
     When `rebuild=True`, clears the cached rows AFTER acquiring the lock
     so a lost race does not wipe a cache another process is actively
@@ -8699,10 +9449,25 @@ def sync_cache(
     # verdict. Settled by the clean end-of-walk write; every other exit
     # withdraws a present marker in ``finally``.
     walk_marker_owed = False
+    # #1055: the Claude waiter, once registered; released after the writer
+    # unlock on every exit path (the outermost ``finally``).
+    drain_waiter: dict = {}
     try:
         with _perf.phase("flock") as _p_flock:
             _acquired = _acquire_cache_flock(lock_fh, timeout=lock_timeout)
-            _p_flock.set_meta(contended=not _acquired)
+            _drain_wait, _waited = "none", 0.0
+            if (not _acquired and lock_timeout is None
+                    and drain_wait_seconds is not None
+                    and drain_wait_seconds > 0):
+                _refused_at = time.monotonic()
+                try:
+                    _drain_wait = _wait_behind_drain_unit(
+                        lock_fh, drain_wait_seconds, drain_waiter)
+                finally:
+                    _waited = time.monotonic() - _refused_at
+                _acquired = _drain_wait == "acquired"
+            _p_flock.set_meta(contended=not _acquired, drain_wait=_drain_wait,
+                              drain_wait_seconds=round(_waited, 3))
         if not _acquired:
             eprint("[cache] sync already in progress; using existing cache")
             stats.lock_contended = True
@@ -8895,8 +9660,9 @@ def sync_cache(
             # Clear the walk-complete sentinel atomically with the wipe
             # (cctally-dev#93, D5/D2): a stale "complete" marker must never
             # survive a destructive rebuild. The end-of-loop write below
-            # re-establishes it only after this rebuild's clean walk.
-            conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
+            # re-establishes it only after this rebuild's clean walk. #916:
+            # the residual token goes in the same statement.
+            _clear_claude_walk_verdicts(conn)
             # Issue #139: a rebuild walks every file from offset 0, so the
             # per-file fused walk below repopulates the whole message
             # index — that satisfies any deferred existing-install backfill.
@@ -9219,12 +9985,24 @@ def sync_cache(
         # one exists, so a repeated orphaned sync doesn't churn a no-op write
         # txn every tick); merely withholding THIS run's end-of-loop rewrite
         # is not enough, since a stale marker from a previous sync would
-        # otherwise survive and keep vouching for completeness. Setting
-        # walk_clean=False additionally suppresses the end-of-loop rewrite so
-        # the marker stays absent for this run. With the marker gone the
-        # upgrade gate DEFERs the 008/009/010 recomputes (rather than
-        # certifying aggregates that still include data from files no longer
-        # on disk). The safe CLEANUP lives OUT of sync_cache, in
+        # otherwise survive and keep vouching for completeness. The orphan
+        # set is kept in ``residual_orphans`` and the end-of-loop block
+        # withholds the marker for this run whenever it is non-empty. With the
+        # marker gone the upgrade gate DEFERs the 008/009/010 recomputes
+        # (rather than certifying aggregates that still include data from
+        # files no longer on disk).
+        #
+        # #916: orphans no longer set walk_clean=False. walk_clean describes
+        # the on-disk sources only, so a walk whose ONLY defect is orphan rows
+        # ends "residual-only" and writes the
+        # `claude_ingest_walk_orphan_residual` token instead of the marker.
+        # The token is the accounting frontier's completeness signal and
+        # nobody else's: the walk never reads or writes the orphan rows, so
+        # every on-disk source's bytes are still reflected in the cache, which
+        # is all the frontier certifies. Without it a residual the prune gates
+        # refuse kept the dashboard re-walking every transcript on every tick
+        # until a rebuild. The marker keeps its D5a meaning unchanged.
+        # The safe CLEANUP lives OUT of sync_cache, in
         # _prune_orphaned_cache_entries — it re-derives the safe orphan set
         # independently and removes the full derived surface under three
         # gates: A (session-id not shared by a survivor), B (coverage — every
@@ -9251,6 +10029,7 @@ def sync_cache(
         # file for an orphan and nuke the walk-complete marker. Skip it entirely
         # for targeted: the live-tail fast path never prunes orphans (the full
         # background sync owns that).
+        residual_orphans: "tuple[str, ...]" = ()
         if not targeted:
             global _LAST_WARNED_ORPHAN_SET
             on_disk_paths = {str(jp) for jp in paths}
@@ -9283,7 +10062,10 @@ def sync_cache(
                         "DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'"
                     )
                     conn.commit()
-                walk_clean = False  # orphaned rows -> cache doesn't mirror disk (D5a)
+                # Orphaned rows -> the cache doesn't mirror disk (D5a): the
+                # end-of-loop block withholds the marker (#916: and writes the
+                # residual token when the on-disk walk was clean).
+                residual_orphans = tuple(sorted(orphaned_tracked_paths))
             else:
                 # No orphans this walk: clear the throttle memory so a LATER,
                 # distinct orphan episode (even one recreated at the same paths)
@@ -9363,7 +10145,8 @@ def sync_cache(
             # full-reset (cctally-dev#93, D5/D2): the cache is being wiped, so
             # any "complete" marker is now stale. The end-of-loop write below
             # re-establishes it only after this run's clean re-ingest walk.
-            conn.execute("DELETE FROM cache_meta WHERE key='claude_ingest_walk_complete'")
+            # #916: the residual token goes in the same statement.
+            _clear_claude_walk_verdicts(conn)
             # Crash-safety: also clear session_files's size/offset tracking
             # so a partial-state recovery on the NEXT sync forces every
             # file's per-file branch to take the fresh-ingest path. Without
@@ -9413,15 +10196,19 @@ def sync_cache(
         # "walk" phase (never per-row — Section 2 rule: volume is a count, not
         # N timed phases). Opened via the context-manager protocol so the hot
         # loop body below is not reindented; counts recorded after the loop.
-        # #195: is the cache-write-split re-walk armed? Computed ONCE per
-        # sync_cache call, before the file loop, so every file in this walk uses
-        # one statement. Cache migration 030 sets this flag and zeroes the
-        # per-file cursors; the end-of-walk block below clears it after a clean,
-        # non-targeted full walk. While armed, the chained-conflict variant is
-        # used so a replayed NULL-key row updates in place instead of raising
-        # IntegrityError and rolling back its whole file. Scoped to THIS flag
-        # (not marker-absence) so migration 020's loud duplicate-physical-key
-        # backstop stays intact on every other ingest path.
+        # #195: is the cache-write-split re-walk armed? Read ONCE per
+        # sync_cache call, before the file loop. Cache migration 030 sets this
+        # flag and resets the per-file cursors to -1; the end-of-walk block
+        # below clears it after a non-targeted full walk that is clean on disk,
+        # either fully clean or residual-only (#916). While armed, every file
+        # uses the chained-conflict variant so a replayed NULL-key row updates
+        # in place instead of raising IntegrityError and rolling back its whole
+        # file. #916: the statement is chosen PER FILE (``use_rewalk`` in the
+        # loop): a file whose own cursor still reads -1 takes the chained
+        # variant even after the flag retired. Scoped to the flag and to -1
+        # cursors (not marker-absence) so migration 020's loud
+        # duplicate-physical-key backstop stays intact on every other ingest
+        # path.
         rewalk_armed = conn.execute(
             "SELECT 1 FROM cache_meta WHERE key=?",
             (_cctally_db_sib.CACHE_CREATION_SPLIT_REWALK_KEY,),
@@ -9663,13 +10450,24 @@ def sync_cache(
                     # collides on idx_entries_physical and would roll back the
                     # whole per-file transaction. Steady state keeps the
                     # single-target SQL and its LOUD physical-key backstop.
+                    #
+                    # #916: the obligation is also carried per file. Migration
+                    # 030 is the only producer of a negative ``size_bytes``,
+                    # so a ``-1`` cursor is a file not yet re-walked since the
+                    # reset, still owed the chained clause even after a
+                    # residual-only walk retired the global flag (an orphan
+                    # whose transcript reappears). Read from THIS file's own
+                    # ``prev`` row: the ``prev_size`` local is unbound for a
+                    # new file and stale for a file after a ``-1`` one.
+                    use_rewalk = rewalk_armed or (
+                        prev is not None and prev[0] < 0)
                     if attribution_binds is not None:
                         _sql = (SESSION_ENTRY_UPSERT_SQL_REWALK_LINKED
-                                if rewalk_armed
+                                if use_rewalk
                                 else SESSION_ENTRY_UPSERT_SQL_LINKED)
                     else:
                         _sql = (SESSION_ENTRY_UPSERT_SQL_REWALK
-                                if rewalk_armed else SESSION_ENTRY_UPSERT_SQL)
+                                if use_rewalk else SESSION_ENTRY_UPSERT_SQL)
                     conn.executemany(_sql, stamped_rows)
                     stats.rows_changed += conn.total_changes - before
                 # Conversation message ingest (Plan 1). Lands in the SAME
@@ -9851,7 +10649,12 @@ def sync_cache(
         # writes nothing after the first; the value is therefore the instant
         # the current run of complete walks began. Any exit that does not reach
         # here withdraws the marker (``walk_marker_owed`` in ``finally``).
-        if walk_clean and applied_at_start and not targeted:
+        #
+        # #916: a walk that is clean on disk but still tracks orphans
+        # (``residual_orphans``) writes the residual token instead. The two
+        # are mutually exclusive: the marker branch deletes the token, and the
+        # orphan leg already deleted the marker before a token is written.
+        if walk_clean and applied_at_start and not targeted and not residual_orphans:
             conn.execute(
                 "INSERT INTO cache_meta(key, value) "
                 "VALUES('claude_ingest_walk_complete', ?) "
@@ -9866,8 +10669,52 @@ def sync_cache(
                 "DELETE FROM cache_meta WHERE key=?",
                 (_cctally_db_sib.CACHE_CREATION_SPLIT_REWALK_KEY,),
             )
+            # #916: the residual cleared (pruned, rebuilt or restored); the
+            # marker now vouches, so the token goes in the same transaction.
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key=?",
+                (_ingest_frontier.CLAUDE_WALK_ORPHAN_RESIDUAL_KEY,),
+            )
             conn.commit()
             stats.full_walk_complete = True
+            walk_marker_owed = False
+        elif walk_clean and applied_at_start and not targeted:
+            # #916: residual-only. Every on-disk source was visited cleanly,
+            # so the split re-walk flag retires here too: the only files still
+            # owed their re-walk are absent orphans, and each one's own ``-1``
+            # cursor re-selects the chained clause if it reappears. The marker
+            # stays absent (D5a), and ``full_walk_complete`` stays False.
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key=?",
+                (_cctally_db_sib.CACHE_CREATION_SPLIT_REWALK_KEY,),
+            )
+            # #901 W8: an unchanged orphan set writes nothing. ``at`` is
+            # excluded from the comparison, so it records when the current
+            # set was first seen; the value is debug-only and no reader acts
+            # on it.
+            token = {
+                "orphans": len(residual_orphans),
+                "fingerprint": hashlib.sha256(
+                    "\n".join(residual_orphans).encode("utf-8")).hexdigest(),
+            }
+            row = conn.execute(
+                "SELECT value FROM cache_meta WHERE key=?",
+                (_ingest_frontier.CLAUDE_WALK_ORPHAN_RESIDUAL_KEY,),
+            ).fetchone()
+            try:
+                held = json.loads(row[0]) if row is not None else None
+            except (TypeError, ValueError):
+                held = None
+            if not (isinstance(held, dict)
+                    and held.get("orphans") == token["orphans"]
+                    and held.get("fingerprint") == token["fingerprint"]):
+                token["at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                _set_cache_meta(
+                    conn, _ingest_frontier.CLAUDE_WALK_ORPHAN_RESIDUAL_KEY,
+                    json.dumps(token))
+            conn.commit()
+            stats.full_walk_residual_only = True
+            stats.orphan_residual_count = len(residual_orphans)
             walk_marker_owed = False
         # #279 S2 F1: rolling parse-health record. Anomaly-delta-gated so
         # steady-state (incl. targeted live-tail) syncs stay zero-write;
@@ -9892,15 +10739,29 @@ def sync_cache(
         # stalling the lock under heavy-reader contention.
         _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
     finally:
-        if walk_marker_owed:
-            _withdraw_cache_meta_marker(conn, "claude_ingest_walk_complete")
-        # #901 §5.3c (W9): the end of a cache sync is a checkpoint boundary.
-        _wal_checkpoint.at_boundary(conn)
+        # #1055 spec 4.5: nested so a cleanup failure still unlocks the
+        # writer, and the Claude waiter is released only after that unlock.
         try:
-            fcntl.flock(lock_fh, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        lock_fh.close()
+            try:
+                if walk_marker_owed:
+                    _withdraw_cache_meta_marker(
+                        conn, "claude_ingest_walk_complete")
+                    # #916: an unsettled walk cannot vouch for residual-only
+                    # either.
+                    _withdraw_cache_meta_marker(
+                        conn, _ingest_frontier.CLAUDE_WALK_ORPHAN_RESIDUAL_KEY)
+                # #901 §5.3c (W9): the end of a cache sync is a checkpoint
+                # boundary.
+                _wal_checkpoint.at_boundary(conn)
+            finally:
+                try:
+                    fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                lock_fh.close()
+        finally:
+            if drain_waiter.get("waiter") is not None:
+                drain_waiter["waiter"].release()
     return stats
 
 
@@ -11301,7 +12162,9 @@ def _record_codex_container_status(conn, stats, *, census_complete: bool,
             prior = decoded if isinstance(decoded, dict) else {}
         except (TypeError, ValueError):
             prior = {}
-    observed = {k: int(stats.container_skipped.get(k, 0))
+    # #1052 spec 5.3: every skip the pass saw, its unit phase's included.
+    seen_skipped = stats.all_container_skipped()
+    observed = {k: int(seen_skipped.get(k, 0))
                 for k in _CONTAINER_SKIP_KEYS}
     # D3: verification debt is pending work only. A terminal `unverified`
     # container is reported (and warned about) on its own and never feeds V
@@ -11356,7 +12219,7 @@ def _record_codex_container_status(conn, stats, *, census_complete: bool,
     # ingestion observation does not pretend that an idle walk probed Python.
     new_capability_observation = bool(
         stats.files_processed or stats.container_pending
-        or any(stats.container_skipped.values()) or stats.rebuild_refused)
+        or any(seen_skipped.values()) or stats.rebuild_refused)
     decoder = prior.get("decoder")
     decoder_observed_at = prior.get("decoderObservedAt", prior.get("observedAt"))
     if new_capability_observation or decoder not in (
@@ -11892,9 +12755,57 @@ class CodexIngestStats:
     barrier_deferred_targets: dict = field(default_factory=dict)
     barrier_published_paths: set = field(default_factory=set)
     barrier_retry_causes: set = field(default_factory=set)
+    # #1052 spec 5.4: the conversation pass's terminal deferrals. A unit whose
+    # contributor carries the conversations store's terminal `unverified`
+    # verdict, and none of whose files is blocked, publishes nothing and is
+    # not retried. ``barrier_keys_terminal`` counts its keys (they stay in
+    # ``barrier_keys_deferred`` too) and ``barrier_terminal_keys`` maps each
+    # terminal file to the keys it holds back (a residual field the
+    # transcript worker does not serialize). ``barrier_container_skipped``
+    # counts, by reason, the unit-phase skips of paths phase 1 did not skip:
+    # ``container_skipped`` is phase 1's census only.
+    barrier_keys_terminal: int = 0
+    barrier_terminal_keys: dict = field(default_factory=dict)
+    barrier_container_skipped: dict = field(default_factory=dict)
     # The status writer already observes capability for unresolved work.
     # Explicit adapters reuse it; unchanged accepted generations never probe.
     container_decoder: "str | None" = None
+    # #982 spec 4.1 steps 4 and 7: a heal walk piece's own report. The files
+    # it ingested (or reset), whether its ``_ingest_limit`` stopped it before
+    # the next such file, the census files it examined successfully
+    # (ingested, reset or found unchanged; never a failed, torn-deferred,
+    # held or U6-skipped file), its discovery set (the census when it is a
+    # walk's first piece), whether it left no census file unwalked, and
+    # whether it made the transition (deleted the heal record) in its
+    # end-of-walk transaction.
+    heal_counted_paths: set = field(default_factory=set)
+    heal_limit_stopped: bool = False
+    heal_examined: "frozenset[str]" = frozenset()
+    heal_discovered: "frozenset[str] | None" = None
+    heal_walk_complete: bool = False
+    heal_transitioned: bool = False
+    # Revision 7: the committed cursor row of every census file this piece
+    # visited (read after its last commit, under its locks), and the visited
+    # files of earlier pieces whose rows changed before the walk's last piece.
+    heal_visit_rows: dict = field(default_factory=dict)
+    heal_visit_changed: "frozenset[str]" = frozenset()
+    # #982 spec 4.4: a budgeted call declined `replay_pending` while a replay
+    # heal record exists (the store is cleared and partly refilled), so the
+    # hook must not run its projection or budget leg over it. A budgeted call
+    # that met contention sets it from an unlocked read of the same record
+    # (`_codex_replay_refill_unlocked`), and its hook publishes no request.
+    replay_refill: bool = False
+    # #982 spec 4.5a (Generation): an executor unit whose pass generation is
+    # not the heal record's (or that found a fresh clear only a new pass's
+    # start unit may perform) wrote nothing; the executor ends its pass
+    # `restart`.
+    heal_generation_stale: bool = False
+    # #972 §5.4: conversations whose rollup the full pass's reconcile
+    # rewrote (thread-derived fields drifted from the current answer).
+    rollups_reattributed: int = 0
+    # #972 §5.8 rule 4: rollups the reconcile skipped because deriving their
+    # expected fields raised a non-database error (an unresolvable cwd).
+    rollups_reconcile_skipped: int = 0
 
     @property
     def targeted_clean(self) -> bool:
@@ -11906,7 +12817,29 @@ class CodexIngestStats:
                 and self.files_failed == 0
                 and not self.container_pending
                 and not self.barrier_retry
-                and not any(self.container_skipped.values()))
+                and not any(self.all_container_skipped().values()))
+
+    def all_container_skipped(self) -> "dict[str, int]":
+        """Every container skip this pass saw, by reason (#1052 spec 5.3):
+        phase 1's census plus the unit phase's skips of other paths. The two
+        are path-disjoint by construction, so the sum counts each path once.
+        """
+        merged = dict(self.container_skipped)
+        for reason, count in self.barrier_container_skipped.items():
+            merged[reason] = merged.get(reason, 0) + count
+        return merged
+
+
+def _print_codex_done_line(stats: CodexIngestStats) -> None:
+    """`cache-sync`'s Codex summary line (the first leg's and the heal's)."""
+    eprint(
+        f"[cache-sync] codex done: {stats.files_processed} processed, "
+        f"{stats.files_skipped_unchanged} skipped, "
+        f"{stats.files_reset_truncated} reset, "
+        f"{stats.rows_changed} rows changed, "
+        f"{stats.lines_malformed} malformed, "
+        f"{stats.token_events_skipped} drift-skipped"
+    )
 
 
 def _progress_codex_stderr(stats: CodexIngestStats, *, force: bool = False) -> None:
@@ -12113,7 +13046,7 @@ def _record_codex_replay_deferral(conn: sqlite3.Connection) -> None:
             raise
 
 
-def _defer_codex_replay_drain() -> str:
+def _defer_codex_replay_drain(*, short: bool = False) -> str:
     """Hand the declined byte-zero replay to a detached worker (public #5).
 
     Returns ``"spawned"``, ``"throttled"`` or ``"failed"`` — for the lifecycle
@@ -12128,6 +13061,10 @@ def _defer_codex_replay_drain() -> str:
     re-read everything", and slicing that corrupts account attribution — so
     there is nothing to fall back to. The record written at the decline site is
     what makes a drain that never succeeds diagnosable.
+
+    ``short`` (#982 spec 4.5a): a heal pass that ended ``restart`` asks for
+    the short retry throttle even when no heal record exists (a replay
+    re-armed after the pass's transition leaves only the marker).
     """
     marker = _cctally_core.APP_DIR / CODEX_REPLAY_DRAIN_MARKER_NAME
     try:
@@ -12135,6 +13072,20 @@ def _defer_codex_replay_drain() -> str:
     except OSError:
         age = None
     if age is not None and 0 <= age < CODEX_REPLAY_DRAIN_SPAWN_THROTTLE_SECONDS:
+        # #982 spec 4.5a: every path that requests this worker comes through
+        # here, so the heal record's short retry throttle is applied once,
+        # for all of them. Probed only inside the window it can change.
+        if (age < CODEX_HEAL_RETRY_THROTTLE_SECONDS
+                or not (short or _codex_heal_record_present())):
+            return "throttled"
+    if _codex_heal_walk_running():
+        # A heal pass is running: hooks request the worker on every tick
+        # while a record exists, and a worker spawned now would only run the
+        # provenance, verification, reset, membership and seal drains beside
+        # the executor. The pass requests the worker itself, after releasing
+        # this lock, when it ends `contended` or `degraded`; on `restart` its
+        # callers re-run it inline. The marker is not stamped, so the first
+        # request after the pass is not throttled by this one.
         return "throttled"
     try:
         _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -12143,6 +13094,51 @@ def _defer_codex_replay_drain() -> str:
         return "failed"
     return ("spawned" if _spawn_codex_worker(CODEX_REPLAY_DRAIN_COMMAND)
             else "failed")
+
+
+def _codex_heal_walk_running() -> bool:
+    """Whether a heal pass holds ``codex-heal-walk.lock``: a non-blocking
+    exclusive probe on a separate open file description, released at once.
+    Never creates the file; any other error answers False (spawn as before).
+    """
+    path = _cctally_core.APP_DIR / CODEX_HEAL_WALK_LOCK_NAME
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _codex_heal_record_present() -> bool:
+    """Whether cache.db holds a well-formed heal record, read through a raw
+    ``mode=rw`` connection (no schema apply, migration or store lock; never
+    creates the file). Anything unreadable answers False, which keeps the
+    hourly throttle."""
+    path = pathlib.Path(_cctally_core.CACHE_DB_PATH)
+    try:
+        if not path.is_file():
+            return False
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw",
+                               uri=True, timeout=1.0)
+    except (OSError, sqlite3.Error):
+        return False
+    try:
+        record = load_codex_heal_record(conn)
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    return record is not None and not record.get("malformed")
 
 
 class ResetDrainResult(NamedTuple):
@@ -12338,14 +13334,33 @@ def _cmd_codex_replay_drain_body(args) -> int:
         conn = open_cache_db()
         try:
             stats = CodexIngestStats()
-            if ((history.outcome == "settled" and history.candidates)
-                    or conn.execute("SELECT 1 FROM cache_meta WHERE key=? LIMIT 1",
-                                    (CODEX_REPLAY_FROM_ZERO_KEY,)).fetchone()):
-                stats = sync_codex_cache(
-                    conn, maintenance="caller",
-                    lock_timeout=CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS)
+            replay_armed = conn.execute(
+                "SELECT 1 FROM cache_meta WHERE key=? LIMIT 1",
+                (CODEX_REPLAY_FROM_ZERO_KEY,)).fetchone() is not None
+            heal_record = load_codex_heal_record(conn)
         finally:
             conn.close()
+        # #982 spec 4.6: the byte-zero replay and the history heal that
+        # follows a settled census both run as admitted per-file units, never
+        # as one locked walk; a record left by a dead executor resumes from
+        # its phase. The executor picks replay mode itself when the marker or
+        # a replay record exists.
+        heal = HealResult("none", None, 0, 0, 0, 0, 0)
+        if (replay_armed or heal_record is not None
+                or (history.outcome == "settled" and history.candidates)):
+            heal = run_codex_admitted_heal(
+                wait_for_requests=True,
+                population=(None if heal_record is not None or replay_armed
+                            else _codex_history_candidates()))
+            if heal.outcome in ("replay_due", "restart"):
+                # Spec 4.5a: a replay armed during the history heal ended
+                # that pass before its fenced walk; this pass replays.
+                heal = run_codex_admitted_heal(wait_for_requests=True)
+            if heal.outcome == "contended":
+                stats = CodexIngestStats(lock_contended=True)
+            elif heal.stats is not None:
+                # Either mode: the heal's own counts, summed over its units.
+                stats = heal.stats
         if stats.rebuild_refused:
             _log("refused", f"rebuild_refused={stats.rebuild_refused}")
             return 0
@@ -12379,7 +13394,9 @@ def _cmd_codex_replay_drain_body(args) -> int:
         f"reset_done={reset_result.reset} reset_unchanged={reset_result.unchanged} "
         f"barrier_proven={scan.proven} barrier_sealed={seal.sealed} "
         f"barrier_remaining={seal.remaining} history={history.outcome} "
-        f"history_candidates={history.candidates} history_traced={history.traced}")
+        f"history_candidates={history.candidates} history_traced={history.traced} "
+        f"heal={heal.outcome} heal_units={heal.units} "
+        f"heal_degraded={heal.degraded}")
     return 0
 
 
@@ -12483,6 +13500,15 @@ def _sync_codex_cache_locked(
     _on_first_file_rollback: Callable[[], None] | None = None,
     _on_file_committed: Callable[[str], None] | None = None,
     _on_file_prepared: Callable[[str], None] | None = None,
+    _walk_share: "_CodexWalkShare | None" = None,
+    _ingest_limit: "int | None" = None,
+    _heal_census: "frozenset[str] | None" = None,
+    _heal_visited: "frozenset[str]" = frozenset(),
+    _heal_visited_rows: "dict[str, tuple | None] | None" = None,
+    _defer_finalization: bool = False,
+    _heal_transition: bool = False,
+    _replay_stage: "str | None" = None,
+    _heal_generation: "str | None" = None,
 ) -> CodexIngestStats:
     """Read-through delta ingest of ~/.codex/sessions/**/*.jsonl.
 
@@ -12520,6 +13546,66 @@ def _sync_codex_cache_locked(
     duplicated cost — measured at roughly half of every growing turn. Every
     other caller keeps ``"auto"``, because the sync-internal reconcile is what
     keeps the projection current for the dashboard and ``cache-sync``.
+
+    The private ``_walk_share`` … ``_heal_transition`` arguments belong to the
+    heal executor (#982 spec 4.1–4.3, ``run_codex_admitted_heal``):
+
+    * ``_walk_share``: this call is an executor unit. Its resolver and ledger
+      path set come from the share (bound under the locks, sealed after the
+      last commit), and the heal fence's population hold and thread-row guard
+      do not apply to it. Every other call holds the population.
+    * ``_ingest_limit``: this call is one piece of a heal walk. After that
+      many files were ingested or reset, the walk stops before the next file
+      with bytes to ingest or reset; it and the rest stay unwalked, as at a
+      budget stop (no deadline, no ``delta_append``), so the piece does not
+      certify. A file that fails does not count.
+    * ``_heal_census`` / ``_heal_visited``: the walk's census (the first
+      piece's discovery set, ``stats.heal_discovered``; ``None`` on the first
+      piece) and the census files earlier pieces examined successfully
+      (``stats.heal_examined``). A piece skips visited files and files
+      outside the census without examining them, counting them as walked
+      (``files_skipped_unchanged``), exactly as the single walk treats a file
+      it already visited or one created after its discovery.
+      ``stats.heal_walk_complete`` says the piece left no census file
+      unwalked.
+    * ``_defer_finalization``: the walk's own settlement runs only the
+      ``expand`` and ``model`` stages and the change-log prune stays owed.
+    * ``_heal_visited_rows``: each visited file's committed cursor row as
+      recorded when a piece visited it (``stats.heal_visit_rows``). The piece
+      that completes the walk re-reads them under its own locks (revision
+      7): a visited file whose row another writer changed since its visit
+      still counts as walked, but stays in the backlog, makes the barrier
+      census ``0`` and withholds the full-walk certificate
+      (``stats.heal_visit_changed``); it is not re-examined.
+    * ``_heal_transition``: the piece that completes the walk deletes a
+      history heal record in its end-of-walk transaction, whether or not it
+      failed a file or deferred one for a torn ``auth.json``: such a file
+      stays owed exactly as the single walk leaves it
+      (``stats.heal_transitioned``). A replay record is ended by the
+      unchanged consumption block instead: deleted with the marker, or moved
+      to phase ``certify`` when the replay is blocked.
+    * ``_replay_stage="start"`` (#982 spec 4.5): the replay's start unit runs
+      the byte-zero replay's preamble (D1 snapshot, preflight refusals, the
+      clear, which writes the replay heal record, and the authoritative
+      rehydration, which marks it ``rehydrated``) and returns before the
+      walk. With a replay record already present nothing is cleared again,
+      unless a later arming site marked it ``reclear``: the start unit of a
+      new pass is the only executor unit that performs that fresh clear.
+    * ``_heal_generation`` (spec 4.5a): the ``gen`` of the record the unit's
+      pass started with, carried by every executor unit but the start unit.
+      Under the writer locks a unit whose generation is not the record's, or
+      that would have to perform a fresh clear (``reclear``, or an armed
+      marker without a replay record), writes nothing and reports
+      ``stats.heal_generation_stale``; the transition and the consumption
+      block act only when the generations match.
+
+    A replay heal record (spec 4.5) changes every other writer: the D1 test
+    and the compressed-history ``known=`` read its persisted ``known`` set,
+    nothing re-clears, a record not yet ``rehydrated`` is rehydrated first,
+    a targeted call that is not an executor unit and every budgeted call
+    decline ``replay_pending`` (the budgeted one records the deferral and
+    sets ``stats.replay_refill``), and an unbudgeted ordinary call completes
+    the remaining refill as an ordinary walk.
     """
     if quota_reconcile not in ("auto", "defer"):
         raise ValueError(
@@ -12575,7 +13661,14 @@ def _sync_codex_cache_locked(
     rebuild_prune_scope: "_CodexPruneScope | None" = None
     ordinary_prune_scope: "_CodexPruneScope | None" = None
     raised = False
+    # #982: True once this call bound the heal executor's share under its
+    # locks; only such a call may seal (or must invalidate) it.
+    share_bound = False
     try:
+        if _CODEX_PRE_STORE_LOCK_HOOK is not None:
+            # Test seam (#982 R1): after admission returned, immediately
+            # before this sync's own store-lock acquisition.
+            _CODEX_PRE_STORE_LOCK_HOOK()
         with _perf.phase("flock") as _p_flock:
             acquired = acquire_cache_writer_flocks(
                 _cctally_core.CACHE_LOCK_PATH,
@@ -12588,6 +13681,11 @@ def _sync_codex_cache_locked(
         if acquired is None:
             eprint("[codex-cache] sync already in progress; using existing cache")
             stats.lock_contended = True
+            if deadline is not None:
+                # #982 spec 4.4: tell the hook whether this tick would have
+                # declined as a replay refill, so it publishes no waiting
+                # request that the refill units could only wait out.
+                stats.replay_refill = _codex_replay_refill_unlocked(conn)
             return stats
         if _after_locks is not None and _after_locks():
             stats.lock_contended = stats.drain_yielded = True
@@ -12641,7 +13739,80 @@ def _sync_codex_cache_locked(
             "SELECT 1 FROM cache_meta WHERE key=?",
             (CODEX_REPLAY_FROM_ZERO_KEY,),
         ).fetchone() is not None
-        if replay_pending and (targeted or deadline is not None):
+        if _replay_stage not in (None, "start"):
+            raise ValueError(
+                "sync_codex_cache: _replay_stage must be None or 'start'")
+        if _replay_stage is not None and (
+                targeted or rebuild or deadline is not None):
+            raise ValueError(
+                "sync_codex_cache: _replay_stage is an unbudgeted whole-tree "
+                "start unit")
+        if _heal_generation is not None and (
+                _walk_share is None or _replay_stage is not None or rebuild):
+            raise ValueError(
+                "sync_codex_cache: _heal_generation belongs to an executor "
+                "unit that is not the start unit")
+        # #982 spec 4.5: a replay heal record means the clear already
+        # happened (its start unit committed). Every writer then refills
+        # with the persisted D1 set instead of clearing again; only the
+        # executor's units refill out of the single walk's order.
+        heal_record = load_codex_heal_record(conn)
+        replay_record = (heal_record if heal_record is not None
+                         and heal_record.get("mode") == "replay" else None)
+        replay_active = replay_pending or replay_record is not None
+        if _replay_stage is not None and not replay_active:
+            # Nothing to start: another writer consumed the replay.
+            return stats
+        # #982 spec 4.5a (Generation): every executor unit but the start unit
+        # belongs to the pass whose record generation it carries. A record
+        # rewritten since (a fresh clear writes a new `gen`), a `reclear`
+        # mark, or an armed marker without a replay record (a fresh clear
+        # only a new pass's start unit may perform) ends that pass: this unit
+        # writes nothing -- no ingest, clear, consumption, transition or
+        # settlement, and no withdrawal of the full-walk certificate -- so no
+        # piece ever skips a file it visited before a clear it did not see.
+        if (_walk_share is not None and _replay_stage is None
+                and _codex_heal_generation_stale(
+                    heal_record, replay_pending, _heal_generation)):
+            stats.heal_generation_stale = True
+            walk_marker_owed = False
+            return stats
+        # #982 spec 4.5a: a replay record re-armed by a later arming site
+        # (`reclear`) is cleared again like an armed marker; a malformed one
+        # (its D1 set or rehydration flag unreadable) declines every writer,
+        # because clearing would recapture D1 from a partly refilled store.
+        # The payload (population and D1 set) is parsed only by a call that
+        # will use it, once, or taken from the executor's share. A `reclear`
+        # mark acts only with the marker its arming site wrote in the same
+        # transaction (`_codex_replay_reclear_due`); one whose marker is gone
+        # (only a damaged store has it) is a record that no longer asks for a
+        # replay, refilled with and retired like any other.
+        replay_reclear = _codex_replay_reclear_due(replay_record,
+                                                   replay_pending)
+        replay_payload: "CodexHealPayload | None" = None
+        if replay_record is not None and not replay_record.get("malformed") \
+                and deadline is None and not (targeted and _walk_share is None):
+            replay_payload = (
+                _walk_share.heal_payload(conn, replay_record)
+                if _walk_share is not None
+                else load_codex_heal_payload(conn, replay_record))
+        replay_malformed = replay_record is not None and (
+            bool(replay_record.get("malformed"))
+            or (deadline is None and not (targeted and _walk_share is None)
+                and replay_payload is None))
+        refill_record = (replay_record if replay_record is not None
+                         and not replay_reclear and not replay_malformed
+                         else None)
+        if replay_active and (
+                # Spec 4.5a (revision 10): every writer, an explicit
+                # `cache-sync --rebuild` included, fails closed on a malformed
+                # record. Its persisted D1 set may be the only evidence for a
+                # rollout not yet refilled, and a fresh capture cannot recover
+                # it, so no clear may run over it.
+                replay_malformed
+                or deadline is not None
+                or (targeted and (_walk_share is None
+                                  or refill_record is None))):
             # A live-tail tick must DEFER, never raise through the
             # `targeted and rebuild` guard below.
             #
@@ -12668,13 +13839,54 @@ def _sync_codex_cache_locked(
             # and Codex ingest froze permanently. So the budgeted decline
             # RECORDS itself (doctor reads the record) and hands the unbudgeted
             # drain to a detached worker.
+            #
+            # #982 spec 4.5: with a replay heal record (the clear committed)
+            # a targeted call proceeds only as an executor unit, and a
+            # budgeted one still declines: ingesting outside the executor's
+            # order would change thread rows and anchors relative to the
+            # single walk. `replay_refill` tells the hook that the store is
+            # cleared and partly refilled (no projection, no budget leg): a
+            # record in phase `units`, or one too malformed to tell. A
+            # blocked replay's `certify` record ends the fence, and its hooks
+            # project and run the budget leg as for a blocked replay today.
             if deadline is not None:
                 _record_codex_replay_deferral(conn)
+                stats.replay_refill = replay_record is not None and (
+                    bool(replay_record.get("malformed"))
+                    or replay_record.get("phase") == "units")
             stats.deferred_reason = "replay_pending"
             return stats
         # Both incompatible combinations already returned at the decline above,
-        # so the marker-OR'd rebuild needs no second guard.
-        rebuild = rebuild or replay_pending
+        # so the marker-OR'd rebuild needs no second guard. A replay whose
+        # start unit committed (a replay record) never clears again: the
+        # caller refills with the record's persisted D1 set. An explicit
+        # caller rebuild still clears (it is its own single walk) and keeps
+        # the persisted set in its snapshot (a malformed record declined
+        # above, whatever the caller asked).
+        rebuild = rebuild or (replay_pending and (replay_record is None
+                                                  or replay_reclear))
+        replay_refill = refill_record is not None and not rebuild
+        if _walk_share is not None and deadline is not None:
+            raise ValueError(
+                "sync_codex_cache: _walk_share is an unbudgeted heal unit")
+        # #982 spec 4.3: a history heal record in phase `units` is the fence.
+        # A sync without the executor's share holds its population (skips
+        # those files, exactly as unsettled history is held) and requests the
+        # worker, which resumes a dead executor from the record. A rebuild is
+        # itself the single walk the heal stands in for: it ingests every
+        # file and retires the record in its clear transaction below.
+        heal_history = (heal_record is not None
+                        and heal_record.get("mode") == "history")
+        heal_population: "frozenset[str]" = frozenset()
+        if (heal_history and heal_record.get("phase") == "units"
+                and _walk_share is None and not rebuild):
+            # The one parse of the payload in this call. Unreadable holds
+            # nothing more (the fence itself still stands, fail closed).
+            history_payload = load_codex_heal_payload(conn, heal_record)
+            if history_payload is not None:
+                heal_population = history_payload.population
+            stats.drain_requested = tuple(sorted(
+                set(stats.drain_requested) | {CODEX_REPLAY_DRAIN_COMMAND}))
         # #927 spec §4.2 B4: the ordinary prune's protection needs every
         # retained identity at a discovered path the scope refuses, including
         # path-level refusal under a recognized root and child-only
@@ -12715,7 +13927,10 @@ def _sync_codex_cache_locked(
         # design rejects, and it is what breaks acceptance criterion 4. Captured
         # BEFORE the clear because the clear is what erases the evidence. A
         # rollout first seen DURING a rebuild is absent here and takes a normal
-        # first-ingest decision.
+        # first-ingest decision. The clear below persists this set in its own
+        # transaction for EVERY clear (the replay record's `known`, #982 4.5;
+        # an explicit rebuild arms the replay there, #1051), so an interrupt
+        # between the clear's commit and the walk's completion never loses it.
         # Keyed on the DURABLE file identity, never on `path`. `path` holds the
         # first configured candidate spelling, which is unstable across
         # `$CODEX_HOME` reordering and symlink respelling (review F12) — a
@@ -12736,6 +13951,20 @@ def _sync_codex_cache_locked(
                 except (ValueError, TypeError, OSError):
                     continue
             rebuild_known_identities |= _codex_history_identities(conn)
+            if replay_payload is not None:
+                # #982 spec 4.5: an explicit rebuild (or a re-armed replay's
+                # fresh clear, spec 4.5a) over a refill in progress keeps
+                # every identity the replay's own snapshot captured before its
+                # clear (the cursors it erased).
+                rebuild_known_identities |= replay_payload.known
+        elif replay_refill:
+            # #982 spec 4.5: the snapshot the replay's start unit captured
+            # before its clear, persisted in the record. Never recaptured: the
+            # cursors it was taken from are gone. Shared, never copied: a
+            # refill only reads it.
+            rebuild_known_identities = replay_payload.known
+        # Which reads use the D1 snapshot: a clearing rebuild's and a refill's.
+        d1_snapshot = rebuild or replay_refill
         if rebuild and not targeted:
             # #485: rebuild used to clear first and discover second. With an
             # empty/missing/misconfigured root that made the explicit repair
@@ -12748,12 +13977,30 @@ def _sync_codex_cache_locked(
             preflight_sources, _preflight_root_keys = (
                 _collect_retained_codex_paths_and_roots(conn)
             )
+            preflight_roots = _codex_provider_roots()
+            # #983 spec 5.2: a pre-#294 S1 row carries no source_root_key. The
+            # snapshot above skipped its cursor, and the partition would never
+            # check the configured root that holds it, so resolve each one to
+            # its owning root before either guard reads it. A discovered file
+            # joins the D1 snapshot here, before the clear and the walk.
+            if any(root_key is None for _path, root_key in preflight_sources):
+                discovered_by_identity = {
+                    str(item.physical_path): item for item in preflight_files}
+                resolved_sources: list[tuple[str, str | None]] = []
+                for _path, root_key in preflight_sources:
+                    if root_key is None:
+                        root_key, owner_file = _codex_legacy_null_root_owner(
+                            _path, discovered_by_identity, preflight_roots)
+                        if owner_file is not None:
+                            rebuild_known_identities.add(
+                                codex_file_identity(owner_file))
+                    resolved_sources.append((_path, root_key))
+                preflight_sources = resolved_sources
             preflight_source_root_keys = {
                 root_key
                 for _path, root_key in preflight_sources
                 if root_key is not None
             }
-            preflight_roots = _codex_provider_roots()
             (
                 _safe_sources,
                 refused_sources,
@@ -12797,12 +14044,45 @@ def _sync_codex_cache_locked(
         if rebuild:
             # Clear INSIDE the lock — see sync_cache() for the full
             # rationale. Done before the existing SELECT so delta
-            # detection sees an empty baseline.
+            # detection sees an empty baseline. The clear, the full
+            # finalization debt, the replay marker and the replay record
+            # with the D1 set commit together in this one transaction
+            # (#1051): there is no intermediate commit.
             if _clear_codex_derived_rows(conn):
                 _bump_codex_physical_mutation_seq(conn)
             # #980 D3: full re-derivation restores the unattributed state, so
             # every root's whole range is owed, in the wipe's own transaction.
             add_codex_finalization_debt(conn, full=True)
+            if heal_history:
+                # #982: this walk re-reads every rollout in discovery order.
+                _delete_codex_heal_record(conn)
+            if not replay_pending:
+                # #1051: every clear runs as a byte-zero replay, an explicit
+                # `cache-sync --rebuild` included. Arming in the clear's own
+                # transaction is what persists the D1 snapshot below: an
+                # explicit rebuild interrupted after this commit and before
+                # its walk completes leaves the marker and the replay record,
+                # so every retry refills with the persisted `known` instead of
+                # sending pre-mechanism history to the live `auth.json`. The
+                # predicate is marker absence, not `not replay_active`, so a
+                # replay record that lost its marker gets it back too. From
+                # here on this call runs the replay's lifecycle: the
+                # rehydration marks the record, a clean complete walk consumes
+                # both, a blocked one moves the record to `certify`.
+                arm_codex_replay_from_zero(conn)
+                replay_pending = True
+                replay_active = True
+            if replay_active:
+                # #982 spec 4.5: the clear's own transaction writes the replay
+                # heal record with the D1 snapshot, so no later writer clears
+                # again or recaptures it from the cursors this just erased.
+                # The rehydration's transaction below marks it `rehydrated`.
+                _store_codex_heal_record(
+                    conn, {"mode": "replay", "phase": "units",
+                           "rehydrated": False},
+                    population=[str(item.source_path)
+                                for item in preflight_files],
+                    known=rebuild_known_identities)
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Codex cached entries")
         # #416 spec §3.4: rehydrate the attribution map from the journal BEFORE
@@ -12847,8 +14127,16 @@ def _sync_codex_cache_locked(
         except sqlite3.DatabaseError:
             _cursor_row = None
         _cursor_text = _cursor_row[0] if _cursor_row else None
+        # #982 spec 4.5: a replay record whose rehydration never committed (a
+        # crash between the clear's commit and the rehydration's) is
+        # rehydrated authoritatively first, under these locks, before any
+        # rollout is read; the same transaction marks it `rehydrated`.
+        mark_rehydrated = replay_active and (
+            rebuild or (refill_record is not None
+                        and not refill_record.get("rehydrated")))
+        authoritative_rehydration = bool(rebuild) or mark_rehydrated
         _since = None
-        if _cursor_text and not rebuild:
+        if _cursor_text and not authoritative_rehydration:
             _seg, _sep, _off = str(_cursor_text).rpartition(":")
             if _seg and _off.isdigit():
                 _since = (_seg, int(_off))
@@ -12869,10 +14157,10 @@ def _sync_codex_cache_locked(
             # `database is locked` trigger #297 documents.
             _rehydration = _jr.rehydrate_codex_journal_families(
                 conn,
-                authoritative=bool(rebuild),
+                authoritative=authoritative_rehydration,
                 file_account_since=_since,
                 window_attribution_since=(
-                    None if rebuild
+                    None if authoritative_rehydration
                     else load_codex_window_attribution_cursor(conn)),
                 caller="sync_codex_cache(rebuild=True)",
             )
@@ -12903,7 +14191,15 @@ def _sync_codex_cache_locked(
             # without the caller having to model that function's write
             # conditions. Getting this wrong strands an open transaction across
             # the whole walk.
-            if rebuild or _new_cursor != _cursor_text or conn.in_transaction:
+            if mark_rehydrated:
+                rehydrated_record = load_codex_heal_record(conn)
+                if (rehydrated_record is not None
+                        and rehydrated_record.get("mode") == "replay"
+                        and not rehydrated_record.get("malformed")):
+                    rehydrated_record["rehydrated"] = True
+                    _store_codex_heal_fence(conn, rehydrated_record)
+            if (authoritative_rehydration or _new_cursor != _cursor_text
+                    or conn.in_transaction):
                 conn.commit()
             # Both reports come AFTER the commit (closeout review C5): the
             # `except` below rolls back, so anything printed before it would
@@ -12929,6 +14225,10 @@ def _sync_codex_cache_locked(
             eprint(
                 "[cache-sync] could not rehydrate Codex attribution decisions "
                 f"or window attributions: {exc}; deferring the Codex walk")
+            return stats
+        if _replay_stage == "start":
+            # #982 spec 4.5: the start unit ends with the rehydration; the
+            # executor's units refill in the single walk's order.
             return stats
 
         # #980 D2: a budgeted call settles the finalization debt it inherited
@@ -13225,8 +14525,14 @@ def _sync_codex_cache_locked(
         # #980 F3: a budgeted walk bounds the resolver's group seed read with
         # its walk deadline (late-bound clock, so the walk's test seam drives
         # it); an unbudgeted call is unchanged.
-        anchor_resolver = CodexResetAnchorResolver(
-            conn, deadline=deadline, clock=lambda: _walk_clock())
+        if _walk_share is not None:
+            # #982 spec 4.2: the single walk's own resolver, shared across the
+            # heal's units; kept only while no other writer mutated quota.
+            anchor_resolver = _walk_share.bind_walk(conn)
+            share_bound = True
+        else:
+            anchor_resolver = CodexResetAnchorResolver(
+                conn, deadline=deadline, clock=lambda: _walk_clock())
         # #901 §5.3c (W11, Q14): every call without the hook's budget prepares
         # its delta with no write transaction open and applies it in one
         # transaction, each file in its own savepoint, at most
@@ -13246,6 +14552,16 @@ def _sync_codex_cache_locked(
         # Whole-transaction losses per file, so a persistent one ends.
         w11_losses: "dict[str, int]" = {}
         walk_queue = collections.deque(enumerate(walk))
+        # #982 spec 4.1 steps 4 and 7: a heal walk piece's census (its own
+        # discovery set on the first piece) and the census files it found
+        # unchanged; ``None`` outside a heal walk.
+        heal_census: "frozenset[str] | None" = None
+        heal_unchanged: "set[str]" = set()
+        if _ingest_limit is not None:
+            stats.heal_discovered = frozenset(
+                str(item.source_path) for item in files)
+            heal_census = (stats.heal_discovered if _heal_census is None
+                           else frozenset(_heal_census))
 
         def _w11_batch_bytes() -> int:
             return sum(item.new_input for item in w11_batch)
@@ -13495,7 +14811,9 @@ def _sync_codex_cache_locked(
         strike_marks: list[tuple[str, int]] = []
         barrier_holds: list = []
         barrier_touched: set[str] = set()
-        history = _CodexHistoryContext(conn)
+        history = _CodexHistoryContext(
+            conn, ledger_source=(None if _walk_share is None
+                                 else _walk_share.ledger_paths))
         for _walk_index, discovered in _walk_items():
             # The budget is checked BEFORE a file is opened, so a tick either
             # commits a file whole (or to a recorded partial offset) or does not
@@ -13506,11 +14824,27 @@ def _sync_codex_cache_locked(
                 break
             jp = discovered.source_path
             path_str = str(jp)
+            if heal_census is not None and (
+                    path_str in _heal_visited or path_str not in heal_census):
+                # #982 spec 4.1: an earlier piece of this walk examined the
+                # file (bytes appended since belong to later syncs), or it was
+                # created after the census. Either way the single walk would
+                # not read it again, so it is walked, never examined.
+                stats.files_skipped_unchanged += 1
+                continue
             if path_str in protected_paths:
                 # The file is still visible, but its configured root did not
                 # yield recognizable Codex data. Treat that as unknown
                 # filesystem state: neither truncation/requalification reset
                 # nor append ingestion may replace the retained generation.
+                continue
+            if path_str in heal_population:
+                # #982 spec 4.3: only the heal executor ingests population
+                # files, in the single walk's order; held like unsettled
+                # history (the worker was requested above).
+                stats.container_reads_held += 1
+                stats.container_skipped["verification-pending"] = (
+                    stats.container_skipped.get("verification-pending", 0) + 1)
                 continue
             selected = _select_codex_container(jp)
             if selected is None:
@@ -13541,7 +14875,7 @@ def _sync_codex_cache_locked(
                 # included, is classified like compressed history.
                 verdict = history.classify(
                     conn, codex_file_identity(discovered), path_str,
-                    known=rebuild_known_identities if rebuild else (),
+                    known=rebuild_known_identities if d1_snapshot else (),
                     archive=selected.location == _rc.ARCHIVE)
                 if verdict == "unknown":
                     # Untraced compressed history waits for the off-hook
@@ -13721,6 +15055,8 @@ def _sync_codex_cache_locked(
                     and size == prev_size
                 ):
                     stats.files_skipped_unchanged += 1
+                    if heal_census is not None:
+                        heal_unchanged.add(path_str)
                     continue
                 elif (
                     not requalified and not replaced and not incomplete
@@ -13746,6 +15082,32 @@ def _sync_codex_cache_locked(
                     initial_total_tokens = 0
                     prev_total_tokens = None
 
+            # #982 spec 4.1 steps 4 and 7: a heal walk piece ingests (or
+            # resets) at most `_ingest_limit` files. Reaching the next file
+            # with bytes to ingest or reset stops the piece BEFORE it is read:
+            # it and the rest stay unwalked, as at a budget stop, and the
+            # piece does not certify.
+            if (_ingest_limit is not None
+                    and path_str not in stats.heal_counted_paths
+                    and len(stats.heal_counted_paths) >= _ingest_limit):
+                requeue = (_w11_flush(final=False) if w11 and w11_batch
+                           else [])
+                # W11 counts a file when it is prepared; one whose batch then
+                # failed ingested nothing, so it does not count (the next
+                # piece re-examines it) and this piece goes on.
+                stats.heal_counted_paths &= set(committed_state)
+                if len(stats.heal_counted_paths) < _ingest_limit:
+                    if requeue:
+                        walk_queue.extendleft(
+                            reversed(requeue + [(_walk_index, discovered)]))
+                        continue
+                else:
+                    stats.heal_limit_stopped = True
+                    owed = ({_walk_index}
+                            | {index for index, _item in requeue}
+                            | {index for index, _item in walk_queue})
+                    unwalked = [walk[index] for index in sorted(owed)]
+                    break
             # #901 §5.3c (W11): a file's new input is known before it is read.
             # Preparation stops before the file that would take the batch past
             # either bound; that batch is applied and committed, and
@@ -13870,7 +15232,7 @@ def _sync_codex_cache_locked(
                 # an ascending list, so the appended low offset would then shadow
                 # the real decision for every later byte in the file.
                 file_account_key = None
-            elif rebuild and file_identity in rebuild_known_identities:
+            elif d1_snapshot and file_identity in rebuild_known_identities:
                 # Spec D1: history that was never durably stamped becomes
                 # unattributed; nothing is inferred. A rebuild re-reads bytes
                 # that were ingested BEFORE this mechanism existed, and reading
@@ -14463,6 +15825,7 @@ def _sync_codex_cache_locked(
                         inode=st.st_ino,
                         container=container_acceptance,
                         barrier=barrier_read,
+                        thread_guard=heal_population,
                     ),
                     merges=anchor_resolver.take_pending_merges(),
                     reset_counted=bool(truncated or requalified),
@@ -14477,6 +15840,8 @@ def _sync_codex_cache_locked(
                     skip_reasons=dict(iter_state.skip_reasons),
                 ))
                 _codex_w11_trace("prepare_end", path_str, new_input)
+                if _ingest_limit is not None:
+                    stats.heal_counted_paths.add(path_str)
                 # Private test seam: after a file is prepared and before the
                 # next file's preparation, which under W11 is where a later
                 # target's turn begins (its commit comes with its batch's).
@@ -14535,6 +15900,7 @@ def _sync_codex_cache_locked(
                         inode=st.st_ino,
                         container=container_acceptance,
                         barrier=barrier_read,
+                        thread_guard=heal_population,
                     )
                 except sqlite3.DatabaseError as exc:
                     conn.rollback()
@@ -14567,6 +15933,8 @@ def _sync_codex_cache_locked(
                 anchor_resolver.discard_uncommitted_file()
                 continue
             anchor_resolver.mark_file_committed()
+            if _ingest_limit is not None:
+                stats.heal_counted_paths.add(path_str)
             # #901 §5.3c (W9): the size trigger is evaluated after each commit.
             _wal_checkpoint.after_commit(conn)
             committed_state[path_str] = (
@@ -14625,6 +15993,24 @@ def _sync_codex_cache_locked(
         # points: the pre-open deadline check fills `unwalked`, while a stop
         # INSIDE a file only sets the flag.
         walk_complete = not stats.budget_exhausted and not unwalked
+        # #982 spec 4.1 steps 4 and 7 (revision 7): the piece that completes
+        # a heal walk certifies a file an earlier piece visited only while its
+        # committed cursor row still equals the one recorded at that visit.
+        # A file another writer changed since (a hook that ingested part of an
+        # append and stopped at its budget, say) still counts as walked, but
+        # stays in this piece's backlog, makes the barrier census 0 and
+        # withholds the full-walk certificate, exactly as a single walk
+        # followed by that writer would leave them; it is not re-examined.
+        visit_changed: "list[CodexDiscoveredFile]" = []
+        if heal_census is not None and walk_complete and _heal_visited_rows:
+            current_rows = _load_codex_session_files_rows(
+                conn, sorted(_heal_visited_rows))
+            changed = frozenset(
+                path for path, row in _heal_visited_rows.items()
+                if current_rows.get(path) != row)
+            stats.heal_visit_changed = changed
+            visit_changed = [item for item in files
+                             if str(item.source_path) in changed]
         _p_walk.set_count(stats.files_processed)
         _p_walk.set_meta(skipped=stats.files_skipped_unchanged,
                          rows=stats.rows_changed)
@@ -14671,7 +16057,8 @@ def _sync_codex_cache_locked(
                     else (unwalked[0] if unwalked else None))
                 backlog_files, backlog_bytes = _codex_backlog_after(
                     partial_files + unwalked
-                    + [item.discovered for item in withdrawn],
+                    + [item.discovered for item in withdrawn]
+                    + visit_changed,
                     existing, committed_state)
                 stats.backlog_files = backlog_files
                 stats.backlog_bytes = backlog_bytes
@@ -14750,8 +16137,32 @@ def _sync_codex_cache_locked(
                 elif walk_complete:
                     conn.execute("DELETE FROM cache_meta WHERE key = ?",
                                  ("codex_torn_auth_deferred",))
+                # #982 spec 4.1 step 5: the transition. The fenced walk's
+                # piece that leaves no census file unwalked ends a history
+                # heal's fence here, in its own end-of-walk transaction
+                # (before its settlement, which the executor defers to the
+                # finalization units anyway), whether or not it failed a file
+                # or deferred one for a torn `auth.json`: such a file stays
+                # owed exactly as the single walk leaves it, and the census
+                # below, set from this piece's counters, keeps it blocking
+                # new seals. (A replay heal keeps the consumption conditions
+                # of the block after this one.) A run that later withdraws
+                # its last batch repeats this step with `walk_complete` False
+                # after the rollback undid the delete.
+                if _heal_transition:
+                    stats.heal_transitioned = False
+                    if walk_complete:
+                        transition_record = load_codex_heal_record(conn)
+                        if (transition_record is not None
+                                and transition_record.get("mode") == "history"
+                                and transition_record.get("gen")
+                                == _heal_generation):
+                            _delete_codex_heal_record(conn)
+                            stats.heal_transitioned = True
                 # Consume the byte-zero replay marker only after a clean full walk,
-                # and only when THIS call observed it. A contended call returned
+                # and only when THIS call observed it or armed it itself (#1051:
+                # every clear arms the marker in its own transaction, so an
+                # explicit rebuild consumes what it armed). A contended call returned
                 # long before here, and a walk that failed or deferred a file leaves
                 # the marker standing — a surviving marker is what makes the repair
                 # retry on the next sync, and it is also what keeps
@@ -14769,6 +16180,19 @@ def _sync_codex_cache_locked(
                 # file. It is defense in depth today — a budgeted tick declines a
                 # pending replay outright above — but the two clears must keep the
                 # same shape.
+                # #982 spec 4.5a (Generation): an executor walk consumes the
+                # marker, ends a replay record or moves it to `certify` only
+                # while the record is still its pass's, re-read here under the
+                # same locks (the preamble already returned otherwise).
+                heal_generation_ok = True
+                if _walk_share is not None:
+                    heal_generation_ok = not _codex_heal_generation_stale(
+                        load_codex_heal_record(conn),
+                        conn.execute(
+                            "SELECT 1 FROM cache_meta WHERE key=? LIMIT 1",
+                            (CODEX_REPLAY_FROM_ZERO_KEY,)).fetchone()
+                        is not None,
+                        _heal_generation)
                 if (
                     walk_complete
                     and stats.files_failed == 0
@@ -14786,17 +16210,26 @@ def _sync_codex_cache_locked(
                         )
                     ):
                         _clear_codex_prune_refusal(conn)
-                    if replay_pending:
+                    if replay_pending and heal_generation_ok:
                         conn.execute("DELETE FROM cache_meta WHERE key = ?",
                                      (CODEX_REPLAY_FROM_ZERO_KEY,))
-                    conn.execute("DELETE FROM cache_meta WHERE key = ?",
-                                 (CODEX_REPLAY_BLOCKED_KEY,))
-                    # The budgeted-decline record is cleared by the same walk, for
-                    # the same reason: an unbudgeted walk reaching here is exactly
-                    # the caller whose absence the record was reporting.
-                    conn.execute("DELETE FROM cache_meta WHERE key = ?",
-                                 (CODEX_REPLAY_DEFERRED_KEY,))
-                elif replay_pending and walk_complete:
+                    # #982 spec 4.1 step 5: a replay heal record ends with
+                    # the marker, in the same transaction.
+                    consumed_record = load_codex_heal_record(conn)
+                    if (heal_generation_ok and consumed_record is not None
+                            and consumed_record.get("mode") == "replay"):
+                        _delete_codex_heal_record(conn)
+                        stats.heal_transitioned = _heal_transition
+                    if heal_generation_ok:
+                        conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                                     (CODEX_REPLAY_BLOCKED_KEY,))
+                        # The budgeted-decline record is cleared by the same
+                        # walk, for the same reason: an unbudgeted walk
+                        # reaching here is exactly the caller whose absence
+                        # the record was reporting.
+                        conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                                     (CODEX_REPLAY_DEFERRED_KEY,))
+                elif replay_pending and walk_complete and heal_generation_ok:
                     # A full walk ran and could NOT consume the marker, so the
                     # replay — and with it every Codex transcript ingest, which
                     # defers behind this marker — is stalled rather than merely
@@ -14808,6 +16241,15 @@ def _sync_codex_cache_locked(
                         "files_failed": stats.files_failed,
                         "files_deferred_torn": stats.files_deferred_torn,
                     }, sort_keys=True))
+                    # #982 spec 4.1 step 5: a blocked replay ends its fence
+                    # (phase `certify`) and keeps `known`; nothing re-clears.
+                    blocked_record = load_codex_heal_record(conn)
+                    if (blocked_record is not None
+                            and blocked_record.get("mode") == "replay"
+                            and blocked_record.get("phase") == "units"):
+                        blocked_record["phase"] = "certify"
+                        _store_codex_heal_fence(conn, blocked_record)
+                        stats.heal_transitioned = _heal_transition
                 conn.execute(_CODEX_FINALIZATION_RELEASE)
             # #980 D3/D4: settle the persisted finalization debt — the debt
             # this call's batches wrote and any debt inherited — in order:
@@ -14837,15 +16279,21 @@ def _sync_codex_cache_locked(
             # a later call (or the executor) revisits it; a budgeted call
             # admits a unit only while the budget leaves room, and a unit that
             # reaches the deadline rolls back and is never reported as a zero.
+            settle_stages = (
+                {"stages": _CODEX_HEAL_FENCED_STAGES} if _defer_finalization
+                else {})
             outcome = _codex_settle_finalization(
                 conn, deadline=budget_deadline, clock=_finalization_clock,
-                core_model=True, strike_state=strike_state)
+                core_model=True, strike_state=strike_state, **settle_stages)
             for message in outcome.errors:
                 eprint(message)
             if (outcome.model_failed or outcome.adoption_failed
                     or outcome.reconcile_failed):
                 stats.maintenance_failed = True
             if outcome.cancelled or outcome.deferred_to_worker or (
+                    # #982: a fenced or deferred settlement leaves debt owed.
+                    outcome.fenced or (
+                        _defer_finalization and not outcome.completed)) or (
                     budget_deadline is not None and not outcome.completed):
                 # Cancelled, handed to the worker, or a unit the remaining
                 # budget could not admit: the persisted debt stays owed.
@@ -14870,7 +16318,11 @@ def _sync_codex_cache_locked(
             # prunes; when the prune is due it records it as owed maintenance
             # for the drain executor instead.
             with _codex_finalization_stage(conn):
-                if deadline is None:
+                # #982 spec 4.3: during the heal fence (and in a heal round
+                # that defers its settlement) a due prune stays owed for the
+                # executor instead.
+                if (deadline is None and not _defer_finalization
+                        and not _codex_heal_fence_active(conn)):
                     _prune_codex_accounting_change_log(conn)
                 elif _codex_change_log_prune_due(conn):
                     record_codex_owed_maintenance(conn, change_log_prune=True)
@@ -14889,6 +16341,13 @@ def _sync_codex_cache_locked(
             stats.maintenance_failed = False
             finalization_notes.clear()
             _finalization_steps(False, w11_withdrawn)
+        if heal_census is not None:
+            # #982 spec 4.1: committed and unchanged census files are
+            # visited; a withdrawn batch's files are not (`committed_state`
+            # forgot them), so the next piece examines them again.
+            stats.heal_examined = frozenset(
+                (heal_unchanged | set(committed_state)) & heal_census)
+            stats.heal_walk_complete = walk_complete and not w11_lost
         # Projection intentionally runs only after this function releases the
         # Codex cache flock in ``finally`` below.  cache.db and stats.db are not
         # cross-database atomic: after this committed ingest, a projection
@@ -14975,6 +16434,7 @@ def _sync_codex_cache_locked(
             and not stats.files_deferred_reset
             and not stats.container_pending
             and not stats.container_reads_held
+            and not stats.heal_visit_changed
             and (
                 stats.files_processed + stats.files_skipped_unchanged
                 + sum(stats.container_skipped.values())
@@ -15016,6 +16476,7 @@ def _sync_codex_cache_locked(
                 barrier_census = bool(
                     walk_complete and stats.files_failed == 0
                     and stats.files_deferred_torn == 0 and not w11_lost
+                    and not stats.heal_visit_changed
                     and stats.files_processed + stats.files_skipped_unchanged
                     + sum(stats.container_skipped.values())
                     + stats.container_pending == stats.files_total)
@@ -15083,6 +16544,11 @@ def _sync_codex_cache_locked(
         # one recorded the drain as owed above.
         if deadline is None:
             _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
+        if heal_census is not None and stats.heal_examined:
+            # Revision 7: what this piece visited, as committed, read after
+            # its last write and before its locks are released.
+            stats.heal_visit_rows = _load_codex_session_files_rows(
+                conn, sorted(stats.heal_examined))
     except BaseException:
         raised = True
         raise
@@ -15126,7 +16592,16 @@ def _sync_codex_cache_locked(
                         raise
             if read_policy is not None and raised:
                 read_policy.invalidate("cache_unavailable")
+            if share_bound and not raised:
+                # #982 spec 4.2: after this unit's last commit, before its
+                # locks are released: the next unit reuses the memo only if
+                # nobody mutated quota in between.
+                _walk_share.seal(conn)
+                share_bound = False
         finally:
+            if share_bound:
+                # An exception (or a failure above): the next unit reseeds.
+                _walk_share.invalidate()
             # #981 R4: released on every path, whatever the pin raised.
             release_cache_writer_flocks(held_writer_flocks)
 
@@ -15342,7 +16817,297 @@ class FinalizationOutcome:
     restored: int = 0
     readopted: int = 0
     deferred_to_worker: bool = False
+    #: #982 spec 4.3: the heal fence restricted this settlement to the
+    #: ``expand`` and ``model`` stages; callers treat it like a deferred unit.
+    fenced: bool = False
     errors: list = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------
+# #982 / #975 — the Codex heal record and its fence (spec 4.3)
+# --------------------------------------------------------------------------
+#
+# The heal record is two ``cache_meta`` keys written and retired together:
+#
+# * ``codex_heal_walk``, the small FENCE key ``{"v", "gen", "mode", "phase"}``
+#   plus, in replay mode, ``"rehydrated"`` and, once a later arming site
+#   re-arms the replay, ``"reclear"``. Every fence check reads only this key.
+# * ``codex_heal_walk_payload``, the history-sized half ``{"v", "gen",
+#   "population"}`` plus, in replay mode, ``"known"`` (the D1 snapshot). It is
+#   parsed at most once per sync call, or once per executor pass (the walk
+#   share hands it to the units), and bound to the fence key by ``gen``.
+#
+# Both keys are written once by the heal executor's start unit (or the
+# replay's clear) in one transaction and deleted together once by the
+# transition (the first fenced certification round that walks clean and
+# complete); they are never rewritten per unit. Only the fence key changes in
+# between: the rehydration sets ``rehydrated``, a blocked replay moves it to
+# phase ``certify``, and ``arm_codex_replay_from_zero`` sets ``reclear``.
+# While the fence key holds phase ``units`` (the fence):
+#
+# * only the executor's units (syncs carrying its ``_walk_share``) ingest a
+#   population file; every other sync holds them and requests the worker;
+# * every one-way stamping path is restricted: the settlement chokepoint runs
+#   only ``expand`` and ``model`` and reports ``fenced``, and the two stamping
+#   kernels stamp nothing (or raise ``CodexHealFenced`` when strict);
+# * a non-executor thread-row upsert never replaces a population file's row;
+# * the accounting change-log prune deletes nothing and stays owed.
+
+CODEX_HEAL_WALK_KEY = "codex_heal_walk"
+CODEX_HEAL_PAYLOAD_KEY = "codex_heal_walk_payload"
+CODEX_HEAL_WALK_LOCK_NAME = "codex-heal-walk.lock"
+CODEX_HEAL_FENCED_TOKEN = "deferred_heal"
+_CODEX_HEAL_RECORD_VERSION = 1
+_CODEX_HEAL_FENCED_STAGES = ("expand", "model")
+
+
+class CodexHealFenced(sqlite3.DatabaseError):
+    """A strict stamping kernel refused while the heal fence holds.
+
+    A ``sqlite3.DatabaseError`` whose text is the status token
+    ``deferred_heal``, mirroring ``deferred_model``: ``account attribute``'s
+    all-or-nothing apply rolls its cache transaction back and reaches its
+    existing ``recordedPending`` outcome, and a rerun after the heal
+    completes it."""
+
+
+class CodexHealPayload(NamedTuple):
+    """The history-sized half of a heal record, parsed once."""
+
+    gen: str
+    population: "frozenset[str]"
+    known: "frozenset[str] | None"   # replay mode only (the D1 snapshot)
+
+
+def _codex_heal_meta_value(conn: sqlite3.Connection, key: str):
+    try:
+        row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                           (key,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return None
+        raise
+    return None if row is None else row[0]
+
+
+def load_codex_heal_record(conn: sqlite3.Connection) -> "dict | None":
+    """The heal record's small fence key, or None. Never the payload.
+
+    Unreadable fails closed. A record nobody can parse is a fence over an
+    unknown population marked ``malformed``: in history mode (the next
+    executor's transition removes it), or in replay mode when the record
+    says so or the byte-zero replay marker is armed, because a replay record
+    that lost its D1 set must never be cleared again with a recaptured one
+    (spec 4.5a): writers decline and the executor ends ``degraded``."""
+    text = _codex_heal_meta_value(conn, CODEX_HEAL_WALK_KEY)
+    if text is None:
+        return None
+    try:
+        record = json.loads(str(text))
+    except (TypeError, ValueError):
+        record = None
+    if (isinstance(record, dict)
+            and record.get("v") == _CODEX_HEAL_RECORD_VERSION
+            and isinstance(record.get("gen"), str)
+            and record.get("mode") in ("history", "replay")
+            and record.get("phase") in ("units", "certify")
+            and isinstance(record.get("reclear", False), bool)
+            and (record.get("mode") != "replay"
+                 or isinstance(record.get("rehydrated"), bool))):
+        return record
+    replay = (isinstance(record, dict) and record.get("mode") == "replay")
+    if not replay:
+        try:
+            replay = conn.execute(
+                "SELECT 1 FROM cache_meta WHERE key=? LIMIT 1",
+                (CODEX_REPLAY_FROM_ZERO_KEY,)).fetchone() is not None
+        except sqlite3.OperationalError:
+            replay = False
+    return {"v": _CODEX_HEAL_RECORD_VERSION, "gen": None,
+            "mode": "replay" if replay else "history", "phase": "units",
+            "malformed": True}
+
+
+def _codex_replay_refill_unlocked(conn: sqlite3.Connection) -> bool:
+    """Would a budgeted sync decline as a replay refill (#982 spec 4.4)?
+
+    Read without the store locks by a budgeted call that met contention: a
+    replay heal record in phase ``units``, or one too malformed to tell, is
+    the state in which no budgeted tick ingests, projects or evaluates a
+    budget (the predicate the decline sets ``replay_refill`` from). A waiting
+    request could then only make the refill units idle for its lifetime.
+    A marker without a record (the start unit has not committed) and a
+    blocked replay's ``certify`` record answer False: their hooks still
+    project, so their requests are kept. Unreadable answers False, so the
+    hook publishes its request, as today."""
+    try:
+        record = load_codex_heal_record(conn)
+    except sqlite3.Error:
+        return False
+    return (record is not None and record.get("mode") == "replay"
+            and (bool(record.get("malformed"))
+                 or record.get("phase") == "units"))
+
+
+def load_codex_heal_payload(
+        conn: sqlite3.Connection,
+        record: "dict | None") -> "CodexHealPayload | None":
+    """Parse the record's payload: the population and, in replay mode, the
+    D1 set. None when the record is malformed or the payload is missing,
+    malformed or another record's (its ``gen`` differs); callers fail closed
+    (a history fence over an empty population; a replay that declines)."""
+    if record is None or record.get("malformed"):
+        return None
+    text = _codex_heal_meta_value(conn, CODEX_HEAL_PAYLOAD_KEY)
+    if text is None:
+        return None
+    try:
+        raw = json.loads(str(text))
+    except (TypeError, ValueError):
+        return None
+    if not (isinstance(raw, dict)
+            and raw.get("v") == _CODEX_HEAL_RECORD_VERSION
+            and raw.get("gen") == record.get("gen")):
+        return None
+    population = raw.get("population")
+    if not (isinstance(population, list)
+            and all(isinstance(p, str) for p in population)):
+        return None
+    known = None
+    if record.get("mode") == "replay":
+        known = raw.get("known")
+        if not (isinstance(known, list)
+                and all(isinstance(k, str) for k in known)):
+            return None
+        known = frozenset(known)
+    return CodexHealPayload(str(raw["gen"]), frozenset(population), known)
+
+
+def _codex_heal_fence_active(conn: sqlite3.Connection) -> bool:
+    """The fence: a heal record in phase ``units``."""
+    record = load_codex_heal_record(conn)
+    return record is not None and record.get("phase") == "units"
+
+
+def _codex_heal_fence_json(record: dict) -> str:
+    fence = {key: value for key, value in record.items()
+             if key not in ("malformed", "population", "known")}
+    return json.dumps(fence, sort_keys=True, separators=(",", ":"))
+
+
+def _store_codex_heal_record(conn: sqlite3.Connection, record: dict, *,
+                             population, known=None) -> dict:
+    """Write a NEW record, both keys under a fresh ``gen``, on the caller's
+    transaction (the history start unit, the replay clear). Returns the
+    fence key as written."""
+    fence = {key: value for key, value in record.items()
+             if key not in ("malformed", "population", "known", "reclear")}
+    fence["v"] = _CODEX_HEAL_RECORD_VERSION
+    fence["gen"] = uuid.uuid4().hex
+    payload = {"v": _CODEX_HEAL_RECORD_VERSION, "gen": fence["gen"],
+               "population": sorted(set(str(p) for p in population))}
+    if fence.get("mode") == "replay":
+        payload["known"] = sorted(set(known or ()))
+    conn.execute(
+        "INSERT OR REPLACE INTO cache_meta(key, value) VALUES (?, ?)",
+        (CODEX_HEAL_PAYLOAD_KEY,
+         json.dumps(payload, sort_keys=True, separators=(",", ":"))))
+    conn.execute(
+        "INSERT OR REPLACE INTO cache_meta(key, value) VALUES (?, ?)",
+        (CODEX_HEAL_WALK_KEY, _codex_heal_fence_json(fence)))
+    return fence
+
+
+def _store_codex_heal_fence(conn: sqlite3.Connection, record: dict) -> None:
+    """Rewrite only the fence key of an existing record (its ``gen`` and
+    payload unchanged): ``rehydrated``, phase ``certify``, ``reclear``."""
+    conn.execute(
+        "INSERT OR REPLACE INTO cache_meta(key, value) VALUES (?, ?)",
+        (CODEX_HEAL_WALK_KEY, _codex_heal_fence_json(record)))
+
+
+def _delete_codex_heal_record(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM cache_meta WHERE key IN (?, ?)",
+                 (CODEX_HEAL_WALK_KEY, CODEX_HEAL_PAYLOAD_KEY))
+
+
+def arm_codex_replay_from_zero(conn: sqlite3.Connection) -> None:
+    """Arm the guarded byte-zero Codex replay, on the caller's transaction.
+
+    Every arming site goes through here (spec 4.5a). Without a replay heal
+    record this writes ``CODEX_REPLAY_FROM_ZERO_KEY`` and nothing else. With
+    one (a refill in progress or a blocked replay's ``certify`` record) the
+    clear already happened, so a bare marker would only be refilled and the
+    repair it was armed for would never re-derive the rows already refilled.
+    The record is marked ``reclear`` instead: the next writer clears again
+    exactly as an armed marker does today, with the fresh D1 capture united
+    with the record's persisted ``known`` (a rollout not yet refilled keeps
+    its pre-mechanism identity, I7), and writes a new record. A malformed
+    record is left as it is: it already fails closed.
+    """
+    _set_cache_meta(conn, CODEX_REPLAY_FROM_ZERO_KEY, "1")
+    record = load_codex_heal_record(conn)
+    if (record is not None and record.get("mode") == "replay"
+            and not record.get("malformed") and not record.get("reclear")):
+        record["reclear"] = True
+        _store_codex_heal_fence(conn, record)
+
+
+def _codex_replay_reclear_due(record: "dict | None",
+                              replay_armed: bool) -> bool:
+    """Whether a replay record's ``reclear`` mark asks for a fresh clear.
+
+    ``arm_codex_replay_from_zero`` writes the mark with the replay marker in
+    one transaction, and the consumption block deletes the marker with the
+    record, so the mark acts only while its marker is armed. A mark whose
+    marker is gone (only a damaged ``cache_meta`` has one) asks for nothing:
+    every writer treats the record as one that no longer needs a replay,
+    refills with its persisted D1 set and retires it, and none clears."""
+    return bool(replay_armed and record is not None
+                and record.get("mode") == "replay" and record.get("reclear"))
+
+
+def _codex_heal_generation_stale(record: "dict | None", replay_armed: bool,
+                                 generation: "str | None") -> bool:
+    """#982 spec 4.5a (Generation): whether an executor unit of the pass
+    that started with record generation ``generation`` must write nothing.
+
+    True when the store now asks for a fresh clear, which only the start
+    unit of a new pass (or an unbudgeted ordinary sync outside any pass) may
+    perform: the replay marker is armed without a replay record, or the
+    replay record is marked ``reclear`` with that marker armed
+    (``_codex_replay_reclear_due``). Also true when the record is not
+    the pass's (another ``gen``). An unreadable record has no ``gen``, so it
+    is the pass's only when the pass started from it (a malformed history
+    record, which that pass's transition removes; a malformed replay record
+    still declines every writer below). A missing record with no armed
+    marker is not stale: the pass's transition (or another writer's
+    complete walk) ended it, and the finalization units and the closing walk
+    run after that."""
+    if replay_armed and (record is None or record.get("mode") != "replay"):
+        return True
+    if record is None:
+        return False
+    return (_codex_replay_reclear_due(record, replay_armed)
+            or record.get("gen") != generation)
+
+
+def _codex_heal_fenced_kernel(conn: sqlite3.Connection, strict: bool) -> bool:
+    """The stamping kernels' own check (spec 4.3): True means "stamp nothing";
+    strict callers get ``CodexHealFenced`` instead."""
+    try:
+        fenced = _codex_heal_fence_active(conn)
+    except sqlite3.DatabaseError as exc:
+        if (isinstance(exc, sqlite3.OperationalError)
+                and _is_sqlite_interrupt(exc)):
+            # A cancellation, never a swallowable read error (D4).
+            raise CodexFinalizationCancelled("interrupt") from exc
+        if strict:
+            raise
+        return True
+    if fenced and strict:
+        raise CodexHealFenced(CODEX_HEAL_FENCED_TOKEN)
+    return fenced
 
 
 def _codex_malformed_debt() -> CodexFinalizationDebt:
@@ -15993,6 +17758,13 @@ def _codex_settle_finalization(
     """
     outcome = FinalizationOutcome()
     budgeted = deadline is not None
+    if _codex_heal_fence_active(conn):
+        # #982 spec 4.3: while a heal holds its population, adoption and
+        # reconciliation (one-way NULL -> account stamps) would decide from a
+        # partly ingested store. Expansion and model resolution are safe:
+        # model resolution reads only the observation's own rollout.
+        stages = tuple(s for s in stages if s in _CODEX_HEAL_FENCED_STAGES)
+        outcome.fenced = True
     if strike_state is None:
         # One call, one strike: a caller settling in several steps (the sync's
         # pre-walk settle and its finalization) shares one state instead.
@@ -16359,6 +18131,9 @@ def apply_codex_window_spend_adoption(
         high = max(span[1] for span in spans.values())
         reset_bounds = (low - _CODEX_ACCOUNT_WEEK, high + _CODEX_ACCOUNT_WEEK)
         candidate_bounds = (low - _CODEX_ACCOUNT_WEEK, high)
+    # #982 spec 4.3: no one-way stamp while a heal holds its population.
+    if _codex_heal_fenced_kernel(conn, strict):
+        return 0
 
     from _cctally_quota import load_codex_quota_observations
 
@@ -16501,6 +18276,59 @@ def _codex_stored_identity_path(
     return _codex_identity_path(selected, _codex_root_for_logical(logical, roots))
 
 
+def _codex_legacy_null_root_owner(
+        path: str,
+        discovered_by_identity: "dict[str, CodexDiscoveredFile]",
+        roots: "list[CodexProviderRoot]",
+) -> "tuple[str | None, CodexDiscoveredFile | None]":
+    """#983 spec 5.2: ``(root_key, discovered_file | None)`` for a stored path
+    whose row carries no ``source_root_key`` (pre-#294 S1), or ``(None, None)``.
+
+    Ownership follows discovery's own answer, never literal containment of the
+    stored spelling, because a symlinked spelling, overlapping roots and the
+    #970 archive release all defeat that. In order:
+
+    1. the stored identity names a discovered file: that file's root, and the
+       file itself so the rebuild's D1 snapshot gains exactly the identity the
+       walk computes for it;
+    2. otherwise the first root in configured order whose CANONICALIZED walk
+       or archive scope contains the identity (``_codex_scope_root`` would
+       compare the configured spelling, which misses a symlinked root);
+    3. otherwise a configured root ``_codex_provider_roots`` omitted (an
+       unmounted volume, a missing directory), keyed as ``_codex_prune_scope``
+       keys it, so the scope refuses it as configured but unrecognizable;
+    4. otherwise no owner: the path is outside every configured root and stays
+       removable, as a root-keyed row whose root left the configured set is.
+    """
+    try:
+        phys = _codex_stored_identity_path(path, roots)
+    except (OSError, TypeError, ValueError):
+        return None, None
+    discovered = discovered_by_identity.get(str(phys))
+    if discovered is not None:
+        return discovered.source_root_key, discovered
+    for root in roots:
+        scopes = [root.walk_root]
+        if root.archive_root is not None:
+            scopes.append(root.archive_root)
+        for scope in scopes:
+            try:
+                if phys.is_relative_to(_canonical_codex_path(scope)):
+                    return root.source_root_key, None
+            except (OSError, TypeError, ValueError):
+                continue
+    walked = {root.source_root_key for root in roots}
+    for raw_root in _cctally()._codex_home_roots():
+        try:
+            canonical = _canonical_codex_path(raw_root)
+            key = source_root_key(str(canonical))
+            if key not in walked and phys.is_relative_to(canonical):
+                return key, None
+        except (OSError, TypeError, ValueError):
+            continue
+    return None, None
+
+
 
 def codex_file_key_for_entry_path(
     source_root_key: str, source_path: str, *,
@@ -16620,9 +18448,9 @@ class _CodexHistoryContext:
     """One walk's provenance state, read once before the walk loop."""
 
     __slots__ = ("payload", "traced", "settle_on_finish", "ledger_paths",
-                 "consulted", "archives_covered")
+                 "consulted", "archives_covered", "ledger_source")
 
-    def __init__(self, conn):
+    def __init__(self, conn, *, ledger_source=None):
         import _cctally_journal as _jr
         self.payload = _codex_history_marker(conn)
         self.archives_covered = _codex_history_marker_covers_archives(
@@ -16635,6 +18463,9 @@ class _CodexHistoryContext:
                                  and _jr.journal_high_water() is None)
         self.ledger_paths = None
         self.consulted = False
+        # #982 spec 4.2: a heal unit reads the ledger path set through its
+        # share (one full read per pass, then only new rows).
+        self.ledger_source = ledger_source
 
     def classify(self, conn, identity: str, path: str, *, known=(),
                  archive: bool = False) -> str:
@@ -16657,7 +18488,9 @@ class _CodexHistoryContext:
             self.consulted = True
             return "history"
         if self.ledger_paths is None:
-            self.ledger_paths = _codex_ledger_paths(conn)
+            self.ledger_paths = (_codex_ledger_paths(conn)
+                                 if self.ledger_source is None
+                                 else self.ledger_source(conn))
         if _codex_has_history_provenance(conn, identity, path,
                                          ledger_paths=self.ledger_paths):
             return "history"
@@ -16721,6 +18554,40 @@ def _codex_history_candidates(*, archive_only: bool = False) -> "list[str]":
         conn.close()
 
 
+def _codex_provenance_identity_write(
+        share: _CodexWalkShare, path: str, apply, *, wait_for_requests: bool):
+    """One provenance identity's admitted transaction over ``share``.
+
+    ``apply(conn, anchors)`` receives the identity's resolver, built from
+    copies of the share's committed-evidence base (#975, spec 4.2), and
+    returns whether it applied. After the commit, still under the writer
+    locks, the base absorbs that identity's stored rows and the token is
+    sealed. A refusal, an exception or a rollback adds nothing and drops the
+    base, so the next identity seeds from the committed store.
+    """
+    applied: list = []
+
+    def run(conn):
+        result = apply(conn, share.identity_resolver(conn))
+        applied.append(bool(result))
+        return result
+
+    def absorb(conn) -> None:
+        if applied and applied[0]:
+            share.absorb_identity(conn, path)
+            share.seal(conn)
+
+    try:
+        admitted, result = _codex_admitted_cache_write(
+            run, wait_for_requests=wait_for_requests, after_commit=absorb)
+    except BaseException:
+        share.invalidate()
+        raise
+    if not admitted or not result:
+        share.invalidate()
+    return admitted, result
+
+
 def run_codex_history_provenance_drain(
         *, wait_for_requests: bool = True) -> ProvenanceDrainResult:
     """Settle provenance and retained quota before historical raw ingestion.
@@ -16753,6 +18620,9 @@ def run_codex_history_provenance_drain(
                       for path, item in prepared.items()}
         traced, high_water, quotas, decisions = _jr._codex_journal_history_evidence(
             candidates, identities=identities.values(), capture=True)
+        # #975 RC2: one committed-evidence seed for the whole pass, so each
+        # anchor group is read once rather than once per identity.
+        share = _CodexWalkShare()
         for path in candidates:
             item, identity = prepared[path], identities[path]
             # Codex legacy normalization is independent of Claude's cutover
@@ -16761,7 +18631,7 @@ def run_codex_history_provenance_drain(
             records = list(_jr._decoded_quota_stream(quotas.get(path, ()), None))
             file_ops = decisions.get(identity, ())
 
-            def apply(conn, path=path, item=item, identity=identity,
+            def apply(conn, anchors, path=path, item=item, identity=identity,
                       records=records, file_ops=file_ops):
                 live = _qualify_codex_targets({path})
                 if (len(live) != 1
@@ -16774,7 +18644,8 @@ def run_codex_history_provenance_drain(
                     return False  # another writer moved the captured population
                 before = conn.total_changes
                 _jr._apply_file_account_records(conn, file_ops)
-                _jr._apply_quota_records(conn, records, quiet=True)
+                _jr._apply_quota_records(conn, records, quiet=True,
+                                         anchors=anchors)
                 if conn.total_changes != before:
                     # Preserve triggers/change ledgers; no partial recovery
                     # mints journal coverage or leaves old coverage standing.
@@ -16782,8 +18653,8 @@ def run_codex_history_provenance_drain(
                     _bump_codex_physical_mutation_seq(conn)
                 return True
 
-            admitted, applied = _codex_admitted_cache_write(
-                apply, wait_for_requests=wait_for_requests)
+            admitted, applied = _codex_provenance_identity_write(
+                share, path, apply, wait_for_requests=wait_for_requests)
             if not admitted or not applied:
                 return ProvenanceDrainResult("yielded", len(candidates), len(traced))
         # A changed inventory is retried from one new captured census; never
@@ -16817,6 +18688,511 @@ def run_codex_history_provenance_drain(
                                      len(candidates), len(traced))
     finally:
         _release_worker_lock(worker)
+
+
+def _codex_replay_heal_due(conn: sqlite3.Connection) -> bool:
+    """An armed byte-zero replay or a replay heal record (#982 spec 4.6)."""
+    if conn.execute("SELECT 1 FROM cache_meta WHERE key=? LIMIT 1",
+                    (CODEX_REPLAY_FROM_ZERO_KEY,)).fetchone() is not None:
+        return True
+    record = load_codex_heal_record(conn)
+    return record is not None and record.get("mode") == "replay"
+
+
+class HealResult(NamedTuple):
+    """What one ``run_codex_admitted_heal`` pass did (#982 spec 4.1)."""
+
+    outcome: str      # "done", "busy", "yielded", "contended", "degraded",
+                      # "refused", "replay_due", "restart" or "none"
+    mode: "str | None"
+    units: int        # admitted targeted units: population and owed pass
+    owed_units: int   # of them, the owed pass's
+    degraded: int     # population files still owed after their attempts (U6)
+    finalization_units: int
+    certification_rounds: int  # fenced and closing full rounds
+    #: The last admitted sync's stats (the start unit's when it refused, the
+    #: last walk piece's otherwise) with every work counter of the summary
+    #: line (`_CODEX_HEAL_SUMMED_COUNTERS`) summed over every unit and piece
+    #: of the pass, except the skipped count: the files the pass only found
+    #: unchanged, each once. The failed and torn-deferred counts stay the
+    #: last piece's. Each file is reported once, as the single walk does.
+    #: ``None`` when no unit ran.
+    stats: "CodexIngestStats | None" = None
+
+
+#: The work counters a heal pass reports summed over its units and pieces.
+_CODEX_HEAL_SUMMED_COUNTERS = (
+    "files_processed", "files_skipped_unchanged", "files_reset_truncated",
+    "rows_changed", "lines_malformed", "token_events_skipped")
+
+
+class _CodexHealYield(Exception):
+    """A fresh hook request made a non-waiting executor give up its pass."""
+
+
+class _CodexHealContended(Exception):
+    """Another writer held the store locks for longer than the replay worker
+    has always waited for them (``CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS``)."""
+
+
+class _CodexHealRestart(Exception):
+    """A unit found its pass generation stale (spec 4.5a): the record was
+    rewritten, or a fresh clear only a new pass's start unit may perform is
+    due. The unit wrote nothing; the pass ends ``restart``."""
+
+
+def _codex_heal_owed_files(
+        conn: sqlite3.Connection,
+        files: "list[CodexDiscoveredFile]") -> "list[CodexDiscoveredFile]":
+    """The discovered files whose bytes ``_codex_backlog_after`` still owes:
+    no cursor, an incomplete cursor, or a size beyond the cursor."""
+    existing = _load_codex_session_files_rows(
+        conn, [str(item.source_path) for item in files])
+    return [item for item in files
+            if _codex_backlog_after([item], existing)[0]]
+
+
+def run_codex_admitted_heal(
+        *, wait_for_requests: bool = True,
+        population: "list[str] | None" = None) -> HealResult:
+    """Run a Codex history heal as admitted per-file units (#982 spec 4.1).
+
+    Single-flight through ``codex-heal-walk.lock`` (busy returns ``busy``).
+    No writer lock is held between units, and every unit is admitted the way
+    ``_apply_codex_verdict`` admits a verdict: the store is opened before
+    admission, ``admit`` takes only the gate (the sync owns its locks, tried
+    without waiting), and the sync rechecks for a fresh request once it holds
+    them (``_after_locks``). A contended or rechecked unit changed nothing;
+    with ``wait_for_requests`` the executor waits out every fresh request and
+    retries the same unit, otherwise it returns ``yielded``. Store locks that
+    another writer holds continuously for ``CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS``
+    (the replay worker's lock wait) end the pass ``contended``.
+
+    History mode runs when ``population`` (the census a settled provenance
+    pass just produced) is given or a history heal record exists, in order:
+
+    1. the start unit writes the record (phase ``units``: the fence);
+    2. one targeted unit per population file, in discovery order;
+    3. the owed pass: every discovered file still owed, at most twice each;
+    4. the fenced walk: one full walk in admitted pieces (``_ingest_limit=1``,
+       ``_heal_census``, ``_heal_visited``, settlement deferred), each
+       ingesting or resetting at most one file, until a piece leaves no
+       census file unwalked; that piece makes the transition, deleting the
+       record, whether or not a file failed (it stays owed);
+    5. the #980 executor's unbudgeted finalization units until the debt is
+       empty (a failed or idle unit hands the rest to ``_codex-prune-drain``);
+    6. the closing walk: a second walk in pieces, with its own census and
+       visited set and with ordinary settlement and sealing; its last piece
+       certifies the walk.
+
+    A piece that neither completes its walk nor adds a census file to the
+    visited set (only an existing refusal such as ``quota_index_pending``
+    does) ends the pass as ``degraded``: the record stays, and the worker is
+    requested again. Every other piece but the last adds a visited file, so a
+    walk takes at most one piece more than its census has files.
+
+    Replay mode (spec 4.5) runs when ``CODEX_REPLAY_FROM_ZERO_KEY`` or a
+    replay record exists, whatever ``population`` says. Its start unit
+    (``_replay_stage="start"``) captures the D1 snapshot, clears and writes
+    the record (population: every discovered file), then rehydrates; a
+    resumed pass whose record is not yet ``rehydrated`` reruns it, which
+    rehydrates without clearing again. A refused start (``rebuild_refused``
+    or a prune refusal) clears nothing and returns ``refused``. Steps 2-6
+    follow exactly as in history mode, except that the fenced walk's last
+    piece ends the record through the unchanged consumption block: deleted
+    with the marker, or moved to phase ``certify`` when the replay is
+    blocked (a failed or torn-deferred file). A ``certify`` record resumes at
+    step 5: its fence is over, and the closing walk retries the blocked file
+    and consumes the marker once it walks clean.
+
+    Generation (spec 4.5a): every unit after the start unit carries the
+    ``gen`` of the record the pass started with (``_heal_generation``), and
+    each finalization unit checks it under its store locks too. A unit that
+    finds another ``gen``, a ``reclear`` mark or an armed marker without a
+    replay record writes nothing; the pass then ends ``restart``, discarding
+    its census, visited set and cached payload, and requests the worker under
+    the short retry throttle. Only the next pass's start unit performs the
+    fresh clear, so no piece skips a file it visited before that clear.
+    """
+    import _lib_codex_drain_admission as adm
+    worker = _worker_lock(CODEX_HEAL_WALK_LOCK_NAME)
+    if worker is None:
+        return HealResult("busy", None, 0, 0, 0, 0, 0)
+    counts = {"units": 0, "owed": 0, "degraded": 0, "final": 0, "rounds": 0}
+    summed = collections.Counter()
+    last: dict = {"stats": None, "mode": "history"}
+    # The summary reports each file at most once per pass, as the single
+    # walk does: a file any unit processed (or reset) counts as processed
+    # only, and one the pass only found unchanged counts as skipped once,
+    # however many walks re-find it. A piece's skips of visited and
+    # out-of-census files stay in its own `files_skipped_unchanged` (the
+    # barrier census sum needs them) and never reach the pass's count.
+    pass_files: "dict[str, set[str]]" = {"processed": set(), "unchanged": set()}
+    # A worker requested by this pass (`contended`, `degraded`) is spawned
+    # after the heal lock is released: `_defer_codex_replay_drain` spawns
+    # nothing while a pass holds it.
+    worker_owed = {"replay": False}
+
+    def request_worker() -> None:
+        worker_owed["replay"] = True
+
+    def count_pass_files(only_paths, stats: CodexIngestStats) -> None:
+        if only_paths is not None:
+            if stats.files_processed or stats.files_reset_truncated:
+                pass_files["processed"].update(only_paths)
+            elif stats.files_skipped_unchanged:
+                pass_files["unchanged"].update(only_paths)
+            return
+        counted = set(stats.heal_counted_paths)
+        pass_files["processed"] |= counted
+        pass_files["unchanged"] |= set(stats.heal_examined) - counted
+
+    def result(outcome: str, mode: "str | None" = None) -> HealResult:
+        stats = last["stats"]
+        if stats is not None:
+            stats = _dc_replace(stats, **{
+                **{name: summed[name] for name in _CODEX_HEAL_SUMMED_COUNTERS},
+                "files_skipped_unchanged": len(
+                    pass_files["unchanged"] - pass_files["processed"])})
+        return HealResult(outcome, last["mode"] if mode is None else mode,
+                          counts["units"], counts["owed"],
+                          counts["degraded"], counts["final"],
+                          counts["rounds"], stats)
+
+    share = _CodexWalkShare()
+    # The generation of the record this pass works on (spec 4.5a), set once
+    # the start unit (or the probe of a resumed record) has it.
+    pass_state: dict = {"gen": None}
+
+    def recheck() -> bool:
+        return bool(adm.fresh_requests(_cctally_core.APP_DIR))
+
+    def admitted_sync(kind: str, **kwargs) -> CodexIngestStats:
+        # The store locks held by another writer (not a hook request, which
+        # expires) are waited for as long as the replay worker's single sync
+        # always waited for them, then the pass gives up as `contended`.
+        contended_since: "float | None" = None
+        while True:
+            stats = None
+            conn = open_cache_db()
+            try:
+                admission = adm.admit(_cctally_core.APP_DIR,
+                                      lambda: "sync-owns-locks",
+                                      lambda token: None)
+                if admission.admitted:
+                    try:
+                        with _perf.phase("codex_heal_unit") as _p_unit:
+                            _p_unit.set_meta(kind=kind)
+                            if kind != "start":
+                                kwargs["_heal_generation"] = pass_state["gen"]
+                            stats = sync_codex_cache(
+                                conn, maintenance="caller", lock_timeout=0,
+                                _walk_share=share, _after_locks=recheck,
+                                **kwargs)
+                    finally:
+                        adm.finish(admission, lambda token: None)
+            finally:
+                conn.close()
+            if stats is not None and stats.heal_generation_stale:
+                raise _CodexHealRestart()
+            if stats is not None and not stats.lock_contended:
+                last["stats"] = stats
+                for name in _CODEX_HEAL_SUMMED_COUNTERS:
+                    summed[name] += int(getattr(stats, name) or 0)
+                count_pass_files(kwargs.get("only_paths"), stats)
+                return stats
+            if not wait_for_requests:
+                raise _CodexHealYield()
+            if (stats is not None and not stats.drain_yielded
+                    and not adm.fresh_requests(_cctally_core.APP_DIR)):
+                now = time.monotonic()
+                if contended_since is None:
+                    contended_since = now
+                if now - contended_since >= CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS:
+                    raise _CodexHealContended()
+            else:
+                # An admission refusal, a drain yield, or a raw refusal met
+                # while a request (a Codex hook's, or the Claude waiter,
+                # #1055 spec 4.3) is fresh: a deliberate wait, not continuous
+                # contention.
+                contended_since = None
+            _drain_backoff(adm)
+
+    def run_finalization_units() -> None:
+        """Step 5: unbudgeted finalization units until the debt is empty.
+        Store locks another writer holds continuously are waited for as long
+        as every other unit waits for them, then the pass is `contended`."""
+        contended_since: "float | None" = None
+        while True:
+            conn = open_cache_db()
+            try:
+                if load_codex_finalization_debt(conn).empty:
+                    break
+                conn.rollback()
+                admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
+                                      _release_cache_store_locks)
+                if not admission.admitted:
+                    if not wait_for_requests:
+                        raise _CodexHealYield()
+                    if adm.fresh_requests(_cctally_core.APP_DIR):
+                        contended_since = None
+                    else:
+                        now = time.monotonic()
+                        if contended_since is None:
+                            contended_since = now
+                        if (now - contended_since
+                                >= CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS):
+                            raise _CodexHealContended()
+                    _drain_backoff(adm)
+                    continue
+                contended_since = None
+                try:
+                    # Spec 4.5a: under the store locks, the unit belongs to
+                    # this pass's record generation or writes nothing.
+                    if _codex_heal_generation_stale(
+                            load_codex_heal_record(conn),
+                            conn.execute(
+                                "SELECT 1 FROM cache_meta WHERE key=? LIMIT 1",
+                                (CODEX_REPLAY_FROM_ZERO_KEY,)).fetchone()
+                            is not None,
+                            pass_state["gen"]):
+                        raise _CodexHealRestart()
+                    with _perf.phase("codex_heal_unit") as _p_unit:
+                        _p_unit.set_meta(kind="finalization")
+                        ok, model_cleared = _run_codex_executor_unit(
+                            conn, "finalization")
+                except BaseException:
+                    conn.rollback()
+                    raise
+                finally:
+                    adm.finish(admission, _release_cache_store_locks)
+            finally:
+                conn.close()
+            if model_cleared:
+                try:
+                    from _cctally_quota import _defer_codex_quota_verification
+                    _defer_codex_quota_verification()
+                except Exception:
+                    pass
+            if not ok:
+                # The prune drain's executor owns this debt with its
+                # `blocked` rule; the closing round's settlement retries too.
+                _request_codex_drain_worker(CODEX_PRUNE_DRAIN_COMMAND)
+                break
+            counts["final"] += 1
+
+    def probe_state() -> "tuple[dict | None, bool]":
+        """The record's fence key and whether the replay marker is armed."""
+        conn = open_cache_db()
+        try:
+            return (load_codex_heal_record(conn), conn.execute(
+                "SELECT 1 FROM cache_meta WHERE key=? LIMIT 1",
+                (CODEX_REPLAY_FROM_ZERO_KEY,)).fetchone() is not None)
+        finally:
+            conn.close()
+
+    try:
+        record, replay = probe_state()
+        replay_mode = replay or (record is not None
+                                 and record.get("mode") == "replay")
+        if replay_mode:
+            last["mode"] = "replay"
+            if (record is not None and record.get("mode") == "replay"
+                    and record.get("malformed")):
+                # Spec 4.5a: a replay record whose D1 set cannot be read is
+                # never cleared again (every writer declines); nothing here
+                # can make progress without it.
+                return result("degraded")
+            # 1. The replay's start unit: the clear (which writes the record)
+            # and the rehydration. Rerun on a resumed record that never
+            # rehydrated; it clears nothing once the record exists, unless a
+            # later arming site re-armed it (`reclear`, spec 4.5a).
+            if (record is None or record.get("mode") != "replay"
+                    or not record.get("rehydrated")
+                    or _codex_replay_reclear_due(record, replay)):
+                start_stats = admitted_sync("start", _replay_stage="start")
+                record, replay = probe_state()
+                if record is None or record.get("mode") != "replay":
+                    if not replay:
+                        return result("none")   # consumed by another writer
+                    if start_stats.rebuild_refused or start_stats.prune_refused:
+                        return result("refused")
+                    request_worker()
+                    return result("degraded")
+                if record.get("malformed"):
+                    return result("degraded")
+                if _codex_replay_reclear_due(record, replay):
+                    # The fresh clear did not run (refused or deferred).
+                    if start_stats.rebuild_refused or start_stats.prune_refused:
+                        return result("refused")
+                    request_worker()
+                    return result("degraded")
+                if not record.get("rehydrated"):
+                    # The rehydration failed and rolled back; a later
+                    # worker reruns it before any rollout is read.
+                    request_worker()
+                    return result("degraded")
+        else:
+            if record is None and not population:
+                return result("none", None)
+            if record is not None and record.get("phase") != "units":
+                return result("none")
+        if record is not None:
+            pass_state["gen"] = record.get("gen")
+
+        # 1. The start unit.
+        if record is None:
+            fresh_population = sorted(set(str(p) for p in population))
+
+            def start(conn):
+                current = load_codex_heal_record(conn)
+                if current is not None:
+                    return current
+                written = _store_codex_heal_record(
+                    conn, {"mode": "history", "phase": "units"},
+                    population=fresh_population)
+                share.remember_heal_payload(CodexHealPayload(
+                    written["gen"], frozenset(fresh_population), None))
+                return written
+
+            admitted, record = _codex_admitted_cache_write(
+                start, wait_for_requests=wait_for_requests,
+                contention_bound=CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS)
+            if not admitted:
+                return result("yielded")
+            if record.get("mode") != "history" or record.get("phase") != "units":
+                return result("none", record.get("mode"))
+            pass_state["gen"] = record.get("gen")
+
+        def walk_in_pieces(kind: str, **kwargs) -> bool:
+            """Steps 4 and 7: one full walk in admitted pieces. True when a
+            piece left no census file unwalked; False when a piece neither
+            completed the walk nor visited a file (no progress). Each
+            visited file's committed row is kept for the last piece's
+            revalidation (revision 7)."""
+            census: "frozenset[str] | None" = None
+            visited: "dict[str, tuple | None]" = {}
+            while True:
+                stats = admitted_sync(
+                    kind, _ingest_limit=1, _heal_census=census,
+                    _heal_visited=frozenset(visited),
+                    _heal_visited_rows=dict(visited), **kwargs)
+                counts["rounds"] += 1
+                if census is None and stats.heal_discovered is not None:
+                    census = stats.heal_discovered
+                added = set(stats.heal_examined) - set(visited)
+                for path in added:
+                    visited[path] = stats.heal_visit_rows.get(path)
+                if stats.heal_walk_complete:
+                    return True
+                if not added:
+                    return False
+
+        if record.get("phase") == "units":
+            # The pass's one parse of the population (and, in replay mode,
+            # the D1 set the units then take from the share).
+            conn = open_cache_db()
+            try:
+                payload = share.heal_payload(conn, record)
+            finally:
+                conn.close()
+            if payload is None and last["mode"] == "replay":
+                return result("degraded")   # unreadable D1 set: fail closed
+            members = (frozenset() if payload is None
+                       else payload.population)
+
+            # 2. Population units, in the single walk's (discovery) order.
+            attempts: "collections.Counter[str]" = collections.Counter()
+            for item in _discover_codex_files_with_roots():
+                path = str(item.source_path)
+                if path not in members:
+                    continue
+                attempts[path] += 1
+                admitted_sync("population", only_paths={path})
+                counts["units"] += 1
+
+            # 3. The owed pass: appearances after the census, tails another
+            # writer left, and population files a targeted unit declined.
+            while True:
+                files = _discover_codex_files_with_roots()
+                conn = open_cache_db()
+                try:
+                    owed = _codex_heal_owed_files(conn, files)
+                finally:
+                    conn.close()
+                todo = [item for item in owed
+                        if attempts[str(item.source_path)] < 2]
+                if not todo:
+                    # Only population files: a file that appeared after the
+                    # census is a later sync's, as for the single walk.
+                    counts["degraded"] = sum(
+                        1 for item in owed if str(item.source_path) in members)
+                    break
+                for item in todo:
+                    path = str(item.source_path)
+                    attempts[path] += 1
+                    admitted_sync("owed", only_paths={path})
+                    counts["units"] += 1
+                    counts["owed"] += 1
+
+            # Spec 4.5a: a replay armed meanwhile (or re-armed over this
+            # replay) makes every piece below clear and refill one file;
+            # end the pass instead, without a transition. The next pass
+            # starts in replay mode, whose clear retires a history record.
+            current, armed = probe_state()
+            if ((last["mode"] == "history" and armed)
+                    or _codex_replay_reclear_due(current, armed)):
+                return result("replay_due")
+
+            # 4. The fenced walk, whose last piece makes the transition
+            # (replay: the unchanged consumption block deletes the record
+            # with the marker, or moves it to `certify` when blocked).
+            walk_in_pieces("certification", _defer_finalization=True,
+                           _heal_transition=True)
+            conn = open_cache_db()
+            try:
+                current = load_codex_heal_record(conn)
+            finally:
+                conn.close()
+            if current is not None and current.get("phase") == "units":
+                # No progress (or a complete walk that could not end the
+                # record): the fence stays, and every hook keeps requesting
+                # the worker while the record exists. Without a record (or
+                # with a `certify` one), the last piece made the transition
+                # or another walk (a rebuild) retired it meanwhile.
+                request_worker()
+                return result("degraded")
+
+        # 5. Finalization units of the #980 executor, now unfenced.
+        run_finalization_units()
+
+        # 6. The closing walk: ordinary settlement; it certifies the walk.
+        # The fence is gone, so a refusal here is the ordinary syncs' to
+        # retry (the refusing piece requested its own worker).
+        if not walk_in_pieces("closing"):
+            return result("degraded")
+        return result("done")
+    except _CodexHealYield:
+        return result("yielded")
+    except _CodexHealContended:
+        # The record (and with it the fence) stays: request the worker, which
+        # the record's short retry throttle lets through within minutes.
+        request_worker()
+        return result("contended")
+    except _CodexHealRestart:
+        # Spec 4.5a: the census and visited set died with the walk's frame;
+        # the cached payload is another generation's. The next pass starts
+        # over from its own start unit (the fresh clear, when one is due).
+        share.forget_heal_payload()
+        # Spawns nothing while this pass holds the heal lock (every caller
+        # re-runs the executor inline on `restart`), which keeps a re-run and
+        # a spawned worker from racing for the lock.
+        _defer_codex_replay_drain(short=True)
+        return result("restart")
+    finally:
+        _release_worker_lock(worker)
+        if worker_owed["replay"]:
+            _request_codex_drain_worker(CODEX_REPLAY_DRAIN_COMMAND)
 
 
 class _CodexFileBaselineResolver:
@@ -16916,6 +19292,10 @@ def reconcile_codex_window_attribution_spend(
     """
     from _cctally_quota import resolve_codex_window_attributions_with_evidence
 
+    # #982 spec 4.3: `account attribute` calls this directly, so the kernel
+    # checks the heal fence itself (strict: `CodexHealFenced`).
+    if _codex_heal_fenced_kernel(conn, strict):
+        return (0, 0)
     try:
         with _codex_cancellable_read(conn, deadline, clock):
             active = load_active_window_attributions(conn)
@@ -21355,6 +23735,7 @@ def _claude_batch_committed(conn, released, sessions, stats, touched_sessions,
 _CONVERSATION_RESIDUAL_FIELDS = frozenset({
     "failed_paths", "barrier_deferred_keys", "barrier_deferred_targets",
     "barrier_published_paths", "barrier_retry_causes",
+    "barrier_terminal_keys",                                  # #1052
 })
 
 
@@ -22125,6 +24506,32 @@ def _cache_side_replay_pending(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def _cache_side_history_heal_pending(conn: sqlite3.Connection) -> bool:
+    """Whether cache.db holds a history heal fence (#982 spec 4.3, R10).
+
+    Per-file heal units commit one population file at a time, and a
+    cursorless contributor's membership is unknown until its own unit reads
+    it, so the barrier cannot hold a conversation whose other contributor is
+    still to come. The pass therefore publishes nothing while the fence holds;
+    the heal's transition ends it once every population file is accounted.
+    Qualified through ``cache_db`` like ``_cache_side_replay_pending``, and a
+    connection without the attachment reports False.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_db.cache_meta WHERE key=?",
+            (CODEX_HEAL_WALK_KEY,)).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    if row is None:
+        return False
+    try:
+        record = json.loads(str(row[0]))
+    except (TypeError, ValueError):
+        return True                     # malformed fails closed, as the fence
+    return not (isinstance(record, dict) and record.get("phase") != "units")
+
+
 def _clear_codex_conversation_store(conn: sqlite3.Connection) -> None:
     """Clear only the re-derivable Codex transcript families."""
     conn.execute("DELETE FROM codex_conversation_events")
@@ -22199,6 +24606,75 @@ def _codex_conversation_cursor_row(conn, path: str):
         f"SELECT {_CODEX_CONVERSATION_CURSOR_COLUMNS} "
         "FROM codex_conversation_source_files WHERE path=?", (path,)).fetchone()
     return None if row is None else tuple(row[1:])
+
+
+def _codex_conversation_accepted(row) -> _AcceptedContainer:
+    """The container evidence of a conversations cursor row (``row[1:]``)."""
+    return _accepted_container(row, ext=14, mtime=1, device=12, inode=13, size=0)
+
+
+def _codex_cursor_unverified(row) -> bool:
+    """A conversations cursor row whose state is explicitly ``unverified``."""
+    return row is not None and _codex_conversation_accepted(row).state == "unverified"
+
+
+_CURSOR_UNREAD = object()
+
+
+def _classify_codex_unit_file(conn, discovered, *, executor_paths,
+                              protected_paths, requal_held, unit, targeted,
+                              cursor=_CURSOR_UNREAD) -> str:
+    """``"blocked"``, ``"terminal"`` or ``"quiet"`` for one unit file (#1052
+    spec 5.1), by the accessors and in the order of the conversation loop's
+    own checks. Never decodes: a cursorless compressed container, whose
+    decision would validate it, is blocked before the decision is reached,
+    and an executor path, the only other decoding entrance, is blocked first.
+
+    Terminal is the conversations store's terminal verdict exactly: an
+    explicitly ``unverified`` cursor whose decision is the quiet
+    ``skip/verification-unverified``. The decision maps every non-accepted,
+    non-pending state to that reason, so the reason alone is not enough.
+
+    Quiet is a ``read`` decision the loop would not refuse before reading a
+    byte of it. The loop refuses two such files, and so does this (#1052
+    review F2): in a targeted pass, a retained cursor the file no longer
+    continues (truncated, replaced, or under another root), and, in ``unit``,
+    a certificate that names another generation of the file. ``cursor`` is
+    the row the caller already read, if any."""
+    path_str = str(discovered.source_path)
+    if path_str in protected_paths or path_str in executor_paths:
+        return "blocked"
+    selected = _select_codex_container(discovered.source_path)
+    if selected is None:
+        return "blocked"
+    prev = (_codex_conversation_cursor_row(conn, path_str)
+            if cursor is _CURSOR_UNREAD else cursor)
+    if requal_held and _codex_held_by_requalification(
+            requal_held, frozenset(), discovered, selected.location,
+            first_sight=prev is None):
+        return "blocked"
+    if prev is None and selected.kind == _rc.ZSTD:
+        return "blocked"
+    decision = _codex_container_decision(
+        selected, None if prev is None else _codex_conversation_accepted(prev),
+        executor_path=False, should_stop=None)
+    if decision.action == "read":
+        fp = selected.fingerprint
+        size = int(decision.size)
+        if targeted and prev is not None and (
+                size < prev[0] or prev[3] != discovered.source_root_key
+                or _ingest_frontier.source_identity_replaced(
+                    prev[12], prev[13], fp.device, fp.inode)):
+            return "blocked"
+        if unit is not None and unit.cap_for(path_str, _rc.generation_token(
+                fp, size if selected.kind == _rc.ZSTD else None)) is None:
+            return "blocked"
+        return "quiet"
+    if (decision.action == "skip"
+            and decision.reason == "verification-unverified"
+            and _codex_cursor_unverified(prev)):
+        return "terminal"
+    return "blocked"
 
 
 def _codex_conversation_population_subset(conn, keys) -> "set[str]":
@@ -22291,15 +24767,24 @@ class _CodexPublicationWork:
     files as ``(discovered, unit)`` and ``(None, unit)`` (the loop commits the
     unit). Planning captures one read snapshot between the two phases and
     releases it before any publication transaction begins.
+
+    #1052 spec 5.1: each planned unit is classified before any of its files
+    is yielded. A terminal deferral (a terminal contributor and no blocked
+    file) yields nothing, so nothing of it is read, decoded or published.
     """
 
-    def __init__(self, conn, files, *, only_paths, stats):
+    def __init__(self, conn, files, *, only_paths, stats,
+                 executor_paths=frozenset(), protected_paths=frozenset(),
+                 requal_held=None):
         self.conn = conn
         self.files = list(files)
         self.files_by_path = {str(d.source_path): d for d in self.files}
         self.only_paths = (None if only_paths is None
                            else {str(path) for path in only_paths})
         self.stats = stats
+        self.executor_paths = frozenset(executor_paths)
+        self.protected_paths = frozenset(protected_paths)
+        self.requal_held = requal_held or {}
         self.population_present = conn.execute(
             "SELECT 1 FROM cache_db.codex_barrier_population LIMIT 1"
         ).fetchone() is not None
@@ -22314,9 +24799,48 @@ class _CodexPublicationWork:
         yield None, None
         self.units = _plan_codex_publication_units(self.conn, self)
         for unit in self.units:
+            terminal = self._terminal_paths(unit)
+            if terminal:
+                # #1052 spec 5.2: deferred, never retried. A retry flag raised
+                # elsewhere is neither set nor cleared here.
+                unit.failed = True
+                self.stats.barrier_keys_deferred += len(unit.keys)
+                self.stats.barrier_keys_terminal += len(unit.keys)
+                named = self.stats.barrier_terminal_keys
+                for path in terminal:
+                    named[path] = named.get(path, frozenset()) | frozenset(unit.keys)
+                continue
             for discovered in unit.files:
                 yield discovered, unit
             yield None, unit
+
+    def _terminal_paths(self, unit) -> "tuple[str, ...]":
+        """The terminal files of a terminal deferral; ``()`` for every other
+        unit, which the loop then treats exactly as before (#1052 spec 5.1).
+
+        A unit none of whose files has an ``unverified`` conversations cursor
+        is not classified further. Otherwise one blocked file makes the whole
+        unit an ordinary one, so its own refusal (G10, pending verification,
+        a protected or executor path, an unread new identity) still reaches
+        the loop's retryable failure."""
+        cursors = [
+            (discovered, _codex_conversation_cursor_row(
+                self.conn, str(discovered.source_path)))
+            for discovered in unit.files]
+        if not any(_codex_cursor_unverified(row) for _d, row in cursors):
+            return ()
+        terminal = []
+        for discovered, row in cursors:
+            verdict = _classify_codex_unit_file(
+                self.conn, discovered, executor_paths=self.executor_paths,
+                protected_paths=self.protected_paths,
+                requal_held=self.requal_held, unit=unit,
+                targeted=self.only_paths is not None, cursor=row)
+            if verdict == "blocked":
+                return ()
+            if verdict == "terminal":
+                terminal.append(str(discovered.source_path))
+        return tuple(terminal)
 
     def _defer(self, discovered, keys, *, generation, size) -> bool:
         path = str(discovered.source_path)
@@ -22792,6 +25316,38 @@ def _rollback_codex_file_savepoint(conn: sqlite3.Connection) -> bool:
     return False
 
 
+class _CodexConversationCensus:
+    """One conversation pass's container skips and held reads (#1052 5.3).
+
+    The census is phase 1's: its skips are ``container_skipped``. A
+    unit-phase skip of a path phase 1 did not skip is counted once in
+    ``barrier_container_skipped`` instead, so certification never counts one
+    file twice. ``container_reads_held`` counts distinct logical paths across
+    both phases."""
+
+    def __init__(self, stats):
+        self.stats = stats
+        self.skipped_phase1: "set[str]" = set()
+        self.skipped_units: "set[str]" = set()
+        self.held: "set[str]" = set()
+
+    def skip(self, path: str, reason: str, *, unit_phase: bool) -> None:
+        stats = self.stats
+        if not unit_phase:
+            self.skipped_phase1.add(path)
+            stats.container_skipped[reason] = (
+                stats.container_skipped.get(reason, 0) + 1)
+        elif path not in self.skipped_phase1 and path not in self.skipped_units:
+            self.skipped_units.add(path)
+            stats.barrier_container_skipped[reason] = (
+                stats.barrier_container_skipped.get(reason, 0) + 1)
+
+    def hold(self, path: str) -> None:
+        if path not in self.held:
+            self.held.add(path)
+            self.stats.container_reads_held += 1
+
+
 def _sync_codex_conversations_locked(
     conn: sqlite3.Connection,
     *,
@@ -22878,6 +25434,9 @@ def _sync_codex_conversations_locked(
         # sync in its own worker), so nothing else orders them.
         if _cache_side_replay_pending(conn):
             stats.deferred_reason = "cache_replay_pending"
+            return stats
+        if _cache_side_history_heal_pending(conn):
+            stats.deferred_reason = "cache_heal_pending"
             return stats
         # #968 spec 5.11: the barrier extends this admission point. Its state
         # or attachment missing fails closed rather than reading as "no
@@ -23078,7 +25637,10 @@ def _sync_codex_conversations_locked(
         location_marks: "list[tuple[str, _rc.SelectedContainer, _AcceptedContainer]]" = []
         batch = _CodexConversationBatch()
         work = _CodexPublicationWork(
-            conn, files, only_paths=only_paths, stats=stats)
+            conn, files, only_paths=only_paths, stats=stats,
+            executor_paths=executor_paths, protected_paths=protected_paths,
+            requal_held=requal_held)
+        census = _CodexConversationCensus(stats)
         for discovered, unit in work:
             if discovered is None:
                 if unit is None:          # the phase boundary
@@ -23118,7 +25680,7 @@ def _sync_codex_conversations_locked(
                     requal_held, frozenset(), discovered, selected.location,
                     first_sight=prev is None):
                 # G10: held until both stores retire the direct-era spelling.
-                stats.container_reads_held += 1
+                census.hold(path_str)
                 stats.drain_requested = tuple(sorted(
                     set(stats.drain_requested) | {CODEX_PRUNE_DRAIN_COMMAND}))
                 if unit is not None:
@@ -23127,8 +25689,8 @@ def _sync_codex_conversations_locked(
                 continue
             _fp = selected.fingerprint
             st = _CodexContainerStat(_fp.size, _fp.mtime_ns, _fp.device, _fp.inode)
-            accepted = (None if prev is None else _accepted_container(
-                prev, ext=14, mtime=1, device=12, inode=13, size=0))
+            accepted = (None if prev is None
+                        else _codex_conversation_accepted(prev))
             container_decision = _codex_container_decision(
                 selected, accepted, executor_path=path_str in executor_paths, should_stop=None)
             if container_decision.action == "adopt-location":
@@ -23145,12 +25707,15 @@ def _sync_codex_conversations_locked(
                 continue
             if container_decision.action == "skip":
                 reason = container_decision.reason
-                stats.container_skipped[reason] = stats.container_skipped.get(reason, 0) + 1
+                census.skip(path_str, reason, unit_phase=unit is not None)
                 if selected.kind == _rc.ZSTD and prev is None:
-                    stats.container_reads_held += 1
+                    census.hold(path_str)
                 if unit is not None:
                     # A failed publication is still due, even when its failure
                     # was an unreadable skip rather than pending verification.
+                    # #1052: a unit reaching a terminal contributor here also
+                    # carries a blocked file (or its cursor changed after
+                    # classification), so it stays retryable.
                     batch = _fail_codex_publication_unit(
                         conn, batch, stats, retry=True)
                 _report_conversation_progress(progress, "ingest", stats)
@@ -23357,9 +25922,9 @@ def _sync_codex_conversations_locked(
                         raise _rc.ContainerError("unstable-stat")
             except _rc.ContainerError as exc:
                 reason = _container_skip_reason(exc.category)
-                stats.container_skipped[reason] = stats.container_skipped.get(reason, 0) + 1
+                census.skip(path_str, reason, unit_phase=unit is not None)
                 if selected.kind == _rc.ZSTD and prev is None:
-                    stats.container_reads_held += 1
+                    census.hold(path_str)
                 if unit is not None:
                     batch = _fail_codex_publication_unit(conn, batch, stats, retry=True)
                 _report_conversation_progress(progress, "ingest", stats)
@@ -23564,6 +26129,11 @@ def _sync_codex_conversations_locked(
                 _commit_codex_conversation_batch(conn, batch, stats, progress)
                 batch = _CodexConversationBatch()
         _commit_codex_conversation_batch(conn, batch, stats, progress)
+        if only_paths is None:
+            # #972 §5.4: the rollups the walk did not rewrite still follow the
+            # current thread metadata and filesystem. Failed files do not stop
+            # it; a targeted pass never runs it.
+            _reconcile_codex_rollup_attribution(conn, stats)
         if (work.seal_seq is not None and work.backlog_complete
                 and not stats.barrier_retry):
             # Every certificate sealed up to this token was considered. Units
@@ -23581,7 +26151,8 @@ def _sync_codex_conversations_locked(
                     conn, "codex_conversation_source_files", path, adopted, snap)
             conn.commit()
         if (stats.container_pending
-                or stats.container_skipped.get("verification-pending", 0)):
+                or stats.container_skipped.get("verification-pending", 0)
+                or stats.barrier_container_skipped.get("verification-pending", 0)):
             stats.drain_requested = ("_codex-replay-drain",)
         run_codex_find_projection_backfill(conn)
         _report_conversation_progress(progress, "finalize", stats)
@@ -23626,7 +26197,7 @@ def _sync_codex_conversations_locked(
                              and not stats.prune_refused
                              and not stats.files_deferred_torn
                              and not stats.container_pending
-                             and not any(stats.container_skipped.values())
+                             and not any(stats.all_container_skipped().values())
                              and stats.files_processed + stats.files_skipped_unchanged
                              == stats.files_total),
             cursor_table="codex_conversation_source_files")
@@ -23805,7 +26376,9 @@ def _run_transcript_rebuild_worker(
             emit({
                 "event": "result",
                 "stats": {
-                    name: value for name, value in asdict(stats).items()
+                    name: (sorted(value) if isinstance(value, (set, frozenset))
+                           else value)
+                    for name, value in asdict(stats).items()
                     if name not in _CONVERSATION_RESIDUAL_FIELDS
                 },
                 "statsType": type(stats).__name__,
@@ -24136,6 +26709,21 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
         def _sync_codex_leg(
             active_conn: sqlite3.Connection,
         ) -> CodexIngestStats:
+            if not args.rebuild and _codex_replay_heal_due(active_conn):
+                # #982 spec 4.6: an armed byte-zero replay (or one a dead
+                # executor left) clears and refills through the admitted heal
+                # executor, before provenance runs, as the first sync did.
+                with _perf.phase("codex_heal") as _p_heal:
+                    heal = run_codex_admitted_heal(wait_for_requests=True)
+                    if heal.outcome in ("replay_due", "restart"):
+                        # Spec 4.5a: re-armed during the pass (or a unit
+                        # found its generation stale); replay again.
+                        heal = run_codex_admitted_heal(wait_for_requests=True)
+                    _p_heal.set_meta(outcome=heal.outcome, units=heal.units,
+                                     mode=heal.mode)
+                if heal.outcome in ("busy", "contended"):
+                    return CodexIngestStats(lock_contended=True)
+                return heal.stats or CodexIngestStats()
             with _perf.phase("sync_codex_cache"):
                 return sync_codex_cache(
                     active_conn,
@@ -24233,14 +26821,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
             )
             contended = True
         elif not stats.lock_contended:
-            eprint(
-                f"[cache-sync] codex done: {stats.files_processed} processed, "
-                f"{stats.files_skipped_unchanged} skipped, "
-                f"{stats.files_reset_truncated} reset, "
-                f"{stats.rows_changed} rows changed, "
-                f"{stats.lines_malformed} malformed, "
-                f"{stats.token_events_skipped} drift-skipped"
-            )
+            _print_codex_done_line(stats)
         # #416 review B4: emitted on EVERY branch (including a contended or
         # incomplete rebuild) — a deferral means Codex spend and quota stopped
         # updating, which the "done" line's zeroes look identical to. Exit code
@@ -24256,14 +26837,41 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
         codex_stats = stats
         if not stats.lock_contended:
             history = run_codex_history_provenance_drain(wait_for_requests=True)
-            if history.outcome == "settled" and history.candidates:
-                # Same accounting path and lock policy, without repeating the
-                # rebuild clear: the now-settled historical inputs can be read.
-                codex_stats = sync_codex_cache(
-                    conn, progress=_progress_codex_stderr, lock_timeout=lt,
-                    maintenance="caller")
-                if codex_stats.lock_contended:
+            heal_record = load_codex_heal_record(conn)
+            # A replay the first leg left blocked (or unfinished) keeps the
+            # executor in replay mode; the history heal waits for it.
+            if not _codex_replay_heal_due(conn) and (
+                    (history.outcome == "settled" and history.candidates)
+                    or (heal_record is not None
+                        and heal_record.get("mode") == "history")):
+                # #982 spec 4.6: the now-settled historical inputs are read by
+                # the admitted heal executor, one file per unit, in place of a
+                # second whole-tree sync under one writer-lock hold.
+                with _perf.phase("codex_heal") as _p_heal:
+                    heal = run_codex_admitted_heal(
+                        wait_for_requests=True,
+                        population=(None if heal_record is not None
+                                    else _codex_history_candidates()))
+                    if heal.outcome in ("replay_due", "restart"):
+                        # Spec 4.5a: a replay armed during this heal ended
+                        # its pass before the fenced walk; replay now, as the
+                        # first leg would have.
+                        heal = run_codex_admitted_heal(wait_for_requests=True)
+                    _p_heal.set_meta(outcome=heal.outcome, units=heal.units)
+                if heal.stats is not None and heal.stats.rebuild_refused:
+                    # The inline re-run's replay was refused by the #485/#968
+                    # preflight: reported exactly as the first leg reports a
+                    # refused replay (every marker was kept).
+                    conn.close()
+                    eprint(CODEX_REBUILD_REFUSED_MESSAGE)
+                    _p_root.__exit__(None, None, None)
+                    return 3
+                if heal.outcome in ("busy", "contended"):
+                    codex_stats = CodexIngestStats(lock_contended=True)
                     contended = True
+                elif heal.stats is not None:
+                    # The heal's summary, once, in the first leg's format.
+                    _print_codex_done_line(heal.stats)
             if not codex_stats.lock_contended:
                 run_codex_barrier_membership_scan(wait_for_requests=True)
                 run_codex_barrier_seal_drain(wait_for_requests=True)

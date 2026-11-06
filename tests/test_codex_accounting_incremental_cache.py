@@ -5,6 +5,8 @@ import datetime as dt
 import sqlite3
 from dataclasses import dataclass
 
+import pytest
+
 from conftest import load_script, redirect_paths
 
 
@@ -609,3 +611,253 @@ def test_moving_upper_bound_admits_preexisting_future_row(tmp_path, monkeypatch)
     finally:
         cache.reset_codex_accounting_cache_state()
         conn.close()
+
+
+# ── #971: thread-trigger path subquery (spec D1, T1, T2) ─────────────────────
+
+#: The shipped (head-51) thread path subquery, verbatim, as the oracle the
+#: rewrite is held to. It is deliberately a test constant and NOT read from
+#: production code: reading it from there would compare the rewrite with itself.
+SHIPPED_THREAD_PATHS = """
+            SELECT DISTINCT entries.source_root_key, entries.source_path
+              FROM codex_session_entries AS entries
+              LEFT JOIN codex_session_files AS files
+                ON files.source_root_key = entries.source_root_key
+               AND files.path = entries.source_path
+             WHERE (
+                    entries.source_root_key = {image}.source_root_key
+                AND entries.conversation_key = {image}.conversation_key
+             ) OR (
+                    files.source_root_key = {image}.source_root_key
+                AND files.last_native_thread_id = {image}.native_thread_id
+             )
+        """
+ROOT = "root-a"
+OTHER_ROOT = "root-b"
+
+
+def _thread_store(tmp_path, name="cache.db"):
+    ns = load_script()
+    conn = sqlite3.connect(tmp_path / name)
+    ns["_cctally_db"]._apply_cache_schema(conn)
+    conn.commit()
+    return conn
+
+
+def _entry(conn, path, root, conversation, offset):
+    conn.execute(
+        "INSERT INTO codex_session_entries "
+        "(source_path, source_root_key, line_offset, timestamp_utc, session_id, "
+        " model, input_tokens, cached_input_tokens, output_tokens, "
+        " reasoning_output_tokens, total_tokens, conversation_key) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (path, root, offset, "2026-08-14T11:00:00Z", f"session-{offset}",
+         "gpt-5", 10, 2, 3, 1, 13, conversation),
+    )
+
+
+def _file(conn, path, root, native):
+    conn.execute(
+        "INSERT INTO codex_session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        " last_native_thread_id, source_root_key) VALUES (?,?,?,?,?,?,?)",
+        (path, 1, 1, 1, START.isoformat(), native, root),
+    )
+
+
+def _thread(conn, conversation, native, path="/threads/t.jsonl"):
+    conn.execute(
+        "INSERT INTO codex_conversation_threads "
+        "(conversation_key, source_root_key, native_thread_id, root_thread_id, "
+        " source_path, cwd, git_json) VALUES (?,?,?,?,?,?,?)",
+        (conversation, ROOT, native, native, path, "/project", "{}"),
+    )
+
+
+def _case_data(conn, case, conversation, native, tag, offset):
+    """Seed one T1 case for one thread image; returns the next offset."""
+    def entry(path, root, conv):
+        nonlocal offset
+        offset += 1
+        _entry(conn, path, root, conv, offset)
+
+    if case == "conversation-arm":
+        entry(f"/e/{tag}-conv.jsonl", ROOT, conversation)
+        entry(f"/e/{tag}-conv.jsonl", ROOT, conversation)
+    elif case == "alias-arm-with-entries":
+        _file(conn, f"/f/{tag}-alias.jsonl", ROOT, native)
+        entry(f"/f/{tag}-alias.jsonl", ROOT, f"unrelated-{tag}-1")
+    elif case == "alias-arm-without-entries":
+        _file(conn, f"/f/{tag}-bare.jsonl", ROOT, native)
+    elif case == "root-mismatch-conversation-arm":
+        entry(f"/e/{tag}-other.jsonl", OTHER_ROOT, conversation)
+    elif case == "root-mismatch-alias-arm":
+        _file(conn, f"/f/{tag}-other.jsonl", OTHER_ROOT, native)
+        entry(f"/f/{tag}-other.jsonl", OTHER_ROOT, f"unrelated-{tag}-2")
+        # The file is in the thread's root, its entries only in another.
+        _file(conn, f"/f/{tag}-split.jsonl", ROOT, native)
+        entry(f"/f/{tag}-split.jsonl", OTHER_ROOT, f"unrelated-{tag}-3")
+    elif case == "null-conversation-key":
+        entry(f"/e/{tag}-nullconv.jsonl", ROOT, None)
+    elif case == "null-native-thread-id":
+        _file(conn, f"/f/{tag}-nullnative.jsonl", ROOT, None)
+        entry(f"/f/{tag}-nullnative.jsonl", ROOT, f"unrelated-{tag}-4")
+    elif case == "null-root":
+        entry(f"/e/{tag}-nullroot.jsonl", None, conversation)
+        _file(conn, f"/f/{tag}-nullroot.jsonl", None, native)
+        entry(f"/f/{tag}-nullroot.jsonl", None, f"unrelated-{tag}-5")
+    elif case == "both-arms-one-path":
+        _file(conn, f"/f/{tag}-both.jsonl", ROOT, native)
+        entry(f"/f/{tag}-both.jsonl", ROOT, conversation)
+    elif case == "no-match":
+        _file(conn, f"/f/{tag}-none.jsonl", ROOT, f"unrelated-native-{tag}")
+        entry(f"/f/{tag}-none.jsonl", ROOT, f"unrelated-{tag}-6")
+    else:  # pragma: no cover - a typo in the parameter table
+        raise AssertionError(case)
+    return offset
+
+
+def _oracle_paths(conn, conversation, native):
+    sql = SHIPPED_THREAD_PATHS.replace("{image}.", ":")
+    return set(conn.execute(sql, {
+        "source_root_key": ROOT, "conversation_key": conversation,
+        "native_thread_id": native}))
+
+
+def _ledger_mark(conn):
+    seq = int(conn.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='codex_accounting_mutation_seq'").fetchone()[0])
+    last = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) FROM codex_accounting_change_log"
+    ).fetchone()[0]
+    return seq, last
+
+
+T1_CASES = (
+    "conversation-arm", "alias-arm-with-entries", "alias-arm-without-entries",
+    "root-mismatch-conversation-arm", "root-mismatch-alias-arm",
+    "null-conversation-key", "null-native-thread-id", "null-root",
+    "both-arms-one-path", "no-match",
+)
+
+
+@pytest.mark.parametrize("verb", ["insert", "delete", "update"])
+@pytest.mark.parametrize("case", T1_CASES)
+def test_thread_triggers_match_the_shipped_path_oracle(tmp_path, case, verb):
+    """#971 T1 (failure: a rewritten thread path subquery drops or adds a dirty
+    path or a sequence bump, silently staling or over-invalidating the
+    dashboard's accounting read model). Every thread mutation writes exactly
+    the ledger rows the shipped OR query predicts."""
+    conn = _thread_store(tmp_path)
+    try:
+        offset = _case_data(conn, case, "conv-t", "native-t", "old", 0)
+        if verb == "update":
+            _case_data(conn, case, "conv-u", "native-u", "new", offset)
+        conn.commit()
+        if verb in ("delete", "update"):
+            _thread(conn, "conv-t", "native-t")
+            conn.commit()
+        expected_paths = _oracle_paths(conn, "conv-t", "native-t")
+        if verb == "update":
+            expected_paths |= _oracle_paths(conn, "conv-u", "native-u")
+        seq_before, last_before = _ledger_mark(conn)
+
+        if verb == "insert":
+            _thread(conn, "conv-t", "native-t")
+        elif verb == "delete":
+            conn.execute("DELETE FROM codex_conversation_threads "
+                         "WHERE conversation_key='conv-t'")
+        else:
+            conn.execute(
+                "UPDATE codex_conversation_threads SET conversation_key='conv-u', "
+                "native_thread_id='native-u' WHERE conversation_key='conv-t'")
+        conn.commit()
+
+        seq_after, _ = _ledger_mark(conn)
+        written = set(conn.execute(
+            "SELECT mutation_seq, change_kind, source_root_key, source_path "
+            "FROM codex_accounting_change_log WHERE seq > ?", (last_before,)))
+        bump = 1 if expected_paths else 0
+        assert seq_after - seq_before == bump, (case, verb, expected_paths)
+        assert written == {
+            (seq_before + 1, "path", root, path) for root, path in expected_paths
+        }, (case, verb)
+        if case in ("conversation-arm", "alias-arm-with-entries",
+                    "both-arms-one-path"):
+            assert expected_paths, f"non-vacuity: {case} must name a path"
+        if case == "both-arms-one-path":
+            assert len(written) == (2 if verb == "update" else 1)
+    finally:
+        conn.close()
+
+
+def _thread_trigger_steps(tmp_path, *, entries, files, verb, matching):
+    conn = _thread_store(tmp_path, f"steps-{entries}-{verb}-{matching}.db")
+    try:
+        conn.executemany(
+            "INSERT INTO codex_session_files "
+            "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+            " last_native_thread_id, source_root_key) VALUES (?,?,?,?,?,?,?)",
+            [(f"/u/{i}.jsonl", 1, 1, 1, START.isoformat(), f"u-native-{i}", ROOT)
+             for i in range(files)])
+        conn.executemany(
+            "INSERT INTO codex_session_entries "
+            "(source_path, source_root_key, line_offset, timestamp_utc, "
+            " session_id, model, input_tokens, cached_input_tokens, "
+            " output_tokens, reasoning_output_tokens, total_tokens, "
+            " conversation_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(f"/u/{i % files}.jsonl", ROOT, i, "2026-08-14T11:00:00Z",
+              f"u-session-{i}", "gpt-5", 10, 2, 3, 1, 13, f"u-conv-{i}")
+             for i in range(entries)])
+        if matching:
+            _entry(conn, "/t/conv.jsonl", ROOT, "conv-t", 1)
+            _file(conn, "/t/alias.jsonl", ROOT, "native-t")
+            _entry(conn, "/t/alias.jsonl", ROOT, "unrelated-t", 1)
+            _entry(conn, "/t/new.jsonl", ROOT, "conv-u", 1)
+        conn.commit()
+        if verb in ("delete", "update"):
+            _thread(conn, "conv-t", "native-t")
+            conn.commit()
+        seq_before, _ = _ledger_mark(conn)
+        counter = [0]
+
+        def tick():
+            counter[0] += 1
+            return 0
+
+        conn.set_progress_handler(tick, 1)
+        if verb == "insert":
+            _thread(conn, "conv-t", "native-t")
+        elif verb == "delete":
+            conn.execute("DELETE FROM codex_conversation_threads "
+                         "WHERE conversation_key='conv-t'")
+        else:
+            conn.execute(
+                "UPDATE codex_conversation_threads SET conversation_key='conv-u', "
+                "native_thread_id='native-u' WHERE conversation_key='conv-t'")
+        conn.set_progress_handler(None, 0)
+        conn.commit()
+        seq_after, _ = _ledger_mark(conn)
+        assert seq_after - seq_before == (1 if matching else 0), (
+            "non-vacuity: the matching case must run the ledger-writing body")
+        return counter[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("matching", [True, False],
+                         ids=["matching", "no-match"])
+@pytest.mark.parametrize("verb", ["insert", "delete", "update"])
+def test_thread_trigger_work_is_bounded_by_its_own_conversation(
+    tmp_path, verb, matching,
+):
+    """#971 T2 (failure: one thread mutation costs work proportional to the
+    whole Codex history of its root, about 200 ms per thread row on a real
+    store, which every prune and every thread upsert pays). The VM steps of
+    one mutation do not grow with unrelated entries and files in the root."""
+    small = _thread_trigger_steps(
+        tmp_path, entries=50, files=5, verb=verb, matching=matching)
+    big = _thread_trigger_steps(
+        tmp_path, entries=5000, files=500, verb=verb, matching=matching)
+    assert big <= small + 64, (verb, matching, small, big)

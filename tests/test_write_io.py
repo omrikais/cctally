@@ -1017,3 +1017,29 @@ def test_the_watch_names_tracked_deferrals_with_their_anchored_keys():
     assert wio.startup_watch() == {P: ("id-a", frozenset({K, K2}))}
     wio.release_admission("loopExit")
     assert wio.startup_watch() == {}
+
+
+def test_a_terminal_deferral_names_its_identities_and_settles():
+    """Detects (#1052): writeIo's admission hold never settling on a stable
+    terminal residual, settling across a changed one (the same path and count
+    now holding back a different conversation), or a certifiable,
+    obligation-free terminal pass that cannot take the drained exit."""
+    def terminal(path, key):
+        return _res(barrier_keys_deferred=1, barrier_keys_terminal=1,
+                    barrier_terminal_keys={path: frozenset({key})})
+
+    residual = terminal(P, K)
+    assert ("barrier_terminal", ((P, (K,)),)) in residual
+    assert dict(residual)["barrier_keys_terminal"] == 1
+
+    def digest(res):
+        return wio.residual_digest({"codex": res}, {})
+
+    assert digest(terminal(P, K)) == digest(residual)
+    assert digest(terminal(Q, K)) != digest(residual)
+    assert digest(terminal(P, K2)) != digest(residual)
+    drain = _drain()
+    assert drain.observe(_pass(codex=residual)) is None
+    assert drain.observe(_pass(codex=terminal(P, K))) == "settled"
+    assert drain.observe(_pass(codex=terminal(P, K2))) is None
+    assert _drain().observe(_pass(certifiable=True, codex=residual)) == "drained"

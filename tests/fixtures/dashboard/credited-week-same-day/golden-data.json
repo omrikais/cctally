@@ -190,7 +190,7 @@
     "week_index": [
       {
         "block_count": 0,
-        "detail_stamp": "3857ab8b3aea5363",
+        "detail_stamp": "02fd05b9ce7e01ec",
         "end_at_utc": "2026-04-20T14:00:00Z",
         "has_observation_gap": false,
         "is_current": true,
@@ -202,7 +202,7 @@
       },
       {
         "block_count": 0,
-        "detail_stamp": "5345b1d11093fd59",
+        "detail_stamp": "af7c258c86235ed5",
         "end_at_utc": "2026-04-17T15:00:00Z",
         "has_observation_gap": false,
         "is_current": false,
@@ -214,7 +214,7 @@
       },
       {
         "block_count": 0,
-        "detail_stamp": "217ec2cbb81c0ae7",
+        "detail_stamp": "939b5bf2232f6b85",
         "end_at_utc": "2026-04-17T03:00:00Z",
         "has_observation_gap": false,
         "is_current": false,
@@ -1152,7 +1152,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 12,
+  "source_schema_version": 13,
   "sources": {
     "all": {
       "availability": "ok",
@@ -1435,7 +1435,7 @@
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "3857ab8b3aea5363",
+                "detail_stamp": "02fd05b9ce7e01ec",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,
@@ -1447,7 +1447,7 @@
               },
               {
                 "block_count": 0,
-                "detail_stamp": "5345b1d11093fd59",
+                "detail_stamp": "af7c258c86235ed5",
                 "end_at_utc": "2026-04-17T15:00:00Z",
                 "has_observation_gap": false,
                 "is_current": false,
@@ -1459,7 +1459,7 @@
               },
               {
                 "block_count": 0,
-                "detail_stamp": "217ec2cbb81c0ae7",
+                "detail_stamp": "939b5bf2232f6b85",
                 "end_at_utc": "2026-04-17T03:00:00Z",
                 "has_observation_gap": false,
                 "is_current": false,
@@ -3118,7 +3118,7 @@
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "3857ab8b3aea5363",
+                "detail_stamp": "02fd05b9ce7e01ec",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,
@@ -3130,7 +3130,7 @@
               },
               {
                 "block_count": 0,
-                "detail_stamp": "5345b1d11093fd59",
+                "detail_stamp": "af7c258c86235ed5",
                 "end_at_utc": "2026-04-17T15:00:00Z",
                 "has_observation_gap": false,
                 "is_current": false,
@@ -3142,7 +3142,7 @@
               },
               {
                 "block_count": 0,
-                "detail_stamp": "217ec2cbb81c0ae7",
+                "detail_stamp": "939b5bf2232f6b85",
                 "end_at_utc": "2026-04-17T03:00:00Z",
                 "has_observation_gap": false,
                 "is_current": false,

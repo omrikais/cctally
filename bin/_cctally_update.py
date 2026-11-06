@@ -2882,12 +2882,17 @@ class _DashboardUpdateCheckThread(threading.Thread):
         hub: "SSEHub | None" = None,
         snapshot_ref: "_SnapshotRef | None" = None,
         runtime_bind: "str | None" = None,
+        sync_lock: "threading.Lock | None" = None,
     ) -> None:
         super().__init__(name="cctally-update-check")
         self._stop_event = stop_event
         self._hub = hub
         self._ref = snapshot_ref
         self._runtime_bind = runtime_bind
+        # #932 §4.2: the dashboard's publisher lock, so this republish cannot
+        # land after (and supersede) a newer locked publish. ``None`` keeps
+        # the unserialized behaviour for callers that publish nothing else.
+        self._sync_lock = sync_lock
 
     def run(self) -> None:
         c = _cctally()
@@ -2953,24 +2958,38 @@ class _DashboardUpdateCheckThread(threading.Thread):
         because a full sync can publish while the precomputes above are being
         gathered; writing a whole snapshot read before that sync would regress
         every data field and can restore a partial hydration seed.
+
+        #932 §4.2: the precomputes stay outside ``sync_lock``; the patch and
+        its publish run inside it (blocking), so they are serialized with every
+        snapshot publisher. The hub's latest delivery is what ``/api/data`` and
+        new subscribers read, and without the lock a republish of an older
+        deferred object could land after the settle publish that replaced it.
         """
+        import contextlib
         c = _cctally()
+        tui = c._cctally_tui
         c._load_sibling("_lib_snapshot_cache").reset_doctor_memo()
-        doctor_payload = c._cctally_tui._tui_precompute_doctor_payload(
+        doctor_payload = tui._tui_precompute_doctor_payload(
             _now_utc(), self._runtime_bind,
         )
-        fresh = self._ref.replace_fields(
-            envelope_precompute=(
-                c._cctally_tui._tui_precompute_envelope_config(load_config())
-            ),
-            doctor_payload=doctor_payload,
-            # #278 §1.4.1: a version-banner refresh republishes complete data;
-            # force the hydration latch clear so a republish that happens to
-            # carry a prior hydrating seed/partial doesn't freeze the client's
-            # loading skeletons.
-            hydrating=False,
-        )
-        self._hub.publish(fresh)
+        envelope_precompute = tui._tui_precompute_envelope_config(load_config())
+        lock = (self._sync_lock if self._sync_lock is not None
+                else contextlib.nullcontext())
+        with lock:
+            held = self._ref.get()
+            fresh = self._ref.replace_fields(
+                envelope_precompute=envelope_precompute,
+                doctor_payload=doctor_payload,
+                # #278 §1.4.1: a version-banner refresh republishes complete
+                # data; force the hydration latch clear so a republish that
+                # happens to carry a prior hydrating seed/partial doesn't
+                # freeze the client's loading skeletons. #932 §4.2: except
+                # over an explicit stats deferral, which is still loading.
+                hydrating=(held.hydrating
+                           if tui._tui_snapshot_is_stats_deferral(held)
+                           else False),
+            )
+            self._hub.publish(fresh)
 
 
 def cmd_update(args) -> int:

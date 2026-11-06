@@ -639,7 +639,11 @@ def _codex_observation_hold_only(stats, *, executor_owned=False):
         return False
     if getattr(stats, "barrier_retry", False) and not executor_owned:
         return False
-    skipped = getattr(stats, "container_skipped", {})
+    # #1052: every skip the pass saw, its unit phase's included, when the
+    # stats object splits them; otherwise its single census dict.
+    every_skip = getattr(stats, "all_container_skipped", None)
+    skipped = (every_skip() if callable(every_skip)
+               else getattr(stats, "container_skipped", {}))
     return (bool(getattr(stats, "container_pending", 0) or any(skipped.values()))
             and set(skipped) <= {
                 "decoder-unavailable", "decode-error", "read-error",

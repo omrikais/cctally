@@ -4023,6 +4023,111 @@ def test_capture_derives_probe_entries_from_the_frozen_transcripts_cwds(tmp_path
     assert fr.verify(freeze, full=True)["valid"] is True
 
 
+def _git_dir(path, *, complete=True):
+    """A `.git` directory: a repository's (HEAD, objects/, refs/) or a stray
+    container's (only a commit-message file, the #976 trigger)."""
+    git = path / ".git"
+    if complete:
+        (git / "objects").mkdir(parents=True)
+        (git / "refs").mkdir()
+        (git / "HEAD").write_text("ref: refs/heads/main\n")
+    else:
+        (git / "worktrees" / "x").mkdir(parents=True)
+        (git / "worktrees" / "x" / "CCTALLY_COMMIT_MSG").write_text("m\n")
+    return git
+
+
+def _git_cwds(tree, *cwds):
+    (tree["rollout"].parent / "rollout-g.jsonl").write_text("\n".join(
+        line for cwd in cwds for line in _codex_cwd_lines(str(cwd))) + "\n")
+
+
+# #976 T8: the product's marker rule stats `.git/HEAD`, `.git/objects` and
+# `.git/refs` of a `.git` directory. A freeze that did not record them would
+# answer those stats as `unmapped` (an INVALID run) instead of from the
+# captured tree, so the frozen git-root walk could not reproduce the product's.
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+@pytest.mark.parametrize("where", ["root", "target"])
+def test_capture_probes_git_directory_children(tmp_path, where):
+    fr = _load("frozen_roots")
+    tree = _link_tree(tmp_path)
+    base = (tree["home"] / ".codex" / "worktrees" if where == "root"
+            else tree["memory_target"])
+    full, half = base / "full", base / "half"
+    complete, stray = _git_dir(full), _git_dir(half, complete=False)
+    (full / "sub").mkdir()
+    (half / "sub").mkdir()
+    _git_cwds(tree, full / "sub", half / "sub")
+    manifest = _capture(fr, tmp_path, tree)
+    probes = {e["logical"]: e for e in manifest["entries"] if e.get("class") == "probe"}
+    absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    children = ("HEAD", "objects", "refs")
+    for child, kind in zip(children, ("file", "dir", "dir")):
+        e = probes[str(complete / child)]
+        st = os.lstat(complete / child)
+        assert e["type"] == kind and "physical" not in e
+        assert (e["dev"], e["ino"], e["mode"], e["size"]) == (
+            st.st_dev, st.st_ino, st.st_mode, st.st_size)
+        if where == "target":
+            assert e["root"] is None and e["deniedTarget"] == str(base)
+        else:
+            assert e["root"] is not None and "deniedTarget" not in e
+        assert absences[str(stray / child)] == "probe-absent"
+    below = {k for k in list(probes) + list(absences)
+             if k.startswith((str(complete) + "/", str(stray) + "/"))}
+    assert below == {str(g / c) for g in (complete, stray) for c in children}
+    tsv = _tsv(tmp_path / "freeze")
+    assert all(any(l.startswith(f"E\tP\t{complete / c}\t") for l in tsv)
+               for c in children)
+    assert all(f"A\t{stray / c}" in tsv for c in children)
+    assert fr.verify(tmp_path / "freeze", full=True)["valid"] is True
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_capture_git_symlink_to_directory_takes_directory_branch(tmp_path):
+    """`os.path.isdir` follows a link, so a `.git` link to a repository
+    directory is a marker for the product; the freeze records its children
+    (through the link spelling), while a dangling `.git` link records none."""
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    wt = tree["home"] / ".codex" / "worktrees"
+    real = _git_dir(pathlib.Path(os.path.realpath(tmp_path)) / "outside" / "repo")
+    linked, dangling = wt / "linked", wt / "dangling"
+    (linked / "sub").mkdir(parents=True)
+    (dangling / "sub").mkdir(parents=True)
+    os.symlink(str(real), linked / ".git")
+    os.symlink(str(wt / "missing"), dangling / ".git")
+    _git_cwds(tree, linked / "sub", dangling / "sub")
+    manifest = _capture(fr, tmp_path, tree)
+    link = _entry(manifest, linked / ".git")
+    assert link["type"] == "symlink" and link["followed"]["type"] == "dir"
+    for child, kind in zip(("HEAD", "objects", "refs"), ("file", "dir", "dir")):
+        e = _entry(manifest, linked / ".git" / child)
+        assert e["class"] == "probe" and e["type"] == kind
+        assert e["ino"] == os.lstat(real / child).st_ino
+    gone = _entry(manifest, dangling / ".git")
+    assert gone["type"] == "symlink" and gone["followed"] is None
+    assert not any(x["logical"].startswith(str(dangling / ".git") + "/")
+                   for x in manifest["entries"] + manifest["absences"])
+    assert fr.verify(tmp_path / "freeze", full=True)["valid"] is True
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_capture_git_file_records_nothing_new(tmp_path):
+    """A `.git` FILE counts by presence and is never opened, so nothing below
+    it is probed (no `gitdir:` target either)."""
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    repo = tree["home"] / ".codex" / "worktrees" / "wt"
+    (repo / "sub").mkdir(parents=True)
+    (repo / ".git").write_text("gitdir: /elsewhere/.git/worktrees/wt\n")
+    _git_cwds(tree, repo / "sub")
+    manifest = _capture(fr, tmp_path, tree)
+    assert _entry(manifest, repo / ".git")["type"] == "file"
+    assert not any(x["logical"].startswith((str(repo / ".git") + "/", "/elsewhere"))
+                   for x in manifest["entries"] + manifest["absences"])
+
+
 @pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_probe_presents_a_links_lstat_stat_and_target(tmp_path):
     fr = _load("frozen_roots")
@@ -4125,16 +4230,24 @@ def test_capture_probes_cwds_at_and_below_a_denied_directory_link_target(tmp_pat
     absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
     assert absences.get(str(t / "notes" / "deep" / ".git")) == "probe-absent"
     assert absences.get(str(t / "gone")) == "probe-absent"
-    # the target itself keeps O1's presentation; nothing below an absence or a
-    # `.git`, nothing copied, the target still denied
+    # #976: the empty `.git` directory's HEAD, objects and refs are recorded
+    # absences (the marker rule stats them), and nothing else below it
+    notes_git = t / "notes" / ".git"
+    assert {k for k in list(probes) + list(absences)
+            if k.startswith(str(notes_git) + "/")} == {
+        str(notes_git / c) for c in ("HEAD", "objects", "refs")}
+    assert all(absences[str(notes_git / c)] == "probe-absent"
+               for c in ("HEAD", "objects", "refs"))
+    # the target itself keeps O1's presentation; nothing below an absence,
+    # nothing copied, the target still denied
     assert str(t) not in probes and str(t) not in absences
-    assert not any(k.startswith((str(t / "gone") + "/", str(t / "notes" / ".git") + "/"))
+    assert not any(k.startswith(str(t / "gone") + "/")
                    for k in list(probes) + list(absences))
     assert [d["logical"] for d in manifest["deniedTargets"]] == [str(t)]
     summary = manifest["probes"]
     assert summary["targetCwds"] == 3 and summary["cwds"] == 0, summary
-    assert summary["targetEntries"] == 4 and summary["targetAbsences"] == 2, summary
-    assert summary["entries"] == 4 and summary["absences"] == 2, summary
+    assert summary["targetEntries"] == 4 and summary["targetAbsences"] == 5, summary
+    assert summary["entries"] == 4 and summary["absences"] == 5, summary
     tsv = _tsv(freeze)
     lines = {l.split("\t")[2]: l.split("\t") for l in tsv if l.startswith("E\tP\t")}
     assert sorted(lines) == sorted(probes)

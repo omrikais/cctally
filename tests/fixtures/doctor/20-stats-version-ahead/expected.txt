@@ -23,11 +23,11 @@ Database
   ✓ stats.db                 version 99 / 13 known
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
-  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1023) — no journal data available
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1024) — no journal data available
       → Restore the journal/ directory from backup, then run `cctally db rebuild --db stats`
   ✓ Rebuild worker           no stats.db upgrade rebuild has run; no stats.db auto-heal has run
-  ✓ Migrations               0/64 applied
-  ⚠ Pending migrations       64 pending
+  ✓ Migrations               0/65 applied
+  ⚠ Pending migrations       65 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit

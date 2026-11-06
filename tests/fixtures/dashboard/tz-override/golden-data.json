@@ -144,7 +144,7 @@
     "week_index": [
       {
         "block_count": 1,
-        "detail_stamp": "7aebc77ccf20f29a",
+        "detail_stamp": "5904700f9159def1",
         "end_at_utc": "2026-04-20T14:00:00Z",
         "has_observation_gap": false,
         "is_current": true,
@@ -848,7 +848,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 12,
+  "source_schema_version": 13,
   "sources": {
     "all": {
       "availability": "ok",
@@ -1130,7 +1130,7 @@
             "week_index": [
               {
                 "block_count": 1,
-                "detail_stamp": "7aebc77ccf20f29a",
+                "detail_stamp": "5904700f9159def1",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,
@@ -2371,7 +2371,7 @@
             "week_index": [
               {
                 "block_count": 1,
-                "detail_stamp": "7aebc77ccf20f29a",
+                "detail_stamp": "5904700f9159def1",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,

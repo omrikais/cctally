@@ -73,8 +73,8 @@ GOLDEN_ROOT="${CCTALLY_PRICING_CHECK_GOLDEN_ROOT:-$REPO_ROOT/tests/fixtures/pric
 REGENERATE="${CCTALLY_PRICING_CHECK_REGENERATE:-}"
 
 # Pinned analytic clock (the only clock coupling in this payload — see the
-# header). It is PRICING_SNAPSHOT_DATE, the day the embedded tables and every
-# current suppression were last verified against the vendor, so the goldens
+# header). It is PRICING_SNAPSHOT_DATE, the date of the latest pricing sync (a
+# targeted sync re-verifies only the cards it names), so the goldens
 # record the check as it reads at capture rather than at some later calendar
 # position. The assertion below is what makes that statement true rather than
 # merely intended: a snapshot bump that left this pin behind would otherwise
@@ -84,7 +84,7 @@ REGENERATE="${CCTALLY_PRICING_CHECK_REGENERATE:-}"
 # generically by tests/test_pricing_check.py::
 # test_no_suppression_expires_before_the_pricing_snapshot_date, and the cutover
 # itself is asserted in tests/test_codex_56_pricing.py.
-PINNED_AS_OF="2026-10-14T00:00:00Z"
+PINNED_AS_OF="2026-11-05T00:00:00Z"
 
 SNAPSHOT_DATE=$(sed -n \
     's/^PRICING_SNAPSHOT_DATE[[:space:]]*=[[:space:]]*"\([0-9-]*\)".*/\1/p' \

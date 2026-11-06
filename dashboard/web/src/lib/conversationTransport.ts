@@ -3,6 +3,7 @@ import {
   normalizeConversationRef,
   type ConversationRef,
   type ConversationSource,
+  type SnippetPart,
 } from '../types/conversation';
 
 export type ConversationTransportStatus =
@@ -175,6 +176,7 @@ export interface QualifiedSearchHit {
   item_key: string | null;
   title: string | null;
   snippet: string;
+  snippet_parts?: SnippetPart[];   // #1036
   badges: string[];
   last_activity_utc: string | null;
   project_label: string | null;

@@ -79,6 +79,13 @@ _COMPLETE_KEYS = {
 #: clean except for pending prune debt writes a fresh one; any other
 #: unbudgeted or certifying full walk deletes it.
 CODEX_FULL_WALK_DEBT_ONLY_KEY = "dashboard_codex_full_walk_debt_only"
+#: #916. cache.db's residual-only token: the most recent exhaustive Claude
+#: walk visited every on-disk source cleanly and its only defect was tracked
+#: rows whose transcripts no longer exist (orphans the prune gates refused).
+#: Mutually exclusive with ``claude_ingest_walk_complete``, which keeps its
+#: D5a meaning for the upgrade gate; only this frontier reads the token, as a
+#: second way for the Claude store to be complete. Its JSON value is debug-only.
+CLAUDE_WALK_ORPHAN_RESIDUAL_KEY = "claude_ingest_walk_orphan_residual"
 CODEX_CONVERSATION_WALK_DEBT_ONLY_KEY = "dashboard_codex_conversation_walk_debt_only"
 #: How long a frontier holds a debt-only store before walking it again: the
 #: certificate's own staleness bound, so a store whose certificate is
@@ -1872,6 +1879,15 @@ def _pending_identity(conn) -> tuple[str, ...]:
 
 
 def _provider_complete(conn, provider: str) -> bool:
+    if provider == "claude":
+        # #916: a residual-only walk certifies every on-disk source as fully
+        # as a clean one; the orphan rows it leaves are never read or written
+        # by a walk, so they cannot hide pending work.
+        row = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key IN (?, ?) LIMIT 1",
+            (_COMPLETE_KEYS[provider], CLAUDE_WALK_ORPHAN_RESIDUAL_KEY),
+        ).fetchone()
+        return row is not None
     row = conn.execute(
         "SELECT 1 FROM cache_meta WHERE key=? LIMIT 1",
         (_COMPLETE_KEYS[provider],),
@@ -2228,7 +2244,10 @@ def provider_sync_certifiable(mode: str, stats: object) -> bool:
     if mode == "targeted":
         return bool(getattr(stats, "targeted_clean", True))
     if mode == "full":
-        return bool(getattr(stats, "full_walk_complete", False))
+        # #916: ``full_walk_residual_only`` exists only on the Claude
+        # ``IngestStats``; Codex stats and ``_DebtCleared`` read False.
+        return bool(getattr(stats, "full_walk_complete", False)
+                    or getattr(stats, "full_walk_residual_only", False))
     return False
 
 

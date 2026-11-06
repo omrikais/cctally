@@ -255,6 +255,18 @@ export function DoctorCategoryRow({
   );
 }
 
+function latestSnapshotSummary(c: DoctorCheck): string {
+  if (c.id !== 'data.latest_snapshot_age') return c.summary;
+  const details = c.details ?? {};
+  if ('effective_freshness_age_s' in details) {
+    const effective = details.effective_freshness_age_s;
+    return typeof effective === 'number' ? humanizeAge(effective) : c.summary;
+  }
+  return typeof details.latest_snapshot_age_s === 'number'
+    ? humanizeAge(details.latest_snapshot_age_s)
+    : c.summary;
+}
+
 export function DoctorCheckRow({ c }: { c: DoctorCheck }): JSX.Element {
   const [showDetails, setShowDetails] = useState(false);
   const hasDetails = c.details && Object.keys(c.details).length > 0;
@@ -263,11 +275,13 @@ export function DoctorCheckRow({ c }: { c: DoctorCheck }): JSX.Element {
   // chip. Humanize it client-side from the raw age in `details` (leaving the
   // CLI `cctally doctor` output and its goldens untouched). Falls back to the
   // server summary when the age detail is absent (e.g. "none recorded").
-  const summary =
-    c.id === 'data.latest_snapshot_age' &&
-    typeof c.details?.latest_snapshot_age_s === 'number'
-      ? humanizeAge(c.details.latest_snapshot_age_s)
-      : c.summary;
+  //
+  // #1018: the check now measures the newer of the materialized snapshot and
+  // the newest accepted reading, published as `effective_freshness_age_s`. A
+  // number is humanized; a present null (no valid evidence, or freshness
+  // unavailable during stats maintenance) shows the server summary; only an
+  // older server that omits the key falls back to the legacy snapshot age.
+  const summary = latestSnapshotSummary(c);
   return (
     <div className={`doctor-modal__check doctor-modal__check--${c.severity}`}>
       <p>

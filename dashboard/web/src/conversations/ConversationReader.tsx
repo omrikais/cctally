@@ -121,6 +121,19 @@ const REASSERT_BUDGET_MS = 800;    // wall-clock fallback ceiling (refresh-rate-
 const HEADING_EDGE_WALK_MAX = 8;
 const HEADING_MOUNT_ATTEMPTS = 6;
 
+// #1037 — the header's branch slot, shared by the compact and desktop
+// variants: the branch when there is one; `no branch recorded` (operator
+// decision O1) only when Codex reports that its retained git metadata names
+// none; otherwise `—` (Claude without a branch, unreadable metadata, or a
+// server that predates the status).
+export function formatReaderBranch(
+  detail: Pick<ConversationDetail, 'git_branch' | 'provider_meta'>,
+): string {
+  if (typeof detail.git_branch === 'string' && detail.git_branch !== '') return detail.git_branch;
+  if (detail.provider_meta?.git_branch_status === 'not_recorded') return 'no branch recorded';
+  return '—';
+}
+
 // First non-blank line of the first MAIN-session, non-marker human message;
 // fallback project_label → session_id. Mirrors the kernel _session_titles_map
 // (#165 Q6). The opening human is always on page 1.
@@ -3151,7 +3164,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
             <div className="conv-reader-headmain">
               <div className="conv-reader-title">{title || detail.session_id}</div>
               <div className="conv-reader-meta">
-                {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {Array.from(new Set(detail.models.map(abbreviateModel))).join(', ')}
+                {detail.project_label || '—'} · {formatReaderBranch(detail)} · {fmt.usd2(detail.cost_usd)} · {Array.from(new Set(detail.models.map(abbreviateModel))).join(', ')}
               </div>
             </div>
             {/* #228 S3 C2 — the ⋯ overflow menu: Export, Compare with…, Latest ↓,
@@ -3215,7 +3228,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
         <div className="conv-reader-headmain">
           <div className="conv-reader-title">{title || detail.session_id}</div>
           <div className="conv-reader-meta">
-            {detail.project_label || '—'} · {detail.git_branch ?? '—'} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
+            {detail.project_label || '—'} · {formatReaderBranch(detail)} · {fmt.usd2(detail.cost_usd)} · {detail.models.join(', ')}
           </div>
         </div>
         <div className="conv-reader-controls" onFocusCapture={onHeadFocusCapture}>

@@ -867,10 +867,7 @@ def _apply_owed_outputs(base, start, output_end, boundary) -> frozenset:
             {"lines": 0, "bytes": 0, "decodes": 0}, boundary=boundary)
     elif prefix.cutover_claude is None:
         prefix.cutover_claude = _lib_accounts.UNATTRIBUTED
-    for record in prefix.slots:
-        if record is not None:
-            _journal._normalize_legacy_account_stamp(
-                record, prefix.cutover_claude)
+    _install_window_normalizer(prefix, prefix.cutover_claude)
     selection = _lib_journal.resolve_effective_events(
         prefix.slots, protocol_prefix_evidence=tuple(prefix.evidence))
     owed: dict = {}
@@ -926,13 +923,22 @@ def _apply_owed_outputs(base, start, output_end, boundary) -> frozenset:
 # --------------------------------------------------------------------------
 
 class _Prefix:
-    """One pass over the journal through the round's target."""
+    """One pass over the journal through the round's target.
+
+    #1004 spec D4: `slots` and `window` are `RetainedRecords` (each record a
+    reader retains decoded is a streamed slot, re-read and digest-checked on
+    access), and `coordinates` is the window's `LineCoordinates` starts view,
+    parallel to `window`. With `MATERIALIZE_FOR_TESTS` they are today's
+    lists (a test switch)."""
 
     def __init__(self):
-        self.slots: list = []          # selector slots, one per decoded record
+        # selector slots, one per decoded record
+        self.slots = _journal._new_retained_records()
         self.evidence: list = []       # protocol-resolution prefix evidence
-        self.window: list = []         # window records (placeholders kept)
-        self.coordinates: list = []    # parallel to `window`
+        # window records (placeholders kept)
+        self.window = _journal._new_retained_records()
+        # parallel to `window`: each position's `(segment, offset)`
+        self.coordinates = self.window.coordinates.starts()
         self.excluded_revisions: dict = {}
         self.inert_revisions: dict = {}
         self.begin_at: dict = {}
@@ -976,6 +982,8 @@ def _window_omits(record) -> bool:
 
 
 def _read_prefix(start, target, boundary) -> _Prefix:
+    import _lib_retained_records
+    materialize = _lib_retained_records.MATERIALIZE_FOR_TESTS
     out = _Prefix()
     segments = _journal.list_segments()
     hasher = _journal._new_prefix_hasher()
@@ -1007,13 +1015,13 @@ def _read_prefix(start, target, boundary) -> _Prefix:
             # compacted before anything holds a reference to it.
             record = _lib_journal.compact_retained(record)
         if not admitted:
-            out.slots.append(None)
+            out.slots.append_retained(None, segment, offset, len(raw))
             if record.get("t") in ("evt", "correction"):
                 _bump(out.excluded_revisions, record)
             if in_window:
-                out.window.append({**placeholder, "quarantine": {
-                    "record": record, "segment": segment, "offset": offset}})
-                out.coordinates.append((segment, offset))
+                out.window.append_retained({**placeholder, "quarantine": {
+                    "record": record, "segment": segment, "offset": offset}},
+                    segment, offset, len(raw))
             prior["hw"] = end
             continue
         if t == "op":
@@ -1032,13 +1040,57 @@ def _read_prefix(start, target, boundary) -> _Prefix:
             out.begin_at.setdefault(record.get("id"), record.get("at"))
             out.begins.setdefault(record.get("id"), []).append(record)
             out.batch_family.setdefault(record.get("id"), record.get("family"))
-        out.slots.append(
-            record if t in _lib_journal_router.RETAINED_RECORD_TYPES else None)
+        if t in _lib_journal_router.RETAINED_RECORD_TYPES:
+            if materialize:
+                out.slots.append_retained(record, segment, offset, len(raw))
+            else:
+                out.slots.append_streamed(raw, segment, offset, len(raw))
+        else:
+            out.slots.append_retained(None, segment, offset, len(raw))
         if in_window and not omitted:
-            out.window.append(record)
-            out.coordinates.append((segment, offset))
+            if materialize:
+                out.window.append_retained(record, segment, offset, len(raw))
+            else:
+                out.window.append_streamed(raw, segment, offset, len(raw))
         prior["hw"] = end
+    if materialize:
+        # Every slot is a retained object here, so this decodes nothing; a
+        # record both lists keep is one shared object, as before.
+        slots, window = out.slots, out.window
+        out.slots, out.window = list(slots), list(window)
+        out.coordinates = list(window.coordinates.starts())
+        slots.close()
+        window.close()
     return out
+
+
+def _install_window_normalizer(prefix: _Prefix, cutover_claude) -> None:
+    """#1004 spec D4: normalize the prefix's retained records under the
+    resolved ``cutover_claude`` at decode time, on both `slots` and `window`,
+    replacing the in-place loop both `_apply_owed_outputs` and
+    `_complete_window` ran before any consumer read a record.
+
+    The loop normalized the selector slots, which are the retained decision
+    records (`RETAINED_RECORD_TYPES`), and with them the very same objects
+    the window shares; a window observation was normalized only in each
+    replay's private copy (`_normalized_copy`). The hook keeps exactly that
+    scope on both sequences. Normalization is idempotent and a pure function
+    of the record and the cutover, so every decode yields an equal record."""
+    if isinstance(prefix.slots, list):
+        # MATERIALIZE_FOR_TESTS: today's lists and today's loop.
+        for record in prefix.slots:
+            if record is not None:
+                _journal._normalize_legacy_account_stamp(
+                    record, cutover_claude)
+        return
+    retained_types = _lib_journal_router.RETAINED_RECORD_TYPES
+
+    def normalize(record) -> None:
+        if record.get("t") in retained_types:
+            _journal._normalize_legacy_account_stamp(record, cutover_claude)
+
+    prefix.slots.set_normalizer(normalize)
+    prefix.window.set_normalizer(normalize)
 
 
 def _held_observation_ids(slots) -> frozenset:
@@ -1110,15 +1162,30 @@ def _no_cache_read_adapters():
             setattr(cctally, name, value)
 
 
-def _normalized_copy(record, cutover_claude):
+def _normalized_copy(record, cutover_claude, *, fresh=False):
     """One window record as a replay sees it: a private deep copy, its legacy
     account stamp normalized under ``cutover_claude`` (an excluded placeholder
     is only copied). Reads only this record and the journal-wide cutover
-    value (#997 spec D5)."""
-    out = copy.deepcopy(record)
+    value (#997 spec D5).
+
+    ``fresh`` (#1004 spec D4): ``record`` is a streamed slot's own decode,
+    already private, so it is normalized in place and returned without the
+    copy (the copy of a private dict equals it)."""
+    out = record if fresh else copy.deepcopy(record)
     if out.get("t") != _lib_account_protocol.EXCLUDED_PLACEHOLDER_TYPE:
         _journal._normalize_legacy_account_stamp(out, cutover_claude)
     return out
+
+
+def _retained_window_ids(window) -> "frozenset | None":
+    """The identities of the window's retained objects (its placeholders),
+    or None for a list window, all of whose records are retained. A retained
+    object lives as long as the window, so no fresh decode offered while
+    the window is alive can share its id."""
+    if isinstance(window, list):
+        return None
+    return frozenset(id(window.slot(i)) for i in range(len(window))
+                     if not window.is_streamed(i))
 
 
 def _replay(base, tmp, name, prefix, held_ids, cache_conn, *, retention,
@@ -1132,6 +1199,7 @@ def _replay(base, tmp, name, prefix, held_ids, cache_conn, *, retention,
     copy_path = tmp / name
     shutil.copyfile(base, copy_path)
     cutover_claude = prefix.cutover_claude
+    retained = _retained_window_ids(prefix.window)
     by_input: dict = {}
     conn = _cctally_core.open_db(_target_path=str(copy_path))
     try:
@@ -1143,7 +1211,9 @@ def _replay(base, tmp, name, prefix, held_ids, cache_conn, *, retention,
         # offered, never the whole window up front.
         events = _cctally_rederive.replay_scratch_records(
             conn, prefix.window, cache_conn, fold=fold, held_ids=held_ids,
-            prepare=lambda record: _normalized_copy(record, cutover_claude),
+            prepare=lambda record: _normalized_copy(
+                record, cutover_claude,
+                fresh=retained is not None and id(record) not in retained),
             coordinates=prefix.coordinates, skip_indexes=skip,
             on_input=lambda index, derived: by_input.__setitem__(
                 index, list(derived)),
@@ -1209,12 +1279,15 @@ def _legacy_decided_inputs(prefix, by_input=None) -> frozenset:
     previous-release reading closed at that second, and treating that retry
     as the reading's own history left the reading's decision unjournaled."""
     legacy = prefix.legacy_origin_ids
-    out = {index for index, record in enumerate(prefix.window)
-           if _is_legacy_input(record)
-           and _SNAPSHOT_ID_PREFIX + str(record.get("id")) in legacy}
+    # One pass (#1004 D4: each access decodes a streamed record, so the
+    # legacy inputs are found once rather than by a lookup per input).
+    legacy_inputs = {index: record.get("id")
+                     for index, record in enumerate(prefix.window)
+                     if _is_legacy_input(record)}
+    out = {index for index, record_id in legacy_inputs.items()
+           if _SNAPSHOT_ID_PREFIX + str(record_id) in legacy}
     for index, derived in (by_input or {}).items():
-        if not (0 <= index < len(prefix.window)
-                and _is_legacy_input(prefix.window[index])):
+        if index not in legacy_inputs:
             continue
         if any(event["id"] in legacy for event in derived
                if _lib_rederive._is_owned_event(event)):
@@ -1253,10 +1326,7 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
             {"lines": 0, "bytes": 0, "decodes": 0}, boundary=boundary)
     elif prefix.cutover_claude is None:
         prefix.cutover_claude = _lib_accounts.UNATTRIBUTED
-    for record in prefix.slots:
-        if record is not None:
-            _journal._normalize_legacy_account_stamp(
-                record, prefix.cutover_claude)
+    _install_window_normalizer(prefix, prefix.cutover_claude)
     accumulators: dict = {}
     selection = _lib_journal.resolve_effective_events(
         prefix.slots, protocol_prefix_evidence=tuple(prefix.evidence),
@@ -1290,20 +1360,23 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
             return False
         _lib_rebuild_progress.phase(
             "completion:replay-without", round=round_index)
-        events_a, _ = _replay(
+        # #1004: only the events are kept. A discarded `by_input` bound to a
+        # local would stay alive through the next replay (≈ 24 MB at 195 k
+        # inputs, measured by T11's residual census).
+        events_a = _replay(
             base, tmp, f"without-{round_index}.db", prefix, held_ids,
             cache_conn, skip=gap,
-            retention=_retention(effective, prefix, owed, legacy=legacy))
+            retention=_retention(effective, prefix, owed, legacy=legacy))[0]
         reference: dict = {}
         for event in events_a:
             reference.setdefault(
                 event["id"], _lib_journal.event_content_hash(event))
         _lib_rebuild_progress.phase(
             "completion:replay-with", round=round_index)
-        events_b, _ = _replay(
+        events_b = _replay(
             base, tmp, f"with-{round_index}.db", prefix, held_ids, cache_conn,
             retention=_retention(effective, prefix, owed, legacy=legacy,
-                                 reference=reference))
+                                 reference=reference))[0]
     with_gap = _owned_by_id(events_b)
     without_gap = _owned_by_id(events_a)
 

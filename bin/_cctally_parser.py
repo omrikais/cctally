@@ -3428,8 +3428,8 @@ def _build_doctor_parser(subparsers, name, *, help_text, xref=None):
                     actionable remediation guidance for non-OK rows.
 
                     Exit code: 0 unless any check is FAIL (then exit 2). WARN
-                    rows do not change the exit code — doctor is a read-only
-                    diagnostic and warn-class findings are advisories.
+                    rows do not change the exit code — doctor never changes
+                    your data and warn-class findings are advisories.
 
                     See docs/commands/doctor.md for the full check inventory
                     and JSON schema reference.

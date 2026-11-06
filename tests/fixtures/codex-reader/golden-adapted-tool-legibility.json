@@ -1,8 +1,8 @@
 {
   "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
   "title": "Exercise the synthetic tool-legibility shapes",
-  "project_label": "—",
-  "git_branch": null,
+  "project_label": "project-red",
+  "git_branch": "fixture-branch",
   "started_utc": "2026-08-02T09:00:02Z",
   "last_activity_utc": "2026-08-02T09:04:02Z",
   "cost_usd": 0.0039,
@@ -970,6 +970,7 @@
     },
     "unattributed_cost_usd": 0,
     "parent": null,
-    "children": []
+    "children": [],
+    "git_branch_status": "recorded"
   }
 }

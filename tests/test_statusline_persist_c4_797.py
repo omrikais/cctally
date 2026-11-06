@@ -124,8 +124,8 @@ def test_persistence_leg_opens_no_journal_or_database(app, tmp_path, monkeypatch
         sl._statusline_persist(_parsed(app, transcript, percent=20, session=name,
                                        now=int(clock.value)), sync_for_test=True)
     forks = []
-    monkeypatch.setattr(sl, "_fork_persist", lambda fd, reservation: (
-        forks.append(fd), sl._release_reservation(reservation)))
+    monkeypatch.setattr(sl, "_dispatch_render_worker", lambda reservation: (
+        forks.append(reservation), sl._release_reservation(reservation)))
     forbidden = []
 
     def refuse(label):
@@ -185,7 +185,7 @@ def test_persistence_leg_median_t10(app, tmp_path, monkeypatch):
     sl = sys.modules["_cctally_statusline"]
     pa = sys.modules["_lib_provider_activity"]
     clock = _Clock(monkeypatch)
-    monkeypatch.setattr(sl, "_fork_persist", lambda fd, reservation: sl._release_reservation(
+    monkeypatch.setattr(sl, "_dispatch_render_worker", lambda reservation: sl._release_reservation(
         reservation))
     real_capture = pa.capture_activity
     constant = real_capture(None, cache_path=tmp_path / "unused.json")
@@ -265,7 +265,7 @@ def test_v2_coordination_state_joins_legacy_inventory(app, tmp_path, monkeypatch
     import _cctally_core as core
     import _cctally_journal as journal
     sl = sys.modules["_cctally_statusline"]
-    monkeypatch.setattr(sl, "_fork_persist", lambda fd, reservation:
+    monkeypatch.setattr(sl, "_dispatch_render_worker", lambda reservation:
                         sl._release_reservation(reservation))
     assert core.STATUSLINE_ACCOUNT_BOUND_DIR.name == "statusline-account-bound-v3"
     assert core.STATUSLINE_ACCOUNT_BOUND_V2_DIR.name == (

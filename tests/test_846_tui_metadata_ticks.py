@@ -63,6 +63,7 @@ class _TickHarness:
         # ever consulted — which would make every assertion below pass for a
         # reason that has nothing to do with the carrier.
         self.bundle = self.tui._tui_build_source_bundle(
+            claude_input_identity=self.tui._tui_read_claude_input_identity(self.stats),
             stats_conn=self.stats,
             now_utc=now_utc,
             display_tz_name="UTC",
@@ -481,6 +482,7 @@ def test_846_the_idle_gate_clears_the_armed_key_it_refuses_on(
         tui._tui_empty_snapshot(NOW), source_bundle=bundle)
     idle = tui._tui_build_idle_snapshot(
         prior,
+        claude_input_identity=tui._tui_read_claude_input_identity(ticks.stats),
         now_utc=NOW,
         precompute_envelope=False,
         runtime_bind=None,
@@ -534,6 +536,7 @@ def test_846_a9_the_idle_snapshot_rebuilds_the_transient_generation(
         )
         idle = tui._tui_build_idle_snapshot(
             prior,
+            claude_input_identity=tui._tui_read_claude_input_identity(harness.stats),
             now_utc=NOW,
             precompute_envelope=False,
             runtime_bind=None,

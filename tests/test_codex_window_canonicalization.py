@@ -1035,6 +1035,10 @@ def test_the_rebuild_rematerialization_never_journals_a_terminal_event(stats_ns)
 # BEHAVIOURAL evidence — which is the part a diff cannot give — is below: the
 # canonicalization lands through an ordinary reconcile, so nothing about it
 # needs a rebuild to take effect.
+#
+# The epoch value itself is pinned once, in tests/test_stats_index_epoch_pin.py,
+# whose bump checklist sends a bump that changes `quota_window_blocks` grouping
+# back to this analysis.
 # --------------------------------------------------------------------------
 
 def test_the_projection_body_converges_a_jittered_window_without_a_rebuild(
@@ -1073,36 +1077,6 @@ def test_the_projection_body_converges_a_jittered_window_without_a_rebuild(
     finally:
         conn.close()
         cache.close()
-
-
-def test_the_stats_index_epoch_tripwire(stats_ns):
-    """Guard-rail, deliberately labelled as one: it pins the DECISION, not a
-    behaviour. #416 Slice 2 changes no stats schema — the only schema change is
-    cache migration 032, and the cache registry is not frozen — so the epoch
-    must stay where it is. A future change that genuinely needs a bump will turn
-    this red and force the author to re-read Task 10 Step 6 first.
-
-    Public #5 IS such a change and deliberately turned it red: the incremental
-    projector adds the reverse map + composable group digest to
-    `quota_window_blocks` and the `quota_projection_ledger_state` row, which is
-    a stats SCHEMA change against a frozen registry. 1004 -> 1005 -> 1007.
-    #496 S3 was the next such change: `stats_publication_stamp` carries the
-    publication identity the in-place protocol resolves a pending marker
-    against, so 1007 -> 1008. #496 S5b is the current one: durable selector
-    state adds three `journal_selector_*` tables plus the reserved
-    `stats_quota_projection_state`, so 1008 -> 1009. #538 advances to 1010 for
-    the rollback-journal transition without another schema change, and #661 S2
-    advances to 1011 for the `meter_rate_change_events` table. #750 S2
-    advances to 1012 for that table's four rate-change disclosure columns, and
-    #750 S3 advances to 1013 for reset-event origin identity plus the
-    transactional debounce state. #769 S2 advances to 1014 for the
-    source-local five-hour credit confirmation state, and #769 S11 advances to
-    1015 for `weekly_usage_snapshots.weekly_observation_held`, and #869 advances
-    to 1016 for `five_hour_blocks.pricing_provenance_json`, and #901 advances
-    to 1017 for read indexes, #825/#832 to 1018 for the account-bound
-    journal fence, and #797/#823/#840 to 1019 for its revision 2, and #1019/#1014 to 1020 for its revision 3, then #943 to 1021, then #1015 to 1022, then #948 to 1023."""
-    import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1023
 
 
 # --------------------------------------------------------------------------

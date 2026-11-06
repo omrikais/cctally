@@ -492,3 +492,96 @@ def test_apply_error_output_unchanged_by_release(
     _inv, _status, text_out, text_err = runs["on", False]
     assert text_out == ""
     assert text_err
+
+
+# --- #1004 T6: the coordinate-backed records themselves ----------------------
+
+
+def _install_retained_probe(monkeypatch, registry):
+    """Track every preview's real `records` sequence, its coordinates and
+    its `record_ends` view (weakly, unreplaced), and every journal line
+    reader the planner opens, so the probe sees the #1004 containers and
+    file handles rather than copies of them."""
+    import _cctally_journal as runtime
+    import _cctally_rederive as rederive
+
+    real_preview = rederive._preview_from_snapshot
+    real_rebuild = runtime.rebuild_stats_index
+    real_reader = rederive._RederiveLineReader
+    readers: list = []
+
+    class TrackedReader(real_reader):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            readers.append(weakref.ref(self))
+
+    def wrapped_preview(*args, **kwargs):
+        built = real_preview(*args, **kwargs)
+        number = registry.previews
+        registry.previews += 1
+        for label, obj in (("records", built.records),
+                           ("record_ends", built.record_ends),
+                           ("coordinates",
+                            getattr(built.records, "coordinates", None))):
+            try:
+                registry.track(f"preview{number}.{label}", obj)
+            except TypeError:  # an empty tuple: nothing to retain
+                pass
+        return built
+
+    def probe_rebuild(**kwargs):
+        gc.collect()
+        live = registry.live()
+        open_handles = [
+            ref() for ref in readers
+            if ref() is not None and ref()._fh is not None]
+        registry.observations.append((_site(kwargs), live))
+        registry.open_handles = open_handles
+        return real_rebuild(**kwargs)
+
+    monkeypatch.setattr(rederive, "_RederiveLineReader", TrackedReader)
+    monkeypatch.setattr(rederive, "_preview_from_snapshot", wrapped_preview)
+    monkeypatch.setattr(runtime, "rebuild_stats_index", probe_rebuild)
+    return readers
+
+
+@pytest.mark.parametrize("scenario, release", [
+    ("correction", "on"),
+    ("recovery", "on"),
+    ("reviewed-fresh-correction", "on"),
+    ("reviewed-retry-correction", "on"),
+    ("correction", "disabled"),
+])
+def test_apply_releases_retained_records_before_rebuild(
+    scenario, release, tmp_path, monkeypatch,
+):
+    """#1004 T6 (#997 T18 on the real containers): at entry to the rebuild,
+    no preview's `RetainedRecords`, its `LineCoordinates` or its
+    `record_ends` view is reachable, and no journal line reader the planner
+    opened still holds a segment handle. A retained sequence would pin its
+    coordinates and digests, and a leaked handle would keep a rotated
+    segment's file open through the whole rebuild. The control (release
+    disabled) must fail at the reachability assertion."""
+    _mod, inv = _setup(scenario, tmp_path, monkeypatch)
+    import _cctally_rederive as rederive
+    import _lib_retained_records as RR
+
+    registry = _Registry()
+    readers = _install_retained_probe(monkeypatch, registry)
+    if release == "disabled":
+        _disable_release(monkeypatch)
+    result = rederive.apply_db_rederive(
+        FAMILY, reviewed_op=inv["op"], expected_plan_hashes=inv["hashes"],
+    )
+    assert result.status == inv["status"]
+    assert any(label.endswith(".coordinates")
+               for label, _ref in registry.refs), (
+        "non-vacuity: a preview carried coordinate-backed records")
+    assert readers, "non-vacuity: the planner re-read journal lines"
+    if release == "disabled":
+        with pytest.raises(AssertionError, match="still reachable"):
+            _assert_released(registry, inv["site"])
+        return
+    _assert_released(registry, inv["site"])
+    assert registry.open_handles == []
+    assert not isinstance(result.preview.records, RR.RetainedRecords)

@@ -1020,6 +1020,9 @@ def test_a_contended_drain_does_not_report_success(root, monkeypatch):
     monkeypatch.setattr(
         cc, "sync_codex_cache",
         lambda conn, **kwargs: cc.CodexIngestStats(lock_contended=True))
+    # #982: the replay runs through the heal executor, which waits for held
+    # store locks as long as this bound (the worker's lock wait) allows.
+    monkeypatch.setattr(cc, "CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS", 0.0)
 
     assert cc.cmd_codex_replay_drain_internal(None) == 0
 

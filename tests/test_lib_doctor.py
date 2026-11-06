@@ -176,6 +176,9 @@ def test_doctor_state_has_required_fields():
         # "unavailable (cause)" instead of a zero or a stale summary.
         "journal_scan_error",
         "journal_listing_error",
+        # #1018: the newest admitted reading and the freshness leg's
+        # unavailable cause (data.latest_snapshot_age).
+        "latest_reading_at", "freshness_unavailable_reason",
     }
     assert fields == expected, fields ^ expected
 
@@ -1038,6 +1041,90 @@ def test_data_latest_snapshot_fail_stale():
 def test_data_latest_snapshot_fail_never():
     r = L._check_data_latest_snapshot_age(_state(latest_snapshot_at=None))
     assert r.severity == "fail"
+
+
+# #1018 spec 5.4: the five-row table over two sources and an unavailable
+# cause. `_ts(n)` is n seconds before the `_state()` now.
+
+_MAINTENANCE = ("unavailable (stats.db maintenance in progress)",
+                "Retry after the stats.db maintenance finishes.")
+_UNREADABLE = ("unavailable (stats.db could not be read)",
+               "See the stats.db check.")
+_SILENT = "No snapshot in >1h. Hooks may be broken — check `cctally setup --status`."
+_RECENT = "Recent but not current. Check Claude Code session is active."
+_NEVER = "Check hooks are installed and Claude Code is running"
+
+
+@pytest.mark.parametrize("snapshot, reading, reason, expected", [
+    # Row 1: fresh evidence decides, from either source, even when the other
+    # source failed (fresh snapshot, failed reading source).
+    (7200, 60, None, ("ok", "60s ago", None, 60)),
+    (120, None, "stats_unreadable", ("ok", "120s ago", None, 120)),
+    (300, 4000, None, ("ok", "300s ago", None, 300)),
+    # Row 2: a cause with no fresh evidence is unavailable, not silence; the
+    # stale snapshot keeps its own age but the effective values are null.
+    (7200, None, "stats_unreadable", ("warn", *_UNREADABLE, None)),
+    (None, None, "stats_maintenance", ("warn", *_MAINTENANCE, None)),
+    (1800, None, "stats_maintenance", ("warn", *_MAINTENANCE, None)),
+    # Row 3.
+    (301, None, None, ("warn", "301s ago", _RECENT, 301)),
+    (7200, 3600, None, ("warn", "3600s ago", _RECENT, 3600)),
+    # Row 4.
+    (3601, None, None, ("fail", "3601s ago", _SILENT, 3601)),
+    (None, 7200, None, ("fail", "7200s ago", _SILENT, 7200)),
+    # Row 5.
+    (None, None, None, ("fail", "never", _NEVER, None)),
+])
+def test_data_latest_snapshot_decision_table(snapshot, reading, reason, expected):
+    """T8 (failure: #1018's false FAIL under flat usage, a false OK, or an
+    unreadable store reported as `never`)."""
+    state = _state(
+        latest_snapshot_at=None if snapshot is None else _ts(snapshot),
+        latest_reading_at=None if reading is None else _ts(reading),
+        freshness_unavailable_reason=reason,
+    )
+    r = L._check_data_latest_snapshot_age(state)
+    severity, summary, remediation, effective_age = expected
+    assert (r.severity, r.summary, r.remediation) == (
+        severity, summary, remediation)
+    assert r.id == "data.latest_snapshot_age"
+    assert r.title == "Latest snapshot"
+    assert r.details["effective_freshness_age_s"] == effective_age
+    assert r.details["effective_freshness_at"] == (
+        None if effective_age is None else _ts(effective_age).isoformat())
+    assert r.details["freshness_unavailable_reason"] == reason
+    assert r.details["latest_reading_age_s"] == reading
+    if snapshot is None:
+        assert "latest_snapshot_age_s" not in r.details
+        assert r.details["latest_snapshot_at"] is None
+    else:
+        assert r.details["latest_snapshot_age_s"] == snapshot
+        assert r.details["latest_snapshot_at"] == _ts(snapshot).isoformat()
+
+
+def test_data_latest_snapshot_future_only_evidence_is_never():
+    """T8: an instant after now is not evidence (no negative age)."""
+    future = _ts(-600)
+    r = L._check_data_latest_snapshot_age(_state(
+        latest_snapshot_at=None, latest_reading_at=future))
+    assert (r.severity, r.summary) == ("fail", "never")
+    assert r.details["latest_reading_at"] == future.isoformat()
+    assert r.details["latest_reading_age_s"] is None
+    assert r.details["effective_freshness_at"] is None
+
+
+def test_data_latest_snapshot_details_keys_and_null_forms():
+    """T8: the five new keys are always present, null when absent; the
+    legacy age key appears only with a snapshot."""
+    r = L._check_data_latest_snapshot_age(_state(latest_snapshot_at=None))
+    assert r.details == {
+        "latest_snapshot_at": None,
+        "latest_reading_at": None,
+        "latest_reading_age_s": None,
+        "effective_freshness_at": None,
+        "effective_freshness_age_s": None,
+        "freshness_unavailable_reason": None,
+    }
 
 
 def test_data_cache_sync_state_ok():

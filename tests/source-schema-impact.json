@@ -1,9 +1,12 @@
 {
   "schemaVersion": 1,
-  "sourceSchemaVersion": 12,
+  "sourceSchemaVersion": 13,
   "consumers": {
     "browserConsumers": [
+      "dashboard/web/src/components/HeroStrip.tsx",
       "dashboard/web/src/components/RecentAlertsSource.test.tsx",
+      "dashboard/web/src/lib/dashboardPresentation.ts",
+      "dashboard/web/src/lib/heroFreshness.ts",
       "dashboard/web/src/modals/CacheReportModal.test.tsx",
       "dashboard/web/src/panels/CacheReportPanel.test.tsx",
       "dashboard/web/src/panels/MonthlyPanel.test.tsx",
@@ -46,6 +49,7 @@
     ],
     "producers": [
       "bin/_cctally_dashboard_envelope.py",
+      "bin/_cctally_tui.py",
       "bin/_lib_dashboard_sources.py"
     ],
     "retainedAndDerivedFields": [
@@ -54,7 +58,8 @@
     ],
     "serverReaders": [
       "bin/_cctally_dashboard.py",
-      "bin/_cctally_dashboard_envelope.py"
+      "bin/_cctally_dashboard_envelope.py",
+      "bin/_cctally_dashboard_share.py"
     ]
   }
 }

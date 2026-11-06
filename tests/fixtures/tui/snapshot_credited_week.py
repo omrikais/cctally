@@ -72,6 +72,9 @@ assert m._cctally_core.APP_DIR == _SHARE, m._cctally_core.APP_DIR
 
 sys.path.insert(0, str(_REPO / "bin"))
 import _fixture_builders  # noqa: E402
+import _lib_oauth_samples  # noqa: E402
+
+_CONFIRMATION_PREFIX = "fixture-credited-week-"
 
 
 def _iso(value: dt.datetime) -> str:
@@ -86,12 +89,31 @@ def _seed_stats() -> None:
                 "INSERT INTO weekly_usage_snapshots "
                 "(captured_at_utc, week_start_date, week_end_date, "
                 " week_start_at, week_end_at, weekly_percent, source, "
-                " payload_json, account_key) VALUES (?,?,?,?,?,?,?,?,?)",
+                " payload_json, account_key, journal_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (_iso(_WEEK_START + dt.timedelta(hours=hours_in)),
                  _WEEK_START.date().isoformat(), _WEEK_END.date().isoformat(),
                  _iso(_WEEK_START), _iso(_WEEK_END), percent, "statusline",
-                 "{}", _ACCOUNT),
+                 "{}", _ACCOUNT, f"sa:{_CONFIRMATION_PREFIX}{hours_in}"),
             )
+        # #1018 twin: the Current Week chip ages from the newest genuine
+        # reading confirming the displayed value, found through the displayed
+        # row's originating observation. The displayed row is the newest
+        # reading (+92h), so it gets the one eligible index row, in the
+        # provider window the in-place credit leaves unchanged.
+        displayed_hours, displayed_percent = _LADDER[-1]
+        conn.execute(
+            "INSERT INTO claude_weekly_observation_index "
+            "(observation_id, account_key, captured_at_utc, weekly_percent, "
+            " weekly_resets_at_utc, weekly_reading_genuine, "
+            " weekly_freshness_eligible) VALUES (?, ?, ?, ?, ?, 1, 1)",
+            (f"{_CONFIRMATION_PREFIX}{displayed_hours}", _ACCOUNT,
+             _lib_oauth_samples.canonical_instant(
+                 _WEEK_START + dt.timedelta(hours=displayed_hours)),
+             displayed_percent,
+             _lib_oauth_samples.normalize_weekly_reset(
+                 int(_WEEK_END.timestamp()))),
+        )
         # Exactly one credit. `old_week_end_at` equals `effective_reset_at_utc`,
         # which is what marks an IN-PLACE credit rather than a re-anchoring
         # reset, and `new_week_end_at` is the week's own unchanged boundary.

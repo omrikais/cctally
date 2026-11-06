@@ -35,6 +35,7 @@ import argparse
 import datetime as dt
 import json
 import math
+import re
 import sqlite3
 import sys
 from collections.abc import Sequence
@@ -169,7 +170,41 @@ ORACLE_MIN_DISTINCT_S3_SUBJECTS = 1
 # an unknown capacity, which is the state `unknown_context_window` describes.
 ORACLE_CONTEXT_WINDOWS = {
     OPUS: 200_000, SONNET: 200_000, HAIKU: 200_000,
+    "claude-opus-5-5": 1_000_000,
 }
+
+# #1022, restated: the prior-generation ids whose bare transcript id may have
+# run in a 200K or a 1M window. A two-window id is tested BEFORE the map above,
+# so `SONNET` (`claude-sonnet-4` once its date is stripped) is two-window here
+# whatever that map says. Above the small window a request proves the large one
+# for itself; at or below it, a request the small window would qualify and the
+# large one would not is undecidable.
+ORACLE_TWO_WINDOW_MODEL_IDS = frozenset({
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+    "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
+    "claude-sonnet-4",
+})
+ORACLE_TWO_WINDOW_SMALL = 200_000
+ORACLE_TWO_WINDOW_LARGE = 1_000_000
+
+
+def _oracle_context_request(model: str, used: int) -> tuple[str, float | None]:
+    """`("decided", fraction)`, `("undecidable", None)` or `("unknown", None)`
+    for one request, restated arithmetically."""
+    lowered = model.lower()
+    normalized = re.sub(r"-\d{8}$", "", lowered)
+    if (lowered.endswith("[1m]")
+            or normalized not in ORACLE_TWO_WINDOW_MODEL_IDS):
+        capacity = ORACLE_CONTEXT_WINDOWS.get(model)
+        if not capacity:
+            return ("unknown", None)
+        return ("decided", used / capacity)
+    if used > ORACLE_TWO_WINDOW_SMALL:
+        return ("decided", used / ORACLE_TWO_WINDOW_LARGE)
+    small = used / ORACLE_TWO_WINDOW_SMALL
+    if small >= ORACLE_MIN_WINDOW_FRACTION:
+        return ("undecidable", None)
+    return ("decided", small)
 
 # Restated, exactly like the floor and the support minima above: a conversation
 # presenting more human-candidate rows than this cannot be decided, because
@@ -226,6 +261,20 @@ def _s3_class_oracle(contributor_class: str, *, not_applicable: bool,
         # statement, so an unreadable accounting store does not overturn it.
         return {**base, "verdict": "not_applicable", "code": None}
     return {**base, "verdict": "withheld", "code": code}
+
+
+def _with_context_fields(shape: dict, *, gap_codes: Sequence[str],
+                         evaluability: float | None = None,
+                         fraction: float | None = None) -> dict:
+    """The Claude short-context class's three further compared fields (#1022).
+
+    `gapCodes` and `evaluabilityCoverage` describe the population and
+    `maxContextWindowFraction` the published maximum, which is what a fraction
+    above 1.0 or an undecided request guessed at would move.
+    """
+    return {**shape, "gapCodes": list(gap_codes),
+            "evaluabilityCoverage": evaluability,
+            "maxContextWindowFraction": fraction}
 
 BASELINE_START = WINDOW_START - (WINDOW_END - WINDOW_START)
 
@@ -810,6 +859,17 @@ class Seed:
 
     def _s3_oracle(self, contributor_class: str, source: str,
                    provider_cause: str | None) -> dict:
+        result = self._s3_oracle_shape(contributor_class, source,
+                                       provider_cause)
+        if (contributor_class == "short_high_context" and source == "claude"
+                and "gapCodes" not in result):
+            # #1022: a class withheld before it measured anything publishes
+            # its cause as its only gap code, no evaluability and no fraction.
+            result = _with_context_fields(result, gap_codes=[result["code"]])
+        return result
+
+    def _s3_oracle_shape(self, contributor_class: str, source: str,
+                         provider_cause: str | None) -> dict:
         if contributor_class == "cache_churn" and source == "codex":
             # Capability, not availability: Codex retains a cached-input ratio
             # and no loss predicate, so an unreadable store cannot overturn it.
@@ -1011,7 +1071,10 @@ class Seed:
                                     not_applicable=False,
                                     code=ORACLE_S3_UNEVALUATED_CODE)
         qualifying_sessions: list[str] = []
-        unevaluable: set[str] = set()
+        # Session → the gap code that made it unevaluable, so the published
+        # `gapCodes` is restated rather than read back.
+        unevaluable: dict[str, str] = {}
+        fractions: dict[str, float] = {}
         for session in sessions:
             rows = self._session_rows(session)
             humans = [row for row in rows
@@ -1035,13 +1098,17 @@ class Seed:
             if len(truncated_humans) > ORACLE_MAX_HUMAN_TURNS:
                 continue                    # decided: the conversation is long
             if len(candidate_rows) > budget:
-                unevaluable.add(session)
+                unevaluable[session] = "scan_budget_exhausted"
                 continue
             if not humans or len(humans) > ORACLE_MAX_HUMAN_TURNS:
                 continue
             first_human = humans[0]["at"]
+            # `best` folds DECIDED fractions only; an undecidable request
+            # (#1022) never enters it, so it can neither qualify a
+            # conversation nor inflate the published maximum.
             best = None
             saw_request = False
+            undecidable = False
             for row in rows:
                 if row["kind"] != "assistant" or row["subagent"]:
                     continue
@@ -1053,18 +1120,25 @@ class Seed:
                 if priced is None:
                     continue
                 saw_request = True
-                capacity = ORACLE_CONTEXT_WINDOWS.get(row["model"])
-                if not capacity:
-                    continue
                 used = (priced["input_tokens"] + priced["cache_read"]
                         + priced["cache_create"])
-                fraction = used / capacity
+                state, fraction = _oracle_context_request(row["model"], used)
+                if state == "undecidable":
+                    undecidable = True
+                    continue
+                if fraction is None:
+                    continue                    # unknown capacity
                 best = fraction if best is None else max(best, fraction)
-            if saw_request and best is None:
-                unevaluable.add(session)
-                continue
+            # Qualification FIRST: a decided request at the floor qualifies
+            # the conversation under either window of its undecidable
+            # siblings.
             if best is not None and best >= ORACLE_MIN_WINDOW_FRACTION:
                 qualifying_sessions.append(session)
+                fractions[session] = best
+                continue
+            if undecidable or (saw_request and best is None):
+                unevaluable[session] = "unknown_context_window"
+                continue
         known = set(sessions)
         candidates = [entry for entry in self.in_window()
                       if entry["session"] in known]
@@ -1072,8 +1146,21 @@ class Seed:
                      if entry["session"] not in unevaluable]
         qualifying = [entry for entry in evaluated
                       if entry["session"] in set(qualifying_sessions)]
-        return self._s3_verdict("short_high_context", candidates=candidates,
-                                evaluated=evaluated, qualifying=qualifying)
+        verdict = self._s3_verdict("short_high_context",
+                                   candidates=candidates,
+                                   evaluated=evaluated, qualifying=qualifying)
+        codes = sorted(set(unevaluable.values()))
+        if candidates and not evaluated:
+            # Nothing could be decided: the cause first, then why.
+            return _with_context_fields(
+                verdict, gap_codes=[ORACLE_S3_UNEVALUATED_CODE] + codes)
+        published = (max(fractions.values())
+                     if verdict["verdict"] == "contributor" else None)
+        return _with_context_fields(
+            verdict, gap_codes=codes,
+            evaluability=(len(evaluated) / len(candidates)
+                          if candidates else None),
+            fraction=published)
 
     def _oracle_subagent_fanout(self) -> dict:
         if self.source == "codex":
@@ -2437,6 +2524,71 @@ def _s3_thin_usd_coverage() -> Seed:
     return seed
 
 
+def _large_request(total: int) -> dict:
+    """A request carrying `total` input-side tokens.
+
+    The creation leg stays at 10,000 so it always covers the builder's default
+    1-hour quantity: a smaller creation would store a negative 5-minute
+    remainder in the usage dict, which pricing would silently clamp.
+    """
+    return {"input_tokens": 10_000, "cache_create": 10_000,
+            "cache_read": total - 20_000, "output_tokens": 500}
+
+
+# 2,000 input-side tokens: decided and not qualifying under any window.
+SMALL_REQUEST = {"input_tokens": 1_000, "cache_create": 200,
+                 "cache_read": 800, "output_tokens": 500}
+
+
+def _prior_generation_context_window(*, targets: bool = True) -> Seed:
+    """#1022: prior-generation requests measured against their PROVABLE window.
+
+    The five target conversations are bare prior-generation ids that ran in
+    either a 200K or a 1M window. A request above 200,000 input-side tokens
+    proves 1M for itself; one at or below 200K that 200K would qualify and 1M
+    would not is undecided and leaves the evaluated population; it never
+    qualifies on a guess, never blocks a sibling that qualifies on its own,
+    and never inflates the published maximum.
+
+    The background is identical on every tree: one Opus 4 conversation at
+    0.82 of its single 200K window (qualifying) and ten Opus 5.5 conversations
+    of two small requests each (decided, not qualifying), so the class
+    measures on both sides. `targets=False` seeds the background alone, the
+    reference store for browser acceptance.
+    """
+    seed = Seed()
+    conversations: list[tuple[str, list[dict]]] = []
+    if targets:
+        conversations += [
+            ("claude-opus-4-8", [_large_request(300_000)]),
+            ("claude-opus-5", [_large_request(850_000)]),
+            ("claude-opus-4-7", [_large_request(180_000)]),
+            ("claude-opus-4-8", [_large_request(180_000),
+                                 _large_request(300_000)]),
+            ("claude-opus-5", [_large_request(850_000),
+                               _large_request(199_000)]),
+        ]
+    conversations.append((OPUS, [_large_request(164_000)]))
+    conversations += [("claude-opus-5-5", [SMALL_REQUEST, SMALL_REQUEST])
+                      for _ in range(10)]
+    for index, (model, requests) in enumerate(conversations):
+        session = f"sess-prior-{index}"
+        project = f"/repo/g{index % 3}"
+        # Three hours apart, so all sixteen conversations sit inside the ten
+        # back-to-back 5-hour blocks seeded below.
+        start = WINDOW_START + dt.timedelta(hours=3 * index)
+        for turn in range(2):
+            seed.add_claude_prompt(session=session,
+                                   at=start + dt.timedelta(minutes=turn),
+                                   project=project)
+        for turn, request in enumerate(requests):
+            seed.add_claude_turn(session=session,
+                                 at=start + dt.timedelta(minutes=10 + turn),
+                                 model=model, project=project, **request)
+    _blocks_for(seed, 10)
+    return seed
+
+
 SCENARIOS = {
     "model-dominant": (_model_dominant, "claude"),
     "project-dominant": (_project_dominant, "claude"),
@@ -2492,6 +2644,8 @@ SCENARIOS = {
     "control-s3-codex-zero-match": (_control_s3_codex_zero_match, "codex"),
     "codex-mixed-transcript-coverage": (
         _codex_mixed_transcript_coverage, "codex"),
+    "prior-generation-context-window": (
+        _prior_generation_context_window, "claude"),
 }
 
 

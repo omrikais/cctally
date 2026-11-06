@@ -1106,6 +1106,9 @@ cmd_stats_epoch_rebuild_internal = (
 cmd_stats_corruption_heal_internal = (
     _cctally_store.cmd_stats_corruption_heal_internal
 )
+# #932: the dashboard publisher classifies a maintenance-busy open under a
+# running detached recovery through this one store-side predicate.
+active_stats_recovery_deferral = _cctally_store.active_stats_recovery_deferral
 # #496 S6: the retained-artifact reclamation worker and `cctally db prune`
 # share one sweep implementation, so both resolve through the same sibling.
 _cctally_retention = _load_sibling("_cctally_retention")
@@ -1651,7 +1654,7 @@ _build_statusline_injections = _cctally_statusline._build_statusline_injections
 # resolve them.
 _statusline_persist = _cctally_statusline._statusline_persist
 _statusline_oauth_tick = _cctally_statusline._statusline_oauth_tick
-_fork_persist = _cctally_statusline._fork_persist
+_dispatch_render_worker = _cctally_statusline._dispatch_render_worker
 _record_args = _cctally_statusline._record_args
 _try_acquire_persist_lock = _cctally_statusline._try_acquire_persist_lock
 _release_persist_lock = _cctally_statusline._release_persist_lock

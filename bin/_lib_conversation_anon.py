@@ -120,11 +120,15 @@ def _dash_encode(path: str) -> str:
 def build_anon_plan(*, project_roots, home_dirs, usernames) -> AnonPlan:
     """Build an :class:`AnonPlan` from injected identity sources.
 
-    ``project_roots`` maps root path -> label. Numbering is deterministic,
-    lexical by root path (``project-1..N``), so CLI and HTTP builds from the same
-    DB produce identical plans (byte-parity depends on this). Duplicate basenames
-    map the bare label to the LOWEST-numbered of their ``project-N`` targets
-    (``setdefault`` over the sorted roots).
+    ``project_roots`` maps root path -> label, or -> a collection of labels
+    (#972 O6: a relabeled Codex root keeps both its repository label and its
+    folder name). Numbering is deterministic, lexical by root path
+    (``project-1..N``), so CLI and HTTP builds from the same DB produce
+    identical plans (byte-parity depends on this). Every label of a root
+    targets that root's ``project-N``; a bare label several roots carry maps to
+    the LOWEST-numbered of their targets (``setdefault`` over the sorted
+    roots), so an added label can move a colliding word to a lower-numbered
+    root. String-only inputs build exactly the plan they always built.
     """
     tokens: dict = {}          # (text, bounded) -> replacement
     label_target: dict = {}    # label -> project-N (lowest-N wins)
@@ -134,9 +138,12 @@ def build_anon_plan(*, project_roots, home_dirs, usernames) -> AnonPlan:
         rep = f"project-{n}"
         tokens[(root, False)] = rep
         tokens[(_dash_encode(root), False)] = f"-{rep}"
-        label = project_roots[root]
-        if label:
-            label_target.setdefault(label, rep)   # lowest-N claims the label
+        labels = project_roots[root]
+        if labels is None or isinstance(labels, str):
+            labels = (labels,)
+        # A None or empty label (alone or inside a collection) names nothing.
+        for label in sorted({label for label in labels if label}):
+            label_target.setdefault(label, rep)   # lowest-N claims it
     for label, rep in label_target.items():
         tokens[(label, True)] = rep
     for h in home_dirs:

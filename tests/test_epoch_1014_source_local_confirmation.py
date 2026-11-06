@@ -26,14 +26,13 @@ from conftest import load_script, redirect_paths
 
 FIXED = dt.datetime(2026, 9, 6, 12, 0, 0, tzinfo=dt.timezone.utc)
 PREVIOUS_EPOCH = 1013
-#: The CURRENT head, not the 1014 this module is named for. The assertions
-#: using it mean "the epoch a store ends up at": the head constant itself, and
-#: the epoch an upgraded 1013 store reaches, which is always the head rather
-#: than the intermediate epoch that first added this table. #769 S11 moved the
-#: head to 1015, then #869 moved it to 1016, then #901 moved it to 1017, then #825/#832 to 1018, then #797/#823/#840 to 1019, then #1019/#1014 to 1020, then #943 to 1021.
+#: The CURRENT head, not the 1014 this module is named for: the epoch an
+#: upgraded 1013 store reaches is always the head rather than the intermediate
+#: epoch that first added this table. It arrived at epoch 1014; the later
+#: history is the comment above `STATS_INDEX_EPOCH` in `bin/_cctally_core.py`.
 #: Everything else here — what epoch 1014 ADDED, and the prose recording it —
 #: is historical fact and stays.
-NEW_EPOCH = 1023
+NEW_EPOCH = _cctally_core.STATS_INDEX_EPOCH
 STATE_TABLE = "five_hour_credit_confirmation_state"
 STATE_COLUMNS = {
     "account_key", "five_hour_window_key", "source", "baseline_pct",
@@ -86,7 +85,7 @@ def _resolve_epoch_transition():
 
 
 def test_the_epoch_is_bumped_and_the_legacy_registry_is_untouched():
-    assert _cctally_core.STATS_INDEX_EPOCH == NEW_EPOCH
+    assert _cctally_core.STATS_INDEX_EPOCH >= 1014
     assert _cctally_core.LEGACY_STATS_HEAD == 13
     import _cctally_db
     assert len(_cctally_db._STATS_MIGRATIONS) == 13, "the registry is FROZEN"

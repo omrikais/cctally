@@ -4416,6 +4416,14 @@ def test_neutral_detail_claude_semantic_envelope():
         # page over item_key: total counts every rendered item, not physical rows.
         assert d["page"]["total"] == 2 and d["page"]["returned"] == 2
         assert d["page"]["has_after"] is False and d["page"]["after"] is None
+        # #1037 twin: a Claude conversation opened from All-providers went
+        # through this envelope and showed `— · —` in the reader header,
+        # because the project label and branch the native detail carries were
+        # dropped here.
+        native = lcq.get_conversation(conn, _SID_A)
+        assert d["project_label"] == native["project_label"] == "proj"
+        assert d["git_branch"] == native["git_branch"] == "main"
+        assert "git_branch_status" not in d
     finally:
         conn.close()
 
@@ -5302,8 +5310,39 @@ def test_claude_neutral_search_hits_carry_section_3_7_fields():
         for h in env["hits"]:
             assert "last_activity_utc" in h and "project_label" in h
             assert h["last_activity_utc"] == "2026-06-01T00:00:05Z"
+        # #1036: the qualified (All-providers) Claude hit forwards the kernel's
+        # structured parts; dropping them would leave the All rail with only
+        # the legacy bracket string to render.
+        kernel = lcq.search_conversations(conn, "Claude", kind="all", limit=20)
+        assert [h["snippet_parts"] for h in env["hits"]] == \
+            [h["snippet_parts"] for h in kernel["hits"]]
+        assert any(p["match"] for h in env["hits"] for p in h["snippet_parts"])
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("kind, query", [
+    ("all", "Synthetic"), ("title", "Synthetic"), ("files", "synthetic")])
+def test_1036_codex_search_hits_carry_one_unmatched_part(
+        tmp_path, monkeypatch, kind, query):
+    """Detects a Codex search hit (message, title or file) without structured
+    parts, or with an invented highlight: Codex excerpts carry no FTS markers,
+    so each hit is one unmatched part equal to its snippet."""
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        env = disp.neutral_search(conn, query, source="codex", kind=kind)
+        assert env["hits"], kind
+        for h in env["hits"]:
+            assert h["snippet_parts"] == (
+                [{"text": h["snippet"], "match": False}] if h["snippet"] else [])
+    finally:
+        conn.close()
+    # Codex excerpts carry no FTS markers: the shared helper is the module's one
+    # source of plain parts (a private copy could drift from the Claude contract).
+    assert q.plain_snippet_parts("a [b] c") == [{"text": "a [b] c", "match": False}]
+    assert q.plain_snippet_parts("") == [] and q.plain_snippet_parts(None) == []
 
 
 # ── A7: external search-cursor codec (§4.3) ───────────────────────────────────
@@ -8771,6 +8810,40 @@ def test_850_a26_the_scoped_connection_excludes_the_same_keys(
         scoped.close()
 
 
+def test_1037_scoped_detail_withholds_the_branch_as_unreadable(
+    v850_store,
+):
+    """#1037 under an account filter. Account scoping empties the threads view so
+    another account's cwd/git metadata cannot leak (`scope_conversations_db_to_account`).
+    Detects two failures: reading the branch past that view through the raw
+    table, and presenting the withheld metadata as `not_recorded` (the O1
+    wording `no branch recorded`) instead of the uncertain `unreadable` (`—`).
+    The header's project label still equals the scoped rail's."""
+    ns, _cache, conversations = v850_store
+    unscoped = q.get_codex_conversation(
+        conversations, "v850-git", effective_speed="standard")
+    assert (unscoped["git_branch"], unscoped["git_branch_status"]) == (
+        None, "not_recorded"), "precondition: retained git metadata names no branch"
+    import _cctally_cache as _cc
+
+    scoped = ns["open_conversations_db"]()
+    try:
+        _cc.scope_conversations_db_to_account(scoped, _V850_ACCOUNT)
+        detail = q.get_codex_conversation(
+            scoped, "v850-git", effective_speed="standard")
+        assert detail["status"] == "ok"
+        assert (detail["git_branch"], detail["git_branch_status"]) == (
+            None, "unreadable")
+        rail = {
+            row["conversation_key"]: row
+            for row in q.list_codex_conversations(
+                scoped, effective_speed="standard")["rows"]
+        }
+        assert detail["project_label"] == rail["v850-git"]["project_label"]
+    finally:
+        scoped.close()
+
+
 def test_850_a25_the_detail_opens_and_the_live_path_equals_the_stored_path(
     v850_store,
 ):
@@ -9399,3 +9472,474 @@ def test_850_undecodable_key_set_still_answers_empty_without_the_table(
         assert q.undecodable_codex_conversation_keys(bare) == frozenset()
     finally:
         bare.close()
+
+
+# --- #972 T2/T4: rollups converge to the current thread metadata and filesystem
+
+
+def _rollup_env(tmp_path, monkeypatch):
+    from _codex_zstd_fixtures import conversation_records, write_rollout
+    from test_codex_bounded_ingest import _auth_json
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    provider = tmp_path / "codex"
+    day = provider / "sessions" / "2026" / "07" / "20"
+    day.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(provider))
+    (provider / "auth.json").write_text(_auth_json("acct-a", "a@example.com"))
+    rollout = day / ("rollout-2026-07-20T11-00-00-"
+                     "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001.jsonl")
+
+    def write(cwd):
+        write_rollout(rollout, conversation_records(
+            2, session_id="0199aaaa-bbbb-7ccc-8ddd-eeeeffff0a01", label="a",
+            cwd=str(cwd)))
+
+    return ns, rollout, write
+
+
+def _rollup_sync(ns):
+    cache = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](cache)
+    finally:
+        cache.close()
+
+
+def _rollup_pass(ns):
+    conn = ns["open_conversations_db"]()
+    try:
+        return ns["sync_codex_conversations"](conn)
+    finally:
+        conn.close()
+
+
+def _rollup_state(ns):
+    """(rollup project fields + revision, the store's render revision)."""
+    conn = ns["open_conversations_db"]()
+    try:
+        rollups = conn.execute(
+            "SELECT conversation_key, project_key, project_label, render_revision "
+            "FROM main.codex_conversation_rollups").fetchall()
+        meta = conn.execute("SELECT value FROM cache_meta "
+                            "WHERE key='conversation_render_revision'").fetchone()
+    finally:
+        conn.close()
+    assert len(rollups) == 1, rollups
+    return rollups[0], None if meta is None else int(meta[0])
+
+
+def _rollup_inputs(ns):
+    """Messages, events and accounting rows: what a relabel must not touch."""
+    conn = ns["open_conversations_db"]()
+    try:
+        return [conn.execute(sql).fetchall() for sql in (
+            "SELECT * FROM main.codex_conversation_messages ORDER BY id",
+            "SELECT * FROM main.codex_conversation_events ORDER BY id",
+            "SELECT * FROM cache_db.codex_session_entries "
+            "ORDER BY source_path, line_offset")]
+    finally:
+        conn.close()
+
+
+def test_rollup_relabels_when_thread_arrives_after_materialization(
+        tmp_path, monkeypatch):
+    """#972: a rollup materialized before its thread row existed stamped
+    `(unassigned)`, which every reader then preferred permanently."""
+    ns, rollout, write = _rollup_env(tmp_path, monkeypatch)
+    write("/tmp/proj-t2")
+    _rollup_pass(ns)                   # the conversation pass before accounting
+    (key, _pk, label, _rev), _ = _rollup_state(ns)
+    assert label == "(unassigned)"     # precondition: no thread row yet
+    _rollup_sync(ns)                   # the thread row arrives in cache.db
+    stats = _rollup_pass(ns)
+    assert stats.rollups_reattributed == 1
+    (key2, project_key, label, revision), meta = _rollup_state(ns)
+    assert key2 == key and label == "proj-t2" and project_key is not None
+    stats = _rollup_pass(ns)
+    assert stats.rollups_reattributed == 0
+    assert _rollup_state(ns) == ((key, project_key, label, revision), meta)
+
+
+def test_rollup_follows_removed_worktree_to_repository(tmp_path, monkeypatch):
+    """#972 + #976: a live worktree under a container holding a stray
+    non-repository `.git/` is removed between full passes; its conversation
+    moves to the repository that held it, never to `.worktrees`."""
+    import shutil
+    from _fixture_builders import make_git_repository_marker
+
+    main = tmp_path / "fs" / "main"
+    make_git_repository_marker(main)
+    stray = main / ".worktrees" / ".git" / "worktrees" / "wt"
+    stray.mkdir(parents=True)
+    (stray / "CCTALLY_COMMIT_MSG").write_text("msg\n")
+    worktree = main / ".worktrees" / "wt"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {main}/.git/worktrees/wt\n")
+    ns, rollout, write = _rollup_env(tmp_path, monkeypatch)
+    write(worktree)
+    _rollup_sync(ns)
+    _rollup_pass(ns)
+    (key, first_key, label, revision), meta = _rollup_state(ns)
+    assert label == "wt"
+    inputs = _rollup_inputs(ns)
+    shutil.rmtree(worktree)
+    stats = _rollup_pass(ns)
+    assert stats.rollups_reattributed == 1
+    (_k, project_key, label, new_revision), new_meta = _rollup_state(ns)
+    assert label == "main" and project_key != first_key
+    assert new_meta == meta + 1 and new_revision == new_meta > revision
+    assert _rollup_inputs(ns) == inputs
+    stats = _rollup_pass(ns)
+    assert stats.rollups_reattributed == 0
+    assert _rollup_state(ns) == ((key, project_key, "main", new_revision), new_meta)
+    assert _rollup_inputs(ns) == inputs
+
+
+def _rollup_rows(ns):
+    """Every rollup's (key, project_key, project_label, render_revision)."""
+    conn = ns["open_conversations_db"]()
+    try:
+        return conn.execute(
+            "SELECT conversation_key, project_key, project_label, render_revision "
+            "FROM main.codex_conversation_rollups ORDER BY conversation_key"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_rollup_keeps_its_label_while_cache_threads_are_absent(
+        tmp_path, monkeypatch):
+    """#972 §5.8 rules 1-2. A removed (or auto-healed) cache.db has no thread
+    rows until its re-ingest; a full conversation pass in that window must not
+    rewrite a correct stored label to `(unassigned)` (and back after the
+    re-sync), which would churn the render revision and show a wrong project."""
+    ns, rollout, write = _rollup_env(tmp_path, monkeypatch)
+    write("/tmp/proj-r")
+    _rollup_sync(ns)
+    _rollup_pass(ns)
+    settled = _rollup_state(ns)
+    assert settled[0][2] == "proj-r"
+    for path in sorted(pathlib.Path(str(core.CACHE_DB_PATH)).parent.glob(
+            pathlib.Path(str(core.CACHE_DB_PATH)).name + "*")):
+        path.unlink()
+    fresh = ns["open_cache_db"]()
+    try:
+        assert fresh.execute(
+            "SELECT COUNT(*) FROM codex_conversation_threads").fetchone() == (0,)
+    finally:
+        fresh.close()
+    stats = _rollup_pass(ns)
+    assert stats.rollups_reattributed == 0
+    assert _rollup_state(ns) == settled
+    _rollup_sync(ns)
+    stats = _rollup_pass(ns)
+    assert stats.rollups_reattributed == 0
+    assert _rollup_state(ns) == settled
+
+
+def _alias_env(tmp_path, monkeypatch, cwds):
+    """Two conversations, one per cwd, under one provider root."""
+    from _codex_zstd_fixtures import conversation_records, write_rollout
+    from test_codex_bounded_ingest import _auth_json
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    provider = tmp_path / "codex"
+    day = provider / "sessions" / "2026" / "07" / "20"
+    day.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(provider))
+    (provider / "auth.json").write_text(_auth_json("acct-a", "a@example.com"))
+    for index, cwd in enumerate(cwds):
+        write_rollout(
+            day / (f"rollout-2026-07-20T11-00-0{index}-"
+                   f"0199aaaa-bbbb-7ccc-8ddd-eeeeffff000{index + 1}.jsonl"),
+            conversation_records(
+                2, session_id=f"0199aaaa-bbbb-7ccc-8ddd-eeeeffff0a0{index + 1}",
+                label=f"c{index}", cwd=str(cwd)))
+    return ns
+
+
+@pytest.mark.parametrize("swap", [False, True])
+def test_symlink_aliased_cwds_keep_their_own_labels(tmp_path, monkeypatch, swap):
+    """#972 §5.8 rule 3. Two no-git cwds that are leaf-symlink aliases of one
+    directory, with different basenames: each conversation keeps the label of
+    its own spelling whichever resolves first, and a settled full pass writes
+    nothing. A shared resolver memo handed one spelling's label to the other
+    and made the walk and the reconcile disagree (a rewrite every pass)."""
+    real = tmp_path / "fs" / "real-a"
+    real.mkdir(parents=True)
+    alias = tmp_path / "fs" / "alias-b"
+    alias.symlink_to(real, target_is_directory=True)
+    cwds = [alias, real] if swap else [real, alias]
+    ns = _alias_env(tmp_path, monkeypatch, cwds)
+    _rollup_sync(ns)
+    _rollup_pass(ns)
+    cache = ns["open_cache_db"]()
+    try:
+        by_cwd = dict(cache.execute(
+            "SELECT cwd, conversation_key FROM codex_conversation_threads"))
+    finally:
+        cache.close()
+    expected = {by_cwd[str(real)]: "real-a", by_cwd[str(alias)]: "alias-b"}
+    settled = _rollup_rows(ns)
+    assert {key: label for key, _pk, label, _rev in settled} == expected
+    stats = _rollup_pass(ns)
+    assert stats.rollups_reattributed == 0
+    assert _rollup_rows(ns) == settled
+
+
+def test_a_missing_thread_row_alone_is_no_drift(tmp_path, monkeypatch):
+    """#972 §5.8 rule 2, isolated. Only one conversation's cache-side thread
+    row is gone; its accounting cursors and every cache-side marker stay, so
+    accounting coverage admits it. Counting the missing row as drift rewrote
+    its correct label to `(unassigned)`; a drifted control conversation in
+    the same pass must still repair."""
+    ns = _alias_env(tmp_path, monkeypatch, ["/tmp/proj-kept", "/tmp/proj-ctl"])
+    _rollup_sync(ns)
+    _rollup_pass(ns)
+    cache = ns["open_cache_db"]()
+    try:
+        by_cwd = dict(cache.execute(
+            "SELECT cwd, conversation_key FROM codex_conversation_threads"))
+    finally:
+        cache.close()
+    kept, control = by_cwd["/tmp/proj-kept"], by_cwd["/tmp/proj-ctl"]
+    settled = {key: (pk, label) for key, pk, label, _rev in _rollup_rows(ns)}
+    assert settled[kept][1] == "proj-kept" and settled[control][1] == "proj-ctl"
+    conn = ns["open_conversations_db"]()
+    try:
+        conn.execute("UPDATE codex_conversation_rollups SET project_key='stale', "
+                     "project_label='stale' WHERE conversation_key=?", (control,))
+        conn.commit()
+    finally:
+        conn.close()
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute("DELETE FROM codex_conversation_threads "
+                      "WHERE conversation_key=?", (kept,))
+        cache.commit()
+        assert cache.execute(
+            "SELECT COUNT(*) FROM codex_session_files").fetchone() == (2,)
+    finally:
+        cache.close()
+    stats = _rollup_pass(ns)
+    assert stats.rollups_reattributed == 1
+    after = {key: (pk, label) for key, pk, label, _rev in _rollup_rows(ns)}
+    assert after == settled
+
+
+@pytest.mark.parametrize("swap", [False, True])
+def test_the_writer_alone_keeps_each_aliased_cwd_label(tmp_path, monkeypatch, swap):
+    """#972 §5.8 rule 3, the writer without the reconcile. Recomputing two
+    symlink-aliased no-git cwds in one `_recompute_codex_rollups` call must
+    give each conversation the answer it gets alone: a resolver memo shared
+    across the call handed the first spelling's label to the second, and a
+    later reconcile only masked it by rewriting the row."""
+    real = tmp_path / "fs" / "real-a"
+    real.mkdir(parents=True)
+    alias = tmp_path / "fs" / "alias-b"
+    alias.symlink_to(real, target_is_directory=True)
+    cwds = [alias, real] if swap else [real, alias]
+    ns = _alias_env(tmp_path, monkeypatch, cwds)
+    cc = sys.modules["_cctally_cache"]
+    monkeypatch.setattr(cc, "_reconcile_codex_rollup_attribution",
+                        lambda conn, stats: 0)
+    _rollup_sync(ns)
+    _rollup_pass(ns)                   # the walk's own writes, no reconcile
+    cache = ns["open_cache_db"]()
+    try:
+        by_cwd = dict(cache.execute(
+            "SELECT cwd, conversation_key FROM codex_conversation_threads"))
+    finally:
+        cache.close()
+    expected = {by_cwd[str(real)]: "real-a", by_cwd[str(alias)]: "alias-b"}
+    assert {key: label for key, _pk, label, _rev in _rollup_rows(ns)} == expected
+
+    def recompute(keys):
+        conn = ns["open_conversations_db"]()
+        try:
+            conn.execute("BEGIN")
+            cc._recompute_codex_rollups(conn, keys, inputs_changed=True)
+            return {key: tuple(conn.execute(
+                "SELECT project_key, project_label FROM main.codex_conversation_rollups "
+                "WHERE conversation_key=?", (key,)).fetchone()) for key in keys}
+        finally:
+            conn.rollback()
+            conn.close()
+
+    keys = sorted(expected)
+    together = recompute(keys)
+    assert together == recompute(keys[::-1])
+    assert together == {key: recompute([key])[key] for key in keys}
+    assert {key: label for key, (_pk, label) in together.items()} == expected
+
+
+# ── #1037 — the Codex reader header's project label and git branch ───────────
+#
+# `get_codex_conversation` carried neither field, so the reader header printed
+# `— · —` for every Codex conversation while the rail showed its project. The
+# detail now carries the rail's `project_label` (same `_rollup_fields`, same
+# undecodable-key exclusion) and the branch from the conversation's OWN
+# retained `git_json`, with a status the header uses to say `no branch
+# recorded` (operator decision O1).
+
+import _lib_codex_metadata as cmeta  # noqa: E402
+
+
+def _decoded(cwd="/synthetic/x", git_json=None, undecodable=()):
+    return cmeta.DecodedCodexProjectMetadata(
+        cwd=cwd, git_json=git_json, undecodable_fields=frozenset(undecodable))
+
+
+@pytest.mark.parametrize("decoded, expected", [
+    (None, (None, "unreadable")),                                   # no thread row
+    (_decoded(undecodable=("git_json",)), (None, "unreadable")),
+    (_decoded(cwd=None, git_json='{"branch":"main"}', undecodable=("cwd",)),
+     ("main", "recorded")),                                         # cwd not consulted
+    (_decoded(git_json=None), (None, "not_recorded")),
+    (_decoded(git_json=""), (None, "not_recorded")),
+    (_decoded(git_json="{not json"), (None, "unreadable")),
+    (_decoded(git_json='["main"]'), (None, "unreadable")),
+    (_decoded(git_json='"main"'), (None, "unreadable")),
+    (_decoded(git_json='{"branch":"main"}'), ("main", "recorded")),
+    (_decoded(git_json='{"branch":" feat/x "}'), (" feat/x ", "recorded")),
+    (_decoded(git_json='{"branch":"   "}'), (None, "not_recorded")),
+    (_decoded(git_json='{"branch":""}'), (None, "not_recorded")),
+    (_decoded(git_json='{"branch":7}'), (None, "not_recorded")),
+    (_decoded(git_json='{"branch":null}'), (None, "not_recorded")),
+    (_decoded(git_json='{"commit_hash":"abc","repository_url":"u"}'),
+     (None, "not_recorded")),
+])
+def test_1037_branch_status_table(decoded, expected):
+    """Detects a header that shows a wrong or fabricated branch, says `no
+    branch recorded` when the stored metadata is unreadable, or hides a
+    readable branch behind an undecodable `cwd` (R-P1)."""
+    assert cmeta.derive_codex_git_branch(decoded) == expected
+
+
+def _codex_writer():
+    # The reader's connection attaches the cache READ-ONLY in some shapes, so
+    # thread metadata is rewritten through a writable cache connection.
+    return load_script()["open_cache_db"]()
+
+
+def _set_thread(ck, **cols):
+    w = _codex_writer()
+    try:
+        for col, value in cols.items():
+            if isinstance(value, bytes):
+                w.execute(f"UPDATE codex_conversation_threads SET {col} = "
+                          "CAST(? AS TEXT) WHERE conversation_key = ?", (value, ck))
+            else:
+                w.execute(f"UPDATE codex_conversation_threads SET {col} = ? "
+                          "WHERE conversation_key = ?", (value, ck))
+        w.commit()
+    finally:
+        w.close()
+
+
+def _rail_label(conn, ck):
+    env = q.list_codex_conversations(conn, effective_speed="standard")
+    row, = [r for r in env["rows"] if r["conversation_key"] == ck]
+    return row["project_label"]
+
+
+def test_1037_codex_detail_header_fields_on_every_ok_page(tmp_path, monkeypatch):
+    """Detects a Codex detail page that omits the header fields (the reader
+    header printed `— · —`) or disagrees with the rail's project label, on the
+    initial, tail, after, before, empty-ok and legacy-export pages; the title
+    is unchanged on each, and a missing rollup (live recompute) still agrees."""
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        label = _rail_label(conn, ck)
+        assert label == "project-red"
+        whole = _detail_of(conn, ck, limit=0)
+        first = _detail_of(conn, ck, limit=1)
+        tail = _detail_of(conn, ck, limit=1, tail=True)
+        assert first["page"]["after"] and tail["page"]["before"]
+        last_key = whole["items"][-1]["item_key"]
+        pages = {
+            "initial": first,
+            "tail": tail,
+            "after": _detail_of(conn, ck, limit=1, after=first["page"]["after"]),
+            "before": _detail_of(conn, ck, limit=1, before=tail["page"]["before"]),
+            "empty": _detail_of(conn, ck, limit=1, after=last_key),
+            "legacy_export": _detail_of(conn, ck, limit=0, legacy_export=True),
+        }
+        assert pages["empty"]["status"] == "ok" and pages["empty"]["items"] == []
+        for name, page in pages.items():
+            assert page["status"] == "ok", name
+            assert page["title"] == whole["title"], name
+            assert (page["project_label"], page["git_branch"],
+                    page["git_branch_status"]) == (
+                label, "fixture-branch", "recorded"), name
+        w = _codex_writer()
+        try:
+            w.execute("DELETE FROM codex_conversation_rollups "
+                      "WHERE conversation_key = ?", (ck,))
+            w.commit()
+        finally:
+            w.close()
+        live = _detail_of(conn, ck, limit=1)
+        assert live["project_label"] == _rail_label(conn, ck) == label
+        assert live["title"] == whole["title"]
+    finally:
+        conn.close()
+
+
+def test_1037_branch_and_project_degrade_independently(tmp_path, monkeypatch):
+    """Detects the project attribution exclusion hiding a readable branch, or
+    an unreadable `git_json` degrading a usable project: an undecodable
+    `git_json` beside a valid `cwd` keeps the project and reads `unreadable`;
+    an undecodable `cwd` beside `{"branch":"main"}` (after the rollup exists)
+    degrades the rail and header project alike and keeps the branch."""
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        _set_thread(ck, git_json=b"{\"branch\":\"\xff\"}")
+        d = _detail_of(conn, ck, limit=1)
+        assert d["project_label"] == _rail_label(conn, ck) == "project-red"
+        assert (d["git_branch"], d["git_branch_status"]) == (None, "unreadable")
+
+        _set_thread(ck, git_json='{"branch":"main"}', cwd=_V850_BAD)
+        d = _detail_of(conn, ck, limit=1)
+        assert d["project_label"] is None and _rail_label(conn, ck) is None
+        assert (d["git_branch"], d["git_branch_status"]) == ("main", "recorded")
+    finally:
+        conn.close()
+
+
+def test_1037_branch_is_never_inherited(tmp_path, monkeypatch):
+    """Detects a child conversation showing its parent's branch (or a parent
+    its child's): the branch comes from the conversation's own thread row."""
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["nested-parent", "nested-child"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        threads = {
+            pathlib.Path(path).stem: (ck, native, parent_native)
+            for ck, native, parent_native, path in conn.execute(
+                "SELECT conversation_key, native_thread_id, parent_thread_id, "
+                "source_path FROM codex_conversation_threads")}
+        parent, parent_native, _ = threads["rollout-nested-parent"]
+        child, _, child_parent_native = threads["rollout-nested-child"]
+        assert child_parent_native == parent_native   # a real parent link
+        _set_thread(parent, git_json='{"branch":"parent-b"}')
+        _set_thread(child, git_json='{"branch":"child-b"}')
+        assert _detail_of(conn, child, limit=1)["git_branch"] == "child-b"
+        assert _detail_of(conn, parent, limit=1)["git_branch"] == "parent-b"
+        _set_thread(child, git_json=None)
+        c = _detail_of(conn, child, limit=1)
+        assert (c["git_branch"], c["git_branch_status"]) == (None, "not_recorded")
+        assert q._conversation_branch(conn, "v1.no-such-conversation") == (
+            None, "unreadable")
+    finally:
+        conn.close()

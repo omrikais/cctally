@@ -909,7 +909,7 @@ def test_projects_env_memo_key_includes_max_wus_id():
         / "bin" / "_cctally_dashboard.py"
     ).read_text()
     assert (
-        "memo_key = (max_id, max_wus_id, entry_mutation_seq, cw_key, weeks_back)"
+        "memo_key = (max_id, max_wus_id, entry_mutation_seq, cw_key, weeks_back,"
         in src
     )
 

@@ -292,8 +292,8 @@ def cmd_statusline(args: argparse.Namespace) -> int:
     # writer (spec 2026-07-17-usage-statusline-fallback). This is a pure
     # side effect that runs AFTER the line is printed and is FULLY guarded:
     # persistence must NEVER break or slow rendering, so the whole call is
-    # wrapped here (the feeder itself forks detached + swallows its own
-    # errors, but this is belt-and-suspenders). Absence of rate_limits or a
+    # wrapped here (the feeder itself dispatches a detached worker + swallows
+    # its own errors, but this is belt-and-suspenders). Absence of rate_limits or a
     # lost persist lock degrades to a clean no-op; the authoritative OAuth
     # confirmation below covers the missing/stale-payload case.
     try:
@@ -458,7 +458,7 @@ def _try_acquire_persist_lock() -> "int | None":
 
     Returns the open fd on success; ``None`` when another render already
     holds it (EWOULDBLOCK) or the lock file can't be opened/locked — in
-    which case the caller renders without forking."""
+    which case the caller renders without dispatching."""
     try:
         _durable_mkdir(_bound_root())
         fd = os.open(_selected_lock_path(), os.O_WRONLY | os.O_CREAT, 0o600)
@@ -1009,7 +1009,24 @@ def _db_file_fingerprint() -> dict[str, "_candidates.FileFingerprint | None"]:
 
 
 def _epoch_from_iso(value: object) -> int:
-    return int(_cctally_core.parse_iso_datetime(str(value), "statusline projection").timestamp())
+    """The epoch second of a stored projection timestamp.
+
+    #1064: an aware value's instant does not depend on the host zone, so it
+    skips ``parse_iso_datetime``'s final conversion to local time. That is
+    one libc local-time call per value, about 60 µs in a bare-fork child on
+    macOS, and the projection sorts every snapshot row by it: the hook's
+    OAuth publication held the selected state 4.3 s instead of 1.6 s. A
+    naive, unparsable or edge-of-range value takes the shared parser
+    unchanged, so every result and every error stays the same.
+    """
+    text = str(value)  # once, as before: the fallback reuses the same string
+    try:
+        parsed = dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+    if parsed is not None and parsed.tzinfo is not None and 1 < parsed.year < 9999:
+        return int(parsed.timestamp())
+    return int(_cctally_core.parse_iso_datetime(text, "statusline projection").timestamp())
 
 
 def _statusline_active_account() -> "str | None":
@@ -1340,6 +1357,21 @@ class _StaleInputs:
     five_accounted: object = None
     five_credits: tuple = ()
     five_samples: tuple = ()
+
+    # #1064 (spec 5.1.5): each sample tuple is prepared once, on its first
+    # kernel use, and every kernel call that reads it passes this view. The
+    # view lives exactly as long as this snapshot (`dataclasses.replace` and
+    # a new classification make a new owner); the tuples stay untouched for
+    # every other reader.
+    @functools.cached_property
+    def sample_view(self):
+        import _lib_stale_proof
+        return _lib_stale_proof.prepare(self.samples)
+
+    @functools.cached_property
+    def five_sample_view(self):
+        import _lib_stale_proof
+        return _lib_stale_proof.prepare(self.five_samples)
 
 
 #: #797 spec 4.4: ``(samples_after, receipts_held, drop_work)`` for the
@@ -2895,6 +2927,18 @@ class _StaleCache:
     #: an eligible one and every render dispatches the detached reducer.
     refused: frozenset = frozenset()
 
+    # #1064 (spec 5.1.5): the render's kernel calls read the cached samples
+    # through one view per decoded cache, exactly as `_StaleInputs` does.
+    @functools.cached_property
+    def sample_view(self):
+        import _lib_stale_proof
+        return _lib_stale_proof.prepare(self.samples)
+
+    @functools.cached_property
+    def five_sample_view(self):
+        import _lib_stale_proof
+        return _lib_stale_proof.prepare(self.five_samples)
+
 
 @dataclasses.dataclass(frozen=True)
 class AccountResult:
@@ -4252,9 +4296,11 @@ def _all_members(candidates) -> list:
 def _stale_axes(stale: "_StaleInputs") -> tuple:
     """Per axis: ``(axis, window, samples, credits, supports)``. The
     five-hour axis checks no supports (its accounted value is detector
-    state)."""
-    return (("sevenDay", stale.window, stale.samples, stale.credits, stale.supports),
-            ("fiveHour", stale.five_window, stale.five_samples, stale.five_credits, None))
+    state). ``samples`` is the snapshot's prepared view (#1064), which every
+    consumer passes to the kernel readers only."""
+    return (("sevenDay", stale.window, stale.sample_view, stale.credits, stale.supports),
+            ("fiveHour", stale.five_window, stale.five_sample_view, stale.five_credits,
+             None))
 
 
 def _stale_member_facts(stale: "_StaleInputs | None", receipts, candidates):
@@ -4340,11 +4386,12 @@ def _completion_receipts(transition, classified, members):
         if accounted is None or window is None:
             continue
         # The five-hour axis earns by exact equality alone (path (i)); its
-        # samples feed refusal, never earning.
+        # samples feed refusal, never earning. (#1064: the empty tuple of an
+        # uncovered or five-hour earn holds no sample, so it needs no view.)
         earned.extend(_lib_stale_proof.earn_receipts(
             [m for m in _axis_members(members, axis) if m.sigma.window == window],
             accounted,
-            stale.samples if axis == "sevenDay" and stale.samples_covered else (),
+            stale.sample_view if axis == "sevenDay" and stale.samples_covered else (),
             completed_at_utc=completed, index_identity=stale.index_identity))
     receipts = _lib_stale_proof.latest_per_token(
         _lib_stale_proof.merge_receipts(kept, earned))
@@ -4359,12 +4406,12 @@ def _completion_receipts(transition, classified, members):
     cache = _StaleCache(
         stale.window, stale.accounted,
         () if stale.window is None else _lib_stale_proof.compact_samples(
-            stale.samples, window=stale.window, floor_epoch=floor),
+            stale.sample_view, window=stale.window, floor_epoch=floor),
         stale.samples_after, stale.samples_covered,
         stale.five_window,
         None if stale.five_accounted is None else stale.five_accounted.percent,
         five_samples=() if stale.five_window is None else _lib_stale_proof.compact_samples(
-            stale.five_samples, window=stale.five_window, floor_epoch=None,
+            stale.five_sample_view, window=stale.five_window, floor_epoch=None,
             axis="fiveHour"),
         refused=refused)
     return receipts, cache
@@ -4474,7 +4521,7 @@ def _receipt_work(transition: _Transition, members) -> bool:
         if cache.samples_after is None or bound is None or cache.samples_after > bound:
             return True
         if _lib_stale_proof.earn_receipts(
-                [member], cache.accounted, cache.samples,
+                [member], cache.accounted, cache.sample_view,
                 completed_at_utc="1970-01-01T00:00:00.000000Z",
                 index_identity="render"):
             return True
@@ -4578,8 +4625,8 @@ def _cached_drop_proof(cache, member) -> tuple:
 
     if cache is None or not cache.samples_covered:
         return False, None
-    window, samples = ((cache.window, cache.samples) if member.axis == "sevenDay"
-                       else (cache.five_window, cache.five_samples))
+    window, samples = ((cache.window, cache.sample_view) if member.axis == "sevenDay"
+                       else (cache.five_window, cache.five_sample_view))
     if window is None or member.window != window:
         return False, None
     bound = _lib_stale_proof.floor_microsecond(member.bound_utc)
@@ -4816,6 +4863,8 @@ def _plan_drop_facts(account_key: str, plan: dict, stale) -> "dict | None":
                 bound.append(member)
         if len(bound) != 1:
             continue
+        # #1064: ``samples`` is the snapshot's view; the empty tuple of a
+        # window-less axis holds no sample, so it needs none.
         facts = _lib_stale_proof.refusal_facts(
             axis, [], samples if window is not None else (), (), (),
             index_identity=stale.index_identity,
@@ -5396,7 +5445,7 @@ def _publish_plan(transition, plan: dict, binding, classified: "_Classified", *,
 
     account_key = transition.account_key
     _crash_point("before-append")
-    # 6f mode wiring (P2 exit-code fix): the statusline persist fork's publish
+    # 6f mode wiring (P2 exit-code fix): the statusline reducer's publish
     # step ingests OPPORTUNISTICALLY. A render tick must NEVER crash on a
     # derivation error — the opportunistic path swallows a cycle exception
     # (loud log only) instead of propagating.
@@ -8134,17 +8183,21 @@ def _spawn_continuation(kind: str, fd: int, argument: "str | None" = None) -> bo
     """Detach one continuation process (`cctally _statusline-continue`) that
     inherits ``fd``, the reservation it runs under. The parent's copy is
     closed here without unlocking, so the child alone holds it. The child
-    is told the store explicitly, so it can only act on this one."""
-    command = [sys.executable,
-               str(pathlib.Path(__file__).resolve().with_name("cctally")),
-               _CONTINUE_COMMAND, "--reservation-fd", str(fd)]
-    if kind == "wait":
-        command += ["--wait", str(argument)]
-    env = dict(os.environ)
-    env["CCTALLY_DATA_DIR"] = str(_cctally_core.APP_DIR)
+    is told the store explicitly, so it can only act on this one. The
+    command is built inside the ``try`` (#1064 review F4), so a failure to
+    build it still closes ``fd`` and releases the reservation rather than
+    leaving it with the caller (the render, whose OAuth child would inherit
+    it)."""
     import subprocess
 
     try:
+        command = [sys.executable,
+                   str(pathlib.Path(__file__).resolve().with_name("cctally")),
+                   _CONTINUE_COMMAND, "--reservation-fd", str(fd)]
+        if kind == "wait":
+            command += ["--wait", str(argument)]
+        env = dict(os.environ)
+        env["CCTALLY_DATA_DIR"] = str(_cctally_core.APP_DIR)
         subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
@@ -8685,12 +8738,13 @@ def _preliminary_decision() -> "_candidates.ReductionDecision | None":
 
 
 def _finalize_wal_checkpoints() -> None:
-    """The W9 finalizer before a forked child's ``os._exit`` (#901 Q14).
+    """The W9 finalizer before a detached process exits (#901 Q14).
 
-    `os._exit` skips `atexit`. The persist child records usage and the OAuth
-    child may too, and either can reach a cache sync that arms a store; the
-    finalizer then attempts one PASSIVE per armed store and closes the
-    keepers. With nothing armed it does nothing."""
+    `os._exit` skips `atexit`. The continuation worker records usage (it runs
+    this before returning from `_statusline-continue`) and the OAuth child,
+    which leaves through `os._exit`, may too; either can reach a cache sync
+    that arms a store. The finalizer then attempts one PASSIVE per armed
+    store and closes the keepers. With nothing armed it does nothing."""
     try:
         import _lib_wal_checkpoint
 
@@ -8699,55 +8753,22 @@ def _finalize_wal_checkpoints() -> None:
         pass
 
 
-def _fork_persist(parent_lock_fd: int, reservation_fd: int) -> None:
-    """Run the revalidated spool reducer in a detached serialized child.
+def _dispatch_render_worker(reservation_fd: int) -> None:
+    """Hand the render's ONE reducer reservation to an exec'd continuation
+    worker (`cctally _statusline-continue --reservation-fd <fd>`).
 
-    Spec 4.3 revision 5: the render's dispatch goes through the ONE reducer
-    reservation, ``reservation_fd``, which the child inherits and runs the
-    continuation worker under — the pass under the selected-state lock it
-    takes once the render releases it, the dashboard nudge after that lock
-    is released (#583 S2), the hand-off of what it could not finish (a
-    dependency waiter per held lock, a frontier wake, the epoch rebuild no
-    worker owns) and the final release check — so a render's child and a
-    dispatched worker never overlap. The parent's copy is closed without
-    unlocking."""
-    try:
-        pid = os.fork()
-    except OSError:
-        _release_reservation(reservation_fd)
-        return
-    if pid > 0:
-        try:
-            os.close(reservation_fd)
-        except OSError:
-            pass
-        return
-
-    # --- child ---
-    try:
-        try:
-            os.close(parent_lock_fd)
-        except OSError:
-            pass
-        try:
-            os.setsid()
-        except OSError:
-            pass
-        try:
-            devnull = os.open(os.devnull, os.O_RDWR)
-            os.dup2(devnull, 0)
-            os.dup2(devnull, 1)
-            os.dup2(devnull, 2)
-            if devnull > 2:
-                os.close(devnull)
-        except OSError:
-            pass
-        _continuation_worker(reservation_fd)
-    except BaseException:
-        pass
-    finally:
-        _finalize_wal_checkpoints()
-        os._exit(0)
+    #1064 spec 5.3: the reducer never runs in a bare-fork child of the
+    render. On macOS a child of a bare `os.fork()` reloads the zone file on
+    every local-time conversion (50-340x slower), which held the selected
+    state for up to an hour per pass. The caller has already released the
+    selected state, so only the reservation reaches the worker
+    (`close_fds=True`, `pass_fds=(fd,)`); it stays held across the hand-off,
+    by the render until the spawn and by the worker after it, so a render's
+    worker and a dispatched worker never overlap. `_spawn_continuation` owns
+    the descriptor in every outcome: a failed spawn closes it, releasing the
+    reservation, the arrival stays durable in the intake and the next
+    activating event reclaims it. Never raises."""
+    _spawn_owned("worker", reservation_fd)
 
 
 def _statusline_persist(parsed, *, sync_for_test: bool = False) -> None:
@@ -8756,9 +8777,10 @@ def _statusline_persist(parsed, *, sync_for_test: bool = False) -> None:
     This is the RENDER path (C4): it captures one binding, logs the arrival
     with the evaluation it actually saw in the account's durable intake and
     only then installs its spool slot (spec 4.2 and 4.3 revision 3, Codex
-    design-fix-round-4 Q4), and decides from files alone whether to fork the
-    detached reducer. Capture precedes the selected-state try-lock, so a
-    render that loses it leaves a durable arrival and registers its wake for
+    design-fix-round-4 Q4), and decides from files alone whether to dispatch
+    the detached reducer (an exec'd continuation worker, #1064). Capture
+    precedes the selected-state try-lock, so a render that loses it leaves a
+    durable arrival and registers its wake for
     the running holder or a worker — it never returns silently on a busy
     lock. It never scans the journal, never establishes the cutover and
     never touches the index."""
@@ -8801,15 +8823,20 @@ def _statusline_persist(parsed, *, sync_for_test: bool = False) -> None:
             _register_capture()
             return
         if sync_for_test:
-            # The synchronous twin of the detached child: the worker body,
+            # The synchronous twin of the detached worker: the worker body,
             # once this frame no longer holds the selected state.
             c._release_persist_lock(lock_fd)
             lock_fd = None
             fd, reservation = reservation, None
             _continuation_worker(fd)
             return
+        # #1064 spec 5.3: the selected state is released BEFORE the dispatch,
+        # so the worker inherits only the reservation, which this frame still
+        # holds and hands over without releasing it.
+        c._release_persist_lock(lock_fd)
+        lock_fd = None
         fd, reservation = reservation, None
-        _fork_persist(lock_fd, fd)
+        _dispatch_render_worker(fd)
     finally:
         if lock_fd is not None:
             c._release_persist_lock(lock_fd)

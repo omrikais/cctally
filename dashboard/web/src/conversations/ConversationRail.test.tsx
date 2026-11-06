@@ -481,6 +481,12 @@ describe('ConversationRail', () => {
       uuid: 'first-turn',
       title: 'how does the lock work',
       snippet: 'how does the [lock] work',
+      // #1036 — the highlight comes from the server's structured parts.
+      snippet_parts: [
+        { text: 'how does the ', match: false },
+        { text: 'lock', match: true },
+        { text: ' work', match: false },
+      ],
       match_kinds: ['title'],
     })];
     searchTotal = 1;
@@ -490,9 +496,10 @@ describe('ConversationRail', () => {
     const row = document.querySelector('.conv-rail-row--hit')!;
     // The redundant facet-echoing "title" badge is gone.
     expect(row.querySelector('.conv-rail-kindb')).toBeNull();
-    // The snippet renders the matched title (with the [..] highlight stripped to a mark).
+    // The snippet renders the matched title with the matched part as a mark.
     const snippet = row.querySelector('.conv-rail-row-snippet')!;
     expect(snippet.textContent).toContain('how does the lock work');
+    expect(Array.from(snippet.querySelectorAll('mark')).map((m) => m.textContent)).toEqual(['lock']);
   });
 
   it('renders a file hit with the path prominently + secondary title; the echoed "file" badge is suppressed in the Files facet', () => {
@@ -627,6 +634,11 @@ describe('ConversationRail', () => {
       uuid: 'prose-hit',
       title: 'how does the lock work',
       snippet: 'the [flock] serializes writers',
+      snippet_parts: [
+        { text: 'the ', match: false },
+        { text: 'flock', match: true },
+        { text: ' serializes writers', match: false },
+      ],
       match_kinds: [],
     })];
     searchTotal = 1;
@@ -638,6 +650,37 @@ describe('ConversationRail', () => {
     const snippet = row.querySelector('.conv-rail-row-snippet');
     expect(snippet).not.toBeNull();
     expect(snippet!.textContent).toContain('flock serializes writers');
+  });
+
+  // #1036 — a hit whose transcript text holds literal brackets. On base the
+  // rail bracket-parsed `snippet`, dropping the brackets and marking `WARN`.
+  it('renders a legacy-only snippet literally: source brackets kept, nothing marked', () => {
+    searchHits = [hit({ uuid: 'warn-hit', snippet: '[WARN] harness.claude', match_kinds: [] })];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'harness' });
+    render(<ConversationRail />);
+    const snippet = document.querySelector('.conv-rail-row--hit .conv-rail-row-snippet')!;
+    expect(snippet.textContent).toBe('[WARN] harness.claude');
+    expect(snippet.querySelector('mark')).toBeNull();
+  });
+
+  it('marks only the structured matched part, keeping the source brackets', () => {
+    searchHits = [hit({
+      uuid: 'warn-hit',
+      snippet: '[WARN] [harness].claude',
+      snippet_parts: [
+        { text: '[WARN] ', match: false },
+        { text: 'harness', match: true },
+        { text: '.claude', match: false },
+      ],
+      match_kinds: [],
+    })];
+    searchTotal = 1;
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'harness' });
+    render(<ConversationRail />);
+    const snippet = document.querySelector('.conv-rail-row--hit .conv-rail-row-snippet')!;
+    expect(snippet.textContent).toBe('[WARN] harness.claude');
+    expect(Array.from(snippet.querySelectorAll('mark')).map((m) => m.textContent)).toEqual(['harness']);
   });
 
   it('a title hit STILL renders its snippet row (file-hit suppression does not touch it)', () => {

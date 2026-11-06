@@ -257,6 +257,37 @@ def test_daybreak_red_alias_prices_from_the_current_cyber_card(capsys):
     assert "unknown model" not in capsys.readouterr().err
 
 
+PREVIEW_ALIAS = "gpt-5.5-cyber-preview"
+CYBER_55 = "gpt-5.5-cyber"
+
+
+def test_cyber_preview_alias_prices_from_the_55_cyber_card(capsys):
+    """#989: the preview identifier prices at the 5.5 Cyber card.
+
+    OpenAI publishes no row for ``gpt-5.5-cyber-preview``; LiteLLM prices it
+    identically to ``gpt-5.5-cyber``, whose card OpenAI does publish, so the
+    alias is an inferred pricing equivalence. Without it a retained preview
+    turn priced at the ``gpt-5`` fallback ($0.18 for this vector, not $1.55).
+    """
+    pricing._unknown_codex_model_warnings.discard(PREVIEW_ALIAS)
+    resolved, fallback = pricing._resolve_codex_pricing(PREVIEW_ALIAS)
+
+    assert PREVIEW_ALIAS not in pricing.CODEX_MODEL_PRICING
+    assert pricing.CODEX_MODEL_ALIASES[PREVIEW_ALIAS] == CYBER_55
+    assert resolved is pricing.CODEX_MODEL_PRICING[CYBER_55]
+    assert fallback is False
+    assert pricing._is_codex_fallback(PREVIEW_ALIAS) is False
+    vector = (100_000, 40_000, 10_000, 0)
+    # $12.50 x 0.06 + $1.25 x 0.04 + $75 x 0.01 per MTok.
+    assert pricing._calculate_codex_entry_cost(
+        PREVIEW_ALIAS, *vector,
+    ) == pytest.approx(1.55)
+    assert pricing._calculate_codex_entry_cost(
+        PREVIEW_ALIAS, *vector, speed="fast",
+    ) == pricing._calculate_codex_entry_cost(CYBER_55, *vector, speed="fast")
+    assert "unknown model" not in capsys.readouterr().err
+
+
 @requires_session_metrics
 def test_session_metrics_rate_card_matches_the_authoritative_table():
     """Every model the second estimator prices agrees with the real table."""
@@ -279,6 +310,13 @@ def test_session_metrics_rate_card_matches_the_authoritative_table():
     assert metrics.PRICING["gpt-6-sol"] == (2.0, 10.0)
     assert metrics.PRICING["gpt-6.1-sol"] == (2.0, 10.0)
     assert metrics.PRICING[LUNA] == (0.1, 0.5)
+    # The parity loop below iterates the estimator's own table, so it cannot
+    # notice a model the authoritative table prices and the estimator lacks
+    # (#989 added three; a missing one estimates its turns at $0).
+    assert metrics.PRICING["gpt-6.1-terra"] == (1.0, 5.0)
+    assert metrics.CACHED_INPUT_FACTORS["gpt-6.1-terra"] == 0.05
+    assert metrics.PRICING["gpt-6-rosalind"] == (15.0, 75.0)
+    assert metrics.PRICING["gpt-6-astra-law"] == (10.0, 50.0)
     for model, (input_per_mtok, output_per_mtok) in metrics.PRICING.items():
         card = pricing.CODEX_MODEL_PRICING[pricing._canonical_codex_model(model)]
         assert input_per_mtok == pytest.approx(
@@ -312,6 +350,24 @@ def test_session_metrics_uses_each_sol_models_cached_input_rate(model, expected)
     }
 
     assert metrics._est_cost({model: 10}, totals) == expected
+
+
+@requires_session_metrics
+def test_session_metrics_prices_terra_cached_input_at_five_percent():
+    """#989: GPT-6.1 Terra's cached input is 5% of input, not the default 10%.
+
+    1M noncached x $1 + 1M cached x $0.05 + 0.1M output x $5 = $1.55; the
+    default factor would estimate $1.60. The vector avoids a rounding tie at
+    the estimator's two-decimal output.
+    """
+    metrics = _load_session_metrics()
+    totals = {
+        "input_tokens": 2_000_000,
+        "cached_input_tokens": 1_000_000,
+        "output_tokens": 100_000,
+    }
+
+    assert metrics._est_cost({"gpt-6.1-terra": 1}, totals) == 1.55
 
 
 @requires_session_metrics

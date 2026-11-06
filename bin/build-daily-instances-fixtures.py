@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
     fixture_source_timestamp_z,
+    make_git_repository_marker,
     seed_session_entry,
     seed_session_file,
 )
@@ -70,13 +71,13 @@ def _iso(ts: dt.datetime) -> str:
 
 
 def _make_git_root(home: Path, rel: str) -> str:
-    """Create a real (empty) ``.git`` dir at ``<home>/<rel>`` and return the
+    """Create a real repository ``.git`` dir at ``<home>/<rel>`` and return the
     absolute realpath'd project path. Storing the realpath in the DB means the
     git-root walk in ``_resolve_project_key`` (which realpaths its input) finds
     ``.git`` on the first iteration regardless of any symlink between the scratch
     mount point and its canonical location (macOS ``/var`` → ``/private/var``)."""
     proj = (home / rel).resolve()
-    (proj / ".git").mkdir(parents=True, exist_ok=True)
+    make_git_repository_marker(proj)
     return str(proj)
 
 

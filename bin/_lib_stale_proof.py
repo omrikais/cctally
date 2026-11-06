@@ -31,7 +31,9 @@ may be eligible for one direction and refused for the other.
 """
 from __future__ import annotations
 
+import bisect
 import dataclasses
+import functools
 import hashlib
 import json
 from typing import Callable, Collection, Iterable, Literal, Mapping, Sequence
@@ -64,16 +66,34 @@ class MalformedReceipt(ValueError):
 # --- instants --------------------------------------------------------------------
 
 
-def _interval(text: str | None) -> tuple[int, int] | None:
-    """The ``[start, end)`` nanosecond interval a canonical instant denotes."""
-    if not isinstance(text, str):
-        return None
+#: #1064 (spec 5.1.1): the bound of each scalar memo below, sized for a
+#: week's provider samples (two instants each) with headroom.
+_MEMO_SIZE = 65536
+
+
+def _parse_interval(text: str) -> tuple[int, int] | None:
     try:
         start = _activity.instant_key(text)
         digits = _activity.instant_precision(text)
     except ValueError:
         return None
     return start, start + 10 ** (9 - min(digits, 9))
+
+
+_memo_interval = functools.lru_cache(maxsize=_MEMO_SIZE)(_parse_interval)
+
+
+def _interval(text: str | None) -> tuple[int, int] | None:
+    """The ``[start, end)`` nanosecond interval a canonical instant denotes.
+
+    #1064: a pure function of the text, memoized for exact ``str`` values
+    only (a subclass is parsed uncached, so only plain text keys the
+    memo)."""
+    if not isinstance(text, str):
+        return None
+    if type(text) is str:
+        return _memo_interval(text)
+    return _parse_interval(text)
 
 
 def after(a: str | None, b: str | None) -> bool:
@@ -220,13 +240,31 @@ def _window_text(window: int) -> str:
     return _samples.normalize_weekly_reset(int(window))
 
 
-def _sample_window(sample) -> str | None:
-    if sample.weekly_resets_at_utc is None:
-        return None
+def _parse_window_identity(value) -> str | None:
     try:
-        return _samples.weekly_window(sample.weekly_resets_at_utc)
+        return _samples.weekly_window(value)
     except ValueError:
         return None
+
+
+_memo_window_identity = functools.lru_cache(maxsize=_MEMO_SIZE)(_parse_window_identity)
+
+
+def _window_identity(value) -> str | None:
+    """The weekly window identity of a raw ``weekly_resets_at_utc`` value, or
+    None where `weekly_window` refuses it. #1064: memoized for exact ``str``
+    and ``int`` values (a bool, a subclass or another type is resolved
+    uncached, so ``True`` never shares ``1``'s entry); any other exception
+    propagates, uncached, exactly as before."""
+    if value is None:
+        return None
+    if type(value) is str or type(value) is int:
+        return _memo_window_identity(value)
+    return _parse_window_identity(value)
+
+
+def _sample_window(sample) -> str | None:
+    return _window_identity(sample.weekly_resets_at_utc)
 
 
 def _in_window(samples: Iterable, window: int) -> list:
@@ -260,6 +298,136 @@ def _latest(samples: Iterable):
     return best
 
 
+# --- the prepared sample view (#1064) ------------------------------------------------
+
+
+class _Window:
+    """One ``(axis, window)`` of a `PreparedSamples`: the positions of its
+    entries in original order and, built on first use, the positions sorted
+    by `_latest`'s order with their order keys (False when the identities do
+    not sort) and the entries' axis values (False when one is not a plain
+    number)."""
+
+    __slots__ = ("positions", "ordered", "keys", "values")
+
+    def __init__(self, positions: list):
+        self.positions = positions
+        self.ordered = None
+        self.keys = None
+        self.values = None
+
+
+class PreparedSamples:
+    """One snapshot's provider samples, prepared once for every kernel call
+    that reads them (#1064 spec 5.1.2).
+
+    It keeps every original sample object in its original order (``iter``
+    yields them; nothing is deduplicated) with its request and capture
+    intervals and its `_latest` order key, and memoizes per ``(axis,
+    window)`` the in-window entries, computed on first use with the very
+    expressions `_in_window` and `_five_in_window` evaluate, so a conversion
+    error surfaces at the reader call that evaluates that window, as before.
+    It caches no fact, proof, receipt or compacted set."""
+
+    __slots__ = ("_samples", "_request", "_capture", "_order", "_windows")
+
+    def __init__(self, samples: Iterable):
+        self._samples = tuple(samples)
+        self._request = [_interval(s.requested_at_utc) for s in self._samples]
+        self._capture = [_interval(s.captured_at_utc) for s in self._samples]
+        self._order = [-1 if r is None else r[0] for r in self._request]
+        self._windows: dict = {}
+
+    def __iter__(self):
+        return iter(self._samples)
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def _window(self, axis: str, window) -> _Window:
+        """The window `_axis_window` selects, memoized by its identity: the
+        normalized reset (weekly) or the exact ``int`` key (five-hour; any
+        other key type is filtered afresh on every call)."""
+        if axis == FIVE_HOUR:
+            if type(window) is not int:
+                return _Window(self._five_positions(window))
+            key = (FIVE_HOUR, window)
+        else:
+            key = (WEEKLY, _window_text(window))
+        found = self._windows.get(key)
+        if found is None:
+            positions = (self._five_positions(window) if axis == FIVE_HOUR
+                         else self._weekly_positions(key[1]))
+            found = self._windows[key] = _Window(positions)
+        return found
+
+    def _weekly_positions(self, text: str) -> list:
+        return [i for i, s in enumerate(self._samples)
+                if s.weekly_percent is not None and _sample_window(s) == text]
+
+    def _five_positions(self, window) -> list:
+        return [i for i, s in enumerate(self._samples)
+                if s.five_hour_percent is not None and s.five_hour_window_key is not None
+                and int(s.five_hour_window_key) == int(window)]
+
+    def _ordered(self, w: _Window):
+        """``w``'s positions sorted by ``(order key, observation_id, -position)``:
+        scanned from its end, the first entry that qualifies is `_latest` of
+        the qualifying entries (its strict ``>`` keeps the earliest original
+        position of a complete-key tie). False when the identities do not
+        sort; the caller then evaluates today's expressions instead."""
+        if w.ordered is None:
+            try:
+                w.ordered = sorted(w.positions, key=lambda i: (
+                    self._order[i], self._samples[i].observation_id, -i))
+            except Exception:  # noqa: BLE001 - the unprepared path decides
+                w.ordered = False
+            else:
+                w.keys = [self._order[i] for i in w.ordered]
+        return w.ordered
+
+    def _proof_values(self, w: _Window, axis: str):
+        """``w``'s axis values by position when a proof may scan the sorted
+        entries (every value a plain number, so ``float`` cannot raise and
+        evaluation order is immaterial), else None."""
+        if self._ordered(w) is False:
+            return None
+        if w.values is None:
+            values = {}
+            for i in w.positions:
+                s = self._samples[i]
+                raw = s.five_hour_percent if axis == FIVE_HOUR else s.weekly_percent
+                if type(raw) not in (float, int, bool):
+                    values = False
+                    break
+                try:
+                    values[i] = float(raw)
+                except OverflowError:
+                    values = False
+                    break
+            w.values = values
+        return None if w.values is False else w.values
+
+    def _latest_requested_after(self, w: _Window, bound_end: int, accept):
+        """`_latest` of ``w``'s entries whose request starts at or after
+        ``bound_end`` (an unparsable request never does) and that ``accept``
+        takes: the sorted entries from the bound on, scanned from the end."""
+        ordered, request = w.ordered, self._request
+        start = bisect.bisect_left(w.keys, bound_end)
+        for idx in range(len(ordered) - 1, start - 1, -1):
+            i = ordered[idx]
+            r = request[i]
+            if r is not None and r[0] >= bound_end and accept(i):
+                return self._samples[i]
+        return None
+
+
+def prepare(samples) -> PreparedSamples:
+    """``samples`` as a `PreparedSamples`: itself when it already is one,
+    else a new view of it (the per-call fallback of every reader)."""
+    return samples if isinstance(samples, PreparedSamples) else PreparedSamples(samples)
+
+
 # --- the proof -----------------------------------------------------------------------
 
 
@@ -276,14 +444,31 @@ def proven_stale(sigma: SampleIdentity, samples: Iterable, *, after_utc: str,
     if sigma.axis not in AXES:
         return None
     reset = sigma.window if advertised_reset_epoch is None else int(advertised_reset_epoch)
-    proving = [
-        s for s in _axis_window(samples, sigma.axis, sigma.window)
-        if _axis_value(s, sigma.axis) < sigma.percent - TOLERANCE_PP
-        and after(s.requested_at_utc, sigma.activity_at_utc)
-        and after(s.requested_at_utc, after_utc)
-        and _before_epoch(s.captured_at_utc, reset)
-    ]
-    return _latest(proving)
+    view = prepare(samples)
+    w = view._window(sigma.axis, sigma.window)
+    values = view._proof_values(w, sigma.axis)
+    if values is None:
+        proving = [
+            s for s in (view._samples[i] for i in w.positions)
+            if _axis_value(s, sigma.axis) < sigma.percent - TOLERANCE_PP
+            and after(s.requested_at_utc, sigma.activity_at_utc)
+            and after(s.requested_at_utc, after_utc)
+            and _before_epoch(s.captured_at_utc, reset)
+        ]
+        return _latest(proving)
+    if not w.positions:
+        return None
+    limit = sigma.percent - TOLERANCE_PP
+    t_m, bound = _interval(sigma.activity_at_utc), _interval(after_utc)
+    if t_m is None or bound is None:
+        return None
+    reset_ns, capture = reset * _NS, view._capture
+
+    def accept(i):
+        c = capture[i]
+        return values[i] < limit and c is not None and c[1] <= reset_ns
+
+    return view._latest_requested_after(w, max(t_m[1], bound[1]), accept)
 
 
 def proven_stale_low(bound_utc: str, samples: Iterable, *, axis: str, window: int,
@@ -302,13 +487,27 @@ def proven_stale_low(bound_utc: str, samples: Iterable, *, axis: str, window: in
     if axis not in AXES or _interval(bound_utc) is None:
         return None
     reset = int(window) if advertised_reset_epoch is None else int(advertised_reset_epoch)
-    proving = [
-        s for s in _axis_window(samples, axis, window)
-        if _axis_value(s, axis) > float(percent) + TOLERANCE_PP
-        and after(s.requested_at_utc, bound_utc)
-        and _before_epoch(s.captured_at_utc, reset)
-    ]
-    return _latest(proving)
+    view = prepare(samples)
+    w = view._window(axis, window)
+    values = view._proof_values(w, axis)
+    if values is None:
+        proving = [
+            s for s in (view._samples[i] for i in w.positions)
+            if _axis_value(s, axis) > float(percent) + TOLERANCE_PP
+            and after(s.requested_at_utc, bound_utc)
+            and _before_epoch(s.captured_at_utc, reset)
+        ]
+        return _latest(proving)
+    if not w.positions:
+        return None
+    limit = float(percent) + TOLERANCE_PP
+    reset_ns, capture = reset * _NS, view._capture
+
+    def accept(i):
+        c = capture[i]
+        return values[i] > limit and c is not None and c[1] <= reset_ns
+
+    return view._latest_requested_after(w, _interval(bound_utc)[1], accept)
 
 
 # --- accounting ------------------------------------------------------------------------
@@ -384,12 +583,29 @@ def earn_receipts(members: Sequence[Member], accounted: Accounted, samples: Iter
     no provider samples."""
     if accounted.axis not in AXES or accounted.percent is None:
         return ()
-    segment = [s for s in _in_window(samples, accounted.window)
-               if accounted.floor_epoch is None
-               or _at_or_after_epoch(s.captured_at_utc, accounted.floor_epoch)]
-    generation = tuple((c.event_id, c.event_revision) for c in accounted.credits
-                       if c.axis == accounted.axis)
-    latest = _latest(segment)
+    view = prepare(samples)
+    w = view._window(WEEKLY, accounted.window)
+    ordered = view._ordered(w)
+    if ordered is False:
+        segment = [s for s in (view._samples[i] for i in w.positions)
+                   if accounted.floor_epoch is None
+                   or _at_or_after_epoch(s.captured_at_utc, accounted.floor_epoch)]
+        generation = tuple((c.event_id, c.event_revision) for c in accounted.credits
+                           if c.axis == accounted.axis)
+        latest = _latest(segment)
+    else:
+        # `_latest` of the segment: the sorted window scanned from its end
+        # to the first entry captured at or after the floor.
+        latest = None
+        floor, capture = accounted.floor_epoch, view._capture
+        for idx in range(len(ordered) - 1, -1, -1):
+            i = ordered[idx]
+            c = capture[i]
+            if floor is None or (c is not None and c[0] >= floor * _NS):
+                latest = view._samples[i]
+                break
+        generation = tuple((c.event_id, c.event_revision) for c in accounted.credits
+                           if c.axis == accounted.axis)
     earned = []
     for m in members:
         s = m.sigma
@@ -503,7 +719,7 @@ def refusal_facts(axis: str, members: Sequence[Member], samples: Iterable,
     fields of `ALL_ELIGIBLE`."""
     if axis not in AXES:
         return {}
-    samples = list(samples)
+    samples = prepare(samples)
     transitions = list(transitions)
     by_sigma: dict[str, list[Receipt]] = {}
     for r in receipts:
@@ -653,21 +869,34 @@ def compact_samples(samples: Iterable, *, window: int,
     ``axis`` selects the window identity and value (five-hour: the canonical
     key and the raw five-hour percent)."""
     margin = int(window) - _RESET_MARGIN_SECONDS
-    keep: dict[str, object] = {}
-    latest: dict[float, object] = {}
-    latest_floor: dict[float, object] = {}
-    for s in _axis_window(samples, axis, window):
-        if not _before_epoch(s.captured_at_utc, margin):
-            keep[s.observation_id] = s
+    view = prepare(samples)
+    items, order, capture = view._samples, view._order, view._capture
+    # #1064: the same sequential per-value algorithm over the prepared
+    # positions; `_latest` of two is "the later one replaces the earlier
+    # only when its (order key, observation_id) is strictly greater".
+    keep: dict[str, int] = {}
+    latest: dict[float, int] = {}
+    latest_floor: dict[float, int] = {}
+
+    def later(prev, i) -> int:
+        if prev is None or (order[i], items[i].observation_id) > (
+                order[prev], items[prev].observation_id):
+            return i
+        return prev
+
+    for i in view._window(axis, window).positions:
+        s, c = items[i], capture[i]
+        if not (c is not None and c[1] <= margin * _NS):
+            keep[s.observation_id] = i
             continue
         v = _axis_value(s, axis)
-        latest[v] = _latest([x for x in (latest.get(v), s) if x is not None])
-        if floor_epoch is None or _at_or_after_epoch(s.captured_at_utc, floor_epoch):
-            latest_floor[v] = _latest([x for x in (latest_floor.get(v), s) if x is not None])
-    for s in [*latest.values(), *latest_floor.values()]:
-        keep[s.observation_id] = s
-    return tuple(sorted(keep.values(),
-                        key=lambda s: (_instant_order(s.requested_at_utc), s.observation_id)))
+        latest[v] = later(latest.get(v), i)
+        if floor_epoch is None or (c is not None and c[0] >= floor_epoch * _NS):
+            latest_floor[v] = later(latest_floor.get(v), i)
+    for i in [*latest.values(), *latest_floor.values()]:
+        keep[items[i].observation_id] = i
+    return tuple(items[i] for i in sorted(
+        keep.values(), key=lambda i: (order[i], items[i].observation_id)))
 
 
 # --- codecs ------------------------------------------------------------------------------------

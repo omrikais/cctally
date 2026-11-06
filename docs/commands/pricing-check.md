@@ -111,7 +111,7 @@ only and does not affect the exit code.
 | `schemaVersion` | `1` | Bumped on a breaking change; adding optional keys does not bump. |
 | `status` | `"ok"` \| `"degraded"` | `degraded` whenever ≥1 network leg failed. Orthogonal to the exit code. |
 | `degraded_components` | `string[]` | Which legs degraded: `"litellm"` and/or `"models_api"`. Empty when complete (and always empty under `--offline`). |
-| `snapshotDate` | ISO date | `PRICING_SNAPSHOT_DATE` — when the embedded tables were last verified against the vendor. |
+| `snapshotDate` | ISO date | `PRICING_SNAPSHOT_DATE` — the date of the latest pricing sync of the embedded tables. A targeted sync re-verifies only the models it changes. |
 | `litellmSource` | URL | The LiteLLM snapshot the drift leg compares against. |
 | `coverage` | `CoverageGap[]` | `{provider, model, kind, entry_count, token_total}`. `kind` ∈ `{"unpriced", "fallback"}`. |
 | `drift.value_drift` | `DriftRow[]` | `{model, field, ours, theirs}` — a shared model whose price field differs beyond a tiny epsilon. |

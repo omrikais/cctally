@@ -492,3 +492,257 @@ def test_rederive_exact_retry_with_stub_suffix_rejected(tmp_path, monkeypatch,
     code, output, unchanged = outcomes[True]
     assert code != 0 and output.get("status") != "applied", output
     assert unchanged
+
+
+# --------------------------------------------------------------------------
+# #1004 T5 — the rederive reader streams its records from coordinates
+# --------------------------------------------------------------------------
+
+
+def _read_both(monkeypatch):
+    """The reader's coordinate-backed result and today's list form (the
+    `MATERIALIZE_FOR_TESTS` switch), over the same journal."""
+    import _cctally_rederive
+    import _lib_retained_records as RR
+    streamed = _cctally_rederive.read_rederive_journal_prefix()
+    with monkeypatch.context() as patch:
+        patch.setattr(RR, "MATERIALIZE_FOR_TESTS", True)
+        listed = _cctally_rederive.read_rederive_journal_prefix()
+    return streamed, listed
+
+
+def test_rederive_reader_streams_records_equal_to_list(
+        tmp_path, monkeypatch, no_append_path_cutover):
+    """#1004 T5: every non-inert record is a streamed slot and every inert
+    Codex observation keeps its interned stub; the sequence equals today's
+    list (`==`) in iteration, indexing, slices, the rederivable subset, the
+    appended-extra view and the normalized planning view. A position that
+    decodes to something else plans from a record the journal never held."""
+    _mod, appended = _store(tmp_path, monkeypatch, stubbed=True)
+    import _cctally_rederive as R
+    import _lib_retained_records as RR
+    (records, hw, ends, evidence), (listed, hw2, listed_ends, evidence2) = (
+        _read_both(monkeypatch))
+    assert isinstance(listed, list) and isinstance(listed_ends, list)
+    assert isinstance(records, RR.RetainedRecords), type(records)
+    assert not isinstance(ends, (list, tuple)), type(ends)
+    assert (hw, evidence) == (hw2, evidence2)
+    assert [i for i in range(len(records)) if records.is_streamed(i)] == [
+        i for i, record in enumerate(appended)
+        if record.get("provider") != "codex"]
+    for i in range(len(records)):
+        if not records.is_streamed(i):
+            assert records[i] is records.slot(i), "a stub is retained as is"
+    assert len(records) == len(listed) == len(appended)
+    assert records == listed and list(records) == listed
+    assert [records[i] for i in range(len(records))] == listed
+    assert list(ends) == listed_ends and ends[-1] == hw
+    for cut in (slice(3, None), slice(None, 7), slice(2, 20, 3),
+                slice(-5, None)):
+        assert list(records[cut]) == listed[cut], cut
+        assert list(ends[cut]) == listed_ends[cut], cut
+    raw = R._rederivable_raw_records(records)
+    assert not isinstance(raw, list)
+    assert list(raw) == R._rederivable_raw_records(listed)
+    extra = {"t": "op", "id": "o:extra", "payload": {"kind": "probe"}}
+    assert list(records.with_extra(extra)) == [*listed, extra]
+    view = R._normalized_planning_view(records)
+    expected = R._normalized_planning_view(listed)
+    assert not isinstance(view, list)
+    assert list(view) == expected
+    assert [view[i] for i in range(len(view))] == expected
+    assert list(view[4:]) == expected[4:]
+    assert list(R._rederivable_raw_records(view)) == (
+        R._rederivable_raw_records(expected))
+
+
+def test_rederive_reader_placeholders_carry_full_original(
+        tmp_path, monkeypatch):
+    """#1004 T5: an excluded observation and an excluded correction keep
+    their positions as placeholders carrying the full original record and
+    its coordinate, equal to today's; the outcome-quarantine fold reads
+    them, so a placeholder with a partial original would widen the wrong
+    envelope."""
+    import test_journal_admission as A
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_journal as jr
+    import _lib_journal as J
+    monkeypatch.setattr(jr, "_utc_now", lambda: A.FIXED)
+    A._seed_with_cutover()
+    legacy_obs = J.unstamped_record(
+        A._usage_obs(J, 70.0, "2026-10-09T11:00:00Z"))
+    legacy_batch = J.legacy_writer_view().make_correction_batch(
+        batch_id="rederive:claude-usage:legacy", family="claude-usage",
+        at="2026-10-09T11:00:00Z",
+        actions=[{"action": "tombstone", "id": "sa:o:none", "rev": 1,
+                  "at": "2026-10-09T11:00:00Z", "payload": None}])
+    A._raw_append(A.SEGMENT, [legacy_obs, *legacy_batch])
+    (records, _hw, ends, _ev), (listed, _hw2, listed_ends, _ev2) = (
+        _read_both(monkeypatch))
+    assert records == listed and list(ends) == listed_ends
+    excluded = [i for i, record in enumerate(listed)
+                if record.get("t") == "excluded"]
+    assert len(excluded) == 1 + len(legacy_batch), excluded
+    originals = [legacy_obs, *legacy_batch]
+    starts = records.coordinates.starts()
+    for index, original in zip(excluded, originals):
+        carried = records[index]["quarantine"]
+        assert carried["record"] == original
+        assert (carried["segment"], carried["offset"]) == starts[index]
+        assert not records.is_streamed(index)
+
+
+class _Measured(Exception):
+    """Stops a preview once its measurement point was reached."""
+
+
+def _many_readings(J, count, *, start_minute=0, account="acct-a"):
+    out = []
+    for n in range(count):
+        minute = start_minute + n
+        captured = (dt.datetime(2026, 7, 25, tzinfo=UTC)
+                    + dt.timedelta(minutes=minute)).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ")
+        out.append(J.make_obs(
+            at=captured, src="record-usage", provider="claude",
+            account=account, payload={
+                "captured_at": captured, "source": "statusline",
+                "weekly_percent": 10 + (minute // 60) % 80,
+                "resets_at": int(dt.datetime(
+                    2026, 7, 28, tzinfo=UTC).timestamp()),
+                "five_hour_percent": minute % 90,
+                "five_hour_resets_at": "2026-07-25T16:00:00Z"}))
+    return out
+
+
+def _without_interning(monkeypatch):
+    """Measure retention with #997 D15's compaction off. Compaction only
+    makes equal short strings one object (`sys.intern`); it changes no
+    sequence's retention, and streaming keeps fewer interned strings alive
+    than retaining every record did. But the interpreter re-sizes its
+    interned-string table as the strings of each fresh decode come and go,
+    so with it on, a measured delta carries ±3.8 MB (the runner's table) by
+    where the table sits in that cycle, whatever the code retains."""
+    import _lib_journal
+    monkeypatch.setattr(_lib_journal, "compact_retained", lambda value: value)
+
+
+def _traced():
+    import gc
+    import tracemalloc
+    gc.collect()
+    return tracemalloc.get_traced_memory()[0]
+
+
+def _per_record(label, delta, count):
+    per = delta / count
+    print(f"T5 {label}: {per:.1f} bytes per streamed record")
+    return per
+
+
+_STREAMED_COUNT = 4000
+
+
+def _large_store(tmp_path, monkeypatch):
+    mod = _isolated(tmp_path, monkeypatch)
+    import _cctally_journal as runtime
+    import _lib_journal as J
+    _seed_cache(mod)
+    import _cctally_rederive
+    monkeypatch.setattr(_cctally_rederive, "_iso_now", lambda: AT)
+    # Claude-dominated, as a rederive's streamed population is: every
+    # position costs its coordinates, digest and slot, stub or not.
+    records = []
+    for n, reading in enumerate(_many_readings(J, _STREAMED_COUNT)):
+        records.append(reading)
+        if not n % 10:
+            records.append(_codex(J, reading["at"], len(records),
+                                  account="acct-x"))
+    runtime.append_records(records, now_utc=dt.datetime(2026, 7, 25,
+                                                        tzinfo=UTC))
+    return mod
+
+
+def test_rederive_reader_and_replay_entry_retain_coordinates(
+        tmp_path, monkeypatch, no_append_path_cutover):
+    """#1004 T5: at the reader's return and at the planner's replay entry
+    the retained records cost under 64 bytes per streamed record (they cost
+    the decoded record, ≈ 0.9 KB, before), which is what keeps a rederive
+    over a growing journal inside #997's 2 GiB ceiling."""
+    import tracemalloc
+    mod = _large_store(tmp_path, monkeypatch)
+    import _cctally_rederive as R
+    seen = {}
+    real_replay = R.replay_scratch_records
+
+    def replay(*args, **kwargs):
+        seen["entry"] = _traced() - base
+        raise _Measured
+
+    monkeypatch.setattr(R, "replay_scratch_records", replay)
+    _without_interning(monkeypatch)
+    tracemalloc.start()
+    try:
+        # A warm-up of both calls first, so one-time module and cache state
+        # is not counted as retention.
+        base = _traced()
+        R.read_rederive_journal_prefix()
+        with pytest.raises(_Measured):
+            mod.preview_db_rederive("claude-usage")
+        base = _traced()
+        result = R.read_rederive_journal_prefix()
+        at_return = _traced() - base
+        assert len(result[0]) == _STREAMED_COUNT + _STREAMED_COUNT // 10
+        del result
+        base = _traced()
+        with pytest.raises(_Measured):
+            mod.preview_db_rederive("claude-usage")
+    finally:
+        tracemalloc.stop()
+        monkeypatch.setattr(R, "replay_scratch_records", real_replay)
+    assert _per_record("reader return", at_return, _STREAMED_COUNT) < 64
+    assert _per_record("replay entry", seen["entry"], _STREAMED_COUNT) < 64
+
+
+def test_rederive_suffix_check_after_reviewed_decision_keeps_nothing(
+        tmp_path, monkeypatch, capsys, no_append_path_cutover):
+    """#1004 T5: after a completed reviewed decision followed by ordinary
+    observations, the preview's suffix check retains nothing: at the point
+    right after it (the cache view opening) the preview holds under 64 bytes
+    per streamed record. Before, the suffix comprehension kept every later
+    record decoded through the whole planning call."""
+    import tracemalloc
+    mod, records = _store(tmp_path, monkeypatch, stubbed=True)
+    apply_args = _reviewed_manifest(mod, records, tmp_path, capsys)
+    assert mod.cmd_db_rederive(apply_args) == 0
+    capsys.readouterr()
+    import _cctally_journal as runtime
+    import _cctally_rederive as R
+    import _lib_journal as J
+    # Appended at the current segment, after the decision's own batch, as
+    # a later recording process does (an older segment is immutable).
+    runtime.append_records(
+        _many_readings(J, _STREAMED_COUNT, start_minute=180))
+    seen = {}
+    real_view = R._open_cache_read_view
+
+    def opening():
+        seen["after-suffix"] = _traced() - base
+        raise _Measured
+
+    monkeypatch.setattr(R, "_open_cache_read_view", opening)
+    _without_interning(monkeypatch)
+    tracemalloc.start()
+    try:
+        base = _traced()
+        with pytest.raises(_Measured):  # the warm-up (see the reader case)
+            mod.preview_db_rederive("claude-usage")
+        base = _traced()
+        with pytest.raises(_Measured):
+            mod.preview_db_rederive("claude-usage")
+    finally:
+        tracemalloc.stop()
+        monkeypatch.setattr(R, "_open_cache_read_view", real_view)
+    assert _per_record("after suffix", seen["after-suffix"],
+                       _STREAMED_COUNT) < 64

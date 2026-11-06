@@ -138,6 +138,22 @@ def _copy_rollout(
     target.write_text("".join(records))
 
 
+def _record_claude_reading(ns, monkeypatch) -> None:
+    """One real Claude weekly reading in the week containing ``NOW``, so the
+    Current Week card resolves a confirming-reading scope and every dashboard
+    phase runs the #1018 twin selector."""
+    captured = NOW - dt.timedelta(minutes=1)
+    monkeypatch.setenv(
+        "CCTALLY_AS_OF", captured.isoformat().replace("+00:00", "Z"))
+    monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
+    assert ns["cmd_record_usage"](argparse.Namespace(
+        percent=21.0, resets_at=str(int(NOW.timestamp()) + 3 * 86400),
+        five_hour_percent=5.0,
+        five_hour_resets_at=str(int(NOW.timestamp()) + 3 * 3600),
+        source="statusline"), nudge_dashboard=False) == 0
+    monkeypatch.delenv("CCTALLY_AS_OF")
+
+
 def _run_lifecycles(tmp_path, monkeypatch):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path / "data")
@@ -666,3 +682,136 @@ def test_historical_quota_natural_key_lookup_uses_its_complete_unique_index(
     print(json.dumps({"tempStore": temp_store, "population": len(control["quota"]),
                       "actualLookups": len(reads), "sql": reads[0].sql,
                       "plans": sorted({detail for s in reads for detail in s.plan})}))
+
+
+#: #1018 twin spec 5.2: the current-week confirming-reading selector.
+WEEKLY_READING_SITE = "_cctally_oauth_samples.latest_weekly_reading_at"
+WEEKLY_READING_INDEX = "idx_claude_weekly_observation_index_freshness"
+
+
+def _seed_weekly_reading_history(conn, history: int) -> None:
+    """One eligible confirmation of the displayed value, behind ``history``
+    newer ineligible rows of the same account, window and value (a held or
+    post-reset suffix) and ``history`` rows each of unrelated history: other
+    values in the window, other windows, another account, and eligible rows
+    of the displayed value captured after now."""
+    reset = "2026-09-14T05:00:00Z"
+    base = dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc)
+
+    def at(seconds: float) -> str:
+        return (base + dt.timedelta(seconds=seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ")
+
+    rows = [("confirm", "acct-a", at(0), 51.0, reset, 1, 1)]
+    for i in range(history):
+        rows += [
+            (f"held-{i}", "acct-a", at(1 + i), 51.0, reset, 1, 0),
+            (f"value-{i}", "acct-a", at(1 + i), 52.0 + i, reset, 1, 1),
+            (f"window-{i}", "acct-a", at(1 + i), 51.0,
+             f"2026-08-{1 + i % 28:02d}T05:00:00Z", 1, 1),
+            (f"account-{i}", f"acct-{i}", at(1 + i), 51.0, reset, 1, 1),
+            (f"future-{i}", "acct-a", at(86_400 + i), 51.0, reset, 1, 1),
+        ]
+    conn.executemany(
+        "INSERT INTO claude_weekly_observation_index (observation_id,"
+        " account_key, captured_at_utc, weekly_percent, weekly_resets_at_utc,"
+        " weekly_reading_genuine, weekly_freshness_eligible)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+    conn.commit()
+
+
+def test_the_weekly_reading_selector_reads_a_bounded_index_range(
+    tmp_path, monkeypatch,
+):
+    """#1018 twin spec 8.6 (failure: the per-tick confirmation lookup scans
+    or sorts the account's history, so every idle tick costs history-sized
+    work). The production selector runs on its partial index with no temp
+    structure, and the VM steps it takes do not grow with an ineligible
+    suffix or with unrelated history."""
+    ns = load_script()
+    samples = importlib.import_module("_cctally_oauth_samples")
+    scope = samples.WeeklyReadingScope(
+        account_key="acct-a", weekly_resets_at_utc="2026-09-14T05:00:00Z",
+        weekly_percent=51.0, lower_bound_utc="2026-09-07T05:00:00Z",
+        upper_bound_utc="2026-09-14T05:00:00Z")
+    now = dt.datetime(2026, 9, 10, 12, tzinfo=dt.timezone.utc)
+    steps = {}
+    for history in (10, 2000):
+        redirect_paths(ns, monkeypatch, tmp_path / f"data-{history}")
+        conn = ns["open_db"]()
+        try:
+            _seed_weekly_reading_history(conn, history)
+        finally:
+            conn.close()
+        with guard.capture_sql_plans() as recorder:
+            recorder.phase = f"selector-{history}"
+            conn = ns["open_db"]()
+            try:
+                counter = [0]
+
+                def tick(counter=counter):
+                    counter[0] += 1
+                    return 0
+
+                conn.set_progress_handler(tick, 1)
+                got = samples.latest_weekly_reading_at(conn, scope, now)
+                conn.set_progress_handler(None, 0)
+            finally:
+                conn.close()
+        assert got == dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc)
+        lookups = [s for s in recorder.statements
+                   if WEEKLY_READING_SITE in s.call_sites]
+        assert lookups, "non-vacuity: the selector ran"
+        for statement in lookups:
+            assert any(WEEKLY_READING_INDEX in detail
+                       for detail in statement.plan), statement.plan
+            assert not any(marker in detail for detail in statement.plan
+                           for marker in guard.TEMP_MARKERS), statement.plan
+        steps[history] = counter[0]
+    assert steps[2000] <= steps[10] + 8, (steps, [s.plan for s in lookups])
+
+
+#: (phase, the builder frame that must be on the selector's stack). Matched
+#: SEPARATELY per phase: one entry naming both would pass on either alone, and
+#: a missing idle refresh is exactly the failure (spec 8.6).
+WEEKLY_READING_PHASES = (
+    ("dashboard-full-cold", "_cctally_tui._tui_build_current_week"),
+    ("dashboard-idle", "_cctally_tui._tui_build_idle_snapshot"),
+)
+
+
+def test_the_weekly_reading_selector_runs_on_full_and_idle_ticks(
+    tmp_path, monkeypatch,
+):
+    """#1018 twin spec 8.6 (failure: the idle tick never re-runs the
+    confirming-reading lookup, so a flat stream freezes the published
+    freshness; or either tick's lookup leaves its partial index or sorts).
+    The G1 lifecycle above carries no Claude reading, so this one seeds a
+    resolvable confirmation scope and judges only the selector's own plan."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    import _lib_snapshot_cache as sc
+    sc.reset_dispatch_state()
+    try:
+        _record_claude_reading(ns, monkeypatch)
+        with guard.capture_sql_plans() as recorder:
+            for offset, (phase, _builder) in enumerate(WEEKLY_READING_PHASES):
+                recorder.phase = phase
+                snap = ns["_tui_build_snapshot"](
+                    now_utc=NOW + dt.timedelta(seconds=15 * offset),
+                    skip_sync=True, precompute_envelope=True,
+                    runtime_bind="127.0.0.1")
+                assert snap.current_week is not None
+                assert snap.current_week.weekly_reading_scope is not None
+    finally:
+        sc.reset_dispatch_state()
+    for phase, builder in WEEKLY_READING_PHASES:
+        lookups = [s for s in recorder.statements
+                   if s.phase == phase and WEEKLY_READING_SITE in s.call_sites
+                   and builder in s.call_sites]
+        assert lookups, f"the selector never ran under {builder} in {phase}"
+        for statement in lookups:
+            assert any(WEEKLY_READING_INDEX in detail
+                       for detail in statement.plan), statement.plan
+            assert not any(marker in detail for detail in statement.plan
+                           for marker in guard.TEMP_MARKERS), statement.plan

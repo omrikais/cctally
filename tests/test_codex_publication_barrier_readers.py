@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+import datetime as dt
 import json
+import os
 import pathlib
 import sqlite3
 import sys
@@ -18,13 +20,16 @@ import _lib_codex_conversation_query as q  # noqa: E402
 import _lib_conversation_dispatch as disp  # noqa: E402
 from _codex_zstd_fixtures import (  # noqa: E402
     conversation_records, token_records, write_rollout, zstd_bytes)
+from conftest import load_script, redirect_paths  # noqa: E402
 from test_codex_bounded_ingest import _auth_json  # noqa: E402
 from test_codex_publication_barrier import (  # noqa: E402,F401 (env is a fixture)
     HOLDS, OTHER_SESSION, REAL_RESOLVE, SESSION, _cache, _certificate,
     _compress, _degrade, _forget_membership, _key, _meta_only, _name, _one,
-    _replace_container, _sync, _sync_stopping_after, _unfixed_prune, env)
+    _replace_container, _sync, _sync_stopping_after, _unfixed_prune,
+    _with_quota, env)
 
 SPEED = "standard"
+TITLE_SESSION = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0a07"
 
 
 def _conv(ns, **kwargs):
@@ -561,33 +566,68 @@ def test_a_live_append_publishes_only_when_eligible(env):
 
 
 def test_legacy_rollups_stay_visible_and_repair_in_place(env):
-    """Barrier case 9: a correct and a stale legacy materialization."""
+    """Barrier case 9: a correct and two stale legacy materializations.
+
+    ``y`` is stale in a thread-derived field, which the first full pass's
+    rollup reconcile repairs from the last-good view while its replacement
+    container still awaits verification (#972 §5.8 rule 1, revisions 5 and
+    6). ``z`` is stale only in its title, a field the reconcile never
+    compares: it stays visible while its publication is pending, and
+    certification's in-place repair rewrites it (#968 §5.11 as amended)."""
     ns, provider, day, _ = env
     x, y = day / _name(11, 1), day / _name(12, 2)
+    z = day / _name(14, 4)
     write_rollout(x, conversation_records(2, session_id=SESSION, label="x",
                                           cwd="/tmp/proj-x"))
     write_rollout(y, conversation_records(2, session_id=OTHER_SESSION, label="y",
                                           cwd="/tmp/proj-y"))
+    write_rollout(z, conversation_records(2, session_id=TITLE_SESSION, label="z",
+                                          cwd="/tmp/proj-z"))
     _sync(ns)
     _conv(ns)
-    kx, ky = _key(ns, x), _key(ns, y)
+    kx, ky, kz = _key(ns, x), _key(ns, y), _key(ns, z)
+    accounts = _accounts(ns)
+    good_z = _surfaces(ns, kz, accounts)
+    assert good_z["list"][0] not in (None, "stale")
     conn = ns["open_conversations_db"]()
-    try:   # a stale materialization an earlier binary left behind
+    try:   # stale materializations an earlier binary left behind
         conn.execute("UPDATE codex_conversation_rollups SET project_key='stale', "
                      "project_label='stale' WHERE conversation_key=?", (ky,))
+        conn.execute("UPDATE codex_conversation_rollups SET title='stale' "
+                     "WHERE conversation_key=?", (kz,))
         conn.commit()
     finally:
         conn.close()
-    accounts = _accounts(ns)
     good_x = _surfaces(ns, kx, accounts)
     revision_x, revision_y = _render_revision(ns, kx), _render_revision(ns, ky)
+    revision_z = _render_revision(ns, kz)
     ids = (_message_ids(ns, kx), _message_ids(ns, ky))
     _compress(x)
     _compress(y)
+    _compress(z)
     _sync(ns)
     _conv(ns)
     assert _surfaces(ns, kx, accounts) == good_x        # visible immediately
-    assert _surfaces(ns, ky, accounts)["list"][1] == "stale"
+    pending_z = _surfaces(ns, kz, accounts)
+    assert pending_z["list"][0] == "stale"              # legacy value stays
+    assert pending_z["list"][1:] == good_z["list"][1:]
+    assert _publication(ns, kz)[1] == 1
+    assert _render_revision(ns, kz) == revision_z
+    # #972 §5.8 rule 1 (revisions 5 and 6): the replacement containers await
+    # verification, so the accounting walk is not complete, but a pending
+    # mark writes container state only: both of y's cursors keep their
+    # logical identity, decoded offsets and the accepted plain generation
+    # (size, inode, content anchor), so accounting still covers its
+    # `session_meta` from the generation the conversation events came from.
+    assert _generation(ns, y)[0] == _generation(ns, y)[1]
+    # The reconcile repairs y's thread-derived fields from the published
+    # thread the last-good view serves, before certification (the #968
+    # amendment), without reading withheld metadata.
+    assert not _full_walk_complete(ns)
+    pending_y = _surfaces(ns, ky, accounts)
+    assert pending_y["list"][1] == _label(ns, "/tmp/proj-y")
+    assert pending_y["thread"] == "/tmp/proj-y"
+    assert _render_revision(ns, ky) > revision_y
     assert _publication(ns, kx)[1] == 1 and _publication(ns, ky)[1] == 1
     _cache().run_codex_container_verification_drain(wait_for_requests=False)
     _sync(ns)
@@ -601,6 +641,9 @@ def test_legacy_rollups_stay_visible_and_repair_in_place(env):
     assert _render_revision(ns, ky) > revision_y        # repaired in place
     assert (_message_ids(ns, kx), _message_ids(ns, ky)) == ids
     assert _publication(ns, kx)[1] == 0 and _publication(ns, ky)[1] == 0
+    assert _surfaces(ns, kz, accounts)["list"] == good_z["list"]
+    assert _render_revision(ns, kz) > revision_z        # certification repaired
+    assert _publication(ns, kz)[1] == 0
 
 
 @pytest.mark.parametrize(
@@ -1000,6 +1043,698 @@ def test_plain_only_conversations_keep_todays_behavior(env):
     assert view == raw
 
 
+# --- #972 T1: the R4 plain metadata interleave --------------------------------
+#
+# A metadata-only contributor B is consumed by the conversation pass before
+# accounting accepts it, so the rollup was materialized from A's thread and no
+# later pass rewrote it. The failure each test detects is a stored project that
+# no longer matches the retained thread metadata, on every reader surface.
+
+
+def _r4_store(tmp_path, monkeypatch, name):
+    """An independent second store (own data dir) over the SAME provider tree,
+    so physical identities and conversation keys compare directly."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / name)
+    monkeypatch.setattr(sys.modules["_cctally_update"], "_spawn_detached",
+                        lambda command: True)
+    return ns
+
+
+def _r4_files(day):
+    a, b = day / _name(11, 1), day / _name(12, 2)
+    write_rollout(a, _with_quota(conversation_records(
+        2, session_id=SESSION, label="a", cwd="/tmp/proj-a")))
+    write_rollout(b, _meta_only(SESSION, "/tmp/proj-b"))
+    return a, b
+
+
+def _r4_preserved(conn):
+    """What a reconcile must never touch: every message and event account
+    stamp, the accounting rows and the quota rows."""
+    return (
+        conn.execute("SELECT source_path, line_offset, account_key "
+                     "FROM main.codex_conversation_messages "
+                     "ORDER BY source_path, line_offset").fetchall(),
+        conn.execute("SELECT source_path, line_offset, account_key "
+                     "FROM main.codex_conversation_events "
+                     "ORDER BY source_path, line_offset").fetchall(),
+        conn.execute("SELECT * FROM cache_db.codex_session_entries "
+                     "ORDER BY source_path, line_offset").fetchall(),
+        conn.execute("SELECT * FROM cache_db.quota_window_snapshots "
+                     "ORDER BY source, source_path, line_offset, "
+                     "logical_limit_key").fetchall(),
+    )
+
+
+def _r4_probe(monkeypatch):
+    """Wrap the reconcile so each call records (before, after, written)."""
+    cc = _cache()
+    real = getattr(cc, "_reconcile_codex_rollup_attribution", None)
+    calls: list = []
+
+    def probe(conn, stats):
+        before = _r4_preserved(conn)
+        written = real(conn, stats)
+        calls.append((before, _r4_preserved(conn), written))
+        return written
+
+    monkeypatch.setattr(cc, "_reconcile_codex_rollup_attribution", probe,
+                        raising=False)
+    return calls
+
+
+def _attribution(ns, cwd: str):
+    cache = ns["open_cache_db"]()
+    try:
+        root = cache.execute(
+            "SELECT source_root_key FROM codex_session_files LIMIT 1").fetchone()[0]
+    finally:
+        cache.close()
+    return _cache()._codex_conversation_project_attribution(root, cwd, None)
+
+
+def _r4_observe(ns, a):
+    """The three project surfaces plus the facts the change must preserve."""
+    key = _key(ns, a)
+    conn = ns["open_conversations_db"]()
+    try:
+        persisted = conn.execute(
+            "SELECT project_key, project_label FROM main.codex_conversation_rollups "
+            "WHERE conversation_key=?", (key,)).fetchone()
+        row = _list_row(conn, key)
+        accounts = sorted({r[0] for r in conn.execute(
+            "SELECT account_key FROM main.codex_conversation_messages "
+            "WHERE account_key IS NOT NULL")})
+        messages = conn.execute(
+            "SELECT source_path, line_offset, account_key "
+            "FROM main.codex_conversation_messages "
+            "ORDER BY source_path, line_offset").fetchall()
+        events = conn.execute(
+            "SELECT source_path, line_offset FROM main.codex_conversation_events "
+            "ORDER BY source_path, line_offset").fetchall()
+    finally:
+        conn.close()
+    assert len(accounts) == 1, accounts
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["scope_conversations_db_to_account"](conn, accounts[0])
+        scoped = _list_row(conn, key)
+    finally:
+        conn.close()
+    cache = ns["open_cache_db"]()
+    try:
+        cursors = sorted(r[0] for r in cache.execute(
+            "SELECT path FROM codex_session_files"))
+        thread_cwd = cache.execute(
+            "SELECT cwd FROM codex_conversation_threads WHERE conversation_key=?",
+            (key,)).fetchone()[0]
+        entries = cache.execute(
+            "SELECT * FROM codex_session_entries "
+            "ORDER BY source_path, line_offset").fetchall()
+        quota = cache.execute(
+            "SELECT * FROM quota_window_snapshots ORDER BY source, source_path, "
+            "line_offset, logical_limit_key").fetchall()
+        population = cache.execute(
+            "SELECT COUNT(*) FROM codex_barrier_population").fetchone()[0]
+    finally:
+        cache.close()
+    return {
+        "key": key, "cursors": cursors, "thread_cwd": thread_cwd,
+        "population": population,
+        "persisted": tuple(persisted) if persisted else None,
+        "list": None if row is None else (
+            row["project_key"], row["project_label"], row["count"]),
+        "scoped": None if scoped is None else (
+            scoped["project_key"], scoped["project_label"], scoped["count"]),
+        "messages": messages, "events": events,
+        "entries": [tuple(r) for r in entries], "quota": [tuple(r) for r in quota],
+    }
+
+
+def _r4_assert_projects(observed, expected, attribution):
+    """Persisted, unqualified and account-scoped project fields agree."""
+    assert observed["persisted"] == attribution == expected["persisted"]
+    assert observed["list"] is not None and observed["list"][:2] == attribution
+    assert observed["scoped"] is not None and observed["scoped"][:2] == attribution
+
+
+def _r4_ordered(ns):
+    _sync(ns)
+    _conv(ns)
+
+
+def _r4_interleaved(ns, a):
+    # The hook-shaped walk never builds the quota natural-key index (#977 C5);
+    # an installed store already has one, so build it first, as one would be.
+    import _cctally_journal
+    _cctally_journal.ensure_quota_index(budgeted=False)
+    _sync_stopping_after(ns, 1)
+    cache = ns["open_cache_db"]()
+    try:
+        assert sorted(r[0] for r in cache.execute(
+            "SELECT path FROM codex_session_files")) == [str(a)]
+    finally:
+        cache.close()
+    _conv(ns)
+    _sync(ns)
+    _conv(ns)
+
+
+def _r4_invariants(observed, a, b):
+    assert observed["cursors"] == sorted([str(a), str(b)])
+    assert observed["population"] == 0           # plain, outside the barrier
+    assert observed["thread_cwd"] == "/tmp/proj-b"
+    assert observed["list"] is not None and observed["list"][2] == 4
+    assert len(observed["messages"]) == 4
+    assert len(observed["quota"]) > 0
+
+
+def test_r4_ordered_control_projects(env):
+    """The fully ordered control: accounting accepts both files before the
+    conversation pass, so every surface shows B's project."""
+    ns, provider, day, _ = env
+    a, b = _r4_files(day)
+    _r4_ordered(ns)
+    observed = _r4_observe(ns, a)
+    _r4_invariants(observed, a, b)
+    attribution = _attribution(ns, "/tmp/proj-b")
+    assert attribution[1] == _label(ns, "/tmp/proj-b")
+    _r4_assert_projects(observed, observed, attribution)
+
+
+def test_r4_plain_metadata_interleave_rematerializes_project(
+        env, tmp_path, monkeypatch):
+    """R4: the interleave converges to the ordered control's project on every
+    surface, and changes no identity, account stamp, accounting or quota row."""
+    ns, provider, day, _ = env
+    a, b = _r4_files(day)
+    _r4_ordered(ns)
+    ordered = _r4_observe(ns, a)
+    ns = _r4_store(tmp_path, monkeypatch, "data-interleaved")
+    calls = _r4_probe(monkeypatch)
+    _r4_interleaved(ns, a)
+    interleaved = _r4_observe(ns, a)
+    _r4_invariants(interleaved, a, b)
+    assert interleaved["key"] == ordered["key"]
+    _r4_assert_projects(interleaved, ordered, _attribution(ns, "/tmp/proj-b"))
+    assert {m[:2] for m in interleaved["messages"]} == {
+        m[:2] for m in ordered["messages"]}
+    assert interleaved["messages"] == ordered["messages"]   # account stamps
+    assert interleaved["events"] == ordered["events"]
+    assert interleaved["entries"] == ordered["entries"]
+    assert interleaved["quota"] == ordered["quota"]
+    assert all(before == after for before, after, _ in calls)
+    assert any(written > 0 for _, _, written in calls), calls
+
+
+def test_r4_interleave_lifecycle_converges(env, tmp_path, monkeypatch):
+    """After the first repair, a further thread change converges again."""
+    ns, provider, day, _ = env
+    a, b = _r4_files(day)
+    calls = _r4_probe(monkeypatch)
+    _r4_interleaved(ns, a)
+    observed = _r4_observe(ns, a)
+    _r4_assert_projects(observed, observed, _attribution(ns, "/tmp/proj-b"))
+    first_calls = len(calls)
+    _append(b, [dict(_meta_only(SESSION, "/tmp/proj-a")[0],
+                     timestamp="2026-07-20T12:30:00.000Z")])
+    _sync(ns)
+    _conv(ns)
+    observed = _r4_observe(ns, a)
+    assert observed["thread_cwd"] == "/tmp/proj-a"
+    _r4_assert_projects(observed, observed, _attribution(ns, "/tmp/proj-a"))
+    assert all(before == after for before, after, _ in calls)
+    assert any(written > 0 for _, _, written in calls[:first_calls]), calls
+    assert any(written > 0 for _, _, written in calls[first_calls:]), calls
+
+
+# --- #972 T6: the reconcile's scope and barrier boundaries --------------------
+
+
+def _rollup_project(ns, key):
+    rows = _conv_rows(ns, "SELECT project_key, project_label "
+                          "FROM main.codex_conversation_rollups "
+                          "WHERE conversation_key=?", (key,))
+    return tuple(rows[0]) if rows else None
+
+
+def _make_stale(ns, key):
+    """A persisted attribution that no longer matches the thread (drift)."""
+    conn = ns["open_conversations_db"]()
+    try:
+        conn.execute("UPDATE codex_conversation_rollups SET project_key='stale', "
+                     "project_label='stale' WHERE conversation_key=?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _plain_conversation(ns, day):
+    a = day / _name(11, 1)
+    write_rollout(a, conversation_records(2, session_id=SESSION, label="a",
+                                          cwd="/tmp/proj-a"))
+    _sync(ns)
+    _conv(ns)
+    return a, _key(ns, a)
+
+
+def test_reconcile_refuses_a_scoped_connection_and_a_scoped_read_writes_nothing(env):
+    """A scoped connection's TEMP rollups mirror the persisted ones; a
+    reconcile there would compare against a shadowed, empty thread view and
+    could rewrite every persisted rollup to `(unassigned)`."""
+    ns, provider, day, _ = env
+    a, key = _plain_conversation(ns, day)
+    _make_stale(ns, key)
+    account = _accounts(ns)[0]
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["scope_conversations_db_to_account"](conn, account)
+        assert _list_row(conn, key)["project_label"] == "stale"
+        with pytest.raises(RuntimeError, match="account-scoped"):
+            _cache()._reconcile_codex_rollup_attribution(
+                conn, _cache().CodexIngestStats())
+    finally:
+        conn.close()
+    assert _rollup_project(ns, key) == ("stale", "stale")
+
+
+def test_a_targeted_pass_leaves_drift_and_the_next_full_pass_repairs_it(env):
+    """The reconcile runs only on full passes; the positive control proves a
+    full pass repairs the same drift."""
+    ns, provider, day, _ = env
+    a, key = _plain_conversation(ns, day)
+    expected = _rollup_project(ns, key)
+    _make_stale(ns, key)
+    stats = _conv(ns, only_paths={str(a)})
+    assert stats.rollups_reattributed == 0
+    assert _rollup_project(ns, key) == ("stale", "stale")
+    stats = _conv(ns)
+    assert stats.rollups_reattributed == 1
+    assert _rollup_project(ns, key) == expected == _attribution(ns, "/tmp/proj-a")
+
+
+def test_the_reconcile_keeps_a_published_attribution_the_barrier_withholds(env):
+    """A population conversation's cache-side thread changed, but no new
+    certificate published it: the reconcile reads the last-good view, so the
+    rollup keeps the published project instead of exposing withheld metadata.
+    A plain conversation's drift in the same pass is the positive control."""
+    ns, provider, day, _ = env
+    a, o = day / _name(11, 1), day / _name(13, 3)
+    write_rollout(a, conversation_records(2, session_id=SESSION, label="a",
+                                          cwd="/tmp/proj-a"))
+    _compress(a)
+    write_rollout(o, conversation_records(1, session_id=OTHER_SESSION, label="o",
+                                          cwd="/tmp/proj-o"))
+    _sync(ns)
+    _conv(ns)
+    key, other = _key(ns, day / _name(11, 1)), _key(ns, o)
+    published = _rollup_project(ns, key)
+    assert published == _attribution(ns, "/tmp/proj-a")
+    assert _publication(ns, key) is not None
+    cache = ns["open_cache_db"]()
+    try:   # the cache-side thread moves on; no seal publishes it
+        cache.execute("UPDATE codex_conversation_threads SET cwd='/tmp/proj-z' "
+                      "WHERE conversation_key=?", (key,))
+        cache.commit()
+    finally:
+        cache.close()
+    assert _attribution(ns, "/tmp/proj-z") != published
+    _make_stale(ns, other)
+    stats = _conv(ns)
+    assert stats.rollups_reattributed == 1                 # the plain control
+    assert _rollup_project(ns, other) == _attribution(ns, "/tmp/proj-o")
+    assert _surfaces(ns, key)["thread"] == "/tmp/proj-a"
+    assert _rollup_project(ns, key) == published
+
+
+def _full_walk_complete(ns) -> bool:
+    cache = ns["open_cache_db"]()
+    try:
+        return cache.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?",
+            (_cache()._ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY,),
+        ).fetchone() is not None
+    finally:
+        cache.close()
+
+
+def test_unrelated_prune_debt_never_starves_a_repair(env):
+    """#972 §5.8 rule 1 (revision 5). Admission is per conversation: prune
+    debt for an unrelated vanished rollout keeps the accounting walk's
+    completion marker absent for as long as the debt stands (the drain may
+    never prove the identity absent), and a reconcile gated on that marker
+    left every drifted rollup unrepaired indefinitely."""
+    ns, provider, day, _ = env
+    a, key = _plain_conversation(ns, day)
+    expected = _rollup_project(ns, key)
+    cache = ns["open_cache_db"]()
+    try:   # debt no walk clears: only the drain worker may act on it
+        cache.execute(
+            "INSERT INTO codex_prune_debt (source_path, source_root_key, "
+            "recorded_at_utc) SELECT ?, source_root_key, '2026-07-21' "
+            "FROM codex_session_files LIMIT 1", (str(day / _name(15, 5)),))
+        cache.commit()
+    finally:
+        cache.close()
+    _sync(ns)
+    assert not _full_walk_complete(ns)
+    _make_stale(ns, key)
+    stats = _conv(ns)
+    assert stats.rollups_reattributed == 1
+    assert _rollup_project(ns, key) == expected == _attribution(ns, "/tmp/proj-a")
+
+
+def test_the_reconcile_waits_until_accounting_covers_every_session_meta(env):
+    """#972 §5.8 rule 1. The R4 pre-state: the conversation pass consumed B's
+    `session_meta`, but accounting has no cursor for B yet, so the cache-side
+    thread still reflects A alone. Repairing then would write A's project
+    (and churn the render revision back once B is accounted); the
+    conversation waits until accounting covers the line, and repairs to B's
+    project on the next full pass after it does."""
+    import _cctally_journal
+    ns, provider, day, _ = env
+    a, b = _r4_files(day)
+    _cctally_journal.ensure_quota_index(budgeted=False)
+    _sync_stopping_after(ns, 1)
+    _conv(ns)
+    key = _key(ns, a)
+    assert _one(ns, "SELECT COUNT(*) FROM codex_session_files WHERE path=?",
+                (str(b),)) == (0,)
+    _make_stale(ns, key)
+    stats = _conv(ns)
+    assert stats.rollups_reattributed == 0
+    assert _rollup_project(ns, key) == ("stale", "stale")   # not A's project
+    _sync(ns)
+    stats = _conv(ns)
+    assert stats.rollups_reattributed == 1
+    assert _rollup_project(ns, key) == _attribution(ns, "/tmp/proj-b")
+
+
+# --- #972 §5.8 rule 1 (revision 6): coverage from the same file generation ----
+
+
+def _generation(ns, path):
+    """Both walks' generation evidence for one path: (accounting, conversation)
+    each as (size_bytes, inode, anchor version, anchor offset, anchor)."""
+    cols = ("size_bytes, inode, content_anchor_version, "
+            "content_anchor_offset, content_anchor")
+    cache = ns["open_cache_db"]()
+    try:
+        f = cache.execute(f"SELECT {cols} FROM codex_session_files WHERE path=?",
+                          (str(path),)).fetchone()
+    finally:
+        cache.close()
+    c = _conv_rows(ns, f"SELECT {cols} FROM codex_conversation_source_files "
+                       "WHERE path=?", (str(path),))
+    return (None if f is None else tuple(f)), (c[0] if c else None)
+
+
+def _vc1_settled(ns, day):
+    """A and B settle on B's project; A then gains project-A metadata."""
+    a, b = _r4_files(day)
+    _sync(ns)
+    _conv(ns)
+    key = _key(ns, a)
+    settled = _rollup_project(ns, key)
+    assert settled == _attribution(ns, "/tmp/proj-b")
+    _append(a, [dict(_meta_only(SESSION, "/tmp/proj-a")[0],
+                     timestamp="2026-07-20T12:30:00.000Z")])
+    return a, b, key, settled
+
+
+def _vc1_accounting_reads_a_only(ns, a, b):
+    import _cctally_journal
+    _cctally_journal.ensure_quota_index(budgeted=False)
+    before = _generation(ns, b)[0]
+    _sync_stopping_after(ns, 1)
+    assert _generation(ns, b)[0] == before          # B's old cursor stands
+    cache = ns["open_cache_db"]()
+    try:
+        assert cache.execute(
+            "SELECT cwd FROM codex_conversation_threads WHERE conversation_key=?",
+            (_key(ns, a),)).fetchone()[0] == "/tmp/proj-a"
+    finally:
+        cache.close()
+
+
+def _vc1_ordered_control(tmp_path, monkeypatch, a):
+    """The same final provider tree, read in order by a fresh store."""
+    ns = _r4_store(tmp_path, monkeypatch, "data-ordered")
+    _sync(ns)
+    _conv(ns)
+    key = _key(ns, a)
+    return _rollup_project(ns, key)
+
+
+@pytest.mark.parametrize("change", ["replaced", "truncated"])
+def test_a_stale_generation_cursor_is_not_coverage(
+        env, tmp_path, monkeypatch, change):
+    """#972 §5.8 rule 1 (revision 6, VC-1). A path and an offset are
+    coordinates, not generation evidence. B's accounting cursor is a legacy
+    row with no content anchor, and B is then replaced at its pathname by a
+    new file (a new inode at B's own size, so only the inode tells them
+    apart) or truncated in place and rewritten smaller (the same inode, so
+    only the size tells them apart), and accounting stops after A. The
+    conversation pass resets B and consumes its new `session_meta` while B's
+    accounting cursor still holds the earlier incarnation's larger offset; a
+    reconcile that took that offset as coverage rewrote the rollup to A's
+    project from a thread row that never saw B's new metadata. It must keep
+    the stored project until accounting re-reads B, then converge to what an
+    ordered read of the same files yields."""
+    ns, provider, day, _ = env
+    a, b, key, settled = _vc1_settled(ns, day)
+    old = b.read_bytes()
+    cache = ns["open_cache_db"]()
+    try:   # a cursor written before content anchors existed
+        cache.execute("UPDATE codex_session_files SET content_anchor=NULL, "
+                      "content_anchor_version=NULL, "
+                      "content_anchor_offset=NULL WHERE path=?", (str(b),))
+        cache.commit()
+    finally:
+        cache.close()
+    if change == "replaced":
+        new = json.dumps(_meta_only(SESSION, "/tmp/proj-c")[0],
+                         separators=(",", ":")).encode() + b"\n"
+        assert len(new) == len(old)
+        tmp = b.with_name("replacement.tmp")
+        tmp.write_bytes(new)
+        inode = b.stat().st_ino
+        os.replace(tmp, b)
+        assert b.stat().st_ino != inode
+        final_cwd = "/tmp/proj-c"
+    else:
+        inode = b.stat().st_ino
+        write_rollout(b, _meta_only(SESSION, "/tmp/c"))   # in place, smaller
+        assert b.stat().st_ino == inode and b.stat().st_size < len(old)
+        final_cwd = "/tmp/c"
+    _vc1_accounting_reads_a_only(ns, a, b)
+    assert _generation(ns, b)[0][0] == len(old)     # offset beyond line 0
+    _conv(ns)
+    events = _conv_rows(ns, "SELECT line_offset, payload_json "
+                            "FROM codex_conversation_events "
+                            "WHERE source_path=? AND record_type='session_meta'",
+                        (str(b),))
+    assert [row[0] for row in events] == [0] and final_cwd in events[0][1]
+    assert _rollup_project(ns, key) == settled      # BASE: A's project
+    assert _rollup_project(ns, key) != _attribution(ns, "/tmp/proj-a")
+    _sync(ns)
+    _conv(ns)
+    accounting, conversation = _generation(ns, b)
+    assert accounting == conversation
+    assert _surfaces(ns, key)["thread"] == final_cwd
+    converged = _rollup_project(ns, key)
+    assert converged == _attribution(ns, final_cwd)
+    assert _vc1_ordered_control(tmp_path, monkeypatch, a) == converged
+
+
+def _quiet_rollout(day, shape):
+    """One quiet conversation in ``shape``; returns its logical path."""
+    path = day / _name(11, 1)
+    write_rollout(path, conversation_records(2, session_id=SESSION, label="q",
+                                             cwd="/tmp/proj-q"))
+    if shape == "compressed":
+        _compress(path)
+    return path
+
+
+@pytest.mark.parametrize("shape", ["plain", "compressed", "archived"])
+def test_a_quiet_rollout_both_walks_read_is_admitted(env, shape):
+    """#972 §5.8 rule 1 (revision 6): no starvation. Once both walks have read
+    a quiet rollout, plain, compressed or archived, both cursors carry the
+    same size, inode and content anchor, so the generation condition admits
+    the conversation and the reconcile repairs a drifted rollup. A leg on
+    which the two walks wrote different evidence for the same quiet file would
+    withhold every repair of that conversation forever."""
+    ns, provider, day, _ = env
+    path = _quiet_rollout(day, shape)
+    _sync(ns)
+    _conv(ns)
+    if shape == "archived":
+        archive = provider / "archived_sessions"
+        archive.mkdir()
+        os.rename(path, archive / path.name)
+        _sync(ns)
+        _conv(ns)
+    key = _key(ns, path)
+    expected = _rollup_project(ns, key)
+    assert expected == _attribution(ns, "/tmp/proj-q")
+    accounting, conversation = _generation(ns, path)
+    assert accounting is not None and accounting == conversation
+    _make_stale(ns, key)
+    stats = _conv(ns)
+    assert stats.rollups_reattributed == 1
+    assert _rollup_project(ns, key) == expected
+
+
+@pytest.mark.parametrize("divergence", ["container", "anchor"])
+def test_evidence_the_walks_keep_apart_never_withholds_a_repair(
+        env, divergence):
+    """#972 §5.8 rule 1 (revision 7): no starvation from evidence the two walks
+    maintain independently. Each walk adopts a verified container into its
+    own cursor on its own schedule, so for days one cursor can describe the
+    adopted `.zst` (its inode) while the other still describes the plain file
+    it replaced (on the real store, 26 `session_meta` rows of 9 compressed
+    conversations, 4 of them drifted, 2026-11-05). And after a partial read
+    followed by an in-place shrink the two walks settle at the same size on
+    the same inode with different content anchors. Comparing inodes across
+    different containers, or comparing anchors at all, withheld every repair
+    of those conversations forever; the size and same-container legs alone
+    decide."""
+    ns, provider, day, _ = env
+    path = _quiet_rollout(day, "compressed")
+    _sync(ns)
+    _conv(ns)
+    key = _key(ns, path)
+    expected = _rollup_project(ns, key)
+    accounting, conversation = _generation(ns, path)
+    assert accounting is not None and accounting == conversation
+    cache = ns["open_cache_db"]()
+    try:   # accounting's cursor diverges; the conversation pass never writes it
+        if divergence == "container":
+            cache.execute("UPDATE codex_session_files SET container_kind='plain', "
+                          "container_path=NULL, inode=inode+7 WHERE path=?",
+                          (str(path),))
+        else:
+            cache.execute("UPDATE codex_session_files SET "
+                          "content_anchor=X'00', content_anchor_offset=1 "
+                          "WHERE path=?", (str(path),))
+        cache.commit()
+    finally:
+        cache.close()
+    assert _generation(ns, path)[0] != _generation(ns, path)[1]
+    _make_stale(ns, key)
+    stats = _conv(ns)
+    assert stats.rollups_reattributed == 1
+    assert _rollup_project(ns, key) == expected
+
+
+@pytest.mark.parametrize(
+    "change", ["thread-deleted", "cwd-unusable", "cursor-regressed"])
+def test_a_change_after_detection_is_admitted_again_inside_the_batch(
+        env, monkeypatch, change):
+    """#972 §5.8 rule 8. Accounting writes under its own locks, so between
+    detection and a repair batch a drifted conversation's thread row can
+    vanish, its cwd can become underivable, or its accounting cursor can fall
+    back behind its `session_meta`. A batch that trusted detection wrote
+    `(unassigned)` over a correct label, failed the whole pass on the
+    underivable cwd, or wrote from unaccounted metadata; the batch must
+    re-admit inside its own snapshot and still repair the other drifted key
+    beside it."""
+    ns, provider, day, _ = env
+    a, key = _plain_conversation(ns, day)
+    b = day / _name(12, 2)
+    write_rollout(b, conversation_records(1, session_id=OTHER_SESSION, label="b",
+                                          cwd="/tmp/proj-b"))
+    _sync(ns)
+    _conv(ns)
+    other = _key(ns, b)
+    expected = _rollup_project(ns, other)
+    _make_stale(ns, key)
+    _make_stale(ns, other)
+    cc = _cache()
+    real = cc._reconcile_codex_rollup_batch
+    batches: list = []
+
+    def interleave(conn, batch, stats, attributions):
+        batches.append(sorted(batch))
+        cache = ns["open_cache_db"]()
+        try:   # another writer, between detection and this batch
+            if change == "thread-deleted":
+                cache.execute("DELETE FROM codex_conversation_threads "
+                              "WHERE conversation_key=?", (key,))
+            elif change == "cwd-unusable":
+                cache.execute("UPDATE codex_conversation_threads "
+                              "SET cwd = '/tmp/proj' || char(0) || 'nul' "
+                              "WHERE conversation_key=?", (key,))
+            else:
+                cache.execute("UPDATE codex_session_files SET last_byte_offset=0 "
+                              "WHERE path=?", (str(a),))
+            cache.commit()
+        finally:
+            cache.close()
+        return real(conn, batch, stats, attributions)
+
+    monkeypatch.setattr(cc, "_reconcile_codex_rollup_batch", interleave)
+    stats = _conv(ns)
+    assert batches == [sorted([key, other])]       # detection admitted both
+    assert stats.rollups_reattributed == 1
+    assert stats.rollups_reconcile_skipped == int(change == "cwd-unusable")
+    assert _rollup_project(ns, other) == expected
+    assert _rollup_project(ns, key) == ("stale", "stale")
+
+
+def test_one_underivable_rollup_is_skipped_and_the_rest_repair(env):
+    """#972 §5.8 rule 4. A cwd the filesystem layer refuses (an embedded NUL
+    makes `realpath` raise ValueError) skips that one rollup and is counted;
+    it must not fail every full pass and block every other repair."""
+    ns, provider, day, _ = env
+    a, key = _plain_conversation(ns, day)
+    b = day / _name(12, 2)
+    write_rollout(b, conversation_records(1, session_id=OTHER_SESSION, label="b",
+                                          cwd="/tmp/proj-b"))
+    _sync(ns)
+    _conv(ns)
+    other = _key(ns, b)
+    expected = _rollup_project(ns, other)
+    _make_stale(ns, key)
+    _make_stale(ns, other)
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute("UPDATE codex_conversation_threads "
+                      "SET cwd = '/tmp/proj' || char(0) || 'nul' "
+                      "WHERE conversation_key=?", (key,))
+        cache.commit()
+    finally:
+        cache.close()
+    stats = _conv(ns)
+    assert stats.files_failed == 0
+    assert stats.rollups_reconcile_skipped == 1
+    assert stats.rollups_reattributed == 1
+    assert _rollup_project(ns, other) == expected
+    assert _rollup_project(ns, key) == ("stale", "stale")
+
+
+def test_the_reconcile_keeps_null_attribution_for_malformed_metadata(env):
+    """A thread whose metadata cannot be read is NULL, never `(unassigned)`:
+    a persisted `(unassigned)` would be a wrong answer every reader prefers."""
+    ns, provider, day, _ = env
+    a, key = _plain_conversation(ns, day)
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute("UPDATE codex_conversation_threads SET cwd = CAST(? AS TEXT) "
+                      "WHERE conversation_key = ?", (b"/tmp/\xffproj", key))
+        cache.commit()
+    finally:
+        cache.close()
+    stats = _conv(ns)
+    assert stats.rollups_reattributed == 1
+    assert _rollup_project(ns, key) == (None, None)
+    stats = _conv(ns)
+    assert stats.rollups_reattributed == 0
+    assert _rollup_project(ns, key) == (None, None)
+
+
 def test_publication_statements_build_no_history_sized_temp_structures(env):
     """#901 G1 for every statement the conversation barrier adds."""
     import _sql_plan_guard as guard
@@ -1366,3 +2101,505 @@ def test_the_startup_deferral_facts_read_the_real_schema(env):
     assert appended["/r/a.jsonl"]["keys"]["k-member"]["required"] == 5
     assert appended["/r/a.jsonl"]["target"]["complete_line_end"] == 180
     assert observe(drain, appended) == before
+
+
+# ── #1052: a terminal contributor certifies without publishing ──────────────
+
+#: The equal-length message-text mutation the cache adopts (its legacy check
+#: compares no messages it does not hold) and the conversations store rejects
+#: (its legacy check compares every event and message): #1052 M3.
+_TERMINAL_TEXT = (b'"text":"Answer a0"', b'"text":"Answer q0"')
+#: Unit shapes: the terminal file alone, or with a quiet plain sibling that
+#: sorts before it (the terminal file is met last) or after it (first).
+_TERMINAL_HOURS = {"alone": (11, None), "sibling_first": (12, 11),
+                   "sibling_last": (11, 12)}
+
+
+def _anchorless(ns, path) -> None:
+    """Both stores' cursors become legacy rows: no content anchor, so only
+    derived-content equivalence decides their verification."""
+    for opener, table in (("open_cache_db", "codex_session_files"),
+                          ("open_conversations_db",
+                           "codex_conversation_source_files")):
+        conn = ns[opener]()
+        try:
+            conn.execute(
+                f"UPDATE {table} SET content_anchor=NULL, "
+                "content_anchor_version=NULL, content_anchor_offset=NULL "
+                "WHERE path=?", (str(path),))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _terminal_unit(ns, day, shape):
+    """#1052 M3 on a real two-store fixture: the cache accepted the
+    compressed container of ``a`` (target READY, sealed), the conversations
+    store ended it ``unverified/legacy-inequivalent``, and the certificate
+    naming ``a`` is unpublished. With a sibling, ``b`` feeds the same
+    conversation and carries certified bytes the conversations store has not
+    consumed. Returns ``(a, zpath, good, b, key)``."""
+    terminal_hour, sibling_hour = _TERMINAL_HOURS[shape]
+    a = day / _name(terminal_hour, 1)
+    write_rollout(a, conversation_records(2, session_id=SESSION, label="a",
+                                          cwd="/tmp/proj-a"))
+    b = None
+    if sibling_hour is not None:
+        b = day / _name(sibling_hour, 2)
+        write_rollout(b, token_records(0, session_id=SESSION)[:1]
+                      + conversation_records(1, session_id=SESSION,
+                                             label="b")[1:])
+    _sync(ns)
+    _conv(ns)
+    key = _key(ns, a)
+    if b is not None:
+        assert _key(ns, b) == key
+    _anchorless(ns, a)
+    good = a.read_bytes()
+    assert _TERMINAL_TEXT[0] in good
+    zpath = a.with_name(a.name + ".zst")
+    zpath.write_bytes(zstd_bytes(good.replace(*_TERMINAL_TEXT, 1)))
+    a.unlink()
+    _sync(ns)
+    _conv(ns)                       # both stores now hold the transition pending
+    _cache().run_codex_container_verification_drain(wait_for_requests=False)
+    if b is not None:
+        _append(b, conversation_records(2, session_id=SESSION,
+                                        label="b")[-4:])
+    _sync(ns)
+    _cache().run_codex_barrier_seal_drain(wait_for_requests=False)
+    _sync(ns)
+    cache_cursor = _one(ns, "SELECT container_state, container_kind "
+                            "FROM codex_session_files WHERE path=?", (str(a),))
+    conv_cursor = _conv_rows(
+        ns, "SELECT container_state, container_state_reason "
+            "FROM codex_conversation_source_files WHERE path=?", (str(a),))
+    target = _one(ns, "SELECT state FROM codex_barrier_targets "
+                      "WHERE source_path=?", (str(a),))
+    assert (tuple(cache_cursor), conv_cursor, tuple(target)) == (
+        ("accepted", "zstd"), [("unverified", "legacy-inequivalent")],
+        ("ready",)), "the fixture did not reach #1052 M3"
+    cert = _certificate(ns, key)
+    assert cert is not None and str(a) in _paths_of(cert)
+    published = _publication(ns, key)
+    assert published is None or published[0] < cert["revision"]
+    return a, zpath, good, b, key
+
+
+def _paths_of(cert) -> set:
+    return {c["path"] for c in cert["contributors"]}
+
+
+def _file_rows(ns, path):
+    """The conversations store's cursor, message and event rows of a file."""
+    return (
+        _conv_rows(ns, "SELECT * FROM codex_conversation_source_files "
+                       "WHERE path=?", (str(path),)),
+        _conv_rows(ns, "SELECT * FROM codex_conversation_messages "
+                       "WHERE source_path=? ORDER BY id", (str(path),)),
+        _conv_rows(ns, "SELECT * FROM codex_conversation_events "
+                       "WHERE source_path=? ORDER BY line_offset", (str(path),)))
+
+
+def _seal_tokens(ns):
+    import _lib_codex_publication_barrier as barrier
+    conn = ns["open_conversations_db"]()
+    try:
+        sealed = conn.execute("SELECT value FROM cache_db.cache_meta WHERE key=?",
+                              (barrier.SEAL_SEQ_KEY,)).fetchone()
+        seen = conn.execute("SELECT value FROM main.cache_meta WHERE key=?",
+                            (barrier.PUBLISHED_SEQ_KEY,)).fetchone()
+    finally:
+        conn.close()
+    return (None if sealed is None else sealed[0],
+            None if seen is None else seen[0])
+
+
+def _reader_seams(monkeypatch):
+    """Count the conversation reader's reads and the full-stream validations
+    (decodes) per logical path. The reader seam is the record iterator the
+    conversation pass consumes a file through; the bounded root-recognition
+    read of a full walk's prune scope is not a publication read."""
+    leaf = sys.modules["_lib_codex_rollout_container"]
+    cc = _cache()
+    opened, validated = [], []
+    real_read = cc._iter_codex_fused_records_with_offsets
+    real_validate = leaf.validate_full_stream
+
+    def read(fh, path_str, *args, **kwargs):
+        opened.append(str(path_str))
+        return real_read(fh, path_str, *args, **kwargs)
+
+    def validate_full_stream(container, *args, **kwargs):
+        validated.append(str(container.logical))
+        return real_validate(container, *args, **kwargs)
+
+    monkeypatch.setattr(cc, "_iter_codex_fused_records_with_offsets", read)
+    monkeypatch.setattr(leaf, "validate_full_stream", validate_full_stream)
+    return opened, validated
+
+
+def _codex_roots():
+    return tuple(r.walk_root for r in _cache()._codex_provider_roots())
+
+
+def _seeded_frontier(ns):
+    """A trusted Codex conversation frontier seeded from the last pass."""
+    import _lib_ingest_frontier as frontier
+    app_dir = ns["APP_DIR"] / "frontier-1052"
+    state = frontier.ConversationSyncFrontier(app_dir)
+    conn = ns["open_conversations_db"]()
+    try:
+        assert state.seed_provider("codex", conn, roots=_codex_roots(),
+                                   trusted=True), state.last_seed_failure
+    finally:
+        conn.close()
+    return state, app_dir
+
+
+def _plan(ns, state):
+    conn = ns["open_conversations_db"]()
+    try:
+        return state.plan_provider("codex", conn, roots=_codex_roots())
+    finally:
+        conn.close()
+
+
+def _force_conversation_state(ns, path, state) -> None:
+    conn = ns["open_conversations_db"]()
+    try:
+        conn.execute("UPDATE codex_conversation_source_files "
+                     "SET container_state=? WHERE path=?", (state, str(path)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("shape", [
+    "alone", "sibling_first", "sibling_last",
+    "control_pending", "control_executor", "control_other_state"])
+def test_a_terminal_unit_certifies_without_publishing(env, monkeypatch, shape):
+    """Detects (#1052): a terminal conversations-store verdict that fails the
+    Codex transcript pass retryably on every pass (`barrier_retry` /
+    `unit_failed`, so neither provider's frontier ever certifies), that
+    publishes or reads the unverified container or a sibling of its unit, or
+    that is classified by its reason alone. The controls keep every other
+    held contributor retryable."""
+    import _lib_ingest_frontier as frontier
+    ns, _provider, day, _ = env
+    unit_shape = "alone" if shape.startswith("control_") else shape
+    a, _zpath, _good, b, key = _terminal_unit(ns, day, unit_shape)
+    if shape.startswith("control_"):
+        kwargs = {}
+        if shape == "control_pending":
+            _force_conversation_state(ns, a, "pending")
+        elif shape == "control_other_state":
+            _force_conversation_state(ns, a, "quarantined")
+        else:
+            kwargs["executor_paths"] = frozenset({str(a)})
+        stats = _conv(ns, **kwargs)
+        assert getattr(stats, "barrier_keys_terminal", 0) == 0
+        assert str(a) not in (getattr(stats, "barrier_terminal_keys", {}) or {})
+        if shape != "control_executor":
+            assert stats.barrier_retry is True
+            assert not frontier.conversation_sync_certifiable("full", stats)
+        return
+    accounts = _accounts(ns)
+    surfaces, publication = _surfaces(ns, key, accounts), _publication(ns, key)
+    rows = _file_rows(ns, a)
+    sibling_rows = None if b is None else _file_rows(ns, b)[0]
+    opened, validated = _reader_seams(monkeypatch)
+    for _ in range(2):
+        del opened[:], validated[:]
+        stats = _conv(ns)
+        assert stats.barrier_retry is False, sorted(stats.barrier_retry_causes)
+        assert stats.barrier_keys_terminal == 1
+        assert stats.barrier_keys_deferred >= stats.barrier_keys_terminal
+        assert stats.barrier_terminal_keys == {str(a): frozenset({key})}
+        assert stats.container_reads_held == 0
+        assert frontier.conversation_sync_certifiable("full", stats)
+        assert _surfaces(ns, key, accounts) == surfaces
+        assert _publication(ns, key) == publication
+        assert _file_rows(ns, a) == rows
+        sealed, seen = _seal_tokens(ns)
+        assert sealed is not None and seen == sealed
+        assert str(a) not in opened and str(a) not in validated
+        if b is not None:
+            assert str(b) not in opened, "the terminal unit read its sibling"
+            assert _file_rows(ns, b)[0] == sibling_rows
+    conn = ns["open_conversations_db"]()
+    try:
+        assert frontier._codex_publication_backlog(conn) == (False, frozenset())
+    finally:
+        conn.close()
+    state, _app_dir = _seeded_frontier(ns)
+    plan = _plan(ns, state)
+    if b is not None:
+        # The sibling's certified bytes stay unconsumed behind its cursor, so
+        # the recent-activity restat names it while that cursor is younger
+        # than its window: a bounded, certifiable pass that reads nothing.
+        assert (plan.mode, plan.reason, plan.paths) == (
+            "targeted", "recent_activity", frozenset({str(b)})), plan
+        del opened[:], validated[:]
+        stats = _conv(ns, only_paths=set(plan.paths))
+        assert stats.barrier_terminal_keys == {str(a): frozenset({key})}
+        assert frontier.conversation_sync_certifiable(
+            "targeted", stats, expected_paths=len(plan.paths))
+        assert not set(opened) & {str(a), str(b)} and str(a) not in validated
+        real_floor = frontier._recency_floor_iso
+        later = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+            seconds=frontier.FRONTIER_RECENT_ACTIVITY_SECONDS + 1)
+        monkeypatch.setattr(frontier, "_recency_floor_iso",
+                            lambda now=None: real_floor(now or later))
+        plan = _plan(ns, state)
+    assert plan.mode == "caught_up", (plan.mode, plan.reason)
+
+
+@pytest.mark.parametrize("discovery", ["ticket", "expiry"])
+def test_a_terminal_unit_recovers_on_new_evidence(env, monkeypatch, discovery):
+    """Detects (#1052): a terminal deferral that never retries after a
+    genuine container change, or a stamped seal token that hides the change
+    from an already-certified frontier. The cache's seal token is held fixed
+    while the frontier discovers the change."""
+    import _lib_ingest_frontier as frontier
+    ns, _provider, day, _ = env
+    a, zpath, good, _b, key = _terminal_unit(ns, day, "alone")
+    accounts = _accounts(ns)
+    surfaces, publication = _surfaces(ns, key, accounts), _publication(ns, key)
+    first = _conv(ns)
+    assert frontier.conversation_sync_certifiable("full", first)
+    state, app_dir = _seeded_frontier(ns)
+    assert _plan(ns, state).mode == "caught_up"
+    sealed_before, _seen = _seal_tokens(ns)
+    # A new fingerprint at the same inode, so no directory moves: the original
+    # text, compressed again.
+    zpath.write_bytes(zstd_bytes(good))
+    if discovery == "ticket":
+        assert frontier.record_activity(app_dir, "codex", str(a))
+        plan = _plan(ns, state)
+        assert plan.mode == "targeted" and str(a) in plan.paths, plan
+        stats = _conv(ns, only_paths=set(plan.paths))
+        expected = len(plan.paths)
+    else:
+        # No ticket, and the cursor is older than the recent-activity restat
+        # window, so only the certificate's age bound can find the change.
+        conn = ns["open_conversations_db"]()
+        try:
+            conn.execute("UPDATE codex_conversation_source_files SET "
+                         "last_ingested_at='2026-07-20T00:00:00+00:00' "
+                         "WHERE path=?", (str(a),))
+            conn.commit()
+        finally:
+            conn.close()
+        assert _plan(ns, state).mode == "caught_up"
+        real_now = frontier._now
+        monkeypatch.setattr(
+            frontier, "_now",
+            lambda: real_now() + frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS + 1)
+        plan = _plan(ns, state)
+        assert (plan.mode, plan.reason) == ("full", "certificate_expired")
+        stats = _conv(ns)
+        expected = 0
+    assert _seal_tokens(ns)[0] == sealed_before
+    assert stats.container_pending >= 1
+    assert not frontier.conversation_sync_certifiable(
+        plan.mode, stats, expected_paths=expected)
+    assert _conv_rows(ns, "SELECT container_state FROM "
+                          "codex_conversation_source_files WHERE path=?",
+                      (str(a),)) == [("pending",)]
+    assert _surfaces(ns, key, accounts) == surfaces
+    # Verification adopts the container in the conversations store; the
+    # cache's anchor was taken over the mutated text, so its own verdict is
+    # `reset/prefix-mismatch`: it re-ingests and re-seals.
+    _sync(ns)
+    _cache().run_codex_container_verification_drain(wait_for_requests=False)
+    assert _conv_rows(ns, "SELECT container_state FROM "
+                          "codex_conversation_source_files WHERE path=?",
+                      (str(a),)) == [("accepted",)]
+    _sync(ns)
+    _cache().run_codex_barrier_seal_drain(wait_for_requests=False)
+    _sync(ns)
+    assert _seal_tokens(ns)[0] != sealed_before
+    assert _surfaces(ns, key, accounts) == surfaces
+    assert _publication(ns, key) == publication
+    published = _conv(ns)
+    assert published.barrier_keys_terminal == 0
+    assert published.barrier_retry is False, sorted(published.barrier_retry_causes)
+    after = _publication(ns, key)
+    assert after is not None and after[0] == _certificate(ns, key)["revision"]
+    assert publication is None or after[0] > publication[0]
+
+
+@pytest.mark.parametrize("blocker", [
+    "g10_closure", "g10_full", "pending_sibling", "pending_closure_sibling",
+    "protected_sibling", "other_state_sibling", "truncated_closure_sibling",
+    "replaced_sibling", "loop_meets_terminal"])
+def test_a_terminal_unit_with_a_blocked_file_keeps_refusing(
+        env, monkeypatch, blocker):
+    """Detects (#1052 R1-P1-1, review F2-F4): terminal dominance that hides a
+    certification refusal another file of the unit raises (a G10
+    requalification hold, a pending verification, a protected path, a state
+    that is not ``unverified``, a targeted pass's reset of a sibling that
+    arrives only through the unit's closure, a certificate naming another
+    generation of a sibling), a held read or a pending skip that the pass
+    double counts or does not report, or a loop that meets a terminal
+    contributor and no longer fails its unit retryably."""
+    import _lib_ingest_frontier as frontier
+    ns, _provider, day, _ = env
+    # The loop fails a unit at its first refusing file, so a sibling whose
+    # own refusal the pass reports must sort before the terminal contributor.
+    shape = ("sibling_first" if blocker in (
+        "pending_closure_sibling", "truncated_closure_sibling")
+        else "sibling_last")
+    a, _zpath, _good, b, _key = _terminal_unit(ns, day, shape)
+    cc = _cache()
+    kwargs = {}
+    if blocker in ("g10_closure", "g10_full"):
+        # The terminal contributor is G10-held: met in the unit's closure
+        # alone (a targeted census of the quiet sibling) or in both phases.
+        root_key = _one(ns, "SELECT source_root_key FROM codex_session_files "
+                            "WHERE path=?", (str(a),))[0]
+        real_held = cc._codex_requalification_held_names
+
+        def held(conn, conv_conn, roots, *, cache_schema=""):
+            names = dict(real_held(conn, conv_conn, roots,
+                                   cache_schema=cache_schema))
+            names[root_key] = frozenset(names.get(root_key, ())) | {a.name}
+            return names
+
+        monkeypatch.setattr(cc, "_codex_requalification_held_names", held)
+        if blocker == "g10_closure":
+            kwargs["only_paths"] = {str(b)}
+    elif blocker in ("pending_sibling", "pending_closure_sibling"):
+        _force_conversation_state(ns, b, "pending")
+        if blocker == "pending_closure_sibling":
+            kwargs["only_paths"] = {str(a)}
+    elif blocker == "other_state_sibling":
+        _force_conversation_state(ns, b, "quarantined")
+    elif blocker == "truncated_closure_sibling":
+        b.write_bytes(b.read_bytes().splitlines(keepends=True)[0])
+        kwargs["only_paths"] = {str(a)}
+    elif blocker == "replaced_sibling":
+        # Same bytes under a new inode, before the cache re-seals: the
+        # certificate names the old generation.
+        twin = b.with_name(b.name + ".new")
+        twin.write_bytes(b.read_bytes())
+        twin.replace(b)
+    elif blocker == "protected_sibling":
+        real_partition = cc._partition_codex_prune_candidates
+
+        def partition(scope, sources, roots, *, refusal):
+            safe, refused, safe_roots, refused_roots = real_partition(
+                scope, sources, roots, refusal=refusal)
+            for path, root in sources:
+                if path == str(b):
+                    safe = [s for s in safe if s[0] != path]
+                    refused = list(refused) + [(path, root)]
+            return safe, refused, safe_roots, refused_roots
+
+        monkeypatch.setattr(cc, "_partition_codex_prune_candidates", partition)
+    else:
+        monkeypatch.setattr(cc, "_classify_codex_unit_file",
+                            lambda *args, **kwargs: "quiet", raising=False)
+    stats = _conv(ns, **kwargs)
+    assert stats.barrier_retry is True
+    assert getattr(stats, "barrier_keys_terminal", 0) == 0
+    mode = "targeted" if "only_paths" in kwargs else "full"
+    assert not frontier.conversation_sync_certifiable(
+        mode, stats, expected_paths=stats.files_total)
+    if blocker in ("g10_closure", "g10_full"):
+        assert stats.container_reads_held == 1
+        assert cc.CODEX_PRUNE_DRAIN_COMMAND in stats.drain_requested
+    if blocker == "pending_closure_sibling":
+        assert stats.barrier_container_skipped == {"verification-pending": 1}
+        assert cc.CODEX_REPLAY_DRAIN_COMMAND in stats.drain_requested
+    if blocker == "truncated_closure_sibling":
+        assert stats.deferred_reason == "truncation"
+
+
+def test_classification_blocks_a_cursorless_container_without_decoding(
+        env, monkeypatch):
+    """Detects (#1052 A5): unit classification that decides a never-ingested
+    compressed contributor, whose decision validates (decodes) the whole
+    stream, instead of leaving it to the loop's own first sight: a full
+    decode per unit on every dashboard pass."""
+    import types
+    ns, _provider, day, _ = env
+    cc = _cache()
+    logical = day / _name(13, 3)
+    write_rollout(logical, conversation_records(1, session_id=SESSION,
+                                                label="z"))
+    _compress(logical)
+    assert not logical.exists()
+
+    def decided(*args, **kwargs):
+        raise AssertionError("classification reached the container decision")
+
+    monkeypatch.setattr(cc, "_codex_container_decision", decided)
+    discovered = types.SimpleNamespace(source_path=logical,
+                                       source_root_key="unused")
+    conn = ns["open_conversations_db"]()
+    try:
+        assert cc._classify_codex_unit_file(
+            conn, discovered, executor_paths=frozenset(),
+            protected_paths=frozenset(), requal_held={}, unit=None,
+            targeted=False, cursor=None) == "blocked"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("unrelated", [0, 20])
+def test_due_pass_file_work_is_fixed_by_the_closure(env, monkeypatch, unrelated):
+    """Detects (#1052 A5): a later due pass whose file work grows with
+    unrelated stored history rather than with the outstanding closure (the
+    ticketed paths plus the contributors of every unpublished certificate),
+    or that reads a terminal contributor."""
+    import _lib_ingest_frontier as frontier
+    ns, _provider, day, _ = env
+    for index in range(unrelated):
+        path = day / _name(15, 100 + index)
+        write_rollout(path, conversation_records(
+            1, session_id=f"0199aaaa-bbbb-7ccc-8ddd-eeeeffff{2000 + index:04d}",
+            label=f"u{index}"))
+        _compress(path)
+    o = day / _name(13, 3)
+    write_rollout(o, conversation_records(1, session_id=OTHER_SESSION,
+                                          label="o"))
+    _compress(o)
+    p = day / _name(14, 5)
+    write_rollout(p, token_records(0, session_id=OTHER_SESSION)[:1]
+                  + conversation_records(1, session_id=OTHER_SESSION,
+                                         label="p")[1:])
+    a, _zpath, _good, _b, _key = _terminal_unit(ns, day, "alone")
+    assert frontier.conversation_sync_certifiable("full", _conv(ns))
+    state, _app_dir = _seeded_frontier(ns)
+    assert _plan(ns, state).mode == "caught_up"
+    # A new seal for one unrelated conversation, from an append (no directory
+    # moves), makes the publication backlog due.
+    _append(p, conversation_records(2, session_id=OTHER_SESSION,
+                                    label="p")[-4:])
+    _sync(ns)
+    closure = {str(a), str(o), str(p)}
+    conn = ns["open_conversations_db"]()
+    try:
+        assert frontier._codex_publication_backlog(conn) == (
+            True, frozenset(closure))
+    finally:
+        conn.close()
+    plan = _plan(ns, state)
+    assert plan.mode == "targeted" and set(plan.paths) == closure, plan
+    selected: list = []
+    real_select = _cache()._select_codex_container
+
+    def select(logical, *args, **kwargs):
+        selected.append(str(logical))
+        return real_select(logical, *args, **kwargs)
+
+    monkeypatch.setattr(_cache(), "_select_codex_container", select)
+    opened, validated = _reader_seams(monkeypatch)
+    stats = _conv(ns, only_paths=set(plan.paths))
+    assert set(selected) == closure
+    assert str(a) not in opened and str(a) not in validated
+    assert frontier.conversation_sync_certifiable(
+        "targeted", stats, expected_paths=len(plan.paths)), (
+        stats.barrier_retry, sorted(stats.barrier_retry_causes))

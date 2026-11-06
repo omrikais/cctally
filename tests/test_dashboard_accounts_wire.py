@@ -162,7 +162,10 @@ def test_decorated_source_emits_per_account_cards_and_cycles(tmp_path, monkeypat
         _cctally_account, "resolve_active_account_keys", lambda: {_ACCT_A})
     cycle_index_calls = []
 
-    def _cycle_index(_conn, *, identity, now_utc, account_key=None):
+    def _cycle_index(_conn, *, identity, now_utc, account_key=None,
+                     **_cost_inputs):
+        # #1050: the source build also hands over the cost inputs
+        # (`cache_conn`, `speed`, `stats_digest`).
         cycle_index_calls.append(account_key)
         return ({"key": f"cycle:{account_key or 'merged'}"},)
 
@@ -1165,6 +1168,7 @@ def test_one_codex_registry_reading_feeds_decoration_and_the_account_scope(
         monkeypatch.setattr(
             _cctally_account, "real_account_count", _first_read_only)
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            claude_input_identity=ns["_cctally_tui"]._tui_read_claude_input_identity(stats),
             stats_conn=stats,
             now_utc=NOW,
             display_tz_name="UTC",

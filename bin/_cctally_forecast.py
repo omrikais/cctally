@@ -135,15 +135,19 @@ def _resolve_forecast_now(as_of: str | None) -> dt.datetime:
 
 
 def _shape_week_samples(rows, *, include_held: bool,
-                        include_account: bool = False) -> list:
+                        include_account: bool = False,
+                        include_journal_id: bool = False) -> list:
     """Turn snapshot rows into the sample tuples `_fetch_current_week_snapshots`
     returns. Both of that function's row-fetch legs go through here so the two
     cannot drift on the tuple width.
 
     `rows` are `(captured_at_utc, weekly_percent, five_hour_percent,
-    weekly_observation_held[, account_key])`. The held flag is appended only
-    for a held-inclusive read, and the account only for an explicit identity
-    read. Existing consumers keep the historical three- or four-field shape.
+    weekly_observation_held[, account_key][, journal_id])`. The held flag is
+    appended only for a held-inclusive read, the account only for an explicit
+    identity read, and the row's `journal_id` (#1018 twin spec 5.3: the
+    displayed row's originating observation) only when asked for, after
+    every other field. Existing consumers keep the historical three- or
+    four-field shape.
     """
     out = []
     for row in rows:
@@ -156,6 +160,8 @@ def _shape_week_samples(rows, *, include_held: bool,
             sample = sample + (int(row[3] or 0),)
         if include_account:
             sample = sample + (row[4],)
+        if include_journal_id:
+            sample = sample + (row[5 if include_account else 4],)
         out.append(sample)
     return out
 
@@ -183,7 +189,8 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
                                   *, account_key: "str | None" = None,
                                   include_held: bool = False,
                                   include_account: bool = False,
-                                  include_scope: bool = False):
+                                  include_scope: bool = False,
+                                  include_journal_id: bool = False):
     """Return (week_start_at, week_end_at, list[(captured_at, percent, five_hr)])
     for the subscription week containing `now_utc`, or None if no snapshot
     exists for the current week.
@@ -241,6 +248,12 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
     reading the five-hour axis selects its reading under exactly this scope
     rather than from the newest sample, which a retired replica or a
     weekly-only reading leaves without a five-hour value.
+
+    ``include_journal_id`` (#1018 twin spec 5.3) appends each row's
+    `journal_id` as the LAST sample field, after the held flag and the
+    account, so the Current Week card can resolve its displayed row's
+    originating observation. Every other caller keeps its tuple width, and
+    the trailing SQL row id ordering is unchanged.
     """
     # #341: optional account scoping — same predicate on every leg so the whole
     # window resolution stays consistent (a real key or the `unattributed`
@@ -254,6 +267,8 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
     # The TUI's multi-account card needs the physical owner of the sample it
     # actually displays. Keep the historical sample shape for every other read.
     _owner_column = ", account_key" if include_account else ""
+    if include_journal_id:
+        _owner_column += ", journal_id"
     _sample_order = " ASC, id ASC" if include_account else " ASC"
     candidates = conn.execute(
         "SELECT week_start_at, week_end_at, week_start_date, MAX(captured_at_utc) AS latest_cap "
@@ -310,7 +325,8 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
             (drow[0],) + _acct_p,
         ).fetchall()
         samples = _shape_week_samples(rows, include_held=include_held,
-                                      include_account=include_account)
+                                      include_account=include_account,
+                                      include_journal_id=include_journal_id)
         samples = [s for s in samples if s[0] <= now_utc]
         if include_scope:
             return week_start_at, week_end_at, samples, (drow[0], None)
@@ -343,7 +359,8 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
         tuple(matching_texts) + (chosen_date,) + _acct_p,
     ), by_id=include_account)
     samples = _shape_week_samples(rows, include_held=include_held,
-                                  include_account=include_account)
+                                  include_account=include_account,
+                                  include_journal_id=include_journal_id)
     samples = [s for s in samples if s[0] <= now_utc]
     if include_scope:
         return (week_start_at, week_end_at, samples,
@@ -579,7 +596,8 @@ def _claude_current_cycle_scope(conn, now_utc: dt.datetime, *,
 
 
 def _claude_cycle_scope_samples(conn, scope: ClaudeCycleScope,
-                                now_utc: dt.datetime):
+                                now_utc: dt.datetime, *,
+                                include_journal_id: bool = False):
     """The decorated card's held-inclusive samples for ``scope`` (#836).
 
     The shape of ``_fetch_current_week_snapshots(include_held=True,
@@ -590,8 +608,10 @@ def _claude_cycle_scope_samples(conn, scope: ClaudeCycleScope,
     ``MAX(captured_at_utc)``. ``week_start_at`` is the NOMINAL start; the
     caller filters from ``scope.effective_start_at``. Samples are filtered to
     ``captured_at <= now_utc``. Returns ``None`` when the window cannot be
-    resolved.
+    resolved. ``include_journal_id`` appends each row's `journal_id` as the
+    last sample field (#1018 twin spec 5.3).
     """
+    _jid = ", journal_id" if include_journal_id else ""
     floor_date = (now_utc.astimezone(dt.timezone.utc).date()
                   - dt.timedelta(days=_CLAUDE_CYCLE_CANDIDATE_DAYS)).isoformat()
     if scope.week_start_at is None:
@@ -615,14 +635,15 @@ def _claude_cycle_scope_samples(conn, scope: ClaudeCycleScope,
             local_tz).astimezone(dt.timezone.utc)
         rows = conn.execute(
             "SELECT captured_at_utc, weekly_percent, five_hour_percent, "
-            "       weekly_observation_held, account_key "
+            "       weekly_observation_held, account_key" + _jid + " "
             "FROM weekly_usage_snapshots "
             "WHERE week_start_date = ? AND account_key = ? "
             "ORDER BY captured_at_utc ASC, id ASC",
             (scope.week_start_date, scope.account_key),
         ).fetchall()
         samples = _shape_week_samples(rows, include_held=True,
-                                      include_account=True)
+                                      include_account=True,
+                                      include_journal_id=include_journal_id)
         samples = [s for s in samples if s[0] <= now_utc]
         return (week_start_at, week_end_at, samples,
                 (scope.week_start_date, None))
@@ -647,7 +668,7 @@ def _claude_cycle_scope_samples(conn, scope: ClaudeCycleScope,
     placeholders = ",".join("?" * len(matching_texts))
     rows = _week_rows_by_capture(conn.execute(
         f"SELECT captured_at_utc, weekly_percent, five_hour_percent, "
-        f"       weekly_observation_held, account_key, id "
+        f"       weekly_observation_held, account_key{_jid}, id "
         f"FROM weekly_usage_snapshots "
         f"WHERE (week_start_at IN ({placeholders}) "
         f"       OR (week_start_at IS NULL AND week_start_date = ?)) "
@@ -655,7 +676,8 @@ def _claude_cycle_scope_samples(conn, scope: ClaudeCycleScope,
         tuple(matching_texts) + (scope.week_start_date, scope.account_key),
     ), by_id=True)
     samples = _shape_week_samples(rows, include_held=True,
-                                  include_account=True)
+                                  include_account=True,
+                                  include_journal_id=include_journal_id)
     samples = [s for s in samples if s[0] <= now_utc]
     return (week_start_at, week_end_at, samples,
             (scope.week_start_date, tuple(matching_texts)))

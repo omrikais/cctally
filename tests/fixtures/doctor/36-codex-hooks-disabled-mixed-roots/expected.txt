@@ -26,8 +26,8 @@ Database
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
   ✓ Rebuild worker           no stats.db upgrade rebuild has run; no stats.db auto-heal has run
-  ✓ Migrations               0/64 applied
-  ⚠ Pending migrations       64 pending
+  ✓ Migrations               0/65 applied
+  ⚠ Pending migrations       65 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit

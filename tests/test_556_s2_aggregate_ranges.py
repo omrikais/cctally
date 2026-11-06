@@ -1072,6 +1072,7 @@ class _Harness:
                 sys.modules["cctally"], "build_project_aggregate_rows", _boom,
             )
         self.bundle = target._tui_build_source_bundle(
+            claude_input_identity=target._tui_read_claude_input_identity(self.stats),
             stats_conn=self.stats,
             now_utc=now_utc,
             display_tz_name="UTC",
@@ -1263,6 +1264,7 @@ def test_the_carrier_survives_degradation_and_never_re_derives(
     )
     # Force the degrade path with a fresh tick that fails ingest.
     degraded = dashboard_harness.tui._tui_build_source_bundle(
+        claude_input_identity=dashboard_harness.tui._tui_read_claude_input_identity(dashboard_harness.stats),
         stats_conn=dashboard_harness.stats,
         now_utc=NOW + dt.timedelta(days=2),
         display_tz_name="UTC",
@@ -1948,6 +1950,7 @@ def test_a_day_rollover_with_a_failed_source_keeps_the_retained_calendar(
     retained_start = first.sources["claude"].aggregate_scope["range"]["start_at"]
 
     rolled = dashboard_harness.tui._tui_build_source_bundle(
+        claude_input_identity=dashboard_harness.tui._tui_read_claude_input_identity(dashboard_harness.stats),
         stats_conn=dashboard_harness.stats,
         now_utc=NOW + dt.timedelta(days=1),
         display_tz_name="UTC",
@@ -2004,10 +2007,11 @@ def test_the_committed_golden_states_the_boundary_by_value():
     # meaning), #564 to 9 (a decorated Codex fallback card's totals changed
     # value), #583 S3 to 10 (the All provider mirror publishes null), and #565
     # to 11 (certified decorated account-cycle legs), and #834 S2 to 12 (the
-    # typed three-state Codex metadata-health result). The
+    # typed three-state Codex metadata-health result), and #1018 twin to 13
+    # (Current Week freshness from the confirming weekly reading). The
     # assertion is kept rather than deleted: it is what tells a reader which
     # wire version this golden was captured against.
-    assert golden["source_schema_version"] == 12
+    assert golden["source_schema_version"] == 13
     aggregates = golden["sources"]["all"]["data"]["aggregates"]
     assert aggregates["range"] == {
         "kind": "absolute_range",
@@ -2331,6 +2335,7 @@ def test_a_missing_projects_envelope_withholds_rather_than_relabels(
     stats = ns["open_db"]()
     try:
         bundle = tui._tui_build_source_bundle(
+            claude_input_identity=tui._tui_read_claude_input_identity(stats),
             stats_conn=stats,
             now_utc=NOW,
             display_tz_name="UTC",
@@ -2458,6 +2463,7 @@ def test_the_source_bundle_carries_the_legacy_labels_into_the_fold(
     stats = ns["open_db"]()
     try:
         bundle = tui._tui_build_source_bundle(
+            claude_input_identity=tui._tui_read_claude_input_identity(stats),
             stats_conn=stats,
             now_utc=NOW,
             display_tz_name="UTC",
@@ -2565,6 +2571,7 @@ def test_the_idle_rebuild_carries_the_prior_projects_envelope(
     try:
         idle = tui._tui_build_idle_snapshot(
             prior,
+            claude_input_identity=tui._tui_read_claude_input_identity(stats),
             now_utc=NOW,
             precompute_envelope=False,
             runtime_bind=None,
@@ -2653,6 +2660,7 @@ def test_the_idle_tick_rebuilds_a_retryable_metadata_health_generation(
     try:
         idle = tui._tui_build_idle_snapshot(
             prior,
+            claude_input_identity=tui._tui_read_claude_input_identity(stats),
             now_utc=NOW,
             precompute_envelope=False,
             runtime_bind=None,
@@ -2770,6 +2778,7 @@ def test_the_bundle_start_fallback_is_a_display_day_boundary(
     try:
         for offset in (dt.timedelta(0), dt.timedelta(hours=1)):
             bundle = tui._tui_build_source_bundle(
+                claude_input_identity=tui._tui_read_claude_input_identity(stats),
                 stats_conn=stats,
                 now_utc=NOW + offset,
                 display_tz_name="UTC",

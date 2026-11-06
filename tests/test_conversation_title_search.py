@@ -397,3 +397,97 @@ def test_search_threads_browse_filters(tmp_path, monkeypatch):
         assert status == 400, (status, body)
     finally:
         stop(srv, srv._test_thread)
+
+
+# --- #1036: title snippets as structured parts ------------------------------
+
+_BRACKET_TITLE = "Review [P1] findings for the tail poll"
+
+
+def _title_original(c, sid, left="[", right="]"):
+    """SQLite's own title snippet() on the same connection (the pre-#1036 bytes,
+    or with empty decorations the plain excerpt)."""
+    return c.execute(
+        f"SELECT snippet(conversation_title_fts, 0, '{left}', '{right}', ' … ', 12) "
+        "FROM conversation_title_fts f "
+        "JOIN conversation_ai_titles t ON t.rowid = f.rowid "
+        "WHERE f.conversation_title_fts MATCH ? AND t.session_id = ?",
+        (cq._fts_query("findings", prefix_last=True), sid)).fetchone()[0]
+
+
+def _seed_bracket_title(c, title=_BRACKET_TITLE):
+    _msg(c, session_id="s1", uuid="h1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="human", text="hi",
+         cwd="/home/u/proj")
+    _title(c, "s1", title)
+
+
+def test_1036_title_parts_keep_literal_brackets():
+    """Detects the title path marking `[P1]` (a literal bracket pair in the
+    title) instead of only the FTS match, or drifting the legacy bytes."""
+    require_fts5()
+    c = _conn()
+    _seed_bracket_title(c)
+    res = cq.search_conversations(c, "findings", kind="title")
+    hit, = res["hits"]
+    assert res["total"] == 1
+    assert hit["snippet_parts"] == [
+        {"text": "Review [P1] ", "match": False},
+        {"text": "findings", "match": True},
+        {"text": " for the tail poll", "match": False}]
+    assert hit["snippet"] == _title_original(c, "s1") == \
+        "Review [P1] [findings] for the tail poll"
+
+
+def test_1036_title_marker_collision_is_retried():
+    """Detects a title containing a whole marker being parsed as a highlight."""
+    require_fts5()
+    c = _conn()
+    _seed_bracket_title(c, "cctally:0:open findings [x]")
+    hit, = cq.search_conversations(c, "findings", kind="title")["hits"]
+    assert "".join(p["text"] for p in hit["snippet_parts"]) == \
+        _title_original(c, "s1", left="", right="")
+    assert [p["text"] for p in hit["snippet_parts"] if p["match"]] == ["findings"]
+    assert hit["snippet"] == _title_original(c, "s1")
+
+
+def test_1036_title_extraction_reads_the_page_snapshot(tmp_path, monkeypatch):
+    """Detects a title rewritten by the production upsert between page
+    selection and extraction dropping the selected hit, changing `total`, or
+    publishing the new title's snippet."""
+    require_fts5()
+    path = tmp_path / "conversations.db"
+    w = sqlite3.connect(path)
+    db._apply_cache_schema(w)
+    w.execute("PRAGMA journal_mode=WAL")
+    _seed_bracket_title(w)
+    w.commit()
+    real = cq._extract_fts_snippets
+    fired = []
+
+    def racing(conn, **kw):
+        if not fired:
+            fired.append(1)
+            w.execute(cc._AI_TITLE_UPSERT_SQL,
+                      ("s1", "completely different words", "a.jsonl", 0))
+            w.commit()
+        return real(conn, **kw)
+
+    monkeypatch.setattr(cq, "_extract_fts_snippets", racing)
+    reader = sqlite3.connect(path)
+    res = cq.search_conversations(reader, "findings", kind="title")
+    assert fired
+    assert res["total"] == 1
+    hit, = res["hits"]
+    assert hit["snippet"] == "Review [P1] [findings] for the tail poll"
+    assert [p["text"] for p in hit["snippet_parts"] if p["match"]] == ["findings"]
+
+
+def test_1036_title_like_hit_is_one_unmatched_part():
+    """Detects the title LIKE fallback inventing a highlight or changing bytes."""
+    c = _conn()
+    _seed_bracket_title(c)
+    hit, = cq.search_conversations(
+        c, "findings", kind="title", fts_available=False)["hits"]
+    assert hit["snippet"] == _BRACKET_TITLE
+    assert hit["snippet_parts"] == [{"text": _BRACKET_TITLE, "match": False}]

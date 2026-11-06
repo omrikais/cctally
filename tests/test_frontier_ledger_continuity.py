@@ -473,3 +473,74 @@ def test_a_dropped_consumer_stops_being_reconciled_against(both_consumers):
 
     plan = accounting.plan_provider("codex", cache, roots=roots)
     assert (plan.mode, plan.reason) == ("caught_up", "unchanged")
+
+
+# ── #1052: one consumer stuck after a rotation, in both directions ─────────
+
+def _refused_walk(stuck: str) -> None:
+    """A walk that may not certify, through the predicate its owner uses."""
+    import types
+    if stuck == "conversation":
+        stats = types.SimpleNamespace(barrier_retry=True, files_total=1,
+                                      files_processed=1)
+        assert not frontier.conversation_sync_certifiable("full", stats)
+    else:
+        stats = types.SimpleNamespace(full_walk_complete=False)
+        assert not frontier.provider_sync_certifiable("full", stats)
+
+
+@pytest.mark.parametrize("exit_", ["recovery", "drop"])
+@pytest.mark.parametrize("stuck", ["accounting", "conversation"])
+def test_a_stuck_peer_after_rotation_recovers_or_is_dropped(
+        both_consumers, monkeypatch, stuck, exit_):
+    """Detects (#1052, from #916): the two-consumer ledger coupling wedging
+    either consumer after a rotation. While one consumer's walk keeps being
+    refused, the other recovers and still plans irreconcilable full walks;
+    the stuck consumer's own recovery, or dropping it (an abandoned
+    accounting frontier is replaced, never reused), ends that."""
+    accounting, transcripts, cache, conversations, app_dir, roots = (
+        both_consumers)
+    clock = frontier._now()
+    monkeypatch.setattr(frontier, "_now", lambda: clock)   # below expiry
+    owners = {"accounting": (accounting, cache),
+              "conversation": (transcripts, conversations)}
+    healthy = "conversation" if stuck == "accounting" else "accounting"
+    stuck_owner, stuck_conn = owners[stuck]
+    healthy_owner, healthy_conn = owners[healthy]
+    _rotate_ledger_generation(app_dir)
+    for round_ in range(2):
+        plan = stuck_owner.plan_provider("codex", stuck_conn, roots=roots)
+        assert (plan.mode, plan.reason) == ("full", "ledger_epoch_changed")
+        _refused_walk(stuck)           # seed and commit withheld
+        recovery = healthy_owner.plan_provider("codex", healthy_conn,
+                                               roots=roots)
+        assert (recovery.mode, recovery.reason) == ("full", (
+            "ledger_epoch_changed" if round_ == 0
+            else "ledger_acknowledgements_irreconcilable"))
+        healthy_owner.commit_provider(recovery, healthy_conn, roots=roots)
+        assert "codex" in healthy_owner._states, healthy_owner.last_seed_failure
+        after = healthy_owner.plan_provider("codex", healthy_conn, roots=roots)
+        assert (after.mode, after.reason) == (
+            "full", "ledger_acknowledgements_irreconcilable")
+    if exit_ == "recovery":
+        plan = stuck_owner.plan_provider("codex", stuck_conn, roots=roots)
+        assert plan.mode == "full"
+        stuck_owner.commit_provider(plan, stuck_conn, roots=roots)
+        assert "codex" in stuck_owner._states, stuck_owner.last_seed_failure
+        for owner, conn in owners.values():
+            plan = owner.plan_provider("codex", conn, roots=roots)
+            assert (plan.mode, plan.reason) == ("caught_up", "unchanged")
+        return
+    if stuck == "conversation":
+        assert transcripts.drop_provider("codex") is True
+    else:
+        frontier.frontier_generations(app_dir).drop(
+            "codex", frontier.DashboardIngestFrontier.CONSUMER)
+        replacement = frontier.DashboardIngestFrontier(app_dir)
+        assert replacement is not accounting
+        fresh = replacement.plan_provider("codex", cache, roots=roots)
+        assert (fresh.mode, fresh.reason) == ("full", "unseeded")
+    for _ in range(2):
+        plan = healthy_owner.plan_provider("codex", healthy_conn, roots=roots)
+        assert (plan.mode, plan.reason) == ("caught_up", "unchanged")
+        healthy_owner.commit_provider(plan, healthy_conn, roots=roots)

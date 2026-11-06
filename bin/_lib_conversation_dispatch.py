@@ -445,6 +445,10 @@ def _claude_detail(
         "status": "ok",
         "conversation_key": conversation_key,
         "title": res["title"],
+        # #1037 twin: the reader header's project and branch slots, as the
+        # native Claude detail carries them (no branch status for Claude).
+        "project_label": res.get("project_label"),
+        "git_branch": res.get("git_branch"),
         "items": neutral_items,
         "page": page,
         "subagent_meta": _map_claude_subagent_meta(
@@ -621,6 +625,9 @@ def _claude_search(
             "item_key": _claude_item_key(sid, uuid) if (sid and uuid) else None,
             "title": h.get("title"),
             "snippet": h.get("snippet"),
+            # #1036: the structured excerpt the viewer renders (the qualified
+            # All-providers rail has nothing else that marks only real matches).
+            "snippet_parts": h.get("snippet_parts", []),
             "badges": list(h.get("match_kinds") or []),
             "last_activity_utc": last_act,
             "project_label": project_label,

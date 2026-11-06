@@ -242,7 +242,7 @@ def test_829_the_source_schema_version_moved_for_the_meaning_change():
     does meet a new server. `docs/cli-contract.md` calls a changed meaning
     breaking, and a partial that used to mean one thing now distinguishes two.
     """
-    assert lds.SOURCE_SCHEMA_VERSION == 12
+    assert lds.SOURCE_SCHEMA_VERSION == 13
 
 
 def _state_construction_sources():
