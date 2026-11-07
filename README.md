@@ -30,15 +30,14 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.117.2** (2026-11-03)
+**Latest stable: v1.118.2** (2026-11-07)
 
-Highlights from the `v1.116.1` to `v1.117.2` stable upgrade:
+Highlights from the `v1.117.2` to `v1.118.2` stable upgrade:
 
-- With more than one Claude account, the `cctally dashboard` Current Week card and modal show one account's cycle, milestones, spend and `$/1%` beside that account's label, and the older/newer cycle buttons stay on that account.
-- `cctally five-hour-breakdown` and the dashboard's five-hour milestones show `, ` (`null` in `--json`) instead of a weekly percentage that a weekly credit later retired.
-- With more than one Claude account, the `cctally dashboard` All view shows its combined spend headline, summing each account's current cycle, instead of usually leaving it out.
+- The Codex hooks that `cctally setup` installs no longer re-read the whole quota history to resolve reset anchors, so recording new Codex usage stays fast on a long history.
+- The dashboard and TUI now regroup a project within about a minute after a git worktree is removed, a repository is created or moved, or a folder becomes a repository; previously they kept the old grouping until restarted.
 
-[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.117.2)
+[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.118.2)
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
