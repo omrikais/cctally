@@ -189,12 +189,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 52,
+                        "registry_size": 53,
                         "user_version": 99
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 99 / 52 known",
+                    "summary": "version 99 / 53 known",
                     "title": "cache.db"
                 },
                 {
@@ -212,7 +212,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": true,
-                            "registry_size": 52,
+                            "registry_size": 53,
                             "user_version": 99
                         },
                         "stats.db": {
@@ -225,7 +225,7 @@
                     "id": "db.version_ahead",
                     "remediation": "Auto-heals on next command, or run `cctally db recover --db cache`",
                     "severity": "warn",
-                    "summary": "cache.db ahead (v99 > known v52) \u2014 auto-heals",
+                    "summary": "cache.db ahead (v99 > known v53) \u2014 auto-heals",
                     "title": "Version ahead"
                 },
                 {
@@ -332,7 +332,8 @@
                                     "049_codex_rollout_containers",
                                     "050_preserve_claude_cost_attribution",
                                     "051_codex_retained_identities",
-                                    "052_codex_delete_trigger_plans"
+                                    "052_codex_delete_trigger_plans",
+                                    "053_codex_reset_anchor_evidence"
                                 ],
                                 "skipped": []
                             },
@@ -360,7 +361,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/65 applied",
+                    "summary": "0/66 applied",
                     "title": "Migrations"
                 },
                 {
@@ -625,13 +626,17 @@
                             [
                                 "cache.db",
                                 "052_codex_delete_trigger_plans"
+                            ],
+                            [
+                                "cache.db",
+                                "053_codex_reset_anchor_evidence"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "65 pending",
+                    "summary": "66 pending",
                     "title": "Pending migrations"
                 },
                 {

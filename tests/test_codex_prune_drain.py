@@ -1359,3 +1359,401 @@ def test_root_qualified_quota_delete_seeks_the_file(tmp_path):
     small = _root_qualified_delete_steps(tmp_path, 100)
     big = _root_qualified_delete_steps(tmp_path, 10_000)
     assert big <= small + 64, (small, big)
+
+
+# ── #1033 spec §5.3/§5.4: the reset-anchor evidence executor unit ───────────
+#
+# Failures detected: a summary published over a concurrent write (it would
+# seed wrong anchors until the next bootstrap), a bootstrap that never
+# finishes or never yields, a repair that leaves a stale bucket, and a clear
+# that leaves the summary unusable or bumps the physical sequence.
+
+_EV_STATE = "codex_reset_anchor_evidence"
+_EV_GEN = "codex_reset_anchor_evidence_generation"
+
+
+def _ev_meta(conn, key):
+    row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                       (key,)).fetchone()
+    return None if row is None else row[0]
+
+
+def _ev_oracle(conn):
+    out = {}
+    for row in conn.execute(
+            "SELECT source_root_key, observed_slot, logical_limit_key, "
+            "resets_at_utc, source_path, line_offset, id "
+            "FROM quota_window_snapshots "
+            "WHERE source='codex' AND observed_slot IS NOT NULL"):
+        count, minimum = out.get(row[:4], (0, tuple(row[4:])))
+        out[row[:4]] = (count + 1, min(minimum, tuple(row[4:])))
+    return out
+
+
+def _ev_summary(conn):
+    return {row[:4]: (row[4], tuple(row[5:8]), row[8]) for row in conn.execute(
+        "SELECT source_root_key, observed_slot, logical_limit_key, "
+        "resets_at_utc, row_count, min_source_path, min_line_offset, min_id, "
+        "stale FROM codex_reset_anchor_evidence")}
+
+
+def _assert_ev_exact(ns):
+    conn = _cache(ns)
+    try:
+        assert _ev_meta(conn, _EV_STATE) == "ready"
+        oracle = _ev_oracle(conn)
+        assert oracle, "non-vacuity: the store holds in-scope quota rows"
+        assert _ev_summary(conn) == {
+            bucket: (count, minimum, 0)
+            for bucket, (count, minimum) in oracle.items()}
+    finally:
+        conn.close()
+
+
+def _ev_set_state(ns, value):
+    conn = _cache(ns)
+    try:
+        conn.execute("UPDATE cache_meta SET value=? WHERE key=?",
+                     (value, _EV_STATE))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ev_stale(ns):
+    return _count(ns, "SELECT COUNT(*) FROM codex_reset_anchor_evidence "
+                      "WHERE stale=1")
+
+
+def test_1033_the_drain_bootstraps_first_and_repairs_once_after_pruning(
+        debt_estate, monkeypatch):
+    drain = _executor()
+    ns, paths, _spawned, _clock = debt_estate
+    cc = _cache_mod()
+    _ev_set_state(ns, "bootstrap")
+    conn = _cache(ns)
+    try:
+        cc.record_codex_owed_maintenance(conn, catch_up_paths=(str(paths[-1]),))
+        conn.commit()
+        assert cc._codex_owed_anything(conn)
+    finally:
+        conn.close()
+    events: list[str] = []
+    real_unit = cc._run_codex_reset_anchor_evidence_unit
+    real_catch_up = cc._run_codex_ingest_catch_up_unit
+
+    def unit(conn, adm_mod, kind, **kwargs):
+        result = real_unit(conn, adm_mod, kind, **kwargs)
+        events.append(f"{kind}:{result}")
+        return result
+
+    def catch_up(conn, adm_mod):
+        events.append("catch_up")
+        return real_catch_up(conn, adm_mod)
+
+    monkeypatch.setattr(cc, "_run_codex_reset_anchor_evidence_unit", unit)
+    monkeypatch.setattr(cc, "_run_codex_ingest_catch_up_unit", catch_up)
+    monkeypatch.setattr(cc, "_CODEX_PRUNE_PRECOMMIT_HOOK",
+                        lambda path, root: events.append("prune"))
+    result = drain(wait_for_requests=False)
+    assert result.identities_deleted == ORPHANS and result.remaining == 0
+    assert events == (["reset_anchor_evidence_bootstrap:published",
+                       "catch_up"] + ["prune"] * ORPHANS
+                      + ["reset_anchor_evidence_repair:published"]), events
+    assert _ev_stale(ns) == 0
+    _assert_ev_exact(ns)
+    conn = _cache(ns)
+    try:
+        assert cc._codex_reset_anchor_evidence_work(conn) is None
+        assert not cc._codex_owed_anything(conn)
+    finally:
+        conn.close()
+
+
+def _ev_foreign_id_update(ns):
+    """An ``id``-only UPDATE by another writer: the change ledger cannot see
+    it; only the evidence generation moves."""
+    raw = sqlite3.connect(ns["_cctally_core"].CACHE_DB_PATH)
+    try:
+        raw.execute(
+            "UPDATE quota_window_snapshots SET id = id + 100000 WHERE id = "
+            "(SELECT MIN(id) FROM quota_window_snapshots WHERE source='codex')")
+        raw.commit()
+    finally:
+        raw.close()
+
+
+@pytest.mark.parametrize("mutations,expected", [
+    (1, "published"), (3, "blocked")])
+def test_1033_a_token_moved_before_publish_reprepares_then_blocks(
+        estate, monkeypatch, mutations, expected):
+    ns, _paths, _spawned, _clock = estate
+    cc = _cache_mod()
+    _ev_set_state(ns, "bootstrap")
+    attempts: list[str] = []
+
+    def prepublish(kind, attempt):
+        attempts.append(kind)
+        if len(attempts) <= mutations:
+            _ev_foreign_id_update(ns)
+
+    monkeypatch.setattr(cc, "_CODEX_EVIDENCE_PREPUBLISH_HOOK", prepublish)
+    conn = _cache(ns)
+    try:
+        outcome = cc._run_codex_reset_anchor_evidence_unit(
+            conn, adm, "reset_anchor_evidence_bootstrap")
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+    assert outcome == expected
+    assert len(attempts) == min(mutations + 1, 3)
+    if expected == "published":
+        _assert_ev_exact(ns)
+    else:
+        conn = _cache(ns)
+        try:
+            assert _ev_meta(conn, _EV_STATE) == "bootstrap"
+            assert cc._codex_reset_anchor_evidence_work(conn) == "bootstrap"
+            assert cc._codex_owed_anything(conn), "the work must stay owed"
+        finally:
+            conn.close()
+
+
+def test_1033_the_drain_blocks_a_contended_unit_for_the_run(
+        estate, monkeypatch):
+    drain = _executor()
+    ns, _paths, _spawned, _clock = estate
+    cc = _cache_mod()
+    _ev_set_state(ns, "bootstrap")
+    calls: list[int] = []
+    monkeypatch.setattr(cc, "_CODEX_EVIDENCE_PREPUBLISH_HOOK",
+                        lambda kind, attempt: (calls.append(attempt),
+                                               _ev_foreign_id_update(ns)))
+    result = drain(wait_for_requests=False)
+    assert result.outcome == "drained"
+    assert calls == [1, 2, 3], "at most three attempts per unit per run"
+    conn = _cache(ns)
+    try:
+        assert _ev_meta(conn, _EV_STATE) == "bootstrap"
+    finally:
+        conn.close()
+
+
+def test_1033_admission_refusal_yields_and_keeps_the_work(estate):
+    ns, _paths, _spawned, _clock = estate
+    cc = _cache_mod()
+    _ev_set_state(ns, "bootstrap")
+    app_dir = ns["_cctally_core"].APP_DIR
+    assert adm.publish_waiting_request(app_dir, root_keys=["any"])
+    budget: dict = {}
+    conn = _cache(ns)
+    try:
+        outcome = cc._run_codex_reset_anchor_evidence_unit(
+            conn, adm, "reset_anchor_evidence_bootstrap", budget=budget)
+        # One refusal with budget left yields (the caller backs off) and
+        # spends one of the run's attempts.
+        assert outcome == "yielded"
+        assert budget == {"reset_anchor_evidence_bootstrap": 2}
+        assert _ev_meta(conn, _EV_STATE) == "bootstrap"
+    finally:
+        conn.close()
+        for request in (app_dir / adm.REQUEST_DIR_NAME).glob("req-*.json"):
+            request.unlink()
+
+
+@pytest.mark.parametrize("runner,setup,first", [
+    ("drain", None, "refuse"),
+    ("inline", None, "refuse"),
+    ("drain", "DROP TRIGGER trg_qws_anchor_evidence_del", "refuse"),
+    ("drain", None, "mismatch"),
+])
+def test_1033_refusals_spend_the_run_budget_across_yields(
+        estate, monkeypatch, runner, setup, first):
+    """Failure detected: a run that waits for requests re-ran the unit with
+    three fresh attempts after every yield, so a refusing gate made it
+    rescan history (seconds per scan) without end. Refusals, including the
+    setup step's, and mismatches share one budget of three per run."""
+    ns, _paths, _spawned, _clock = estate
+    cc = _cache_mod()
+    _ev_set_state(ns, "bootstrap")
+    if setup is not None:
+        conn = _cache(ns)
+        try:
+            conn.execute(setup)
+            conn.commit()
+        finally:
+            conn.close()
+    prepares: list[int] = []
+    admits: list[int] = []
+    backoffs: list[int] = []
+    real_admit = adm.admit
+
+    def prepublish(kind, attempt):
+        prepares.append(attempt)
+        if first == "mismatch" and len(prepares) == 1:
+            _ev_foreign_id_update(ns)
+
+    def admit(*args, **kwargs):
+        admits.append(1)
+        if len(admits) > 10:
+            raise AssertionError("the run kept retrying past its budget")
+        if first == "mismatch" and len(admits) == 1:
+            return real_admit(*args, **kwargs)
+        return adm.Admission(False, None, None)
+
+    monkeypatch.setattr(cc, "_CODEX_EVIDENCE_PREPUBLISH_HOOK", prepublish)
+    monkeypatch.setattr(adm, "admit", admit)
+    monkeypatch.setattr(cc, "_drain_backoff",
+                        lambda adm_mod: backoffs.append(1))
+    if runner == "drain":
+        _executor()(wait_for_requests=True)
+    else:
+        assert cc.run_codex_reset_anchor_evidence(wait_for_requests=True) == 0
+    assert len(admits) == 3, admits
+    assert len(prepares) == (0 if setup is not None else 3), prepares
+    assert len(backoffs) == (1 if first == "mismatch" else 2), backoffs
+    conn = _cache(ns)
+    try:
+        assert _ev_meta(conn, _EV_STATE) == "bootstrap"
+        assert cc._codex_reset_anchor_evidence_work(conn) == "bootstrap"
+        assert cc._codex_owed_anything(conn), "the work must stay owed"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("missing", [
+    "DROP INDEX idx_codex_reset_anchor_evidence_stale",
+    "DROP TRIGGER trg_qws_anchor_evidence_del",
+    "DROP TABLE codex_reset_anchor_evidence"])
+def test_1033_the_setup_step_restores_missing_objects(estate, missing):
+    drain = _executor()
+    ns, _paths, _spawned, _clock = estate
+    cc = _cache_mod()
+    conn = _cache(ns)
+    try:
+        conn.execute(missing)
+        conn.commit()
+        assert cc._codex_reset_anchor_evidence_work(conn) == "bootstrap"
+        assert cc._codex_owed_anything(conn)
+    finally:
+        conn.close()
+    drain(wait_for_requests=False)
+    conn = _cache(ns)
+    try:
+        present = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN (?,?,?,?,?)",
+            ("codex_reset_anchor_evidence",
+             "idx_codex_reset_anchor_evidence_stale",
+             "trg_qws_anchor_evidence_ins", "trg_qws_anchor_evidence_del",
+             "trg_qws_anchor_evidence_upd"))}
+        assert len(present) == 5
+        assert cc._codex_reset_anchor_evidence_work(conn) is None
+    finally:
+        conn.close()
+    _assert_ev_exact(ns)
+
+
+def test_1033_cache_sync_runs_the_unit_inline(estate, monkeypatch):
+    import argparse
+    ns, _paths, _spawned, _clock = estate
+    cc = _cache_mod()
+    _ev_set_state(ns, "bootstrap")
+    kinds: list[str] = []
+    real_unit = cc._run_codex_reset_anchor_evidence_unit
+
+    def unit(conn, adm_mod, kind, **kwargs):
+        kinds.append(kind)
+        return real_unit(conn, adm_mod, kind, **kwargs)
+
+    monkeypatch.setattr(cc, "_run_codex_reset_anchor_evidence_unit", unit)
+    # The drain would run the unit too; the inline call must not need it.
+    monkeypatch.setattr(cc, "run_codex_prune_drain", lambda **kwargs: (
+        cc.PruneDrainResult("drained", 0, 0, 0, 0)))
+    rc = cc.cmd_cache_sync(argparse.Namespace(
+        source="codex", rebuild=False, prune_orphans=False))
+    assert rc == 0
+    assert kinds == ["reset_anchor_evidence_bootstrap"]
+    _assert_ev_exact(ns)
+
+
+def test_1033_bootstrap_and_repair_aggregate_the_lexicographic_minimum(
+        estate):
+    """The independent-minimum counterexample: after the stored minimum is
+    deleted, the survivors' minimum path and minimum offset come from
+    different rows. A per-column MIN() would publish (path of one, offset of
+    the other); the repair and the bootstrap must publish one real row."""
+    drain = _executor()
+    ns, _paths, _spawned, _clock = estate
+    cc = _cache_mod()
+    conn = _cache(ns)
+    try:
+        columns = ("source", "source_root_key", "source_path", "line_offset",
+                   "captured_at_utc", "observed_slot", "logical_limit_key",
+                   "window_minutes", "used_percent", "resets_at_utc")
+        for path, offset in (("/x/0.jsonl", 1), ("/x/a.jsonl", 90),
+                             ("/x/b.jsonl", 2)):
+            conn.execute(
+                f"INSERT INTO quota_window_snapshots ({', '.join(columns)}) "
+                "VALUES ('codex', 'root-x', ?, ?, '2026-07-20T10:00:00Z', "
+                "'primary', 'limit-x', 10080, 10.0, '2026-07-27T00:00:00Z')",
+                (path, offset))
+        conn.execute("DELETE FROM quota_window_snapshots "
+                     "WHERE source_path='/x/0.jsonl'")
+        conn.commit()
+        assert conn.execute(
+            "SELECT stale FROM codex_reset_anchor_evidence "
+            "WHERE source_root_key='root-x'").fetchone() == (1,)
+    finally:
+        conn.close()
+    drain(wait_for_requests=False)
+    _assert_ev_exact(ns)
+    conn = _cache(ns)
+    try:
+        row = conn.execute(
+            "SELECT min_source_path, min_line_offset FROM "
+            "codex_reset_anchor_evidence WHERE source_root_key='root-x'"
+        ).fetchone()
+        assert row == ("/x/a.jsonl", 90)
+    finally:
+        conn.close()
+    _ev_set_state(ns, "bootstrap")
+    drain(wait_for_requests=False)
+    _assert_ev_exact(ns)
+
+
+def test_1033_the_evidence_units_never_run_the_quota_projection(
+        debt_estate, monkeypatch):
+    drain = _executor()
+    ns, _paths, _spawned, _clock = debt_estate
+    quota = sys.modules["_cctally_quota"]
+    _ev_set_state(ns, "bootstrap")
+    calls: list[int] = []
+    monkeypatch.setattr(quota, "reconcile_codex_quota_projection",
+                        lambda *a, **k: calls.append(1))
+    result = drain(wait_for_requests=False)
+    assert result.identities_deleted == ORPHANS
+    assert calls == []
+    _assert_ev_exact(ns)
+
+
+@pytest.mark.parametrize("state", ["ready", "bootstrap"])
+def test_1033_a_whole_provider_clear_leaves_an_empty_ready_summary(
+        estate, state):
+    ns, _paths, _spawned, _clock = estate
+    cc = _cache_mod()
+    _ev_set_state(ns, state)
+    conn = _cache(ns)
+    try:
+        generation = int(_ev_meta(conn, _EV_GEN))
+        seq = _seq(ns)
+        assert cc._clear_codex_derived_rows(conn) is True
+        conn.commit()
+        assert _seq(ns) == seq, "summary work must not bump the physical seq"
+        assert _ev_meta(conn, _EV_STATE) == "ready"
+        assert int(_ev_meta(conn, _EV_GEN)) > generation
+        assert _ev_summary(conn) == {}
+        assert cc._clear_codex_derived_rows(conn) is False
+        conn.commit()
+        assert _ev_meta(conn, _EV_STATE) == "ready"
+    finally:
+        conn.close()

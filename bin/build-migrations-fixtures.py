@@ -8584,6 +8584,112 @@ def build_per_migration_052_codex_delete_trigger_plans(scenario_dir: Path) -> No
     _build_post(pre, post)
 
 
+def build_per_migration_053_codex_reset_anchor_evidence(scenario_dir: Path) -> None:
+    """Per-migration goldens for #1033's reset-anchor evidence summary.
+
+    ``pre.sqlite`` is a 052-head install: the current schema apply creates the
+    summary table, its stale index and its three triggers, so they are
+    removed again with the two ``cache_meta`` keys BEFORE any quota row is
+    written, exactly as a head-52 store never maintained them. It holds three
+    in-scope Codex quota rows over two raw resets and one NULL-slot row, so
+    ``post.sqlite`` records ``bootstrap`` over an empty summary: the handler
+    never scans history.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "053_codex_reset_anchor_evidence"
+    rollout = "/fixtures/codex/sessions/2026/11/06/rollout.jsonl"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index",
+                         "043_codex_window_attributions",
+                         "044_codex_accounting_change_ledger",
+                         "045_conversation_render_revision_columns",
+                         "046_codex_source_file_identity",
+                         "047_spill_free_read_paths",
+                         "048_codex_quota_physical_group_order",
+                         "049_codex_rollout_containers",
+                         "050_preserve_claude_cost_attribution",
+                         "051_codex_retained_identities",
+                         "052_codex_delete_trigger_plans"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            for kind, name in reversed(db.CODEX_RESET_ANCHOR_EVIDENCE_OBJECTS):
+                if kind == "trigger":
+                    conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            conn.execute("DROP TABLE IF EXISTS codex_reset_anchor_evidence")
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key IN (?, ?)",
+                (db.CODEX_RESET_ANCHOR_EVIDENCE_STATE_KEY,
+                 db.CODEX_RESET_ANCHOR_EVIDENCE_GENERATION_KEY))
+            for offset, minute, slot, reset in (
+                    (0, 0, "primary", "2026-11-06T15:00:00Z"),
+                    (1, 5, "primary", "2026-11-06T15:00:00Z"),
+                    (2, 10, "primary", "2026-11-06T15:00:04Z"),
+                    (3, 15, None, "2026-11-06T15:00:00Z")):
+                conn.execute(
+                    "INSERT INTO quota_window_snapshots (source, "
+                    " source_root_key, source_path, line_offset, "
+                    " captured_at_utc, observed_slot, logical_limit_key, "
+                    " limit_id, window_minutes, used_percent, resets_at_utc) "
+                    "VALUES ('codex', 'rk-fixture', ?, ?, ?, ?, "
+                    " 'codex:primary', 'codex', 300, ?, ?)",
+                    (rollout, offset, f"2026-11-06T10:{minute:02d}:00Z",
+                     slot, 10.0 + offset, reset),
+                )
+            conn.execute("PRAGMA user_version=52")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=53")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_conversations_010_codex_conversation_source_file_identity(
     scenario_dir: Path,
 ) -> None:
@@ -9616,6 +9722,9 @@ def main() -> int:
     )
     build_per_migration_052_codex_delete_trigger_plans(
         FIXTURES_ROOT / "per-migration" / "052_codex_delete_trigger_plans"
+    )
+    build_per_migration_053_codex_reset_anchor_evidence(
+        FIXTURES_ROOT / "per-migration" / "053_codex_reset_anchor_evidence"
     )
     build_per_migration_conversations_010_codex_conversation_source_file_identity(
         FIXTURES_ROOT / "per-migration"

@@ -4774,6 +4774,10 @@ def _tui_build_source_bundle(
             codex_version,
             prior_codex.combined_accounting if prior_codex is not None else None,
         )
+        # #1059 ack (b): set only where this build constructs the Claude
+        # state or reuses it at its own version; a degraded, retained or
+        # unavailable state never qualifies.
+        claude_published_current = False
         if claude_ingest_failed:
             warning = SourceDashboardWarning(
                 "source_ingest_failed", "Source ingest failed.", "ingest",
@@ -4796,6 +4800,9 @@ def _tui_build_source_bundle(
             claude = reuse_coherent_source_state(
                 prior_claude, data_version=claude_reuse_version,
             )
+            # #1059 ack (b): an exact-version reuse at this build's own
+            # version is current; a retained refused partial is not.
+            claude_published_current = claude is not None
             # #834 S2 (#830): exact-version reuse now refuses every `partial`
             # prior. The kernel decides whether a REPEATED retainable cause
             # may nonetheless be retained for this tick, so refusing reuse
@@ -4808,6 +4815,7 @@ def _tui_build_source_bundle(
                 data_version=claude_reuse_version,
             ):
                 claude = prior_claude
+                claude_published_current = False
             # #556 S2 §3.6, gate 2 of 2. The version fragment above already
             # rejects a failed generation, but this gate is stated explicitly
             # rather than left implicit in string arithmetic: exact-version
@@ -5001,6 +5009,7 @@ def _tui_build_source_bundle(
             cache_conn.rollback()
             cache_read_tx = False
         if claude is None:
+            claude_published_current = True
             claude_available = "ok" if (claude_cost_usd or claude_total_tokens) else "empty"
             # #341 Task 4 (Ruling C): the conditional per-account Claude wire,
             # symmetric with Codex. Built ONLY when the Claude provider has >1
@@ -5331,6 +5340,10 @@ def _tui_build_source_bundle(
                     return _tui_withdraw_codex_quota_dependency(prior_bundle)
                 return prior_bundle
             raise RuntimeError("source read generation moved during build")
+        if attempt is not None:
+            attempt["claude_published_current"] = bool(
+                claude_published_current
+                and not aggregate_scope_failed(claude))
         return bundle
     finally:
         _record_cache_pin()
@@ -5642,6 +5655,134 @@ def _tui_build_snapshot_impl(
             )
 
 
+def _tui_project_identity_now() -> float:
+    """The monotonic clock of the project-identity sweep (a test seam)."""
+    return time.monotonic()
+
+
+def _tui_codex_regroup_selector(buckets: "frozenset"):
+    """Select retained Codex entries whose opaque key names a bucket in ``B``.
+
+    #1059 §6.2 step 4. The opaque key is per root, so the stale keys are
+    computed once per root an entry carries. An entry whose key came from
+    ``git_json`` never matches, because it was not built from a bucket path.
+    Over-selection costs a reload, never correctness.
+    """
+    opaque_project_key = _cctally()._load_sibling(
+        "_lib_source_analytics").opaque_project_key
+    stale_by_root: "dict[str, frozenset]" = {}
+
+    def select(entry) -> bool:
+        if not buckets:
+            return False
+        root = str(entry.source_root_key)
+        stale = stale_by_root.get(root)
+        if stale is None:
+            stale = frozenset(
+                opaque_project_key("codex", root, bucket) for bucket in buckets)
+            stale_by_root[root] = stale
+        return entry.project_key in stale
+
+    return select
+
+
+def _tui_revalidate_project_identities(
+    *, now_monotonic: "float | None" = None,
+) -> int:
+    """Run the #1059 project-identity sweep when due; apply its flips.
+
+    Called once per snapshot build, after the single top-of-build ingest and
+    before the dispatch read, for every build (the dashboard's periodic,
+    ``/api/sync`` and settings builds, and the TUI's). On a successful sweep
+    with flips, with ``B`` its stale buckets, in this order: evict every cached
+    closed week holding a bucket in ``B`` (totals included); reset the
+    current-week slot iff it holds one; reset the whole-envelope memo; force
+    the retained Codex entries keyed to a bucket in ``B`` to be re-qualified;
+    bump the generation exactly once and record it as the pending regroup
+    generation ``G``. The bump leaves the idle path in the same build and
+    mismatches the range memo's ``base``, which refolds it cold. Nothing else
+    is cleared.
+
+    Cadence retry: a successful due sweep without flips bumps once (and
+    records the new ``G``) while a regroup is still pending or Codex
+    re-qualification is outstanding, so a regroup whose rebuild failed is
+    retried at most once per interval. A failed sweep never bumps; its
+    deadline stays due and it retries itself.
+
+    Returns the build generation, read after these steps; the acknowledgement
+    at the end of the build compares it with ``G``.
+    """
+    c = _cctally()
+    sc = c._load_sibling("_lib_snapshot_cache")
+    now = _tui_project_identity_now() if now_monotonic is None else now_monotonic
+    sweep = sc.revalidate_project_identities(
+        resolve=c._resolve_project_key, now_monotonic=now)
+    if sweep is not None:
+        if sweep.flips:
+            buckets = sweep.old_buckets
+            try:
+                sc.evict_projects_env_weeks_for_buckets(buckets)
+                sc.reset_projects_env_current_if_holds(buckets)
+                c._projects_reset_memo()
+                sc.force_codex_accounting_paths(
+                    _tui_codex_regroup_selector(buckets))
+                sc.bump_generation()
+                sc.mark_project_regroup_pending(sc.current_generation())
+            except BaseException:
+                # The sweep already committed `{fresh}`; without the stale
+                # identities back, no later sweep would see this flip and
+                # the stale grouping would last until restart. The deadline
+                # stays, so the next due sweep retries the whole flip.
+                sc.restore_project_identity_flips(sweep)
+                raise
+        elif (
+            sc.project_regroup_pending() is not None
+            or sc.codex_accounting_work_outstanding()
+        ):
+            sc.bump_generation()
+            sc.note_project_identity_retry_bump()
+            sc.mark_project_regroup_pending(sc.current_generation())
+    return sc.current_generation()
+
+
+def _tui_acknowledge_project_regroup(
+    *,
+    build_generation: int,
+    envelope_built: bool,
+    published_claude=None,
+    claude_published_current: bool = True,
+    dashboard: bool,
+) -> None:
+    """Clear the pending regroup generation ``G`` once this build published it.
+
+    (a) Every path: this build constructed the projects envelope without an
+    exception, and its build generation (read right after the sweep) is at
+    least ``G``. (b) The dashboard path also requires that the published
+    Claude source is the one this build constructed or reused at its own
+    input version (``claude_published_current``), that its aggregate scope
+    did not fail, and that the range memo committed under a generation at
+    least ``G`` (its ``base[3]``), which needs both of its folds to succeed.
+    A build that fails any condition leaves ``G`` set for the cadence retry.
+    """
+    sc = _cctally()._load_sibling("_lib_snapshot_cache")
+    pending = sc.project_regroup_pending()
+    if pending is None:
+        return
+    if not envelope_built or build_generation < pending:
+        return
+    if dashboard:
+        if not claude_published_current or published_claude is None:
+            return
+        if aggregate_scope_failed(published_claude):
+            return
+        state = sys.modules["_cctally_dashboard"]._CLAUDE_RANGE_AGGREGATE_MEMO.get(
+            "state")
+        base = state.get("base") if isinstance(state, dict) else None
+        if not isinstance(base, tuple) or len(base) < 4 or int(base[3]) < pending:
+            return
+    sc.acknowledge_project_regroup()
+
+
 def _tui_build_snapshot_once(
     *,
     now_utc: dt.datetime | None = None,
@@ -5834,6 +5975,29 @@ def _tui_build_snapshot_once(
         # Force pure reads for every view builder below, independent of the
         # caller's flag: the single ingest above is the only glob per tick.
         skip_sync = True
+        # ── #1059: project-identity sweep (cadence-gated, every build) ──
+        # After the ingest and BEFORE the dispatch read, so a filesystem-only
+        # flip bumps the generation this build's dispatch key reads and the
+        # regroup is published by this same build. Outside the
+        # `precompute_envelope` branch and not gated on the caller's
+        # `skip_sync`: an `/api/sync`, settings or TUI build sweeps when due.
+        # `regroup_build_generation` is read once here, before any envelope
+        # construction, and is what the acknowledgement compares with `G`.
+        # Its own phase: a due sweep re-resolves every registered spelling
+        # through the git-root resolver, which is filesystem work that grows
+        # with the project corpus and would otherwise land in the root's
+        # unattributed remainder.
+        with _perf.phase("project_identity"):
+            try:
+                regroup_build_generation = _tui_revalidate_project_identities()
+            except Exception as exc:
+                capture_failure("project-identity", "other", exc)
+                regroup_build_generation = _cctally()._load_sibling(
+                    "_lib_snapshot_cache").current_generation()
+        projects_envelope_built = False
+        # The out-parameter of `_tui_build_source_bundle`: whether the Claude
+        # source it published is current for this build (#1059 ack (b)).
+        source_attempt: dict[str, bool] = {}
         # ── #269 M3.1: shared per-weekref immutable-cost cache (spec §4/§6) ──
         # Gated OFF by default; flipped ON only on the dashboard sync-thread
         # NON-IDLE path below, AFTER the once-per-rebuild `reconcile_weekref_cache`
@@ -6459,7 +6623,12 @@ def _tui_build_snapshot_once(
                 content_revision_leg=(
                     claude_input_identity[0].claude_content_revision
                     if claude_input_identity is not None else None),
+                # #1059: this owner build retains the result through the
+                # envelope memo, so its resolutions feed the identity sweep.
+                project_resolver_cache=c._load_sibling(
+                    "_lib_snapshot_cache").observing_project_memo(),
             )
+            projects_envelope_built = True
         except Exception as exc:
             capture_failure("projects-envelope", "stats_or_cache", exc)
         finally:
@@ -6504,7 +6673,10 @@ def _tui_build_snapshot_once(
                     if bp and k and bp not in key_by_bucket_path:
                         key_by_bucket_path[bp] = k
                 _resolve = _cctally()._resolve_project_key
-                resolver_cache: dict = {}
+                # #1059: an observing memo, so the identity sweep covers the
+                # spellings this binding resolves on the owner.
+                resolver_cache: dict = _cctally()._load_sibling(
+                    "_lib_snapshot_cache").observing_project_memo()
                 annotated: list[TuiSessionRow] = []
                 for srow in sessions:
                     pkey = None
@@ -6702,6 +6874,7 @@ def _tui_build_snapshot_once(
                         evidence_eligible_at=evidence_eligible_at,
                         claude_input_identity=claude_input_identity,
                         codex_speed=codex_speed,
+                        attempt=source_attempt,
                     )
                 if source_bundle is None:
                     raise RuntimeError("source bundle builder returned no bundle")
@@ -6740,6 +6913,21 @@ def _tui_build_snapshot_once(
         if precompute_envelope and dispatch_key is not None:
             _cctally()._load_sibling("_lib_snapshot_cache").store_dispatch_state(
                 dispatch_key, snap,
+            )
+        # #1059: acknowledge a pending regroup only once this build published
+        # it — on the dashboard after the snapshot is stored above, and only
+        # when a dispatch key let it be stored at all.
+        if not precompute_envelope or dispatch_key is not None:
+            published_bundle = snap.source_bundle
+            _tui_acknowledge_project_regroup(
+                build_generation=regroup_build_generation,
+                envelope_built=projects_envelope_built,
+                published_claude=(
+                    published_bundle.sources.get("claude")
+                    if published_bundle is not None else None),
+                claude_published_current=bool(
+                    source_attempt.get("claude_published_current")),
+                dashboard=precompute_envelope,
             )
         # #276 perf: close the "snapshot" root and freeze the completed tree
         # into the process-global slot for the loopback /api/debug/backend

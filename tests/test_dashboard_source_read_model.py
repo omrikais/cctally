@@ -3716,7 +3716,7 @@ def test_codex_source_builder_loads_quota_and_projects_once_from_context(
 
     def projects_from_context(
         start, end, *, speed, sync, group="git-root", cache_conn=None,
-        inventory=None,
+        inventory=None, project_resolver_cache=None,
     ):
         # §4.3: the build hands the reader its ONE inventory.
         assert inventory is not None

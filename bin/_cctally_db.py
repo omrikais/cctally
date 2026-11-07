@@ -4908,6 +4908,269 @@ def _apply_codex_quota_latest_summary(
         conn.execute("RELEASE codex_quota_latest_apply")
 
 
+# ── #1033 §5.1: the exact reset-anchor evidence summary ─────────────────────
+#
+# `CodexResetAnchorResolver._components_for` seeded every anchor group by
+# reading the group's whole quota history (328,727 rows for the measured weekly
+# group) on every appended Codex hook, twice (walk and journal applier). The
+# components depend only on each distinct raw reset's minimum order key and the
+# row count, so this table holds exactly that per in-scope
+# (root, slot, limit key, raw reset) bucket: `row_count`, the lexicographic
+# minimum `(source_path, line_offset, id)` (never independently minimized
+# columns) and `stale`. A stale row's stored minimum is the deleted minimum, a
+# strict lower bound of every survivor; the seed never reads a stale group and
+# the drain's repair unit re-derives it.
+#
+# Membership is `source = 'codex' AND observed_slot IS NOT NULL`; the raw TEXT
+# spelling is the key and the seed folds spellings and skips unparseable raws.
+#
+# The triggers use built-in functions only, so a head-52 binary opening this
+# store keeps them firing, and they never upsert (an outer INSERT OR IGNORE
+# propagates its conflict policy into trigger bodies): an UPDATE, then an
+# INSERT ... WHERE NOT EXISTS. Insert and delete maintenance runs only while
+# the state is `ready`; every statement is a primary-key operation, and the
+# delete trigger never searches quota_window_snapshots for a replacement
+# minimum (#971). An insert whose (source_path, line_offset) is at or below a
+# stale minimum's is the exact minimum (that pair is unique within a bucket),
+# so a heal's same-line reinsert clears the staleness its delete caused. An
+# UPDATE of any key or order column flips the state to `bootstrap` and
+# advances the generation, which the drain's publication token reads (the
+# change ledger excludes `id`). A REPLACE against the snapshots table would
+# delete without firing the delete trigger; test_no_writer_replaces_quota_rows
+# refuses one.
+
+CODEX_RESET_ANCHOR_EVIDENCE_STATE_KEY = "codex_reset_anchor_evidence"
+CODEX_RESET_ANCHOR_EVIDENCE_GENERATION_KEY = (
+    "codex_reset_anchor_evidence_generation")
+CODEX_RESET_ANCHOR_EVIDENCE_READY = "ready"
+CODEX_RESET_ANCHOR_EVIDENCE_BOOTSTRAP = "bootstrap"
+CODEX_RESET_ANCHOR_EVIDENCE_TABLE = "codex_reset_anchor_evidence"
+
+#: The five objects whose joint presence (with a valid state) means the summary
+#: has been maintained since it was last published.
+CODEX_RESET_ANCHOR_EVIDENCE_OBJECTS = (
+    ("table", "codex_reset_anchor_evidence"),
+    ("index", "idx_codex_reset_anchor_evidence_stale"),
+    ("trigger", "trg_qws_anchor_evidence_ins"),
+    ("trigger", "trg_qws_anchor_evidence_del"),
+    ("trigger", "trg_qws_anchor_evidence_upd"),
+)
+
+#: Every key or order column; an UPDATE of any of them invalidates readiness.
+_CODEX_RESET_ANCHOR_EVIDENCE_UPDATE_OF = (
+    "source", "source_root_key", "observed_slot", "logical_limit_key",
+    "resets_at_utc", "source_path", "line_offset", "id",
+)
+
+
+def _codex_reset_anchor_evidence_ddl() -> "tuple[str, ...]":
+    """DDL for the summary, its stale index and its three triggers.
+
+    Triggers are dropped and re-created on every apply, like the latest
+    summary's, so a definition change never leaves an older body behind; the
+    table keeps IF NOT EXISTS and its rows survive.
+    """
+    state = CODEX_RESET_ANCHOR_EVIDENCE_STATE_KEY
+    generation = CODEX_RESET_ANCHOR_EVIDENCE_GENERATION_KEY
+    ready = (f"(SELECT value FROM cache_meta WHERE key = '{state}')"
+             f" = '{CODEX_RESET_ANCHOR_EVIDENCE_READY}'")
+
+    def bucket(image: str) -> str:
+        return (f"source_root_key = {image}.source_root_key"
+                f" AND observed_slot = {image}.observed_slot"
+                f" AND logical_limit_key = {image}.logical_limit_key"
+                f" AND resets_at_utc = {image}.resets_at_utc")
+
+    def in_scope(image: str) -> str:
+        return (f"{image}.source = 'codex'"
+                f" AND {image}.observed_slot IS NOT NULL")
+
+    takes = (
+        "((stale = 0 AND (NEW.source_path, NEW.line_offset, NEW.id)"
+        " < (min_source_path, min_line_offset, min_id))"
+        " OR (stale = 1 AND (NEW.source_path, NEW.line_offset)"
+        " <= (min_source_path, min_line_offset)))")
+    differs = " OR ".join(
+        f"OLD.{column} IS NOT NEW.{column}"
+        for column in _CODEX_RESET_ANCHOR_EVIDENCE_UPDATE_OF)
+    return (
+        "CREATE TABLE IF NOT EXISTS codex_reset_anchor_evidence (\n"
+        "            source_root_key   TEXT    NOT NULL,\n"
+        "            observed_slot     TEXT    NOT NULL,\n"
+        "            logical_limit_key TEXT    NOT NULL,\n"
+        "            resets_at_utc     TEXT    NOT NULL,\n"
+        "            row_count         INTEGER NOT NULL CHECK (row_count > 0),\n"
+        "            min_source_path   TEXT    NOT NULL,\n"
+        "            min_line_offset   INTEGER NOT NULL,\n"
+        "            min_id            INTEGER NOT NULL,\n"
+        "            stale             INTEGER NOT NULL DEFAULT 0"
+        " CHECK (stale IN (0, 1)),\n"
+        "            PRIMARY KEY (source_root_key, observed_slot,"
+        " logical_limit_key, resets_at_utc)\n"
+        "        ) WITHOUT ROWID",
+        "CREATE INDEX IF NOT EXISTS idx_codex_reset_anchor_evidence_stale"
+        " ON codex_reset_anchor_evidence"
+        " (source_root_key, observed_slot, logical_limit_key)"
+        " WHERE stale = 1",
+        "DROP TRIGGER IF EXISTS trg_qws_anchor_evidence_ins",
+        "CREATE TRIGGER trg_qws_anchor_evidence_ins\n"
+        "        AFTER INSERT ON quota_window_snapshots\n"
+        f"        WHEN {in_scope('NEW')} AND {ready}\n"
+        "        BEGIN\n"
+        "            UPDATE codex_reset_anchor_evidence"
+        " SET row_count = row_count + 1,"
+        f" min_source_path = CASE WHEN {takes} THEN NEW.source_path"
+        " ELSE min_source_path END,"
+        f" min_line_offset = CASE WHEN {takes} THEN NEW.line_offset"
+        " ELSE min_line_offset END,"
+        f" min_id = CASE WHEN {takes} THEN NEW.id ELSE min_id END,"
+        f" stale = CASE WHEN {takes} THEN 0 ELSE stale END"
+        f" WHERE {bucket('NEW')};\n"
+        "            INSERT INTO codex_reset_anchor_evidence"
+        " (source_root_key, observed_slot, logical_limit_key, resets_at_utc,"
+        " row_count, min_source_path, min_line_offset, min_id, stale)"
+        " SELECT NEW.source_root_key, NEW.observed_slot,"
+        " NEW.logical_limit_key, NEW.resets_at_utc, 1, NEW.source_path,"
+        " NEW.line_offset, NEW.id, 0"
+        " WHERE NOT EXISTS (SELECT 1 FROM codex_reset_anchor_evidence"
+        f" WHERE {bucket('NEW')});\n"
+        "        END",
+        "DROP TRIGGER IF EXISTS trg_qws_anchor_evidence_del",
+        "CREATE TRIGGER trg_qws_anchor_evidence_del\n"
+        "        AFTER DELETE ON quota_window_snapshots\n"
+        f"        WHEN {in_scope('OLD')} AND {ready}\n"
+        "        BEGIN\n"
+        "            UPDATE cache_meta"
+        f" SET value = '{CODEX_RESET_ANCHOR_EVIDENCE_BOOTSTRAP}'"
+        f" WHERE key = '{state}'"
+        " AND NOT EXISTS (SELECT 1 FROM codex_reset_anchor_evidence"
+        f" WHERE {bucket('OLD')});\n"
+        "            DELETE FROM codex_reset_anchor_evidence"
+        f" WHERE {bucket('OLD')} AND row_count = 1;\n"
+        "            UPDATE codex_reset_anchor_evidence"
+        " SET row_count = row_count - 1,"
+        " stale = CASE WHEN (min_source_path, min_line_offset, min_id)"
+        " = (OLD.source_path, OLD.line_offset, OLD.id) THEN 1 ELSE stale END"
+        f" WHERE {bucket('OLD')};\n"
+        "        END",
+        "DROP TRIGGER IF EXISTS trg_qws_anchor_evidence_upd",
+        "CREATE TRIGGER trg_qws_anchor_evidence_upd\n"
+        "        AFTER UPDATE OF "
+        f"{', '.join(_CODEX_RESET_ANCHOR_EVIDENCE_UPDATE_OF)}"
+        " ON quota_window_snapshots\n"
+        f"        WHEN (({in_scope('OLD')}) OR ({in_scope('NEW')}))"
+        f" AND ({differs})\n"
+        "        BEGIN\n"
+        "            UPDATE cache_meta"
+        " SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+        f" WHERE key = '{generation}';\n"
+        "            INSERT INTO cache_meta (key, value)"
+        f" SELECT '{generation}', '1' WHERE NOT EXISTS"
+        f" (SELECT 1 FROM cache_meta WHERE key = '{generation}');\n"
+        "            UPDATE cache_meta"
+        f" SET value = '{CODEX_RESET_ANCHOR_EVIDENCE_BOOTSTRAP}'"
+        f" WHERE key = '{state}'"
+        f" AND value = '{CODEX_RESET_ANCHOR_EVIDENCE_READY}';\n"
+        "        END",
+    )
+
+
+def _advance_codex_reset_anchor_evidence_generation(
+    conn: sqlite3.Connection,
+) -> None:
+    """Advance (or initialize) the invalidation generation in the caller's
+    transaction. A malformed stored value restarts from it parsed as 0."""
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key = ?",
+        (CODEX_RESET_ANCHOR_EVIDENCE_GENERATION_KEY,)).fetchone()
+    try:
+        current = int(row[0]) if row is not None else 0
+    except (TypeError, ValueError):
+        current = 0
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (CODEX_RESET_ANCHOR_EVIDENCE_GENERATION_KEY, str(current + 1)))
+
+
+def _set_codex_reset_anchor_evidence_state(
+    conn: sqlite3.Connection, state: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (CODEX_RESET_ANCHOR_EVIDENCE_STATE_KEY, state))
+
+
+def _apply_codex_reset_anchor_evidence(conn: sqlite3.Connection) -> None:
+    """Install the reset-anchor evidence summary on every delivery path.
+
+    Shared by ``_apply_cache_schema`` and migration 053 so fresh and upgraded
+    stores converge. Atomic like ``_apply_codex_retained_identity_inventory``:
+    the table, its stale index, the three triggers and the state commit
+    together, as a savepoint inside the caller's transaction or as an
+    IMMEDIATE transaction of their own.
+
+    The state is decided only when any of the five objects was missing before
+    this call, or the state key is missing or malformed: every summary row is
+    deleted, the generation advances and the state becomes ``ready`` when no
+    in-scope Codex quota row exists, else ``bootstrap`` for the drain's
+    off-hook bootstrap unit. A store carrying all five objects and a valid
+    state has been maintained since they were created, so its recorded state
+    stands (a markerless retry changes nothing). A history scan never runs
+    here: the population check is one LIMIT 1 probe. Guarded on the columns
+    the triggers read, which a legacy-shape cache whose schema apply returned
+    early can lack, and on ``cache_meta``.
+    """
+    columns = {
+        str(row[0]) for row in conn.execute(
+            "SELECT name FROM pragma_table_info('quota_window_snapshots')")
+    }
+    if not ({"id", *_CODEX_RESET_ANCHOR_EVIDENCE_UPDATE_OF} <= columns
+            and _table_exists(conn, "cache_meta")):
+        return
+    own_transaction = not conn.in_transaction
+    conn.execute(
+        "BEGIN IMMEDIATE" if own_transaction
+        else "SAVEPOINT codex_reset_anchor_evidence_apply")
+    try:
+        present = {
+            (str(row[0]), str(row[1])) for row in conn.execute(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'trigger')")
+        }
+        complete = all(
+            item in present for item in CODEX_RESET_ANCHOR_EVIDENCE_OBJECTS)
+        state_row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key = ?",
+            (CODEX_RESET_ANCHOR_EVIDENCE_STATE_KEY,)).fetchone()
+        valid_state = state_row is not None and state_row[0] in (
+            CODEX_RESET_ANCHOR_EVIDENCE_READY,
+            CODEX_RESET_ANCHOR_EVIDENCE_BOOTSTRAP)
+        for statement in _codex_reset_anchor_evidence_ddl():
+            conn.execute(statement)
+        if not (complete and valid_state):
+            conn.execute("DELETE FROM codex_reset_anchor_evidence")
+            _advance_codex_reset_anchor_evidence_generation(conn)
+            populated = conn.execute(
+                "SELECT 1 FROM quota_window_snapshots WHERE source = 'codex' "
+                "AND observed_slot IS NOT NULL LIMIT 1").fetchone()
+            _set_codex_reset_anchor_evidence_state(
+                conn, CODEX_RESET_ANCHOR_EVIDENCE_BOOTSTRAP if populated
+                else CODEX_RESET_ANCHOR_EVIDENCE_READY)
+    except BaseException:
+        if own_transaction:
+            conn.rollback()
+        else:
+            conn.execute("ROLLBACK TO codex_reset_anchor_evidence_apply")
+            conn.execute("RELEASE codex_reset_anchor_evidence_apply")
+        raise
+    if own_transaction:
+        conn.commit()
+    else:
+        conn.execute("RELEASE codex_reset_anchor_evidence_apply")
+
+
 def _apply_codex_quota_load_order_index(conn: sqlite3.Connection) -> None:
     """The general loader's ORDER BY, served by an index (#901 §5.1, T1/T3).
 
@@ -5527,6 +5790,11 @@ CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "index", "idx_codex_files_root_thread",
         "_apply_codex_accounting_change_ledger",
         "052_codex_delete_trigger_plans"),
+    # #1033 spec §5.5: migration 053's handler calls the shared helper.
+    *(SchemaDeliveryObject(
+        kind, name, "_apply_codex_reset_anchor_evidence",
+        "053_codex_reset_anchor_evidence")
+      for kind, name in CODEX_RESET_ANCHOR_EVIDENCE_OBJECTS),
 )
 
 
@@ -6370,6 +6638,8 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # window-attribution read order (Amendment 1 item 1). BEFORE the
     # legacy-FTS early-return, so an old-shape cache.db gains them.
     _apply_codex_quota_latest_summary(conn)
+    # #1033 §5.5: the reset-anchor evidence summary and its readiness state.
+    _apply_codex_reset_anchor_evidence(conn)
     _apply_codex_quota_load_order_index(conn)
     _apply_codex_metadata_lookup_indexes(conn)
     _apply_pricing_model_indexes(conn)
@@ -6571,6 +6841,10 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         -- #927: the retained-identity inventory is cache.db prune state. Its
         -- triggers went with the four family tables dropped above.
         DROP TABLE IF EXISTS codex_retained_identities;
+        -- #1033: the reset-anchor evidence summary is a cache.db read model
+        -- over quota_window_snapshots, whose drop above took its triggers;
+        -- dropping the table takes its stale index.
+        DROP TABLE IF EXISTS codex_reset_anchor_evidence;
 
         CREATE TABLE IF NOT EXISTS conversation_source_files (
             path             TEXT PRIMARY KEY,
@@ -10845,6 +11119,36 @@ def _052_codex_delete_trigger_plans(conn: sqlite3.Connection) -> None:
     """
     _apply_codex_accounting_change_ledger(conn)
     _apply_codex_quota_latest_summary(conn)
+    conn.commit()
+
+
+@cache_migration("053_codex_reset_anchor_evidence")
+def _053_codex_reset_anchor_evidence(conn: sqlite3.Connection) -> None:
+    """#1033 spec §5.5: deliver the reset-anchor evidence summary.
+
+    The schema apply that declares the table, its stale index and its three
+    triggers is version-gated, so only a registered migration reaches an
+    already-current store. The shared helper records ``ready`` when no
+    in-scope Codex quota row exists, else ``bootstrap``: the drain's
+    ``reset_anchor_evidence_bootstrap`` unit (or ``cache-sync`` inline)
+    aggregates an existing history off the hook, never here, so an ordinary
+    open pays no history scan. Until then every seed falls back to the full
+    read, which is today's behaviour.
+
+    Downgrade: a head-52 binary opening a head-53 store never reads the
+    summary, and the dispatcher's version-ahead recovery trims this marker.
+    The built-in-only triggers keep maintaining a ``ready`` summary under its
+    writes, including its row-by-row ``_clear_codex_derived_rows``, which
+    empties the summary exactly; a ``bootstrap`` summary stays inert. A
+    re-upgrade re-runs this handler, finds every object and a valid state, and
+    changes nothing.
+
+    Takes no provider flock: the helper's IMMEDIATE transaction (or savepoint)
+    makes the trigger creation and the state decision atomic against every
+    writer. Re-running is a no-op. NO self-stamp — the dispatcher
+    central-stamps on a clean return (#140).
+    """
+    _apply_codex_reset_anchor_evidence(conn)
     conn.commit()
 
 

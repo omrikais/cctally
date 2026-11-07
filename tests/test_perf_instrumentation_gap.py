@@ -301,6 +301,18 @@ _ALLOWLISTED_UNPHASED_CALLS = {
         "most one `dataclasses.replace` of the retained Codex state and its "
         "bundle to withdraw an identity stamp. No query and no I/O."
     ),
+    # ── #1059. The identity sweep itself resolves paths on the filesystem, so
+    # it has its own `project_identity` phase and is absent from this list.
+    '_cctally()._load_sibling("_lib_snapshot_cache").observing_project_memo': (
+        "#1059: constructs one empty observing memo for the cross-nav bind "
+        "after an owner-thread assertion. The resolutions it observes are "
+        "the bind's own `_resolve` calls; the constructor does no I/O."
+    ),
+    "_tui_acknowledge_project_regroup": (
+        "#1059: compares the build generation with the pending regroup "
+        "generation and, on the dashboard, reads the retained range memo's "
+        "base tuple. In-memory comparisons only; no query and no I/O."
+    ),
 }
 
 

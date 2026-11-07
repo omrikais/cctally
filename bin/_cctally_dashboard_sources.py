@@ -7641,6 +7641,9 @@ def _capture_codex_accounting(
                     active_roots,
                     _cache_database_identity(context.cache_conn),
                 ),
+                # #1059: one observing memo per load, so every spelling the
+                # qualified resolution visits is registered for the regroup
+                # sweep.
                 load_all=lambda: load_qualified_codex_entries(
                     accounting_start,
                     accounting_end,
@@ -7648,6 +7651,8 @@ def _capture_codex_accounting(
                     sync=False,
                     cache_conn=context.cache_conn,
                     inventory=inventory,
+                    project_resolver_cache=(
+                        _lib_snapshot_cache.observing_project_memo()),
                 ),
                 load_paths=lambda identities: load_qualified_codex_entries(
                     accounting_start,
@@ -7657,6 +7662,8 @@ def _capture_codex_accounting(
                     cache_conn=context.cache_conn,
                     source_identities=identities,
                     inventory=inventory,
+                    project_resolver_cache=(
+                        _lib_snapshot_cache.observing_project_memo()),
                 ),
                 path_of=lambda entry: (
                     str(entry.source_root_key), str(entry.source_path),

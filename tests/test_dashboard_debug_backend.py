@@ -517,3 +517,104 @@ def test_trace_post_401s_when_the_bearer_is_required_and_absent(
     finally:
         handler.cctally_api_token = None
         stop(srv, srv._test_thread)
+
+
+_PROJECT_WORK_KEYS = {
+    "closedWeekComputes", "fullWindowProjectWalks", "currentWeekColdFolds",
+    "weekrefCostComputes", "rangeFullRefolds", "codexLoadAll",
+    "codexLoadPaths", "codexLoadPathsPaths",
+}
+
+
+def test_debug_backend_project_work_counters_count_only_real_rebuilds(
+    monkeypatch, tmp_path,
+):
+    """#1059 SD3: the work counters are the evidence that a warm tick on an
+    unchanged filesystem rebuilds no closed week. A counter that also moved on
+    a cache hit (or never moved on a miss) would certify a rebuild storm as
+    flat, so a cold cached envelope build must count its closed-week misses and
+    the following warm build none."""
+    import pathlib
+    import _lib_snapshot_cache as sc
+    ns = load_script()
+    dash = ns["_load_sibling"]("_cctally_dashboard")
+    fixture = (pathlib.Path(__file__).resolve().parent / "fixtures"
+               / "projects" / "multi-week.db")
+    import datetime as dt
+    now = dt.datetime(2026, 5, 19, 12, 0, 0, tzinfo=dt.timezone.utc)
+    dash._projects_reset_memo()
+    sc.reset_projects_env_state()
+    conn = sqlite3.connect(fixture)
+    try:
+        before = sc.project_work_stats()
+        dash._build_projects_envelope(
+            conn, now_utc=now, weeks_back=12, use_projects_env_cache=True)
+        cold = sc.project_work_stats()
+        dash._projects_reset_memo()
+        dash._build_projects_envelope(
+            conn, now_utc=now, weeks_back=12, use_projects_env_cache=True)
+        warm = sc.project_work_stats()
+        dash._projects_reset_memo()
+        dash._build_projects_envelope(conn, now_utc=now, weeks_back=12)
+        walked = sc.project_work_stats()
+    finally:
+        conn.close()
+        dash._projects_reset_memo()
+        sc.reset_projects_env_state()
+    assert cold["closedWeekComputes"] > before["closedWeekComputes"]
+    assert cold["currentWeekColdFolds"] == before["currentWeekColdFolds"] + 1
+    assert warm["closedWeekComputes"] == cold["closedWeekComputes"]
+    assert warm["currentWeekColdFolds"] == cold["currentWeekColdFolds"]
+    assert walked["fullWindowProjectWalks"] == (
+        warm["fullWindowProjectWalks"] + 1)
+
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        status, body = _get(srv.server_address[1], "/api/debug/backend")
+        assert status == 200
+        work = json.loads(body)["projectWork"]
+        assert set(work) == _PROJECT_WORK_KEYS
+        assert all(type(value) is int for value in work.values())
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_debug_backend_project_identity_block_reports_the_sweep(
+    monkeypatch, tmp_path,
+):
+    """#1059: the sweep's cost and outcome are the A2 evidence that the
+    cadence bound holds and an unchanged sweep is cheap; a missing or
+    mistyped field makes that evidence unreadable."""
+    import _lib_snapshot_cache as sc
+    from _cctally_cache import _resolve_project_key
+    ns = load_script()
+    sc.reset_project_identity_state()
+    _resolve_project_key(str(tmp_path), "git-root", sc.observing_project_memo())
+    sc.revalidate_project_identities(
+        resolve=_resolve_project_key, now_monotonic=0.0)
+    sc.revalidate_project_identities(
+        resolve=_resolve_project_key, now_monotonic=60.0)
+    srv = _boot(ns, tmp_path, monkeypatch)
+    try:
+        status, body = _get(srv.server_address[1], "/api/debug/backend")
+    finally:
+        stop(srv, srv._test_thread)
+        sc.reset_project_identity_state()
+    assert status == 200
+    block = json.loads(body)["projectIdentity"]
+    assert set(block) == {
+        "sweepAttempts", "sweepSuccesses", "sweepFailures", "spellingsVisited",
+        "flips", "flipBatches", "retryBumps", "lastSweepMs", "totalSweepMs",
+        "observedSpellings", "regroupGeneration", "forcedCodexPathsPending",
+        "codexRequalifyAll", "recentSweeps",
+    }
+    for name in ("lastSweepMs", "totalSweepMs"):
+        assert isinstance(block[name], float)
+    assert block["regroupGeneration"] is None
+    assert block["codexRequalifyAll"] is False
+    assert block["sweepSuccesses"] == 1 and block["observedSpellings"] == 1
+    (record,) = block["recentSweeps"]
+    assert set(record) == {"id", "at", "ms", "spellings", "flips", "outcome",
+                           "retryBump"}
+    assert record["outcome"] == "ok" and record["retryBump"] is False
+    assert record["spellings"] == 1

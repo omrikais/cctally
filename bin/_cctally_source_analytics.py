@@ -1160,9 +1160,16 @@ class _CodexProjectResolution:
 
     __slots__ = ("_group", "_resolver_cache", "_by_cwd", "_by_git_json")
 
-    def __init__(self, group: str = "git-root") -> None:
+    def __init__(
+        self, group: str = "git-root",
+        resolver_cache: "dict[object, object] | None" = None,
+    ) -> None:
         self._group = group
-        self._resolver_cache: dict[object, object] = {}
+        # #1059: the owner's dashboard loads pass an observing memo so every
+        # spelling this resolution visits is registered for the regroup
+        # sweep; every other caller keeps a private plain dict.
+        self._resolver_cache: dict[object, object] = (
+            {} if resolver_cache is None else resolver_cache)
         self._by_cwd: dict[str, object] = {}
         self._by_git_json: dict[str, str | None] = {}
 
@@ -1248,6 +1255,7 @@ def load_qualified_codex_entries(
     source_identities: Iterable[tuple[str, str]] | None = None,
     inventory: "CodexThreadMetadataInventory | None" = None,
     _on_sync: "Callable[[object], object] | None" = None,
+    project_resolver_cache: "dict[object, object] | None" = None,
 ) -> tuple[QualifiedCodexEntry, ...]:
     """Load exactly one bounded, root-qualified Codex accounting read.
 
@@ -1316,7 +1324,10 @@ def load_qualified_codex_entries(
             conn.row_factory = previous_row_factory
 
     return _qualify_codex_rows(
-        rows, inherited_metadata, speed=speed, group=group)
+        rows, inherited_metadata, speed=speed, group=group,
+        projects=_CodexProjectResolution(
+            group, resolver_cache=project_resolver_cache),
+    )
 
 
 def _qualify_codex_rows(

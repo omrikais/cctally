@@ -1930,6 +1930,154 @@ def test_n_a_whole_transaction_loss_in_a_later_file_converges_with_the_control(
         control.close()
 
 
+# ── #1033: W11's per-file merges with summary-backed anchor seeds ───────────
+
+_FULL_SEED_PREFIX = "SELECT source_path, line_offset, id, resets_at_utc"
+
+
+def _quota_record_at(seconds: int, used: float, minutes_after: int) -> dict:
+    """A quota-only weekly ``token_count`` whose reset is ``minutes_after``
+    minutes past the default weekly reset."""
+    record = _quota_record(seconds, used)
+    primary = record["payload"]["info"]["rate_limits"]["primary"]
+    primary["resets_at"] += 60 * minutes_after
+    return record
+
+
+def _evidence_matches_rows(store: CacheStore) -> None:
+    """The ready summary equals a Python aggregate of the physical rows."""
+    conn = store.conn
+    assert conn.execute(
+        "SELECT value FROM cache_meta WHERE key='codex_reset_anchor_evidence'"
+    ).fetchone() == ("ready",)
+    oracle: dict = {}
+    for row in conn.execute(
+            "SELECT source_root_key, observed_slot, logical_limit_key, "
+            "resets_at_utc, source_path, line_offset, id "
+            "FROM quota_window_snapshots "
+            "WHERE source='codex' AND observed_slot IS NOT NULL"):
+        count, minimum = oracle.get(row[:4], (0, tuple(row[4:])))
+        oracle[row[:4]] = (count + 1, min(minimum, tuple(row[4:])))
+    summary = {row[:4]: (row[4], tuple(row[5:8])) for row in conn.execute(
+        "SELECT source_root_key, observed_slot, logical_limit_key, "
+        "resets_at_utc, row_count, min_source_path, min_line_offset, min_id "
+        "FROM codex_reset_anchor_evidence WHERE stale = 0")}
+    assert summary == oracle
+
+
+def _full_reads(statements: list[str]) -> int:
+    return sum(s.startswith(_FULL_SEED_PREFIX) for s in statements)
+
+
+def _spy_summary_seeds(env: Env, patch) -> list[bool]:
+    """Per call of the reset-anchor summary seed, whether it served the group
+    (False: it fell back to the full history read)."""
+    served: list[bool] = []
+    real = env.cache._codex_reset_anchor_summary_seed
+
+    def spy(*args, **kwargs):
+        result = real(*args, **kwargs)
+        served.append(result is not None)
+        return result
+
+    patch.setattr(env.cache, "_codex_reset_anchor_summary_seed", spy)
+    return served
+
+
+@pytest.mark.parametrize("failure", (
+    "file-rollback", "transaction-loss", "deferred-loss"))
+def test_l_summary_seeded_merges_survive_rollback_like_the_control(
+    env, monkeypatch, failure,
+):
+    """#1033 (W11 with summary seeds): merges lost or duplicated across a
+    rolled-back file. l0 gains a reset 20 minutes late (its own component),
+    l1 the bridge 10 minutes late (which retires l0's new anchor) and l2 a
+    member of l0's component. l1 fails: by a file-level rollback, or by a
+    whole-transaction loss that re-prepares the later files. Or, in the
+    deferred-file case, the batch is deferred to the finalization transaction
+    and that transaction is lost, which withdraws all three files. Every seed
+    comes from the evidence summary, whose rows include the batch's
+    uncommitted inserts and drop the rolled-back ones, and the stored anchors
+    equal the per-file control's, before and after the convergent sync that
+    lands the bridge."""
+    store = CacheStore(env, "store")
+    control = _per_file_control(env, monkeypatch, "control")
+    try:
+        rollouts = _three_changed_files(env)
+        _settle(store, control)
+        for rollout, minutes in zip(rollouts, (20, 10, 25)):
+            with rollout.path.open("a", encoding="utf-8") as fh:
+                fh.write(_lines([_quota_record_at(
+                    rollout.clock + 7, 60.0, minutes)]))
+            rollout.clock += TURN_SPACING
+        failing = str(rollouts[1].path)
+        before_rows = [store.file_row(rollout) for rollout in rollouts]
+        results, traces, served, losses = {}, {}, {}, {}
+        for name, target in (("store", store), ("control", control)):
+            if failure == "deferred-loss":
+                # The parse-health record is written when absent.
+                target.conn.execute(
+                    "DELETE FROM cache_meta WHERE key='parse_health_codex'")
+                target.conn.commit()
+            with pytest.MonkeyPatch.context() as patch:
+                if failure == "file-rollback":
+                    _inject_second_file_failure(env, patch, failing)
+                elif failure == "transaction-loss":
+                    _inject_whole_transaction_loss(
+                        env, patch, failing, times=None)
+                else:
+                    losses[name] = _inject_parse_health_transaction_loss(
+                        env, patch)
+                if name == "control":
+                    patch.setattr(env.cache, "_CODEX_W11_ENABLED", False,
+                                  raising=False)
+                served[name] = _spy_summary_seeds(env, patch)
+                target.activate()
+                traces[name] = []
+                target.conn.set_trace_callback(traces[name].append)
+                try:
+                    results[name] = env.cache.sync_codex_cache(target.conn)
+                finally:
+                    target.conn.set_trace_callback(None)
+        assert any(served["store"]) and _full_reads(traces["store"]) == 0, (
+            served["store"], _full_reads(traces["store"]))
+        if failure == "deferred-loss":
+            assert losses["store"] == [True], (
+                "the injected loss did not strike the deferred batch", losses)
+            assert results["store"].files_failed == 3, results["store"]
+            assert [store.file_row(r) for r in rollouts] == before_rows, (
+                "a withdrawn file's cursor moved")
+        else:
+            assert results["store"].files_failed == 1, results["store"]
+            assert (store.file_row(rollouts[1])
+                    == control.file_row(rollouts[1]))
+            assert_same(store.accounting(), control.accounting())
+        _evidence_matches_rows(store)
+
+        statements: list[str] = []
+        store.activate()
+        store.conn.set_trace_callback(statements.append)
+        with pytest.MonkeyPatch.context() as patch:
+            again = _spy_summary_seeds(env, patch)
+            try:
+                store.sync()
+            finally:
+                store.conn.set_trace_callback(None)
+        control.sync()
+        assert any(again) and _full_reads(statements) == 0, again
+        assert_same(store.accounting(), control.accounting())
+        _evidence_matches_rows(store)
+        anchors = {row[0] for row in store.conn.execute(
+            "SELECT DISTINCT canonical_resets_at_utc FROM quota_window_snapshots"
+            " WHERE source='codex'")}
+        assert len(anchors) == 1, (
+            "non-vacuity: the bridge must have merged both components",
+            anchors)
+    finally:
+        store.close()
+        control.close()
+
+
 def _inject_parse_health_transaction_loss(env: Env, patch) -> list:
     """901-QI-001: lose the finalization transaction inside the parse-health
     write — a real ``ROLLBACK`` on the sync connection, then a

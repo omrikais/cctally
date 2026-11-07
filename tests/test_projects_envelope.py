@@ -970,3 +970,491 @@ def test_start_for_date_returns_none_when_a_date_resolves_to_two_segments():
         CREDITED_WEEK_START.date()) == CREDITED_WEEK_START, (
         "a date owned by exactly one interval still resolves"
     )
+
+
+# ===========================================================================
+# #1059 — warm project regrouping on filesystem changes.
+#
+# A warm dashboard retains resolved project identities in its closed-week
+# cache, its current-week accumulator and its whole-envelope memo. Each case
+# warms those through the real cached builder, changes ONLY the filesystem
+# (no cache is cleared by hand), advances the injected monotonic clock past
+# the sweep interval and drives the real orchestration. The decisive failure
+# is a stale or split grouping: the published rows still name the old bucket.
+# ===========================================================================
+
+from conftest import (  # noqa: E402
+    git_init, make_regroup_tree, recreate_worktree, remove_worktree,
+)
+
+_W_CUR = WK_MON
+_W_1 = WK_MON - dt.timedelta(days=7)      # affected closed week
+_W_2 = WK_MON - dt.timedelta(days=14)     # affected closed week
+_W_CTRL = WK_MON - dt.timedelta(days=21)  # control: otherrepo only
+_ARM = 1000.0
+
+
+def _regroup_ns():
+    ns = load_script()
+    return (ns, ns["_load_sibling"]("_cctally_dashboard"),
+            ns["_load_sibling"]("_cctally_tui"))
+
+
+def _ts(week, hours):
+    return (week + dt.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _regroup_rows(tree, spellings):
+    """Entries for `spellings` in two closed weeks and the current week, plus
+    `otherrepo` in every week including the control week. Costs are distinct
+    so a misplaced entry shows in the totals."""
+    rows = []
+    eid = 0
+
+    def add(week, hours, sp, cost, sid, pp):
+        nonlocal eid
+        eid += 1
+        rows.append((eid, f"/j/{sid}.jsonl", _ts(week, hours),
+                     "claude-opus-4-8", cost, sid, pp))
+
+    for w_index, week in enumerate((_W_CTRL, _W_2, _W_1, _W_CUR)):
+        add(week, 1, None, 0.5 + w_index, f"other{w_index}", str(tree.other))
+        if week is _W_CTRL:
+            continue
+        add(week, 2, None, 0.25 + w_index, f"main{w_index}", str(tree.main))
+        for s_index, sp in enumerate(spellings):
+            add(week, 3 + s_index, None, 1.0 + w_index + s_index / 8,
+                f"s{w_index}_{s_index}", str(sp))
+    return rows
+
+
+def _rows_by_bucket(env):
+    return {row["bucket_path"]: row for row in env["current_week"]["rows"]}
+
+
+def _trend_buckets(env):
+    return {p["bucket_path"]: p for p in env["trend"]["projects"]}
+
+
+def _seed_regroup_usage(conn):
+    """Date-only weekly readings for every regroup week, so the envelope's
+    quota denominator (`total_pct`) and every row's `attributed_pct` /
+    `weekly_pct` are populated rather than all `None` (spec 9 R2)."""
+    conn.execute(
+        "CREATE TABLE weekly_usage_snapshots (id INTEGER PRIMARY KEY, "
+        " captured_at_utc TEXT NOT NULL, week_start_date TEXT, "
+        " week_end_date TEXT, week_start_at TEXT, week_end_at TEXT, "
+        " weekly_percent REAL)")
+    for index, week in enumerate((_W_CTRL, _W_2, _W_1, _W_CUR)):
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots (captured_at_utc, "
+            " week_start_date, week_end_date, weekly_percent) "
+            "VALUES (?, ?, ?, ?)",
+            (_ts(week, 12), week.date().isoformat(),
+             (week + dt.timedelta(days=7)).date().isoformat(),
+             11.0 + 7 * index))
+    conn.commit()
+
+
+def _week_sums(env):
+    """Per-week sums across every project row: a regroup that moves rows
+    between projects must keep each of them equal."""
+    weeks = len(env["trend"]["weeks"])
+    cost = [0.0] * weeks
+    pct = [0.0] * weeks
+    for project in env["trend"]["projects"]:
+        for i in range(weeks):
+            cost[i] += project["weekly_cost"][i]
+            pct[i] += project["weekly_pct"][i] or 0.0
+    return cost, pct
+
+
+def _assert_totals_equal(pre, post, *, appended=0.0):
+    """Spec 9 R2: a filesystem-only transition keeps every cost, quota and
+    denominator value; an append adds exactly the appended entry's cost (it
+    moves no weekly reading, so quota fields stay exact)."""
+    cur_index = len(pre["trend"]["weeks"]) - 1
+    assert post["current_week"]["total_cost_usd"] == pytest.approx(
+        pre["current_week"]["total_cost_usd"] + appended, abs=1e-9)
+    for i, (a, b) in enumerate(zip(pre["trend"]["weeks"],
+                                   post["trend"]["weeks"])):
+        extra = appended if i == cur_index else 0.0
+        assert b["total_cost_usd"] == pytest.approx(
+            a["total_cost_usd"] + extra, abs=1e-9)
+        assert b["week_start_at"] == a["week_start_at"]
+        assert b["total_pct"] == a["total_pct"], "quota denominator moved"
+    pre_cost, pre_pct = _week_sums(pre)
+    post_cost, post_pct = _week_sums(post)
+    for i in range(len(pre_cost)):
+        extra = appended if i == cur_index else 0.0
+        assert post_cost[i] == pytest.approx(pre_cost[i] + extra, abs=1e-9)
+        assert post_pct[i] == pytest.approx(pre_pct[i], abs=1e-9)
+    assert sum(r["attributed_pct"] or 0.0
+               for r in post["current_week"]["rows"]) == pytest.approx(
+        sum(r["attributed_pct"] or 0.0
+            for r in pre["current_week"]["rows"]), abs=1e-9)
+    for env in (pre, post):
+        assert sum(r["cost_usd"] for r in env["current_week"]["rows"]) == (
+            pytest.approx(env["current_week"]["total_cost_usd"], abs=1e-9))
+        for week, week_cost in zip(env["trend"]["weeks"], _week_sums(env)[0]):
+            assert week_cost == pytest.approx(week["total_cost_usd"], abs=1e-9)
+
+
+def _transition(case, tree):
+    if case in ("removed_worktree", "append"):
+        remove_worktree(tree)
+    elif case == "git_init_parent":
+        git_init(tree.plain)
+    elif case == "metadata_flip":
+        git_init(tree.solo)
+    elif case == "moved_repo":
+        tree.movable.rename(tree.root / "moved")
+    else:
+        raise AssertionError(case)
+
+
+_CASES = {
+    # case: (spellings, {spelling: bucket before}, {spelling: bucket after})
+    "removed_worktree": (
+        lambda t: [t.feature, t.feature / "src"],
+        lambda t: {t.feature: t.feature, t.feature / "src": t.feature},
+        lambda t: {t.feature: t.main, t.feature / "src": t.main}),
+    "append": (
+        lambda t: [t.feature],
+        lambda t: {t.feature: t.feature},
+        lambda t: {t.feature: t.main}),
+    "git_init_parent": (
+        lambda t: [t.plain_sub],
+        lambda t: {t.plain_sub: t.plain_sub},
+        lambda t: {t.plain_sub: t.plain}),
+    "metadata_flip": (
+        lambda t: [t.alias],
+        lambda t: {t.alias: t.solo},
+        lambda t: {t.alias: t.solo}),
+    "moved_repo": (
+        lambda t: [t.movable, t.movable_sub],
+        lambda t: {t.movable: t.movable, t.movable_sub: t.movable},
+        lambda t: {t.movable: t.movable, t.movable_sub: t.movable_sub}),
+}
+
+
+def _cold_oracle(dash, conn):
+    sc.reset_projects_env_state()
+    dash._projects_reset_memo()
+    sc.reset_project_identity_state()
+    return dash._build_projects_envelope(
+        conn, now_utc=NOW_UTC, weeks_back=12, use_projects_env_cache=True)
+
+
+@pytest.mark.parametrize("case", sorted(_CASES))
+def test_warm_envelope_regroups_after_a_filesystem_change(case, tmp_path):
+    """Detects a warm Projects envelope that keeps the grouping it computed
+    before a worktree removal, a `git init`, a metadata flip or a move, while
+    a restart would regroup — and a regroup that rebuilds unaffected weeks or
+    changes any total."""
+    import copy
+    _ns, dash, tui = _regroup_ns()
+    tree = make_regroup_tree(tmp_path / "tree")
+    spellings_of, before_of, after_of = _CASES[case]
+    spellings = spellings_of(tree)
+    conn = _seed_conn(_regroup_rows(tree, spellings))
+    _seed_regroup_usage(conn)
+    sc.reset_projects_env_state()
+    dash._projects_reset_memo()
+    sc.reset_project_identity_state()
+    clock = {"t": _ARM}
+
+    def build():
+        tui._tui_revalidate_project_identities(now_monotonic=clock["t"])
+        return dash._build_projects_envelope(
+            conn, now_utc=NOW_UTC, weeks_back=12, use_projects_env_cache=True)
+
+    env1 = build()
+    clock["t"] += 10
+    env2 = build()
+    assert env2 is env1, "precondition: the warm memo serves the second build"
+    for sp, bucket in before_of(tree).items():
+        assert any(bp == str(bucket) for (bp, _w) in sc._PROJECTS_ENV_WEEK_CACHE), (
+            f"precondition: the warm cache holds {sp} under {bucket}")
+    if case == "metadata_flip":
+        assert _rows_by_bucket(env2)[str(tree.solo)]["key"] == "alias"
+    assert all(w["total_pct"] is not None for w in env2["trend"]["weeks"]), (
+        "non-vacuity: every week carries a quota denominator")
+    published = copy.deepcopy(env2)
+
+    _transition(case, tree)
+    appended = 0.0
+    if case == "append":
+        appended = 0.375
+        _insert(conn, 999, "/j/new.jsonl", _ts(_W_CUR, 30), "claude-opus-4-8",
+                appended, "snew", str(tree.feature))
+    work = sc.project_work_stats()
+    batches = sc.project_identity_stats()["flipBatches"]
+    clock["t"] = _ARM + 30
+    before_deadline = build()
+    assert sc.project_identity_stats()["flipBatches"] == batches
+    if case != "append":
+        assert before_deadline is env2, "filesystem-only: nothing republished"
+        assert sc.project_work_stats() == work
+
+    clock["t"] = _ARM + 61
+    work = sc.project_work_stats()
+    env3 = build()
+    rows = _rows_by_bucket(env3)
+    trend = _trend_buckets(env3)
+    for sp, bucket in after_of(tree).items():
+        assert str(bucket) in rows and str(bucket) in trend, (sp, bucket)
+    stale = {str(b) for b in before_of(tree).values()} - {
+        str(b) for b in after_of(tree).values()}
+    for bucket in stale:
+        assert bucket not in rows and bucket not in trend, (
+            f"stale grouping: {bucket} is still its own project")
+    if case == "removed_worktree":
+        assert rows[str(tree.main)]["sessions_count"] == 3
+    if case == "metadata_flip":
+        assert rows[str(tree.solo)]["key"] == "solo"
+    _assert_totals_equal(published, env3, appended=appended)
+    assert sc.project_identity_stats()["flipBatches"] == batches + 1
+    computes = (sc.project_work_stats()["closedWeekComputes"]
+                - work["closedWeekComputes"])
+    assert computes == 2, "exactly the two affected closed weeks recompute"
+    assert sc.projects_env_week_get(
+        sc.projects_env_week_key(_W_CTRL)) is not None, "control week stays a hit"
+    assert env2 == published, "an earlier published envelope is never mutated"
+
+    warm = copy.deepcopy(env3)
+    assert _cold_oracle(dash, conn) == warm
+
+
+def test_warm_envelope_intermediate_identity_evicts_retained_current_week(
+    tmp_path,
+):
+    """A→B→A: a current-week row folded under the repository while the
+    worktree was gone stays split under the repository after the worktree
+    returns unless the sweep invalidates every identity observed since the
+    last sweep, not only the first one."""
+    import copy
+    _ns, dash, tui = _regroup_ns()
+    tree = make_regroup_tree(tmp_path / "tree")
+    conn = _seed_conn(_regroup_rows(tree, [tree.feature]))
+    sc.reset_projects_env_state()
+    dash._projects_reset_memo()
+    sc.reset_project_identity_state()
+    clock = {"t": _ARM}
+
+    def build():
+        tui._tui_revalidate_project_identities(now_monotonic=clock["t"])
+        return dash._build_projects_envelope(
+            conn, now_utc=NOW_UTC, weeks_back=12, use_projects_env_cache=True)
+
+    build()
+    remove_worktree(tree)
+    _insert(conn, 999, "/j/new.jsonl", _ts(_W_CUR, 30), "claude-opus-4-8",
+            0.375, "snew", str(tree.feature))
+    clock["t"] += 10
+    split = build()
+    assert str(tree.main) in _rows_by_bucket(split)
+    recreate_worktree(tree)
+    clock["t"] = _ARM + 61
+    env = build()
+    assert str(tree.feature) in _rows_by_bucket(env)
+    assert _rows_by_bucket(env)[str(tree.feature)]["sessions_count"] == 2
+    warm = copy.deepcopy(env)
+    assert _cold_oracle(dash, conn) == warm
+
+
+def test_project_share_follows_the_regrouped_envelope(tmp_path):
+    """A share rendered after the regroup must carry the regrouped rows for
+    every window, the closed weeks of the 4/8/12-week windows included."""
+    import types
+    ns, dash, tui = _regroup_ns()
+    share = ns["_load_sibling"]("_cctally_dashboard_share")
+    tree = make_regroup_tree(tmp_path / "tree")
+    conn = _seed_conn(_regroup_rows(tree, [tree.feature]))
+    sc.reset_projects_env_state()
+    dash._projects_reset_memo()
+    sc.reset_project_identity_state()
+    tui._tui_revalidate_project_identities(now_monotonic=_ARM)
+    dash._build_projects_envelope(
+        conn, now_utc=NOW_UTC, weeks_back=12, use_projects_env_cache=True)
+    remove_worktree(tree)
+    tui._tui_revalidate_project_identities(now_monotonic=_ARM + 61)
+    env = dash._build_projects_envelope(
+        conn, now_utc=NOW_UTC, weeks_back=12, use_projects_env_cache=True)
+    snap = types.SimpleNamespace(projects_envelope=env)
+    for weeks in (1, 4, 8, 12):
+        data = share._build_projects_share_panel_data(
+            {"windowWeeks": weeks}, snap)
+        buckets = {row["bucket_path"] for row in data["rows"]}
+        assert str(tree.main) in buckets, weeks
+        assert str(tree.feature) not in buckets, weeks
+
+
+@pytest.mark.parametrize("failing_step", [
+    "evict_projects_env_weeks_for_buckets",
+    "force_codex_accounting_paths",
+    "mark_project_regroup_pending",
+])
+def test_flip_survives_a_failed_regroup_step(failing_step, tmp_path,
+                                             monkeypatch):
+    """A flip step that raises after the sweep committed its fresh
+    observations would leave no stale identity for any later sweep to see,
+    so the stale grouping would last until the process restarted. The next
+    due sweep (not an earlier build) must report the flip again, record `G`
+    and regroup the envelope."""
+    _ns, dash, tui = _regroup_ns()
+    tree = make_regroup_tree(tmp_path / "tree")
+    conn = _seed_conn(_regroup_rows(tree, [tree.feature]))
+    sc.reset_projects_env_state()
+    dash._projects_reset_memo()
+    sc.reset_project_identity_state()
+    tui._tui_revalidate_project_identities(now_monotonic=_ARM)
+    dash._build_projects_envelope(
+        conn, now_utc=NOW_UTC, weeks_back=12, use_projects_env_cache=True)
+    remove_worktree(tree)
+
+    real = getattr(sc, failing_step)
+    calls = {"n": 0}
+
+    def fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("injected regroup step failure")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sc, failing_step, fail_once)
+    batches = sc.project_identity_stats()["flipBatches"]
+    with pytest.raises(RuntimeError, match="injected regroup step failure"):
+        tui._tui_revalidate_project_identities(now_monotonic=_ARM + 61)
+    assert sc.project_identity_stats()["flipBatches"] == batches + 1
+    assert sc.project_regroup_pending() is None
+    generation = sc.current_generation()
+    tui._tui_revalidate_project_identities(now_monotonic=_ARM + 70)
+    assert sc.current_generation() == generation, (
+        "the retry waits for the next interval, not the next build")
+    tui._tui_revalidate_project_identities(now_monotonic=_ARM + 122)
+    assert sc.project_identity_stats()["flipBatches"] == batches + 2, (
+        "lost flip: the next due sweep no longer sees the stale identity")
+    assert sc.current_generation() == generation + 1
+    assert sc.project_regroup_pending() == sc.current_generation()
+    env = dash._build_projects_envelope(
+        conn, now_utc=NOW_UTC, weeks_back=12, use_projects_env_cache=True)
+    assert str(tree.feature) not in _rows_by_bucket(env)
+    assert str(tree.feature) not in _trend_buckets(env)
+    assert str(tree.main) in _rows_by_bucket(env)
+    conn.close()
+
+
+def test_owner_paths_register_their_spellings(tmp_path):
+    """A retained owner-side resolution through a plain dict escapes the sweep
+    silently: the cached assembly and the observed full-window walk must both
+    feed the registry."""
+    _ns, dash, _tui = _regroup_ns()
+    tree = make_regroup_tree(tmp_path / "tree")
+    conn = _seed_conn(_regroup_rows(tree, [tree.feature]))
+    for cached in (True, False):
+        sc.reset_projects_env_state()
+        dash._projects_reset_memo()
+        sc.reset_project_identity_state()
+        kwargs = ({"use_projects_env_cache": True} if cached else
+                  {"project_resolver_cache": sc.observing_project_memo()})
+        dash._build_projects_envelope(
+            conn, now_utc=NOW_UTC, weeks_back=12, **kwargs)
+        assert set(sc._PROJECT_IDENTITY_STATE["observed"]) >= {
+            str(tree.feature), str(tree.main), str(tree.other)}, cached
+
+
+@pytest.mark.parametrize("entry", ["envelope", "drill"])
+def test_request_thread_fallback_bypasses_the_envelope_memo(entry, tmp_path):
+    """The drill fallback runs on a request thread; reading or writing the
+    process-wide memo there would publish a request-time grouping into the
+    owner's state. `drill` goes through `_project_detail_for_window` with no
+    snapshot envelope, so it fails if that call site stops passing
+    `use_envelope_memo=False`."""
+    _ns, dash, _tui = _regroup_ns()
+    tree = make_regroup_tree(tmp_path / "tree")
+    conn = _seed_conn(_regroup_rows(tree, [tree.feature]))
+    dash._projects_reset_memo()
+    sentinel = {"current_week": {"rows": []}, "trend": {"projects": []}}
+    dash._PROJECTS_ENV_MEMO["key"] = ("stale",)
+    dash._PROJECTS_ENV_MEMO["value"] = sentinel
+    if entry == "envelope":
+        env = dash._build_projects_envelope(
+            conn, now_utc=NOW_UTC, weeks_back=12, use_envelope_memo=False)
+        assert env is not sentinel and env["current_week"]["rows"]
+    else:
+        detail = dash._project_detail_for_window(
+            conn, project_key="feature", weeks_back=12, now_utc=NOW_UTC,
+            projects_envelope=None)
+        assert detail is not None, "non-vacuity: the drill resolved the key"
+    assert dash._PROJECTS_ENV_MEMO["value"] is sentinel
+    assert dash._PROJECTS_ENV_MEMO["key"] == ("stale",)
+    dash._projects_reset_memo()
+    conn.close()
+
+
+@pytest.mark.parametrize("claude_first", [True, False])
+def test_alias_labels_stay_per_consumer_in_both_orders(claude_first, tmp_path):
+    """A shared resolver memo would hand the Codex load the alias spelling the
+    Claude envelope saw first (or the reverse), renaming a project on an
+    unchanged filesystem (P2a). Each consumer keeps its own first spelling,
+    and the unchanged sweep sees no flip."""
+    ns, dash, tui = _regroup_ns()
+    tree = make_regroup_tree(tmp_path / "tree")
+    second = tree.root / "links" / "second"
+    second.symlink_to(tree.solo)
+    claude_order = [tree.alias, second]
+    codex_order = list(reversed(claude_order))
+    conn = _seed_conn(_regroup_rows(tree, claude_order))
+    sc.reset_projects_env_state()
+    dash._projects_reset_memo()
+    sc.reset_project_identity_state()
+
+    codex = sqlite3.connect(tmp_path / "cache.db")
+    ns["_cctally_db"]._apply_cache_schema(codex)
+    for index, cwd in enumerate(codex_order):
+        codex.execute(
+            "INSERT INTO codex_conversation_threads (conversation_key, "
+            " source_root_key, native_thread_id, root_thread_id, source_path, "
+            " cwd) VALUES (?, 'root-a', ?, ?, ?, ?)",
+            (f"c{index}", f"n{index}", f"n{index}", f"/t/{index}.jsonl",
+             str(cwd)))
+        codex.execute(
+            "INSERT INTO codex_session_entries (source_path, source_root_key, "
+            " line_offset, timestamp_utc, session_id, model, input_tokens, "
+            " cached_input_tokens, output_tokens, reasoning_output_tokens, "
+            " total_tokens, conversation_key) "
+            "VALUES (?, 'root-a', 1, ?, ?, 'gpt-5', 10, 2, 3, 1, 13, ?)",
+            (f"/r/{index}.jsonl", _ts(_W_CUR, 1 + index), f"s{index}",
+             f"c{index}"))
+    codex.commit()
+    analytics = ns["_load_sibling"]("_cctally_source_analytics")
+
+    def codex_labels():
+        entries = analytics.load_qualified_codex_entries(
+            _W_CUR, _W_CUR + dt.timedelta(days=7), speed="standard",
+            sync=False, cache_conn=codex,
+            project_resolver_cache=sc.observing_project_memo())
+        assert len({e.project_key for e in entries}) == 1
+        return {e.project_label for e in entries}
+
+    def claude_label():
+        env = dash._build_projects_envelope(
+            conn, now_utc=NOW_UTC, weeks_back=12, use_projects_env_cache=True)
+        return _rows_by_bucket(env)[str(tree.solo)]["key"]
+
+    try:
+        tui._tui_revalidate_project_identities(now_monotonic=_ARM)
+        if claude_first:
+            claude, labels = claude_label(), codex_labels()
+        else:
+            labels, claude = codex_labels(), claude_label()
+        assert claude == "alias"
+        assert labels == {"second"}
+        before = sc.project_identity_stats()["flips"]
+        tui._tui_revalidate_project_identities(now_monotonic=_ARM + 61)
+        assert sc.project_identity_stats()["flips"] == before
+        assert sc.project_regroup_pending() is None
+    finally:
+        codex.close()
+        conn.close()

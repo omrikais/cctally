@@ -252,6 +252,37 @@ class ResetAnchorComponents:
         for raw in raws:
             self.add(raw)
 
+    @classmethod
+    def from_evidence(
+        cls, entries: "Iterable[tuple[dt.datetime, tuple[str, int, int], int]]",
+        *, tolerance_seconds: int = CODEX_RESET_ANCHOR_TOLERANCE_SECONDS,
+    ) -> "ResetAnchorComponents":
+        """Rebuild a group's components from its per-raw evidence (#1033).
+
+        Each entry is ``(instant, order_key, row_count)``: one raw reset
+        spelling's parsed instant, the exact minimum order key of its rows and
+        how many rows carry it. Adding the entries in ascending ``order_key``
+        order reproduces the one-``add``-per-row seed exactly: a member enters
+        when its minimum key is reached, so members, member orders, anchors and
+        iteration order match, and a later row of an existing instant never
+        changes anything the minimum did not already set. ``_next_order``
+        becomes the total row count, the value the per-row seed leaves, so an
+        order-key-less ``add`` afterwards draws the same order.
+        """
+        materialized = list(entries)
+        total = 0
+        for _instant, _order_key, row_count in materialized:
+            if (not isinstance(row_count, int) or isinstance(row_count, bool)
+                    or row_count < 1):
+                raise ValueError("row_count must be a positive int")
+            total += row_count
+        components = cls(tolerance_seconds=tolerance_seconds)
+        for instant, order_key, _row_count in sorted(
+                materialized, key=lambda entry: entry[1]):
+            components.add(instant, order_key=order_key)
+        components._next_order = total
+        return components
+
     @property
     def tolerance_seconds(self) -> int:
         return self._tolerance

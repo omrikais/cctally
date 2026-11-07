@@ -6538,6 +6538,12 @@ def test_jsonl_bytes_reports_per_file_growth_against_its_baseline(tmp_path):
     with open(grow, "a") as fh:
         fh.write('{"x": 1}\n')
     gone.unlink()
+    # ext4 hands a freed inode number straight back, so an unlink-and-rewrite
+    # can keep (st_dev, st_ino) and read as "grown" (public Linux 3.11 on
+    # v1.118.1; 1 in 30 runs on ext4 in Docker). Holding the old inode with a
+    # hard link outside the scanned roots makes the rewrite a different file
+    # on every filesystem, as the D6 replaced-container test does.
+    os.link(swap, tmp_path / "held-r.jsonl")
     swap.unlink()
     swap.write_text("{}\n{}\n")
     (codex / "new.jsonl").write_text("{}\n")

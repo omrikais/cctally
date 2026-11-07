@@ -44,6 +44,7 @@ reason.
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import datetime as dt
 import hashlib
@@ -1404,8 +1405,12 @@ def reset_codex_accounting_cache_state() -> None:
     #857: the consumed provenance token and its allocator are untouched. A
     reset consumes nothing, and the next capture goes cold and mints a token
     no earlier population carried.
+
+    #1059: a reset that discards pending forced paths collapses them into the
+    requalify-all marker first, so the next capture re-qualifies everything.
     """
     _assert_owner()
+    _collapse_codex_forced_paths()
     _CODEX_ACCOUNTING_CACHE_STATE.clear()
 
 
@@ -1432,6 +1437,60 @@ def restore_codex_accounting_cache_state(state: dict[str, object]) -> None:
     _assert_owner()
     _CODEX_ACCOUNTING_CACHE_STATE.clear()
     _CODEX_ACCOUNTING_CACHE_STATE.update(state)
+
+
+# #1059 §6.4: the state key of the pending forced re-qualification set — an
+# immutable frozenset of `(source_root_key, source_path)` identities whose
+# retained `project_key` a filesystem regroup made stale. Inside the state
+# dictionary on purpose: a checkpoint copies it and a restore puts it back with
+# exactly the population it names.
+_CODEX_ACCOUNTING_FORCED_PATHS_KEY = "forced_paths"
+
+
+def _collapse_codex_forced_paths() -> None:
+    """Record that a population with pending forced paths is being discarded.
+
+    #1059 §6.4 (P1): the discarded paths cannot be named any more, so they
+    collapse into `codex_requalify_all`, which lives in the identity state that
+    no clear helper touches. The next capture goes cold and clears it.
+    """
+    if _CODEX_ACCOUNTING_CACHE_STATE.get(_CODEX_ACCOUNTING_FORCED_PATHS_KEY):
+        _PROJECT_IDENTITY_STATE["codex_requalify_all"] = True
+
+
+def force_codex_accounting_paths(select: "Callable[[object], bool]") -> int:
+    """Add the retained entries ``select`` accepts to the pending forced set.
+
+    #1059 §6.2 step 4: one scan of the retained population. Each selected
+    entry contributes `(str(source_root_key), str(source_path))`; the rest of
+    the state is left exactly as it is, so the forced paths are reloaded by the
+    next warm capture's ordinary replacement path. Returns the number of
+    identities newly added.
+    """
+    _assert_owner()
+    state = _CODEX_ACCOUNTING_CACHE_STATE
+    if not state:
+        # An empty state is cold by construction: nothing is retained, so
+        # nothing can be stale.
+        return 0
+    pending = frozenset(state.get(_CODEX_ACCOUNTING_FORCED_PATHS_KEY) or ())
+    selected = {
+        (str(entry.source_root_key), str(entry.source_path))
+        for entry in state.get("entries", ())
+        if select(entry)
+    }
+    added = selected - pending
+    if added:
+        state[_CODEX_ACCOUNTING_FORCED_PATHS_KEY] = frozenset(pending | added)
+    return len(added)
+
+
+def codex_accounting_work_outstanding() -> bool:
+    """Whether a regroup's Codex re-qualification has not been consumed yet."""
+    return bool(
+        _CODEX_ACCOUNTING_CACHE_STATE.get(_CODEX_ACCOUNTING_FORCED_PATHS_KEY)
+        or _PROJECT_IDENTITY_STATE.get("codex_requalify_all")
+    )
 
 
 def _codex_accounting_mutation_seq(conn: sqlite3.Connection) -> int | None:
@@ -1527,8 +1586,15 @@ def current_codex_population_signature() -> tuple | None:
 
 
 def codex_accounting_cache_pending(conn: sqlite3.Connection) -> bool:
-    """Whether the process cache has not consumed the durable ledger head."""
+    """Whether the process cache has not consumed the durable ledger head.
+
+    #1059 §6.4: also True while a regroup's Codex re-qualification is
+    outstanding, so exact-version reuse and settled retention are refused
+    until a capture consumes it.
+    """
     _assert_owner()
+    if codex_accounting_work_outstanding():
+        return True
     current = _codex_accounting_mutation_seq(conn)
     if current is None or not _CODEX_ACCOUNTING_CACHE_STATE:
         return True
@@ -1614,6 +1680,8 @@ def build_cached_codex_accounting(
     cold = (
         current_seq is None
         or not state
+        # #1059 §6.4: a discarded population had pending forced paths.
+        or bool(_PROJECT_IDENTITY_STATE.get("codex_requalify_all"))
         or state.get("extra") != extra_signature
         or state.get("start") != range_start
         or range_end < state.get("end", range_end)
@@ -1661,6 +1729,10 @@ def build_cached_codex_accounting(
                 )
             except sqlite3.Error:
                 cold = True
+        # #1059 §6.4: a regroup's forced re-qualification joins the dirty set
+        # BEFORE the bound below, so forced plus ledger paths count together.
+        if not cold:
+            dirty.update(state.get(_CODEX_ACCOUNTING_FORCED_PATHS_KEY) or ())
         # The qualified path loader emits two SQL parameters and one OR arm per
         # identity. Beyond this bound a cold indexed range read is both safer
         # and cheaper than approaching SQLite's variable/expression limits.
@@ -1668,6 +1740,7 @@ def build_cached_codex_accounting(
             cold = True
 
     if cold:
+        note_project_work("codexLoadAll")
         entries = tuple(sorted(tuple(load_all()), key=order_key))
         if finalize_entries is not None:
             entries = tuple(finalize_entries(entries, None))
@@ -1690,6 +1763,9 @@ def build_cached_codex_accounting(
             "population_signature": population_signature,
             _CODEX_ACCOUNTING_PROVENANCE_STATE_KEY: provenance_token,
         })
+        # #1059 §6.4: a committed cold capture re-qualified everything, so it
+        # consumed every forced path (the clear above) and the marker.
+        _PROJECT_IDENTITY_STATE["codex_requalify_all"] = False
         return CodexAccountingCacheResult(
             entries, (), accounts, True, prior_cached_entries, entries,
             population_signature=population_signature,
@@ -1726,6 +1802,8 @@ def build_cached_codex_accounting(
     prior_dirty = tuple(
         entry for entry in prior_entries if path_of(entry) in dirty
     )
+    note_project_work("codexLoadPaths")
+    note_project_work("codexLoadPathsPaths", len(dirty_paths))
     replacements = tuple(load_paths(dirty_paths))
     entries = tuple(sorted(
         (
@@ -1769,6 +1847,9 @@ def build_cached_codex_accounting(
     state["generation"] = generation
     state["population_signature"] = population_signature
     state[_CODEX_ACCOUNTING_PROVENANCE_STATE_KEY] = provenance_token
+    # #1059 §6.4: the forced paths were reloaded as part of `dirty`, so the
+    # committed state no longer carries them.
+    state.pop(_CODEX_ACCOUNTING_FORCED_PATHS_KEY, None)
     return CodexAccountingCacheResult(
         entries, dirty_paths, dirty_accounts, False, changed_old, changed_new,
         population_signature=population_signature,
@@ -2009,6 +2090,51 @@ def reset_dispatch_state() -> None:
     _LAST_PUBLISHED_SNAPSHOT = None
 
 
+# === #1059 SD3 — project work counters =======================================
+#
+# Cumulative counts of the expensive work sites a warm tick can reach, so the
+# claim "an unchanged filesystem causes no closed-week rebuild" is measured at
+# the work itself rather than inferred from a reconcile flag (`hit=True` on the
+# projects reconcile means only that reconciliation succeeded). Plain integers,
+# incremented only and never reset in production; `/api/debug/backend` reads a
+# copy. Deliberately not an accelerator root: they hold no cached value, so
+# memory enforcement must never clear them.
+_PROJECT_WORK_KINDS = (
+    "closedWeekComputes",
+    "fullWindowProjectWalks",
+    "currentWeekColdFolds",
+    "weekrefCostComputes",
+    "rangeFullRefolds",
+    "codexLoadAll",
+    "codexLoadPaths",
+    "codexLoadPathsPaths",
+)
+_PROJECT_WORK_LOCK = threading.Lock()
+_PROJECT_WORK_COUNTS: dict[str, int] = dict.fromkeys(_PROJECT_WORK_KINDS, 0)
+
+
+def note_project_work(kind: str, n: int = 1) -> None:
+    """Add ``n`` to one work counter; an unknown ``kind`` raises ``ValueError``."""
+    if kind not in _PROJECT_WORK_COUNTS:
+        raise ValueError(f"unknown project work kind: {kind!r}")
+    with _PROJECT_WORK_LOCK:
+        _PROJECT_WORK_COUNTS[kind] += int(n)
+
+
+def project_work_stats() -> dict[str, int]:
+    """A copy of every work counter (all eight keys, integers)."""
+    with _PROJECT_WORK_LOCK:
+        return {kind: int(_PROJECT_WORK_COUNTS[kind])
+                for kind in _PROJECT_WORK_KINDS}
+
+
+def reset_project_work_stats() -> None:
+    """Zero every work counter (test hook only)."""
+    with _PROJECT_WORK_LOCK:
+        for kind in _PROJECT_WORK_KINDS:
+            _PROJECT_WORK_COUNTS[kind] = 0
+
+
 # === #269 M0 — shared per-weekref immutable-cost cache (B1 trend + B3 forecast)
 #
 # A closed subscription week's cost is IMMUTABLE, so it is computed once and
@@ -2067,11 +2193,13 @@ def cached_weekref_cost(*, week_start_at, week_end_at, now_utc, compute):
     the returned float is bit-identical to today's.
     """
     if week_end_at > now_utc:
+        note_project_work("weekrefCostComputes")
         return compute()
     key = _weekref_key(week_start_at, week_end_at)
     hit = _WEEKREF_COST_CACHE.get(key)
     if hit is not None:  # 0.0 is a legitimate cached value, not a miss
         return hit
+    note_project_work("weekrefCostComputes")
     val = compute()
     _WEEKREF_COST_CACHE[key] = val
     return val
@@ -2424,6 +2552,7 @@ def accumulate_projects_current_week(*, week_key, cur_max_id, cur_max_seq,
         ):
             cold = True
     if cold:
+        note_project_work("currentWeekColdFolds")
         mut, week_total, tail = fetch_all_raw()
         _PROJECTS_ENV_CURRENT["state"] = {
             "label": week_key,
@@ -2543,6 +2672,353 @@ def reconcile_projects_env_cache(cache_conn, *, max_entry_id, max_mutation_seq,
         ls["max_seq"] = max_mutation_seq
         ls["max_wus_id"] = max_wus_id
         ls["sf_sig"] = sf_sig
+
+
+def evict_projects_env_weeks_for_buckets(buckets) -> int:
+    """Evict every cached CLOSED week holding a bucket in ``buckets`` (#1059).
+
+    A week is evicted whole: all of its ``(bucket_path, week_iso)`` rows AND
+    its ``_PROJECTS_ENV_WEEK_TOTALS`` entry. The totals dictionary is the hit
+    registry (``projects_env_week_get``), so deleting the affected bucket rows
+    alone would leave a HIT that silently lacks those rows. Weeks that hold no
+    affected bucket, and ``_PROJECTS_ENV_LAST_SEEN``, are untouched, so an
+    unaffected week stays a hit. Returns the number of weeks evicted.
+    """
+    _assert_owner()
+    affected = frozenset(buckets)
+    weeks = {wk for (bp, wk) in _PROJECTS_ENV_WEEK_CACHE if bp in affected}
+    for wk in weeks:
+        _PROJECTS_ENV_WEEK_TOTALS.pop(wk, None)
+        for key in [k for k in _PROJECTS_ENV_WEEK_CACHE if k[1] == wk]:
+            del _PROJECTS_ENV_WEEK_CACHE[key]
+    return len(weeks)
+
+
+def reset_projects_env_current_if_holds(buckets) -> bool:
+    """Reset the CURRENT-week slot iff its retained ``mut`` has a key in
+    ``buckets`` (#1059); return whether it did. The slot's ``mut`` is keyed by
+    ``bucket_path`` (the dashboard's ``_fold_projects_entry`` shape), which is
+    the one fact this module reads from it."""
+    _assert_owner()
+    state = _PROJECTS_ENV_CURRENT["state"]
+    if not isinstance(state, dict):
+        return False
+    mut = state.get("mut")
+    if not isinstance(mut, dict) or not any(bp in mut for bp in buckets):
+        return False
+    reset_projects_env_current_state()
+    return True
+
+
+# === #1059 — warm project regrouping: observation registry + cadence sweep ===
+#
+# Every warm consumer keeps its own resolver memo with today's semantics (so
+# labels and `first_key` values never change on an unchanged filesystem). In
+# owner builds those memos are `ObservedProjectMemo`s, which report each raw
+# spelling's resolutions to the owner-held registry below. The registry keeps
+# the SET of identities observed per spelling since the last successful sweep:
+# a consumer can resolve a spelling under an intermediate identity between two
+# sweeps and retain the result, and the filesystem can then move on or return,
+# so comparing only the first or the latest observation would miss retained
+# state. A cadence-gated sweep re-resolves every registered spelling with one
+# fresh plain memo; a spelling flips when its set holds any identity other than
+# the fresh one. The orchestration (`bin/_cctally_tui.py::
+# _tui_revalidate_project_identities`) invalidates exactly the state built from
+# the stale buckets and bumps the generation once.
+#
+# `_PROJECT_IDENTITY_STATE` is deliberately a PLAIN dict, not an
+# `_ObservedSnapshotDict`, and is never one of `_snapshot_accelerator_roots`:
+# filesystem identity does not depend on database contents, so neither memory
+# enforcement, nor the orphan-prune site, nor a cold or accounting reset may
+# clear it — observation coverage never shrinks. Its size is O(distinct
+# spellings the process resolves in owner builds) and it is reported
+# separately (`project_identity_stats`), never under the accelerator budget.
+# The resolver and the clock are injected, keeping this module free of
+# dashboard imports.
+
+#: The revalidation interval (operator decision Q-OP1): a change is detected
+#: within about 70 s at the default 10 s sync interval.
+PROJECT_IDENTITY_SWEEP_INTERVAL_S: float = 60.0
+_PROJECT_IDENTITY_RING_CAPACITY = 64
+_PROJECT_IDENTITY_FAILURES = (OSError, RuntimeError, ValueError)
+
+_PROJECT_IDENTITY_STATE: dict = {
+    "observed": {},
+    "next_due": None,
+    "regroup_generation": None,
+    "codex_requalify_all": False,
+}
+_PROJECT_IDENTITY_STATS_LOCK = threading.Lock()
+
+
+def _new_project_identity_stats() -> dict:
+    return {
+        "sweepAttempts": 0,
+        "sweepSuccesses": 0,
+        "sweepFailures": 0,
+        "spellingsVisited": 0,
+        "flips": 0,
+        "flipBatches": 0,
+        "retryBumps": 0,
+        "lastSweepMs": 0.0,
+        "totalSweepMs": 0.0,
+    }
+
+
+_PROJECT_IDENTITY_STATS: dict = _new_project_identity_stats()
+_PROJECT_IDENTITY_RECENT: "collections.deque[dict]" = collections.deque(
+    maxlen=_PROJECT_IDENTITY_RING_CAPACITY)
+#: Never rewound, not even by the test reset: a sweep record's `id` names one
+#: attempt for the life of the process.
+_PROJECT_IDENTITY_SWEEP_IDS = itertools.count(1)
+
+
+def project_identity_fields(key) -> tuple:
+    """The compared identity of a resolved ``ProjectKey``.
+
+    ``display_key`` is excluded: it depends on the order in which one memo saw
+    aliases of a directory and carries no filesystem information beyond
+    ``bucket_path`` and ``git_root``. ``ProjectKey`` equality is never used,
+    because it compares ``bucket_path`` only and would miss a same-bucket
+    metadata change (a ``git init`` in a no-git directory).
+    """
+    return (
+        key.bucket_path,
+        key.git_root,
+        bool(key.is_unknown),
+        bool(key.is_no_git),
+    )
+
+
+def _record_project_observation(spelling: str, key) -> None:
+    _assert_owner()
+    fields = project_identity_fields(key)
+    observed = _PROJECT_IDENTITY_STATE["observed"]
+    seen = observed.get(spelling)
+    if seen is None:
+        observed[spelling] = {fields}
+    else:
+        seen.add(fields)
+
+
+class ObservedProjectMemo(dict):
+    """A resolver memo that reports every raw-spelling resolution (#1059).
+
+    ``_resolve_project_key`` writes its memo only by subscript assignment, so
+    overriding ``__setitem__`` sees every write without a resolver change.
+    Only ``("raw", spelling)`` keys are recorded; the normalized string keys
+    are the resolver's internal entries. Reads behave exactly like a plain
+    dict, so a consumer's labels are the ones its own memo would produce.
+    """
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if (
+            isinstance(key, tuple)
+            and len(key) == 2
+            and key[0] == "raw"
+            and isinstance(key[1], str)
+        ):
+            _record_project_observation(key[1], value)
+
+
+def observing_project_memo(initial=None) -> ObservedProjectMemo:
+    """A new observing memo, copied from ``initial`` when given.
+
+    Owner-asserted: only an owner build may feed the registry. Copying never
+    calls ``__setitem__``, and every copied raw entry was recorded when it was
+    first written by the memo it came from.
+    """
+    _assert_owner()
+    if initial is None:
+        return ObservedProjectMemo()
+    return ObservedProjectMemo(initial)
+
+
+@dataclass(frozen=True)
+class ProjectIdentityFlip:
+    """One spelling whose observed identities differ from its fresh one."""
+
+    spelling: str
+    stale: frozenset
+    fresh: tuple
+
+
+@dataclass(frozen=True)
+class ProjectIdentitySweep:
+    """The result of one successful due sweep (possibly with no flips)."""
+
+    flips: tuple
+
+    @property
+    def old_buckets(self) -> frozenset:
+        """The ``bucket_path`` of every stale identity of every flip."""
+        return frozenset(
+            stale[0] for flip in self.flips for stale in flip.stale)
+
+
+def _note_project_identity_sweep(*, ms: float, spellings: int, flips: int,
+                                 ok: bool) -> None:
+    with _PROJECT_IDENTITY_STATS_LOCK:
+        stats = _PROJECT_IDENTITY_STATS
+        stats["sweepAttempts"] += 1
+        stats["sweepSuccesses" if ok else "sweepFailures"] += 1
+        stats["spellingsVisited"] += int(spellings)
+        stats["flips"] += int(flips)
+        if ok and flips:
+            stats["flipBatches"] += 1
+        stats["lastSweepMs"] = float(ms)
+        stats["totalSweepMs"] += float(ms)
+        _PROJECT_IDENTITY_RECENT.append({
+            "id": next(_PROJECT_IDENTITY_SWEEP_IDS),
+            "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "ms": float(ms),
+            "spellings": int(spellings),
+            "flips": int(flips),
+            "outcome": "ok" if ok else "failed",
+            "retryBump": False,
+        })
+
+
+def revalidate_project_identities(
+    *,
+    resolve: "Callable[[str, str, dict], object]",
+    now_monotonic: float,
+    interval: float = PROJECT_IDENTITY_SWEEP_INTERVAL_S,
+) -> "ProjectIdentitySweep | None":
+    """Run the cadence-gated identity sweep when it is due.
+
+    Not due (or the very first call, which only arms the deadline): ``None``.
+    Due: every registered spelling is re-resolved through
+    ``resolve(spelling, "git-root", fresh)`` with ONE fresh plain dictionary
+    (alias sharing inside it cannot change a compared field, because all of
+    them derive from the normalized path). On success each spelling's set is
+    replaced by ``{fresh}``, the deadline moves to ``now + interval``, and the
+    sweep is returned with every spelling whose set held another identity. A
+    failed resolution (``OSError`` / ``RuntimeError`` / ``ValueError``) keeps
+    the registry AND the deadline, so the next build retries, and returns
+    ``None``.
+    """
+    _assert_owner()
+    state = _PROJECT_IDENTITY_STATE
+    next_due = state["next_due"]
+    if next_due is None:
+        state["next_due"] = now_monotonic + interval
+        return None
+    if now_monotonic < next_due:
+        return None
+    observed = state["observed"]
+    spellings = sorted(observed)
+    fresh_memo: dict = {}
+    fresh: dict = {}
+    started = time.perf_counter()
+    try:
+        for spelling in spellings:
+            fresh[spelling] = project_identity_fields(
+                resolve(spelling, "git-root", fresh_memo))
+    except _PROJECT_IDENTITY_FAILURES:
+        _note_project_identity_sweep(
+            ms=(time.perf_counter() - started) * 1000.0,
+            spellings=len(fresh), flips=0, ok=False)
+        return None
+    flips = []
+    for spelling in spellings:
+        now_fields = fresh[spelling]
+        stale = frozenset(
+            fields for fields in observed[spelling] if fields != now_fields)
+        if stale:
+            flips.append(ProjectIdentityFlip(spelling, stale, now_fields))
+    state["observed"] = {
+        spelling: {fields} for spelling, fields in fresh.items()}
+    state["next_due"] = now_monotonic + interval
+    _note_project_identity_sweep(
+        ms=(time.perf_counter() - started) * 1000.0,
+        spellings=len(spellings), flips=len(flips), ok=True)
+    return ProjectIdentitySweep(tuple(flips))
+
+
+def restore_project_identity_flips(sweep: ProjectIdentitySweep) -> None:
+    """Put a sweep's stale identities back after its flip steps failed.
+
+    A successful sweep replaces every set with ``{fresh}`` before the caller
+    applies the flips; if one of those steps raises, nothing else remembers
+    the stale identity and the next sweep would see no flip. Unioning each
+    flip's ``stale`` set back into its spelling's set makes the next due
+    sweep detect the same flip again. The deadline is untouched, so the retry
+    happens at the next interval rather than on every build, and the sweep's
+    counters and ring record keep describing the sweep as it ran.
+    """
+    _assert_owner()
+    observed = _PROJECT_IDENTITY_STATE["observed"]
+    for flip in sweep.flips:
+        observed.setdefault(flip.spelling, set()).update(flip.stale)
+
+
+def mark_project_regroup_pending(generation: int) -> None:
+    """Record ``generation`` as the pending regroup generation ``G``."""
+    _assert_owner()
+    _PROJECT_IDENTITY_STATE["regroup_generation"] = int(generation)
+
+
+def project_regroup_pending() -> "int | None":
+    """The pending regroup generation, or ``None`` when nothing is pending."""
+    return _PROJECT_IDENTITY_STATE["regroup_generation"]
+
+
+def acknowledge_project_regroup() -> None:
+    """Clear the pending regroup generation once a build republished it."""
+    _assert_owner()
+    _PROJECT_IDENTITY_STATE["regroup_generation"] = None
+
+
+def note_project_identity_retry_bump() -> None:
+    """Count one cadence retry bump and mark it on the latest sweep record."""
+    with _PROJECT_IDENTITY_STATS_LOCK:
+        _PROJECT_IDENTITY_STATS["retryBumps"] += 1
+        if _PROJECT_IDENTITY_RECENT:
+            _PROJECT_IDENTITY_RECENT[-1]["retryBump"] = True
+
+
+def project_identity_stats() -> dict:
+    """The ``projectIdentity`` diagnostic block (spec section 7)."""
+    with _PROJECT_IDENTITY_STATS_LOCK:
+        stats = dict(_PROJECT_IDENTITY_STATS)
+        recent = [dict(record) for record in _PROJECT_IDENTITY_RECENT]
+    state = _PROJECT_IDENTITY_STATE
+    regroup = state["regroup_generation"]
+    forced = _CODEX_ACCOUNTING_CACHE_STATE.get("forced_paths") or ()
+    return {
+        "sweepAttempts": int(stats["sweepAttempts"]),
+        "sweepSuccesses": int(stats["sweepSuccesses"]),
+        "sweepFailures": int(stats["sweepFailures"]),
+        "spellingsVisited": int(stats["spellingsVisited"]),
+        "flips": int(stats["flips"]),
+        "flipBatches": int(stats["flipBatches"]),
+        "retryBumps": int(stats["retryBumps"]),
+        "lastSweepMs": float(stats["lastSweepMs"]),
+        "totalSweepMs": float(stats["totalSweepMs"]),
+        "observedSpellings": len(state["observed"]),
+        "regroupGeneration": None if regroup is None else int(regroup),
+        "forcedCodexPathsPending": len(forced),
+        "codexRequalifyAll": bool(state["codex_requalify_all"]),
+        "recentSweeps": recent,
+    }
+
+
+def reset_project_identity_state() -> None:
+    """Drop the registry, deadline, markers and counters (test hook only).
+
+    Not owner-asserted, so the per-test autouse reset works even after an
+    earlier test armed the owner on a thread that has since exited.
+    """
+    _PROJECT_IDENTITY_STATE["observed"] = {}
+    _PROJECT_IDENTITY_STATE["next_due"] = None
+    _PROJECT_IDENTITY_STATE["regroup_generation"] = None
+    _PROJECT_IDENTITY_STATE["codex_requalify_all"] = False
+    with _PROJECT_IDENTITY_STATS_LOCK:
+        _PROJECT_IDENTITY_STATS.clear()
+        _PROJECT_IDENTITY_STATS.update(_new_project_identity_stats())
+        _PROJECT_IDENTITY_RECENT.clear()
 
 
 # === #272 — cache-report per-day cache =====================================
@@ -2804,6 +3280,9 @@ def _snapshot_accelerator_entry_count() -> int:
 
 def _clear_snapshot_accelerators() -> None:
     """Response-preserving overflow fallback: the next tick recomputes cold."""
+    # #1059 §6.4: eviction discards the Codex population too; pending forced
+    # paths survive it as the requalify-all marker.
+    _collapse_codex_forced_paths()
     for root in _snapshot_accelerator_roots():
         root.clear()
     # Preserve the single-slot mapping shape expected by its callers.

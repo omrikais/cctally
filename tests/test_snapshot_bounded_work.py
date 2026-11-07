@@ -3471,3 +3471,164 @@ def test_commit_after_capture_waits_for_the_next_source_generation(
 
     assert aggregate_tokens(generation_a) == 0
     assert aggregate_tokens(generation_b) == 1100
+
+
+# === #1059 — Codex forced re-qualification through the real source build ===
+
+_REGROUP_ARM = 1000.0
+
+
+def _regroup_codex_source(tmp_path, monkeypatch, source_env):
+    """The seeded Codex source with two real accounts and every thread's cwd
+    inside a removable worktree, swept once so the next sweep is due."""
+    from conftest import make_regroup_tree
+    from test_dashboard_accounts_wire import _complete_codex_thread_metadata
+
+    ns, cache, stats, module = source_env
+    account_keys = _decorate_codex_source(cache, stats, monkeypatch, module)
+    _complete_codex_thread_metadata(cache)
+    tree = make_regroup_tree(tmp_path / "tree")
+    cache.execute("UPDATE codex_conversation_threads SET cwd=?",
+                  (str(tree.feature),))
+    cache.commit()
+    tui = ns["_load_sibling"]("_cctally_tui")
+    import _lib_snapshot_cache as sc
+    module.reset_codex_source_caches()
+    sc.reset_project_identity_state()
+    tui._tui_revalidate_project_identities(now_monotonic=_REGROUP_ARM)
+    return tree, tui, sc, account_keys
+
+
+def _codex_project_labels(state):
+    return sorted(
+        row.get("label") or row.get("project_label") or ""
+        for row in state.data["projects"]["rows"]
+    )
+
+
+def test_forced_codex_replacement_matches_the_cold_parent_and_children(
+    tmp_path, monkeypatch, source_env,
+):
+    """Detects a regrouped Codex parent or account child that keeps the
+    removed worktree, or diverges from a cold rebuild of the same store."""
+    from conftest import remove_worktree
+    _ns, cache, stats, module = source_env
+    tree, tui, sc, account_keys = _regroup_codex_source(
+        tmp_path, monkeypatch, source_env)
+    context = _context(module, cache, stats)
+    before = module.build_codex_source_state(context, data_version="regroup")
+    assert set(before.data["account_scopes"]) >= set(account_keys), (
+        "non-vacuity: the account children must be built")
+    assert _codex_project_labels(before) == ["feature"]
+
+    remove_worktree(tree)
+    tui._tui_revalidate_project_identities(now_monotonic=_REGROUP_ARM + 61)
+    assert sc.codex_accounting_work_outstanding()
+    work = sc.project_work_stats()
+    warm = module.build_codex_source_state(context, data_version="regroup")
+    after = sc.project_work_stats()
+    assert _codex_project_labels(warm) == ["mainrepo"], (
+        "stale grouping: the Codex parent still names the removed worktree")
+    for key in account_keys:
+        child = warm.data["account_scopes"][key]["projects"]["rows"]
+        assert child and all(row["label"] == "mainrepo" for row in child), (
+            f"stale grouping in the {key} account child")
+    assert after["codexLoadAll"] == work["codexLoadAll"]
+    assert after["codexLoadPaths"] == work["codexLoadPaths"] + 1
+    assert not sc.codex_accounting_work_outstanding()
+
+    sc.reset_codex_accounting_cache_state()
+    module.reset_codex_account_scope_cache()
+    cold = module.build_codex_source_state(context, data_version="regroup")
+    assert _content(warm) == _content(cold)
+    assert warm.data["hero"]["total_tokens"] == before.data["hero"]["total_tokens"]
+
+
+def test_pending_forced_paths_survive_a_failed_source_build(
+    tmp_path, monkeypatch, source_env,
+):
+    """A rolled-back source build that dropped the forced paths would keep
+    the stale Codex grouping until the process restarted."""
+    from conftest import remove_worktree
+    _ns, cache, stats, module = source_env
+    tree, tui, sc, _accounts = _regroup_codex_source(
+        tmp_path, monkeypatch, source_env)
+    context = _context(module, cache, stats)
+    module.build_codex_source_state(context, data_version="regroup")
+    remove_worktree(tree)
+    tui._tui_revalidate_project_identities(now_monotonic=_REGROUP_ARM + 61)
+    pending = sc._CODEX_ACCOUNTING_CACHE_STATE.get("forced_paths")
+    assert pending, "non-vacuity: the sweep must force the worktree's paths"
+
+    real_sessions = module._cached_codex_session_view
+    failures = {"remaining": 1}
+
+    def fail_once(*args, **kwargs):
+        if failures["remaining"]:
+            failures["remaining"] -= 1
+            raise RuntimeError("injected mid-build failure")
+        return real_sessions(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_cached_codex_session_view", fail_once)
+    with pytest.raises(RuntimeError, match="injected mid-build failure"):
+        module.build_codex_source_state(context, data_version="regroup")
+    assert sc._CODEX_ACCOUNTING_CACHE_STATE.get("forced_paths") == pending
+    retry = module.build_codex_source_state(context, data_version="regroup")
+    assert _codex_project_labels(retry) == ["mainrepo"]
+    assert not sc.codex_accounting_work_outstanding()
+
+    sc.reset_codex_accounting_cache_state()
+    module.reset_codex_account_scope_cache()
+    cold = module.build_codex_source_state(context, data_version="regroup")
+    assert _content(retry) == _content(cold)
+
+
+def test_metadata_skip_with_forced_paths_requalifies_everything(
+    tmp_path, monkeypatch, source_env,
+):
+    """A metadata-skip reset that discarded pending forced paths silently
+    would leave the regroup unconsumed; the marker must force one cold
+    capture, and the cadence retry must wake the build once per due sweep
+    until it lands (P1)."""
+    import sqlite3
+    from conftest import remove_worktree
+    _ns, cache, stats, module = source_env
+    tree, tui, sc, _accounts = _regroup_codex_source(
+        tmp_path, monkeypatch, source_env)
+    context = _context(module, cache, stats)
+    module.build_codex_source_state(context, data_version="regroup")
+    remove_worktree(tree)
+    tui._tui_revalidate_project_identities(now_monotonic=_REGROUP_ARM + 61)
+    sc.acknowledge_project_regroup()  # isolate the Codex half of the retry
+
+    real_probe = module.probe_codex_detail_metadata_health
+    broken = {"on": True}
+
+    def probe(*args, **kwargs):
+        if broken["on"]:
+            raise sqlite3.Error("injected metadata failure")
+        return real_probe(*args, **kwargs)
+
+    monkeypatch.setattr(module, "probe_codex_detail_metadata_health", probe)
+    module.build_codex_source_state(context, data_version="regroup")
+    assert sc.project_identity_stats()["codexRequalifyAll"] is True
+    assert sc.codex_accounting_work_outstanding()
+
+    stats_before = sc.project_identity_stats()["retryBumps"]
+    generation = sc.current_generation()
+    tui._tui_revalidate_project_identities(now_monotonic=_REGROUP_ARM + 122)
+    assert sc.current_generation() == generation + 1
+    tui._tui_revalidate_project_identities(now_monotonic=_REGROUP_ARM + 130)
+    assert sc.current_generation() == generation + 1, "one bump per due sweep"
+    assert sc.project_identity_stats()["retryBumps"] == stats_before + 1
+
+    broken["on"] = False
+    work = sc.project_work_stats()
+    healed = module.build_codex_source_state(context, data_version="regroup")
+    assert sc.project_work_stats()["codexLoadAll"] == work["codexLoadAll"] + 1
+    assert sc.project_identity_stats()["codexRequalifyAll"] is False
+    assert _codex_project_labels(healed) == ["mainrepo"]
+    sc.acknowledge_project_regroup()
+    generation = sc.current_generation()
+    tui._tui_revalidate_project_identities(now_monotonic=_REGROUP_ARM + 183)
+    assert sc.current_generation() == generation, "nothing left to retry"

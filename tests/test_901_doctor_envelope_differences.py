@@ -259,6 +259,7 @@ ADDED_CACHE_MIGRATIONS = (
     "050_preserve_claude_cost_attribution",
     "051_codex_retained_identities",
     "052_codex_delete_trigger_plans",
+    "053_codex_reset_anchor_evidence",
 )
 
 

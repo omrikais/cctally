@@ -14,6 +14,25 @@ from test_codex_publication_barrier import (
 )
 
 
+def _spy_summary_seeds(patch, record, conns=None) -> None:
+    """#1033: call ``record(served)`` for every reset-anchor summary seed,
+    ``served`` False when it fell back to the full history read. A group
+    seeds through a served summary or through the full read, never both.
+    With ``conns``, only seeds on those connections (or a wrapper of one)
+    are recorded, as a trace on them would see them."""
+    cc = _cache()
+    real = cc._codex_reset_anchor_summary_seed
+
+    def spy(conn, *args, **kwargs):
+        result = real(conn, *args, **kwargs)
+        inner = getattr(conn, "conn", conn)
+        if conns is None or any(inner is c for c in conns):
+            record(result is not None)
+        return result
+
+    patch.setattr(cc, "_codex_reset_anchor_summary_seed", spy)
+
+
 @pytest.mark.parametrize("history_files", [2, 6])
 def test_history_quota_membership_is_loaded_once_per_identity(
         env, monkeypatch, history_files):
@@ -39,6 +58,7 @@ def test_history_quota_membership_is_loaded_once_per_identity(
     phase = ["provenance"]
     counts = collections.defaultdict(collections.Counter)
     real_open = cc.open_cache_db
+    traced: list = []
 
     def trace(sql):
         normalized = " ".join(sql.split()).lower()
@@ -68,10 +88,13 @@ def test_history_quota_membership_is_loaded_once_per_identity(
     def opened():
         conn = real_open()
         conn.set_trace_callback(trace)
+        traced.append(conn)
         return conn
 
     monkeypatch.setattr(cc, "open_cache_db", opened)
     monkeypatch.setitem(ns, "open_cache_db", opened)
+    _spy_summary_seeds(monkeypatch, lambda served: served and counts[
+        phase[0]].update(["anchor_summary_seeds"]), traced)
     journal = sys.modules["_cctally_journal"]
     real_iter = journal.iter_range
     def journal_range(*args, **kwargs):
@@ -166,7 +189,10 @@ def test_history_quota_membership_is_loaded_once_per_identity(
             "window_minutes FROM quota_window_snapshots WHERE source='codex'")}
     finally:
         conn.close()
-    assert provenance["anchor_seed_reads"] == len(groups), counts
+    # #1033: a group seeds from the evidence summary when it is ready and
+    # holds no stale bucket, else from the full read; once per group either way.
+    assert (provenance["anchor_seed_reads"]
+            + provenance["anchor_summary_seeds"]) == len(groups), counts
     assert provenance["anchor_base_refresh_reads"] == history_files, counts
 
 
@@ -257,18 +283,23 @@ def _seed_reads(monkeypatch):
     cc = _cache()
     reads = collections.Counter()
     real_open = cc.open_cache_db
+    traced: list = []
 
     def trace(sql):
-        if " ".join(sql.split()).lower().startswith(
+        normalized = " ".join(sql.split()).lower()
+        if normalized.startswith(
                 "select source_path, line_offset, id, resets_at_utc"):
             reads["seed"] += 1
 
     def opened():
         conn = real_open()
         conn.set_trace_callback(trace)
+        traced.append(conn)
         return conn
 
     monkeypatch.setattr(cc, "open_cache_db", opened)
+    _spy_summary_seeds(
+        monkeypatch, lambda served: served and reads.update(["seed"]), traced)
     return reads
 
 
@@ -477,10 +508,12 @@ def test_heal_executor_seeds_once_per_group(env, monkeypatch, history_files,
     assert len(population) == history_files + 2
     counts = collections.Counter()
     real_open = cc.open_cache_db
+    traced: list = []
 
     def trace(sql):
         normalized = " ".join(sql.split()).lower()
-        if normalized.startswith("select source_path, line_offset, id, resets_at_utc"):
+        if normalized.startswith(
+                "select source_path, line_offset, id, resets_at_utc"):
             counts["anchor_seed_reads"] += 1
         if normalized == _LEDGER_FULL_READ:
             counts["ledger_full_reads"] += 1
@@ -490,10 +523,13 @@ def test_heal_executor_seeds_once_per_group(env, monkeypatch, history_files,
     def opened():
         conn = real_open()
         conn.set_trace_callback(trace)
+        traced.append(conn)
         return conn
 
     monkeypatch.setattr(cc, "open_cache_db", opened)
     monkeypatch.setitem(ns, "open_cache_db", opened)
+    _spy_summary_seeds(monkeypatch, lambda served: served and counts.update(
+        ["anchor_seed_reads"]), traced)
     foreign_done: list = []
 
     def committed(kind, *args):
@@ -545,3 +581,218 @@ def test_heal_executor_seeds_once_per_group(env, monkeypatch, history_files,
     assert counts["heal_payload_parses"] <= 1, counts
     if foreign:
         assert foreign_done == [True, "inserted"]
+
+
+# --- #1033 spec §5.1/Q4: the evidence delete trigger is keyed, never a search
+#
+# Each deleted Codex quota row runs three primary-key statements on the
+# evidence summary. A trigger that searched quota_window_snapshots for a
+# replacement minimum would make every prune or heal DELETE history-sized (the
+# #971 class). The deleted file holds a fixed number of rows in one big bucket;
+# only the bucket's unrelated history grows.
+
+_EVIDENCE_FILE = "/roots/r/sessions/0-victim.jsonl"
+
+
+def _evidence_delete_steps(tmp_path, *, history, victim_holds_minimum, heal):
+    import _cctally_db
+    conn = sqlite3.connect(tmp_path / f"evidence-{history}-"
+                           f"{victim_holds_minimum}-{heal}.db")
+    try:
+        _cctally_db._apply_cache_schema(conn)
+        columns = ("source", "source_root_key", "source_path", "line_offset",
+                   "captured_at_utc", "observed_slot", "logical_limit_key",
+                   "window_minutes", "used_percent", "resets_at_utc")
+        insert = (f"INSERT OR IGNORE INTO quota_window_snapshots"
+                  f" ({', '.join(columns)})"
+                  f" VALUES ({', '.join('?' for _ in columns)})")
+
+        def row(path, offset):
+            return ("codex", "root-1033", path, offset,
+                    f"2026-07-20T{offset // 3600 % 24:02d}:"
+                    f"{offset // 60 % 60:02d}:{offset % 60:02d}Z",
+                    "primary", "limit-1033", 10080, 10.0,
+                    "2026-07-25T00:00:00Z")
+
+        victim = (_EVIDENCE_FILE if victim_holds_minimum
+                  else "/roots/r/sessions/z-victim.jsonl")
+        history_rows = [row(f"/roots/r/sessions/h-{i % 7}.jsonl", i)
+                        for i in range(history)]
+        victim_rows = [row(victim, 100_000 + i) for i in range(3)]
+        conn.executemany(insert, history_rows + victim_rows)
+        conn.commit()
+        before = conn.execute(
+            "SELECT row_count, stale FROM codex_reset_anchor_evidence"
+            " WHERE logical_limit_key='limit-1033'").fetchone()
+        counter = [0]
+
+        def tick():
+            counter[0] += 1
+            return 0
+
+        conn.set_progress_handler(tick, 1)
+        conn.execute(
+            "DELETE FROM quota_window_snapshots WHERE source = 'codex' "
+            "AND source_path = ?", (victim,))
+        if heal:
+            conn.executemany(insert, victim_rows)
+        conn.set_progress_handler(None, 0)
+        conn.commit()
+        after = conn.execute(
+            "SELECT row_count, stale FROM codex_reset_anchor_evidence"
+            " WHERE logical_limit_key='limit-1033'").fetchone()
+        assert before == (history + 3, 0)
+        expected_stale = int(victim_holds_minimum and not heal)
+        assert after == (history + (3 if heal else 0), expected_stale), (
+            "the delete trigger must maintain the summary", before, after)
+        return counter[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("heal", [False, True], ids=["prune", "heal"])
+@pytest.mark.parametrize("victim_holds_minimum", [True, False],
+                         ids=["min-row", "non-min-row"])
+def test_1033_evidence_delete_trigger_work_is_bounded_by_history(
+        tmp_path, victim_holds_minimum, heal):
+    """A history-sized evidence trigger (#971 class): the prune DELETE of one
+    file, and a heal's delete-and-reinsert of it, take VM steps independent
+    of 20 versus 2,000 unrelated rows in the same bucket, whether or not the
+    file held the bucket's minimum."""
+    small = _evidence_delete_steps(
+        tmp_path, history=20, victim_holds_minimum=victim_holds_minimum,
+        heal=heal)
+    big = _evidence_delete_steps(
+        tmp_path, history=2000, victim_holds_minimum=victim_holds_minimum,
+        heal=heal)
+    assert big <= small + 256, (small, big)
+
+
+# --- #1033 spec §5.2: the summary seed replaces the full history read ---------
+
+_SEED_KEY = "limit-1033-seed"
+
+
+def _summary_seed_store(tmp_path, name="seed"):
+    import _cctally_db
+    conn = sqlite3.connect(tmp_path / f"{name}.db")
+    _cctally_db._apply_cache_schema(conn)
+    rows = [("/s/b.jsonl", 1, "2026-07-27T00:00:00Z"),
+            ("/s/a.jsonl", 2, "2026-07-27T00:09:00Z"),
+            ("/s/c.jsonl", 3, "2026-07-27T00:18:00+00:00"),
+            ("/s/c.jsonl", 4, "2026-07-27T00:18:00Z"),
+            ("/s/d.jsonl", 5, "not-a-reset")]
+    conn.executemany(
+        "INSERT INTO quota_window_snapshots (source, source_root_key, "
+        " source_path, line_offset, captured_at_utc, observed_slot, "
+        " logical_limit_key, window_minutes, used_percent, resets_at_utc) "
+        "VALUES ('codex', 'root-seed', ?, ?, '2026-07-20T10:00:00Z', "
+        " 'primary', ?, 10080, 10.0, ?)",
+        [(path, offset, _SEED_KEY, raw) for path, offset, raw in rows])
+    conn.commit()
+    return conn
+
+
+def _traced_resolve(conn, reset="2026-07-27T00:27:00Z"):
+    """Resolve one probe: its anchor, the statements on quota history, and
+    whether each summary seed served the group (False: it fell back)."""
+    statements: list[str] = []
+    summary: list[bool] = []
+    conn.set_trace_callback(lambda sql: statements.append(" ".join(sql.split())))
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            _spy_summary_seeds(patch, summary.append)
+            resolver = _cache().CodexResetAnchorResolver(conn)
+            anchor = resolver.resolve(
+                source_root_key="root-seed", observed_slot="primary",
+                logical_limit_key=_SEED_KEY, window_minutes=10080,
+                resets_at_utc=reset, source_path="/s/z.jsonl", line_offset=9)
+    finally:
+        conn.set_trace_callback(None)
+    quota = [s for s in statements if "FROM quota_window_snapshots" in s]
+    return anchor, quota, summary, resolver
+
+
+def test_1033_a_ready_seed_reads_no_quota_history(tmp_path):
+    """The full read silently returning: a ready summary seeds the group with
+    one summary statement and no statement on quota_window_snapshots, and it
+    resolves the anchor the full read resolves."""
+    conn = _summary_seed_store(tmp_path)
+    try:
+        anchor, quota, summary, _resolver = _traced_resolve(conn)
+        assert quota == [] and summary == [True], (quota, summary)
+        conn.execute("UPDATE cache_meta SET value='bootstrap' "
+                     "WHERE key='codex_reset_anchor_evidence'")
+        fallback, quota, summary, _resolver = _traced_resolve(conn)
+        assert len(quota) == 1 and quota[0].startswith(
+            "SELECT source_path, line_offset, id, resets_at_utc"), quota
+        assert anchor == fallback == "2026-07-27T00:09:00Z"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("damage", ["stale-bucket", "missing-trigger",
+                                    "dropped-table", "zero-count",
+                                    "non-integer-offset"])
+def test_1033_an_unusable_summary_falls_back_to_the_full_read(
+        tmp_path, damage):
+    """A stale bucket, a missing trigger, a database error or a corrupt row
+    must never seed from the summary; the fallback is today's full read, and
+    neither a database error from the summary statement nor a corrupt row
+    (a ``ValueError`` while folding it) sets ``_seed_failed`` or escapes the
+    resolver."""
+    conn = _summary_seed_store(tmp_path, damage)
+    try:
+        expected = {
+            "stale-bucket": "2026-07-27T00:18:00Z",
+            "missing-trigger": "2026-07-27T00:09:00Z",
+            "dropped-table": "2026-07-27T00:09:00Z",
+            "zero-count": "2026-07-27T00:09:00Z",
+            "non-integer-offset": "2026-07-27T00:09:00Z",
+        }[damage]
+        if damage == "stale-bucket":
+            conn.execute("DELETE FROM quota_window_snapshots "
+                         "WHERE source_path='/s/a.jsonl'")
+            assert conn.execute(
+                "SELECT COUNT(*) FROM codex_reset_anchor_evidence "
+                "WHERE stale=1").fetchone()[0] == 0, (
+                "precondition: a single-row bucket is removed, not staled")
+            conn.execute("DELETE FROM quota_window_snapshots "
+                         "WHERE source_path='/s/c.jsonl' AND line_offset=3")
+            conn.execute("INSERT INTO quota_window_snapshots (source, "
+                         " source_root_key, source_path, line_offset, "
+                         " captured_at_utc, observed_slot, logical_limit_key, "
+                         " window_minutes, used_percent, resets_at_utc) "
+                         "VALUES ('codex', 'root-seed', '/s/e.jsonl', 6, "
+                         " '2026-07-20T10:00:00Z', 'primary', ?, 10080, 10.0, "
+                         " '2026-07-27T00:00:00Z')", (_SEED_KEY,))
+            conn.execute("DELETE FROM quota_window_snapshots "
+                         "WHERE source_path='/s/b.jsonl'")
+            assert conn.execute(
+                "SELECT COUNT(*) FROM codex_reset_anchor_evidence "
+                "WHERE stale=1").fetchone()[0] == 1
+        elif damage == "missing-trigger":
+            conn.execute("DROP TRIGGER trg_qws_anchor_evidence_upd")
+        elif damage == "dropped-table":
+            conn.execute("DROP TABLE codex_reset_anchor_evidence")
+        else:
+            # Bypass the table's CHECKs, as a damaged file could.
+            conn.commit()
+            conn.execute("PRAGMA ignore_check_constraints = ON")
+            column, value = (("row_count", 0) if damage == "zero-count"
+                             else ("min_line_offset", "x"))
+            assert conn.execute(
+                f"UPDATE codex_reset_anchor_evidence SET {column} = ? "
+                "WHERE min_source_path = '/s/a.jsonl'", (value,)
+            ).rowcount == 1
+            conn.commit()
+            conn.execute("PRAGMA ignore_check_constraints = OFF")
+        conn.commit()
+        anchor, quota, summary, resolver = _traced_resolve(conn)
+        assert len(quota) == 1 and quota[0].startswith(
+            "SELECT source_path, line_offset, id, resets_at_utc"), quota
+        assert summary == [False], summary
+        assert resolver._seed_failed is False
+        assert anchor == expected
+    finally:
+        conn.close()

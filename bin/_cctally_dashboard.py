@@ -6871,9 +6871,14 @@ def build_cached_claude_range_aggregates_from_capture(
     try:
         if "projects" in failures:
             raise failures["projects"]
+        # #1059: observing memos, so a spelling first resolved on an
+        # incremental tick is registered for the identity sweep too. A flip
+        # bumps the generation in `base`, which forces the cold branch below
+        # with a fresh memo in the same build.
+        _sc = _cctally()._load_sibling("_lib_snapshot_cache")
         if incremental:
             project_mut = copy.deepcopy(prior["project_mut"])
-            resolver_cache = dict(prior["resolver_cache"])
+            resolver_cache = _sc.observing_project_memo(prior["resolver_cache"])
             for row, priced_entry in zip(rows, prepared):
                 _fold_projects_entry(
                     project_mut,
@@ -6883,7 +6888,8 @@ def build_cached_claude_range_aggregates_from_capture(
                     priced_entry=priced_entry,
                 )
         else:
-            resolver_cache = {}
+            _sc.note_project_work("rangeFullRefolds")
+            resolver_cache = _sc.observing_project_memo()
             project_mut = fold_projects_over_range(
                 rows,
                 resolver_cache=resolver_cache,
@@ -7080,6 +7086,7 @@ def _assemble_projects_via_cache(
     cw_end: "dt.datetime",
     cur_max_id: int,
     cur_max_seq: int,
+    resolver_cache: "dict | None" = None,
 ) -> "tuple[dict, dict, dict]":
     """Flag-ON assembly (#269 §14 Win 2): recompute only the CURRENT week each
     warm tick; serve CLOSED weeks from the per-(project, week) cache on a hit and
@@ -7097,10 +7104,17 @@ def _assemble_projects_via_cache(
     tick's ``MAX(mutation_seq)`` (the #270 §8 delta watermark, so an id-stable
     in-place finalization is caught). The accumulator is single-writer here (this
     runs only on the sync-thread ``use_projects_env_cache=True`` path).
+
+    #1059: the memo is an OBSERVING memo (``resolver_cache`` when the caller
+    supplies one), because every resolution here can be retained — by the
+    current-week accumulator, a cold seed or a closed-week miss — and a
+    retained resolution the identity sweep cannot see would keep a stale
+    grouping until a restart.
     """
     c = _cctally()
     sc = c._load_sibling("_lib_snapshot_cache")
-    resolver_cache: dict = {}
+    if resolver_cache is None:
+        resolver_cache = sc.observing_project_memo()
     buckets: dict = {}
     total_cost_by_week: dict = {}
     key_by_bucket: dict = {}
@@ -7196,6 +7210,9 @@ def _assemble_projects_via_cache(
             if hit is not None:
                 week_buckets, week_total = hit
             else:
+                # #1059 SD3: counted when attempted, so a raising compute is
+                # still visible as work.
+                sc.note_project_work("closedWeekComputes")
                 week_buckets, week_total = _aggregate_projects_week(
                     conn, week_start=w, week_end=w_end,
                     resolver_cache=resolver_cache,
@@ -7264,6 +7281,8 @@ def _build_projects_envelope(
     weeks_back: int = 12,
     use_projects_env_cache: bool = False,
     content_revision_leg: "str | None" = None,
+    project_resolver_cache: "dict | None" = None,
+    use_envelope_memo: bool = True,
 ) -> dict:
     """Build the ``projects.{current_week, trend}`` envelope block.
 
@@ -7300,6 +7319,13 @@ def _build_projects_envelope(
     lookup; the memo key carries it, so an in-place ``weekly_percent``
     correction (which moves no ``MAX(id)``) rebuilds the envelope. ``None``
     reads it here, on ``conn``.
+
+    #1059: ``project_resolver_cache`` is the resolver memo of the full-window
+    walk, passed through to the cached assembly; ``None`` keeps a fresh plain
+    dict (the walk) or an observing memo (the assembly). An owner build that
+    retains this result passes an observing memo so the identity sweep sees
+    every spelling. ``use_envelope_memo=False`` neither reads nor writes
+    ``_PROJECTS_ENV_MEMO``, for request-thread callers.
     """
     c = _cctally()
 
@@ -7354,7 +7380,7 @@ def _build_projects_envelope(
         cw_key = getattr(current_week, "week_start_at", None)
     memo_key = (max_id, max_wus_id, entry_mutation_seq, cw_key, weeks_back,
                 content_revision_leg)
-    cached = _PROJECTS_ENV_MEMO.get("value")
+    cached = _PROJECTS_ENV_MEMO.get("value") if use_envelope_memo else None
     if cached is not None and _PROJECTS_ENV_MEMO.get("key") == memo_key:
         return cached
 
@@ -7420,13 +7446,17 @@ def _build_projects_envelope(
         buckets, total_cost_by_week, key_by_bucket = _assemble_projects_via_cache(
             conn, week_bounds=week_bounds, cw_start=cw_start, cw_end=cw_end,
             cur_max_id=max_id, cur_max_seq=entry_mutation_seq,
+            resolver_cache=project_resolver_cache,
         )
     else:
         # `_resolve_project_key` is the production resolver; we use git-root
         # mode (default for `cmd_project --group` absent) — matches the
         # CLI's default.
         _resolve_project_key = c._resolve_project_key
-        resolver_cache: dict = {}
+        resolver_cache: dict = (
+            {} if project_resolver_cache is None else project_resolver_cache)
+        c._load_sibling("_lib_snapshot_cache").note_project_work(
+            "fullWindowProjectWalks")
 
         buckets = {}
         total_cost_by_week = {}
@@ -7787,8 +7817,9 @@ def _build_projects_envelope(
         "current_week": cw_block,
         "trend":        trend_block,
     }
-    _PROJECTS_ENV_MEMO["key"] = memo_key
-    _PROJECTS_ENV_MEMO["value"] = result
+    if use_envelope_memo:
+        _PROJECTS_ENV_MEMO["key"] = memo_key
+        _PROJECTS_ENV_MEMO["value"] = result
     return result
 
 
@@ -7849,11 +7880,15 @@ def _project_detail_for_window(
     if projects_envelope is not None:
         env = projects_envelope
     else:
+        # #1059: this fallback runs on a request thread (the `/api/project`
+        # handler passes `None` after a failed envelope build), so it must
+        # neither read nor write the owner's process-wide envelope memo.
         env = _build_projects_envelope(
             conn,
             now_utc=now_utc,
             current_week=current_week,
             weeks_back=weeks_back,
+            use_envelope_memo=False,
         )
 
     # Resolve project_key → bucket_path via the envelope's identity map.
@@ -8722,6 +8757,30 @@ def _debug_memory_owner(stats, *, prefix: str = "") -> dict:
         "evictionCount": field("EvictionCount"),
         "fallbackCount": field("FallbackCount"),
     }
+
+
+def _debug_project_work() -> dict:
+    """#1059 SD3: the project work counters, or ``{}`` when unreadable."""
+    cctally = sys.modules.get("cctally")
+    loader = getattr(cctally, "_load_sibling", None)
+    if not callable(loader):
+        return {}
+    try:
+        return dict(loader("_lib_snapshot_cache").project_work_stats())
+    except Exception:  # noqa: BLE001 -- diagnostics fail closed.
+        return {}
+
+
+def _debug_project_identity() -> dict:
+    """#1059: the project-identity sweep block, or ``{}`` when unreadable."""
+    cctally = sys.modules.get("cctally")
+    loader = getattr(cctally, "_load_sibling", None)
+    if not callable(loader):
+        return {}
+    try:
+        return dict(loader("_lib_snapshot_cache").project_identity_stats())
+    except Exception:  # noqa: BLE001 -- diagnostics fail closed.
+        return {}
 
 
 def _debug_retained_memory(hub, *, main_frontier_stats=None) -> dict:
@@ -9610,6 +9669,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # #901 §5.5: kernel-accounted process writes, the trailing
             # five-minute statistic and its budget verdict. Additive camelCase.
             "writeIo": _debug_write_io(),
+            # #1059 SD3: cumulative counts at the project work sites, so a
+            # warm-tick measurement can prove no closed week was rebuilt.
+            # Additive and opaque, like every field of this diagnostic.
+            "projectWork": _debug_project_work(),
+            # #1059: the identity registry and sweep diagnostics, reported
+            # separately from the accelerator memory budget.
+            "projectIdentity": _debug_project_identity(),
         }
         if body["phases"] is None:
             body["note"] = "tracing_disabled"

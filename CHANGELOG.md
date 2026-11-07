@@ -5,6 +5,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.118.2] - 2026-11-07
+
+### Changed
+- The Codex hooks that `cctally setup` installs no longer re-read the whole quota history to resolve reset anchors, so recording new Codex usage stays fast on a long history.
+
+### Fixed
+- The dashboard and TUI now regroup a project within about a minute after a git worktree is removed, a repository is created or moved, or a folder becomes a repository; previously they kept the old grouping until restarted.
+
 ## [1.118.1] - 2026-11-06
 
 ### Fixed

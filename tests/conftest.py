@@ -686,6 +686,11 @@ def _reset_snapshot_dispatch_state():
             # #271 M4: the projects-envelope current-week accumulator slot —
             # driven directly by the accumulator unit tests, so isolate it.
             "reset_projects_env_current_state",
+            # #1059: the project-identity registry, sweep deadline and
+            # regroup markers. Without this a deadline armed by an earlier
+            # test can fall due inside a later one and flip spellings whose
+            # scratch directories are gone, so an unrelated build leaves idle.
+            "reset_project_identity_state",
             # #279 S5 F6.3: the owner-thread tripwire. Any test that runs the
             # real locked rebuild body arms it, and an arming that happened on
             # a server request thread that has since exited makes every LATER
@@ -908,6 +913,64 @@ def load_script():
     # that mattered, and they now live in exactly one place. This function keeps
     # its `dict` return shape, because 369 modules index it as a namespace.
     return load_script_module().__dict__
+
+
+def make_regroup_tree(root):
+    """#1059 fixture tree for project-identity transitions, under ``root``.
+
+    ``mainrepo/`` is a repository (a ``.git`` directory holding ``HEAD``,
+    ``objects/`` and ``refs/``) with a worktree ``mainrepo/.worktrees/feature``
+    (a ``gitdir:`` ``.git`` file) and ``feature/src``; ``otherrepo/`` is an
+    unaffected repository; ``plain/sub/`` has no marker (for a ``git init`` in
+    ``plain/``); ``solo/`` is a non-git directory reached through the symlink
+    ``links/alias`` (for a same-bucket metadata flip); ``movable/`` is a
+    repository with ``movable/sub/`` (for a move). Paths are realpaths, so the
+    resolver's normalized spelling of each equals the string returned.
+    """
+    root = pathlib.Path(os.path.realpath(root))
+
+    def repo(path):
+        path.mkdir(parents=True, exist_ok=True)
+        git_init(path)
+        return path
+
+    main = repo(root / "mainrepo")
+    feature = main / ".worktrees" / "feature"
+    (feature / "src").mkdir(parents=True)
+    (feature / ".git").write_text(
+        f"gitdir: {main}/.git/worktrees/feature\n")
+    other = repo(root / "otherrepo")
+    (root / "plain" / "sub").mkdir(parents=True)
+    (root / "solo").mkdir()
+    (root / "links").mkdir()
+    (root / "links" / "alias").symlink_to(root / "solo")
+    movable = repo(root / "movable")
+    (movable / "sub").mkdir()
+    return types.SimpleNamespace(
+        root=root, main=main, feature=feature, other=other,
+        plain=root / "plain", plain_sub=root / "plain" / "sub",
+        solo=root / "solo", alias=root / "links" / "alias",
+        movable=movable, movable_sub=movable / "sub",
+    )
+
+
+def git_init(path):
+    """Make ``path`` a repository marker the project walk accepts (#976)."""
+    git = pathlib.Path(path) / ".git"
+    (git / "objects").mkdir(parents=True, exist_ok=True)
+    (git / "refs").mkdir(exist_ok=True)
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+
+
+def remove_worktree(tree):
+    """``git worktree remove`` of the fixture's ``feature`` worktree."""
+    shutil.rmtree(tree.feature)
+
+
+def recreate_worktree(tree):
+    (tree.feature / "src").mkdir(parents=True)
+    (tree.feature / ".git").write_text(
+        f"gitdir: {tree.main}/.git/worktrees/feature\n")
 
 
 def redirect_paths(ns, monkeypatch, tmp_path):

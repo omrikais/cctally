@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import inspect
 import json
+import pathlib
 import sqlite3
 import sys
 from zoneinfo import ZoneInfo
@@ -4051,3 +4052,499 @@ def test_cache_report_cache_empty_today_matches_from_scratch(monkeypatch, tmp_pa
     assert any(r.net_usd != 0.0 for r in scratch.by_project), "closed days non-zero"
     assert to_dict(cold) == to_dict(scratch), "cold == from-scratch"
     assert to_dict(warm) == to_dict(scratch), "empty-today warm == from-scratch"
+
+
+# ===========================================================================
+# #1059 — warm project regrouping through the real dispatch.
+#
+# A worktree removal moves no database row, so before #1059 a running
+# dashboard never even left the idle path. These drive the real
+# `_tui_build_snapshot` with an injected monotonic clock and change only the
+# filesystem; the failure each detects is a published grouping that still
+# names the removed worktree, a marker that clears early or never, or an
+# unchanged sweep that does work.
+# ===========================================================================
+
+
+def _regroup_line(session_id, uuid, *, ts, cwd, cost_tokens=100):
+    return json.dumps({
+        "type": "assistant", "uuid": uuid, "sessionId": session_id,
+        "requestId": f"r-{uuid}", "timestamp": ts, "cwd": cwd,
+        "message": {
+            "role": "assistant", "id": f"m-{uuid}", "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": "x"}],
+            "usage": {"input_tokens": cost_tokens, "output_tokens": 40,
+                      "cache_creation_input_tokens": 0,
+                      "cache_read_input_tokens": 0},
+        },
+    }) + "\n"
+
+
+class _RegroupDashboard:
+    """One scratch HOME, one fixture tree and the real dashboard build."""
+
+    # Closed weeks 06-15 and 06-22 (Monday fallback grid), control 06-08,
+    # current week 06-29; NOW_UTC is Saturday 2026-07-04.
+    _WEEKS = ("2026-06-16T09:00:00Z", "2026-06-23T09:00:00Z",
+              "2026-07-01T09:00:00Z")
+
+    def __init__(self, monkeypatch, tmp_path, *, codex=False):
+        from conftest import make_regroup_tree
+        self.ns = load_script()
+        redirect_paths(self.ns, monkeypatch, tmp_path)
+        if codex:
+            # One Codex rollout whose session cwd is the worktree, so the same
+            # build must regroup both providers.
+            monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+        import _lib_snapshot_cache as sc
+        self.sc = sc
+        self.tui = sys.modules["_cctally_tui"]
+        self.dash = sys.modules["_cctally_dashboard"]
+        self.tmp_path = tmp_path
+        self.tree = make_regroup_tree(tmp_path / "tree")
+        self.clock = 1000.0
+        monkeypatch.setattr(self.tui, "_tui_project_identity_now",
+                            lambda: self.clock)
+        for reset in (sc.reset_dispatch_state, sc.reset_group_a_state,
+                      sc.reset_session_cache_state, sc.reset_doctor_memo,
+                      sc.reset_weekref_cost_state, sc.reset_projects_env_state,
+                      sc.reset_project_identity_state):
+            reset()
+        self.dash._projects_reset_memo()
+        self.ns["reset_claude_range_aggregate_memo"]()
+        self.now = NOW_UTC
+        self._n = 0
+        self.write("other", self.tree.other, extra_weeks=("2026-06-09T09:00:00Z",))
+        self.write("main", self.tree.main)
+        self.write("feat", self.tree.feature)
+        if codex:
+            self.write_codex(self.tree.feature)
+
+    _CODEX_CORPUS = (pathlib.Path(__file__).resolve().parent / "fixtures"
+                     / "codex-parity" / "v1" / "rollouts" / "modern-full.jsonl")
+
+    def write_codex(self, cwd):
+        rollout = (self.tmp_path / "codex-home" / "sessions" / "2026" / "07"
+                   / "02" / "rollout-regroup.jsonl")
+        rollout.parent.mkdir(parents=True, exist_ok=True)
+        text = self._CODEX_CORPUS.read_text()
+        rollout.write_text(
+            text.replace("2026-07-14", "2026-07-02")
+            .replace("/synthetic/root-a/project-red", str(cwd)))
+
+    @staticmethod
+    def codex_labels(snap):
+        data = snap.source_bundle.sources["codex"].data
+        return {r["label"] for r in data["projects"]["rows"]}
+
+    def write(self, session_id, cwd, *, extra_weeks=(), weeks=None):
+        proj = self.tmp_path / ".claude" / "projects" / f"-{session_id}"
+        proj.mkdir(parents=True, exist_ok=True)
+        path = proj / f"{session_id}.jsonl"
+        lines = []
+        for ts in (*extra_weeks, *(weeks or self._WEEKS)):
+            self._n += 1
+            lines.append(_regroup_line(
+                session_id, f"{session_id}-{self._n}", ts=ts, cwd=str(cwd)))
+        with path.open("a") as handle:
+            handle.write("".join(lines))
+
+    def build(self, *, advance=0.0, precompute=True, skip_sync=False):
+        self.clock += advance
+        self.now = self.now + dt.timedelta(seconds=max(advance, 1.0))
+        return self.ns["_tui_build_snapshot"](
+            now_utc=self.now, skip_sync=skip_sync,
+            precompute_envelope=precompute, runtime_bind="127.0.0.1",
+        )
+
+    def env_buckets(self, snap):
+        env = snap.projects_envelope
+        return ({r["bucket_path"] for r in env["current_week"]["rows"]}
+                | {p["bucket_path"] for p in env["trend"]["projects"]})
+
+    @staticmethod
+    def range_labels(snap):
+        data = snap.source_bundle.sources["claude"].data
+        return {r["label"] for r in data["projects"]["aggregate"]["rows"]}
+
+    def assert_regrouped(self, snap, *, merged=True):
+        buckets = self.env_buckets(snap)
+        feature = str(self.tree.feature)
+        if merged:
+            assert feature not in buckets, (
+                "stale grouping: the removed worktree is still a project")
+            assert str(self.tree.main) in buckets
+        else:
+            assert feature in buckets
+
+    def cold_oracle(self):
+        sc = self.sc
+        for reset in (sc.reset_dispatch_state, sc.reset_projects_env_state,
+                      sc.reset_project_identity_state,
+                      sc.reset_codex_accounting_cache_state,
+                      sc._clear_snapshot_accelerators):
+            reset()
+        self.dash._projects_reset_memo()
+        self.ns["reset_claude_range_aggregate_memo"]()
+        return self.ns["_tui_build_snapshot"](
+            now_utc=self.now, skip_sync=True, precompute_envelope=True,
+            runtime_bind="127.0.0.1")
+
+
+def _regroup_totals(snap):
+    """Every token, cost, quota and denominator total the regroup must keep
+    (spec 9 R2), summed across project rows so a regroup that moves rows
+    between projects keeps each one equal. Returns ``(exact, usd)``."""
+    env = snap.projects_envelope
+    weeks = env["trend"]["weeks"]
+    week_cost = [0.0] * len(weeks)
+    week_pct = [0.0] * len(weeks)
+    for project in env["trend"]["projects"]:
+        for i in range(len(weeks)):
+            week_cost[i] += project["weekly_cost"][i]
+            week_pct[i] += project["weekly_pct"][i] or 0.0
+    exact = {
+        "week_start_at": [w["week_start_at"] for w in weeks],
+        "total_pct": [w["total_pct"] for w in weeks],
+        "daily_total_tokens": snap.daily_total_tokens,
+    }
+    usd = {
+        "current_week": env["current_week"]["total_cost_usd"],
+        "current_rows": sum(r["cost_usd"] for r in env["current_week"]["rows"]),
+        "current_attributed_pct": sum(
+            r["attributed_pct"] or 0.0 for r in env["current_week"]["rows"]),
+        "week_totals": [w["total_cost_usd"] for w in weeks],
+        "week_rows": week_cost,
+        "week_pct_rows": week_pct,
+        "daily": snap.daily_total_cost_usd,
+    }
+    for provider in ("claude", "codex"):
+        state = snap.source_bundle.sources.get(provider)
+        if state is None:
+            continue
+        projects = state.data["projects"]
+        rows = (projects["aggregate"]["rows"] if "aggregate" in projects
+                else projects["rows"])
+        for field in sorted({k for r in rows for k in r}):
+            values = [r[field] for r in rows]
+            if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                       for v in values):
+                continue
+            if "token" in field:
+                exact[f"{provider}.{field}"] = sum(values)
+            elif "cost" in field or "usd" in field:
+                usd[f"{provider}.{field}"] = sum(values)
+        hero = state.data.get("hero") or {}
+        if "total_tokens" in hero:
+            exact[f"{provider}.hero.total_tokens"] = hero["total_tokens"]
+    return exact, usd
+
+
+def _assert_regroup_totals_equal(pre, post):
+    pre_exact, pre_usd = _regroup_totals(pre)
+    post_exact, post_usd = _regroup_totals(post)
+    assert post_exact == pre_exact
+    assert post_usd.keys() == pre_usd.keys()
+    for key, value in pre_usd.items():
+        assert post_usd[key] == pytest.approx(value, abs=1e-9), key
+
+
+def test_regroup_leaves_idle_and_publishes_in_the_same_build(
+    monkeypatch, tmp_path,
+):
+    """A filesystem-only removal must leave the idle path in the build of the
+    first due sweep and publish the regrouped envelope, range rows and share
+    input together, with every total unchanged."""
+    from conftest import remove_worktree
+    h = _RegroupDashboard(monkeypatch, tmp_path, codex=True)
+    share = h.ns["_load_sibling"]("_cctally_dashboard_share")
+    first = h.build()
+    second = h.build(advance=10)
+    assert second.projects_envelope is first.projects_envelope, "idle"
+    h.assert_regrouped(second, merged=False)
+    assert "feature" in h.range_labels(second)
+    assert h.codex_labels(second) == {"feature"}, (
+        "non-vacuity: the Codex rollout must be attributed to the worktree")
+
+    remove_worktree(h.tree)
+    before = h.build(advance=10)
+    assert before.data_version == second.data_version, "no sweep before T"
+    assert before.projects_envelope is first.projects_envelope
+
+    regrouped = h.build(advance=45)
+    h.assert_regrouped(regrouped)
+    assert regrouped.data_version != second.data_version, "left the idle path"
+    assert "feature" not in h.range_labels(regrouped)
+    assert "mainrepo" in h.range_labels(regrouped)
+    assert h.codex_labels(regrouped) == {"mainrepo"}, (
+        "stale grouping: the Codex rows still name the removed worktree")
+    data = share._build_projects_share_panel_data({"windowWeeks": 4}, regrouped)
+    assert str(h.tree.feature) not in {r["bucket_path"] for r in data["rows"]}
+    assert h.sc.project_regroup_pending() is None, "acknowledged"
+    exact, usd = _regroup_totals(first)
+    assert exact["daily_total_tokens"] > 0 and "claude.cost_usd" in usd
+    assert any(k.startswith("codex.") and "token" in k for k in exact), (
+        "non-vacuity: the Codex token totals are compared")
+    _assert_regroup_totals_equal(first, regrouped)
+    warm_env = regrouped.projects_envelope
+    warm_labels = h.range_labels(regrouped)
+    warm_codex = h.codex_labels(regrouped)
+    oracle = h.cold_oracle()
+    assert oracle.projects_envelope == warm_env
+    assert h.range_labels(oracle) == warm_labels
+    assert h.codex_labels(oracle) == warm_codex
+
+
+def test_tui_build_publishes_the_regroup_and_acknowledges_it(
+    monkeypatch, tmp_path,
+):
+    """The TUI performs no dispatch read; an acknowledgement keyed on one
+    would leave `G` set forever and retry-bump every interval."""
+    from conftest import remove_worktree
+    h = _RegroupDashboard(monkeypatch, tmp_path)
+    h.build(precompute=False)
+    remove_worktree(h.tree)
+    snap = h.build(advance=61, precompute=False)
+    h.assert_regrouped(snap)
+    assert h.sc.project_regroup_pending() is None
+    retries = h.sc.project_identity_stats()["retryBumps"]
+    generation = h.sc.current_generation()
+    for _ in range(2):
+        h.build(advance=61, precompute=False)
+    assert h.sc.project_identity_stats()["retryBumps"] == retries
+    assert h.sc.current_generation() == generation
+
+
+def test_explicit_skip_sync_build_sweeps_only_when_due(monkeypatch, tmp_path):
+    """An `/api/sync` or settings build (`skip_sync=True`) is an owner build:
+    it must sweep when due and must not sweep before the deadline."""
+    from conftest import remove_worktree
+    h = _RegroupDashboard(monkeypatch, tmp_path)
+    h.build()
+    remove_worktree(h.tree)
+    attempts = h.sc.project_identity_stats()["sweepAttempts"]
+    early = h.build(advance=30, skip_sync=True)
+    assert h.sc.project_identity_stats()["sweepAttempts"] == attempts
+    h.assert_regrouped(early, merged=False)
+    due = h.build(advance=31, skip_sync=True)
+    assert h.sc.project_identity_stats()["sweepAttempts"] == attempts + 1
+    h.assert_regrouped(due)
+
+
+def test_regroup_marker_survives_a_failed_envelope_build(monkeypatch, tmp_path):
+    """Acknowledgement case (i): a regroup whose envelope build raised must
+    stay pending and be republished by the cadence retry, with no database
+    or filesystem change in between."""
+    from conftest import remove_worktree
+    h = _RegroupDashboard(monkeypatch, tmp_path)
+    h.build()
+    real = h.ns["_build_projects_envelope"]
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("envelope build failed once")
+        return real(*args, **kwargs)
+
+    monkeypatch.setitem(h.ns, "_build_projects_envelope", flaky)
+    remove_worktree(h.tree)
+    failed = h.build(advance=61)
+    assert failed.projects_envelope is None
+    pending = h.sc.project_regroup_pending()
+    assert pending is not None, "a failed regroup must stay pending"
+    idle = h.build(advance=10)
+    assert h.sc.project_regroup_pending() == pending
+    assert idle.projects_envelope is None
+    retried = h.build(advance=55)
+    assert h.sc.project_identity_stats()["retryBumps"] == 1
+    h.assert_regrouped(retried)
+    assert h.sc.project_regroup_pending() is None
+
+
+def test_regroup_marker_survives_an_uncommitted_range_fold(
+    monkeypatch, tmp_path,
+):
+    """Acknowledgement case (ii): the projects fold succeeds but the daily
+    fold fails, so the range state does not commit under `G`; clearing `G`
+    then would leave the range rows stale with nothing left to retry."""
+    from conftest import remove_worktree
+    h = _RegroupDashboard(monkeypatch, tmp_path)
+    h.build()
+    real = h.dash._fold_prepared_daily_entries
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("daily fold failed once")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(h.dash, "_fold_prepared_daily_entries", flaky)
+    remove_worktree(h.tree)
+    h.build(advance=61)
+    assert calls["n"] == 1
+    assert h.sc.project_regroup_pending() is not None
+    retried = h.build(advance=61)
+    assert "feature" not in h.range_labels(retried)
+    assert h.sc.project_regroup_pending() is None
+
+
+def test_regroup_marker_survives_a_retained_claude_source(
+    monkeypatch, tmp_path,
+):
+    """Acknowledgement case (iii): under ingest contention the published
+    Claude source is the one retained from before the flip, so its range rows
+    still carry the old grouping and `G` must stay set."""
+    import types
+    from conftest import remove_worktree
+    h = _RegroupDashboard(monkeypatch, tmp_path)
+    h.build()
+    monkeypatch.setitem(h.ns, "sync_cache",
+                        lambda *a, **k: types.SimpleNamespace(
+                            lock_contended=True))
+    remove_worktree(h.tree)
+    h.build(advance=61)
+    assert h.sc.project_regroup_pending() is not None
+
+
+def test_regroup_marker_survives_a_rejected_source_generation(
+    monkeypatch, tmp_path,
+):
+    """Acknowledgement check (b1) as the ONLY failing condition: the range
+    fold commits under `G`, but the builder's post-build read reports a moved
+    stats generation, so the PRIOR bundle (old grouping) is published.
+    Clearing `G` there would leave those rows stale with nothing to retry."""
+    from conftest import remove_worktree
+    h = _RegroupDashboard(monkeypatch, tmp_path)
+    h.build()
+    real = h.ns["compute_signature"]
+    armed = {"on": False, "hits": 0}
+
+    def moved_after_build(*args, **kwargs):
+        signature = real(*args, **kwargs)
+        # The builder's post-build read is the call without the retired
+        # digest; its start read (and the dispatch read) pass it or use `sc`.
+        if armed["on"] and "claude_weekly_retired_digest" not in kwargs:
+            armed["hits"] += 1
+            return signature._replace(max_wus_id=signature.max_wus_id + 1)
+        return signature
+
+    monkeypatch.setitem(h.ns, "compute_signature", moved_after_build)
+    remove_worktree(h.tree)
+    armed["on"] = True
+    rejected = h.build(advance=61)
+    armed["on"] = False
+    assert armed["hits"] == 1, "non-vacuity: the post-build read moved"
+    pending = h.sc.project_regroup_pending()
+    assert pending is not None, "a rejected source generation must stay pending"
+    assert rejected.projects_envelope is not None
+    assert str(h.tree.feature) not in h.env_buckets(rejected), (
+        "non-vacuity: the envelope itself was rebuilt and regrouped")
+    base = h.dash._CLAUDE_RANGE_AGGREGATE_MEMO["state"]["base"]
+    assert int(base[3]) >= pending, (
+        "non-vacuity: the range memo committed under G, so only (b1) holds G")
+    assert "feature" in h.range_labels(rejected), "the prior bundle published"
+    retried = h.build(advance=61)
+    assert "feature" not in h.range_labels(retried)
+    assert h.sc.project_regroup_pending() is None
+
+
+def test_regroup_marker_survives_a_range_memo_left_behind(
+    monkeypatch, tmp_path,
+):
+    """Acknowledgement check (b3) as the ONLY failing condition: the cached
+    range capture fails once, so the from-scratch rows path publishes current
+    rows but commits no range memo under `G`. Clearing `G` there would leave
+    the retained memo at its pre-flip base for the next warm fold."""
+    from conftest import remove_worktree
+    h = _RegroupDashboard(monkeypatch, tmp_path)
+    h.build()
+    real = h.ns["capture_cached_claude_range_aggregates"]
+    calls = {"armed": False, "failed": 0}
+
+    def fail_once(*args, **kwargs):
+        if calls["armed"] and not calls["failed"]:
+            calls["failed"] += 1
+            raise RuntimeError("range capture failed once")
+        return real(*args, **kwargs)
+
+    monkeypatch.setitem(h.ns, "capture_cached_claude_range_aggregates",
+                        fail_once)
+    remove_worktree(h.tree)
+    calls["armed"] = True
+    fallback = h.build(advance=61)
+    assert calls["failed"] == 1
+    pending = h.sc.project_regroup_pending()
+    assert pending is not None, "an uncommitted range memo must stay pending"
+    assert "feature" not in h.range_labels(fallback), (
+        "non-vacuity: the published Claude source is current and regrouped")
+    state = h.dash._CLAUDE_RANGE_AGGREGATE_MEMO["state"]
+    assert state is None or int(state["base"][3]) < pending
+    retried = h.build(advance=61)
+    assert "feature" not in h.range_labels(retried)
+    assert int(h.dash._CLAUDE_RANGE_AGGREGATE_MEMO["state"]["base"][3]) >= (
+        pending)
+    assert h.sc.project_regroup_pending() is None
+
+
+def test_regroup_lifecycle_unchanged_sweeps_are_free_and_a_second_change_regroups(
+    monkeypatch, tmp_path,
+):
+    """After a regroup, unchanged due sweeps must cost nothing (no bump, no
+    dispatch change, no project work), and a later filesystem-only
+    transition must regroup again — including after memory enforcement and
+    an accounting reset/restore, neither of which may drop the observation
+    registry."""
+    from conftest import recreate_worktree, remove_worktree
+    h = _RegroupDashboard(monkeypatch, tmp_path)
+    sc = h.sc
+    h.build()
+    remove_worktree(h.tree)
+    h.assert_regrouped(h.build(advance=61))
+    assert sc.project_regroup_pending() is None
+
+    def assert_unchanged_sweeps_free():
+        generation = sc.current_generation()
+        key, _snap = sc.dispatch_state()
+        work = sc.project_work_stats()
+        stats = sc.project_identity_stats()
+        for _ in range(3):
+            h.build(advance=61)
+        after = sc.project_identity_stats()
+        assert after["sweepSuccesses"] == stats["sweepSuccesses"] + 3
+        assert after["flips"] == stats["flips"]
+        assert after["retryBumps"] == stats["retryBumps"]
+        assert sc.current_generation() == generation
+        assert sc.dispatch_state()[0] == key
+        assert sc.project_work_stats() == work
+        assert sc.project_regroup_pending() is None
+
+    assert_unchanged_sweeps_free()
+
+    # Memory enforcement, then a FILESYSTEM-ONLY transition: no session or
+    # database change follows, so the dispatch key cannot move by itself and
+    # only the surviving registry plus the due sweep can regroup.
+    sc._clear_snapshot_accelerators()
+    recreate_worktree(h.tree)
+    key, _snap = sc.dispatch_state()
+    early = h.build(advance=10)
+    assert sc.dispatch_state()[0] == key, "nothing moves before the deadline"
+    h.assert_regrouped(early)
+    h.assert_regrouped(h.build(advance=51), merged=False)
+    assert sc.project_regroup_pending() is None
+    assert_unchanged_sweeps_free()
+
+    # Registry survival only: this harness has no Codex rollout, so no forced
+    # path crosses the checkpoint/restore here. Pending forced paths across a
+    # checkpoint/restore and a failed load are pinned by
+    # test_codex_accounting_incremental_cache.py::
+    # test_forced_paths_survive_checkpoint_restore_and_a_failed_load and
+    # test_snapshot_bounded_work.py::
+    # test_pending_forced_paths_survive_a_failed_source_build.
+    checkpoint = sc.checkpoint_codex_accounting_cache_state()
+    sc.reset_codex_accounting_cache_state()
+    sc.restore_codex_accounting_cache_state(checkpoint)
+    remove_worktree(h.tree)
+    h.assert_regrouped(h.build(advance=61))
+    assert sc.project_regroup_pending() is None

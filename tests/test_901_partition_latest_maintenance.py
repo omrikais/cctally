@@ -505,3 +505,423 @@ def test_the_conversations_store_carries_no_summary(db):
         assert not (OBJECTS & _objects(connection))
     finally:
         connection.close()
+
+
+# ── #1033 §5.1: the exact reset-anchor evidence summary ─────────────────────
+#
+# One row per in-scope (root, slot, limit key, raw reset) bucket with its row
+# count and its exact lexicographic minimum (source_path, line_offset, id); a
+# stale row's stored minimum is a strict lower bound of the survivors. The
+# reset-anchor seed folds these rows instead of the whole history, so any drift
+# here seeds wrong anchors. The oracle below aggregates the physical rows in
+# Python, sharing nothing with the triggers.
+
+EVIDENCE_STATE_KEY = "codex_reset_anchor_evidence"
+EVIDENCE_GENERATION_KEY = "codex_reset_anchor_evidence_generation"
+EVIDENCE_OBJECTS = {
+    ("table", "codex_reset_anchor_evidence"),
+    ("index", "idx_codex_reset_anchor_evidence_stale"),
+    ("trigger", "trg_qws_anchor_evidence_ins"),
+    ("trigger", "trg_qws_anchor_evidence_del"),
+    ("trigger", "trg_qws_anchor_evidence_upd"),
+}
+EVIDENCE_KEY_ORDER_COLUMNS = (
+    "source", "source_root_key", "observed_slot", "logical_limit_key",
+    "resets_at_utc", "source_path", "line_offset", "id")
+_EV_A = "/roots/a/sessions/a.jsonl"
+_EV_B = "/roots/a/sessions/b.jsonl"
+_EV_C = "/roots/a/sessions/c.jsonl"
+
+
+def _meta(conn, key):
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key=?", (key,)).fetchone()
+    return None if row is None else row[0]
+
+
+def _evidence_generation(conn):
+    return int(_meta(conn, EVIDENCE_GENERATION_KEY))
+
+
+def _evidence_summary(conn):
+    return {
+        tuple(row[:4]): (row[4], tuple(row[5:8]), row[8])
+        for row in conn.execute(
+            "SELECT source_root_key, observed_slot, logical_limit_key,"
+            " resets_at_utc, row_count, min_source_path, min_line_offset,"
+            " min_id, stale FROM codex_reset_anchor_evidence")
+    }
+
+
+def _evidence_oracle(conn):
+    out = {}
+    for row in conn.execute(
+            "SELECT source_root_key, observed_slot, logical_limit_key,"
+            " resets_at_utc, source_path, line_offset, id"
+            " FROM quota_window_snapshots"
+            " WHERE source='codex' AND observed_slot IS NOT NULL"):
+        bucket, order = tuple(row[:4]), tuple(row[4:])
+        if bucket in out:
+            count, minimum = out[bucket]
+            out[bucket] = (count + 1, min(minimum, order))
+        else:
+            out[bucket] = (1, order)
+    return out
+
+
+def _assert_evidence_exact(conn, *, stale_allowed=False):
+    """Exact counts, exact non-stale minima, stale rows a strict lower bound."""
+    assert _meta(conn, EVIDENCE_STATE_KEY) == "ready"
+    summary, oracle = _evidence_summary(conn), _evidence_oracle(conn)
+    assert set(summary) == set(oracle)
+    for bucket, (count, minimum, stale) in summary.items():
+        assert count == oracle[bucket][0], bucket
+        if stale:
+            assert stale_allowed, ("unexpected stale bucket", bucket)
+            assert minimum < oracle[bucket][1], bucket
+        else:
+            assert minimum == oracle[bucket][1], bucket
+
+
+def _evidence_stale(conn):
+    return sorted(bucket for bucket, (_c, _m, stale)
+                  in _evidence_summary(conn).items() if stale)
+
+
+def _seed_evidence(conn):
+    def add(path, offset, **values):
+        _insert(conn, source_path=path, line_offset=offset, **values)
+
+    week = {"logical_limit_key": "limit-weekly", "window_minutes": 10080,
+            "resets_at_utc": "2026-07-25T00:00:00Z"}
+    # One bucket fed by three files; b holds its minimum through a row that
+    # does not hold the minimum offset (path decides first).
+    add(_EV_B, 7)
+    add(_EV_C, 1)
+    add(_EV_B, 9)
+    # The same instant spelled another way is another bucket.
+    add(_EV_C, 2, resets_at_utc="2026-07-20T15:00:00+00:00")
+    add(_EV_B, 3, **week)
+    add(_EV_C, 4, **week)
+    add(_EV_C, 5, observed_slot="secondary")
+    add(_EV_B, 11, observed_slot=None)               # out of scope
+    add(_EV_B, 12, source_root_key=ROOT_B)
+    add(_EV_C, 13, resets_at_utc="not-a-reset")      # kept, skipped at seed
+    add(_EV_B, 14, source="claude", source_root_key=None)
+    conn.commit()
+
+
+@pytest.fixture
+def evidence_conn(db, tmp_path):
+    connection = sqlite3.connect(tmp_path / "evidence.db")
+    db._apply_cache_schema(connection)
+    connection.commit()
+    _seed_evidence(connection)
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def _ev_ids(conn, path):
+    return [row[0] for row in conn.execute(
+        "SELECT id FROM quota_window_snapshots WHERE source='codex'"
+        " AND source_path=? ORDER BY id", (path,))]
+
+
+def _ev_statement_rollback(conn):
+    columns = ", ".join(COLUMNS)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            f"INSERT INTO quota_window_snapshots ({columns})"
+            f" SELECT {columns.replace('line_offset', 'line_offset + 500')}"
+            " FROM quota_window_snapshots WHERE source='codex'"
+            " UNION ALL SELECT 'codex', ?, ?, 999, '2026-07-20T10:00:00Z',"
+            " 'primary', 'limit-primary', 'codex', NULL, 300, 500.0,"
+            " '2026-07-20T15:00:00Z', NULL, NULL, NULL", (ROOT_A, _EV_A))
+
+
+def _ev_transaction_rollback(conn):
+    _insert(conn, source_path=_EV_A, line_offset=0)
+    conn.rollback()
+
+
+def _ev_heal(conn):
+    """A heal deletes a file's rows and re-inserts the same lines (new ids)."""
+    columns = list(COLUMNS)
+    rows = conn.execute(
+        f"SELECT {', '.join(columns)} FROM quota_window_snapshots"
+        " WHERE source='codex' AND source_path=? ORDER BY line_offset",
+        (_EV_B,)).fetchall()
+    conn.execute("DELETE FROM quota_window_snapshots WHERE source='codex'"
+                 " AND source_path=?", (_EV_B,))
+    assert _evidence_stale(conn), "non-vacuity: the delete staled a bucket"
+    conn.executemany(
+        f"INSERT OR IGNORE INTO quota_window_snapshots ({', '.join(columns)})"
+        f" VALUES ({', '.join('?' for _ in columns)})", rows)
+
+
+def _ev_applier_record(**over):
+    """One journal Codex quota observation, as `_apply_quota_records` reads it."""
+    payload = {
+        "kind": "quota_window_snapshot", "source": "codex",
+        "source_root_key": ROOT_A, "source_path": _EV_A, "line_offset": 60,
+        "captured_at_utc": "2026-07-20T10:00:00Z", "observed_slot": "primary",
+        "logical_limit_key": "limit-weekly", "limit_id": "codex",
+        "limit_name": None, "window_minutes": 10080, "used_percent": 10.0,
+        "resets_at_utc": "2026-07-25T00:00:00Z", "plan_type": None,
+        "individual_limit_json": None, "reached_type": None,
+        "observed_model": None,
+    }
+    payload.update(over)
+    return {"t": "obs", "provider": "codex", "payload": payload,
+            "account": None}
+
+
+class _CoveredOracle:
+    """Every record is covered by a durable decision for ``decided``."""
+
+    def __init__(self, decided):
+        self._decided = decided
+
+    def resolve(self, rec):
+        return True, self._decided
+
+
+def _ev_applier(conn, record, *, decided=None):
+    """The journal applier's real write path (`_apply_quota_records`): its
+    `INSERT OR IGNORE` for an uncovered record, or, with ``decided``, the
+    covered record's `ON CONFLICT ... DO UPDATE` upsert."""
+    import _cctally_journal as journal
+    with pytest.MonkeyPatch.context() as patch:
+        if decided is not None:
+            patch.setattr(journal, "_CodexAttributionOracle",
+                          lambda cache: _CoveredOracle(decided))
+        journal._apply_quota_records(conn, [record], quiet=True)
+
+
+def _ev_applier_insert(conn):
+    _ev_applier(conn, _ev_applier_record())
+    assert conn.execute(
+        "SELECT COUNT(*) FROM quota_window_snapshots WHERE source='codex'"
+        " AND source_path=? AND line_offset=60", (_EV_A,)).fetchone() == (1,), (
+        "non-vacuity: the applier inserted its row")
+
+
+def _ev_applier_upsert_update(conn):
+    """A covered re-apply of a stored row takes the upsert's DO UPDATE
+    branch (an UPDATE, which fires no insert trigger), and a second identical
+    re-apply changes nothing."""
+    natural = ("codex", _EV_B, 7, "limit-primary")
+    record = _ev_applier_record(
+        source_path=_EV_B, line_offset=7, logical_limit_key="limit-primary",
+        window_minutes=300, resets_at_utc="2026-07-20T15:00:00Z")
+    for _ in range(2):
+        _ev_applier(conn, record, decided="d" * 32)
+    assert conn.execute(
+        "SELECT account_key FROM quota_window_snapshots WHERE source=?"
+        " AND source_path=? AND line_offset=? AND logical_limit_key=?",
+        natural).fetchone() == ("d" * 32,), (
+        "non-vacuity: the DO UPDATE branch ran")
+
+
+#: name -> (mutation, summary moves, stale buckets expected afterwards).
+EVIDENCE_MUTATIONS = {
+    "walk-batch-insert": (lambda conn: conn.executemany(
+        f"INSERT OR IGNORE INTO quota_window_snapshots ({', '.join(COLUMNS)})"
+        f" VALUES ({', '.join('?' for _ in COLUMNS)})",
+        [("codex", ROOT_A, path, offset, "2026-07-20T10:00:00Z", "primary",
+          "limit-primary", "codex", None, 300, 10.0, reset, None, None, None)
+         for path, offset, reset in (
+             (_EV_A, 50, "2026-07-20T15:00:00Z"),      # takes the minimum
+             (_EV_C, 51, "2026-07-20T15:00:00Z"),      # counted only
+             (_EV_C, 52, "2026-07-20T15:20:00Z"))]),    # a new bucket
+        True, False),
+    "applier-insert": (_ev_applier_insert, True, False),
+    "applier-upsert-do-update": (_ev_applier_upsert_update, False, False),
+    "ignored-duplicate-insert": (lambda conn: _insert(
+        conn, verb="INSERT OR IGNORE", source_path=_EV_B, line_offset=7,
+        resets_at_utc="2026-07-21T00:00:00Z"), False, False),
+    "statement-rollback": (_ev_statement_rollback, False, False),
+    "transaction-rollback": (_ev_transaction_rollback, False, False),
+    "delete-a-non-minimum-row": (lambda conn: conn.execute(
+        "DELETE FROM quota_window_snapshots WHERE source='codex'"
+        " AND source_path=? AND line_offset=9", (_EV_B,)), True, False),
+    "delete-a-minimum-row": (lambda conn: conn.execute(
+        "DELETE FROM quota_window_snapshots WHERE source='codex'"
+        " AND source_path=? AND line_offset=7", (_EV_B,)), True, True),
+    "prune-delete": (lambda conn: conn.execute(
+        "DELETE FROM quota_window_snapshots WHERE source='codex'"
+        " AND source_path=?", (_EV_B,)), True, True),
+    "heal-delete-and-reinsert": (_ev_heal, True, False),
+    "whole-provider-delete": (lambda conn: conn.execute(
+        "DELETE FROM quota_window_snapshots WHERE source='codex'"), True, False),
+    "non-key-updates": (lambda conn: conn.execute(
+        "UPDATE quota_window_snapshots SET canonical_resets_at_utc="
+        "'2026-07-20T15:00:00Z', observed_model='gpt-5', account_key=?,"
+        " used_percent=42.0, captured_at_utc='2026-07-21T00:00:00Z',"
+        " window_minutes=301", ("d" * 32,)), False, False),
+}
+
+
+def test_1033_a_fresh_schema_installs_a_ready_exact_evidence_summary(
+        db, evidence_conn):
+    assert EVIDENCE_OBJECTS <= _objects(evidence_conn)
+    assert len(_evidence_summary(evidence_conn)) == 6, (
+        "non-vacuity: six in-scope buckets (the NULL slot is excluded)")
+    _assert_evidence_exact(evidence_conn)
+
+
+@pytest.mark.parametrize("name", sorted(EVIDENCE_MUTATIONS))
+def test_1033_the_evidence_summary_tracks_every_writer_class(
+        evidence_conn, name):
+    """Summary drift that would seed wrong anchors, after each writer class."""
+    mutate, moves, stale = EVIDENCE_MUTATIONS[name]
+    before = _evidence_summary(evidence_conn)
+    generation = _evidence_generation(evidence_conn)
+    mutate(evidence_conn)
+    evidence_conn.commit()
+    assert (_evidence_summary(evidence_conn) != before) == moves, name
+    assert bool(_evidence_stale(evidence_conn)) == stale, name
+    assert _evidence_generation(evidence_conn) == generation, (
+        "inserts and deletes never advance the invalidation generation")
+    _assert_evidence_exact(evidence_conn, stale_allowed=stale)
+
+
+def test_1033_a_heal_reinsert_clears_the_staleness_its_delete_caused(
+        evidence_conn):
+    """R-a: re-inserted rows keep (path, offset) and gain a larger id, which
+    the full-tuple rule would never accept below the stale minimum."""
+    buckets = set(_evidence_summary(evidence_conn))
+    _ev_heal(evidence_conn)
+    evidence_conn.commit()
+    assert set(_evidence_summary(evidence_conn)) == buckets
+    assert _evidence_stale(evidence_conn) == []
+    _assert_evidence_exact(evidence_conn)
+
+
+def test_1033_a_stale_minimum_is_cleared_only_by_a_lower_prefix(evidence_conn):
+    evidence_conn.execute(
+        "DELETE FROM quota_window_snapshots WHERE source='codex'"
+        " AND source_path=? AND line_offset=7", (_EV_B,))
+    stale = _evidence_stale(evidence_conn)
+    assert len(stale) == 1
+    _insert(evidence_conn, source_path=_EV_C, line_offset=70)   # above: stays
+    assert _evidence_stale(evidence_conn) == stale
+    _assert_evidence_exact(evidence_conn, stale_allowed=True)
+    _insert(evidence_conn, source_path=_EV_A, line_offset=71)   # below: exact
+    assert _evidence_stale(evidence_conn) == []
+    evidence_conn.commit()
+    _assert_evidence_exact(evidence_conn)
+
+
+@pytest.mark.parametrize("column", EVIDENCE_KEY_ORDER_COLUMNS)
+def test_1033_a_key_or_order_update_invalidates_the_summary(
+        evidence_conn, column):
+    """An UPDATE that moves a row between buckets or changes its order would
+    leave the summary silently wrong; it flips the state and advances the
+    generation instead (an id-only update included, which the change ledger
+    cannot see)."""
+    new_value = {
+        "source": "claude", "source_root_key": ROOT_B,
+        "observed_slot": "secondary", "logical_limit_key": "limit-other",
+        "resets_at_utc": "2026-07-21T00:00:00Z", "source_path": _EV_A,
+        "line_offset": 900, "id": 90_000,
+    }[column]
+    target = _ev_ids(evidence_conn, _EV_C)[0]
+    generation = _evidence_generation(evidence_conn)
+    if column == "source":
+        evidence_conn.execute(
+            "UPDATE quota_window_snapshots SET source='claude',"
+            " source_root_key=NULL WHERE id=?", (target,))
+    else:
+        evidence_conn.execute(
+            f"UPDATE quota_window_snapshots SET {column}=? WHERE id=?",
+            (new_value, target))
+    evidence_conn.commit()
+    assert _meta(evidence_conn, EVIDENCE_STATE_KEY) == "bootstrap"
+    assert _evidence_generation(evidence_conn) > generation
+
+
+def test_1033_same_value_and_out_of_scope_updates_keep_the_summary(
+        evidence_conn):
+    generation = _evidence_generation(evidence_conn)
+    evidence_conn.execute(
+        "UPDATE quota_window_snapshots SET resets_at_utc=resets_at_utc,"
+        " id=id, source_path=source_path")
+    evidence_conn.execute(
+        "UPDATE quota_window_snapshots SET resets_at_utc='2026-07-22T00:00:00Z'"
+        " WHERE observed_slot IS NULL OR source='claude'")
+    evidence_conn.commit()
+    assert _evidence_generation(evidence_conn) == generation
+    _assert_evidence_exact(evidence_conn)
+
+
+def test_1033_a_bootstrap_state_turns_insert_and_delete_maintenance_off(
+        evidence_conn):
+    evidence_conn.execute(
+        "UPDATE cache_meta SET value='bootstrap' WHERE key=?",
+        (EVIDENCE_STATE_KEY,))
+    before = _evidence_summary(evidence_conn)
+    _insert(evidence_conn, source_path=_EV_A, line_offset=80)
+    evidence_conn.execute(
+        "DELETE FROM quota_window_snapshots WHERE source='codex'"
+        " AND source_path=?", (_EV_C,))
+    evidence_conn.commit()
+    assert _evidence_summary(evidence_conn) == before
+    assert _meta(evidence_conn, EVIDENCE_STATE_KEY) == "bootstrap"
+
+
+def test_1033_a_delete_whose_bucket_is_missing_invalidates_the_summary(
+        evidence_conn):
+    evidence_conn.execute(
+        "DELETE FROM codex_reset_anchor_evidence"
+        " WHERE logical_limit_key='limit-weekly'")
+    evidence_conn.execute(
+        "DELETE FROM quota_window_snapshots WHERE source='codex'"
+        " AND logical_limit_key='limit-weekly'")
+    evidence_conn.commit()
+    assert _meta(evidence_conn, EVIDENCE_STATE_KEY) == "bootstrap"
+
+
+def test_1033_a_randomized_writer_sequence_keeps_the_evidence_exact(
+        evidence_conn):
+    rng = random.Random(1033)
+    paths = (_EV_A, _EV_B, _EV_C, "/roots/a/sessions/d.jsonl")
+    resets = ("2026-07-20T15:00:00Z", "2026-07-20T15:00:00+00:00",
+              "2026-07-20T15:09:00Z", "2026-07-25T00:00:00Z")
+    for step in range(400):
+        roll = rng.random()
+        if roll < 0.25:
+            ids = [row[0] for row in evidence_conn.execute(
+                "SELECT id FROM quota_window_snapshots")]
+            if ids:
+                evidence_conn.execute(
+                    "DELETE FROM quota_window_snapshots WHERE id=?",
+                    (rng.choice(ids),))
+        elif roll < 0.35:
+            path = rng.choice(paths)
+            rows = evidence_conn.execute(
+                f"SELECT {', '.join(COLUMNS)} FROM quota_window_snapshots"
+                " WHERE source='codex' AND source_path=?", (path,)).fetchall()
+            evidence_conn.execute(
+                "DELETE FROM quota_window_snapshots WHERE source='codex'"
+                " AND source_path=?", (path,))
+            evidence_conn.executemany(
+                f"INSERT OR IGNORE INTO quota_window_snapshots"
+                f" ({', '.join(COLUMNS)})"
+                f" VALUES ({', '.join('?' for _ in COLUMNS)})", rows)
+        else:
+            _insert(
+                evidence_conn, verb="INSERT OR IGNORE",
+                source_path=rng.choice(paths),
+                line_offset=rng.randrange(0, 40),
+                observed_slot=rng.choice(("primary", "secondary", None)),
+                logical_limit_key=rng.choice(("limit-primary", "limit-weekly")),
+                resets_at_utc=rng.choice(resets))
+        if step % 25 == 24:
+            evidence_conn.commit()
+            _assert_evidence_exact(evidence_conn, stale_allowed=True)
+    evidence_conn.commit()
+    _assert_evidence_exact(evidence_conn, stale_allowed=True)
+

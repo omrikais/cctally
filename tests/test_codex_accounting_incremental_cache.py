@@ -861,3 +861,326 @@ def test_thread_trigger_work_is_bounded_by_its_own_conversation(
     big = _thread_trigger_steps(
         tmp_path, entries=5000, files=500, verb=verb, matching=matching)
     assert big <= small + 64, (verb, matching, small, big)
+
+
+# === #1059 — the Codex twin: forced re-qualification after a regroup =======
+#
+# The accounting cache retains each entry's `project_key`, resolved at load
+# time, and reloads only ledger-dirty paths. A worktree removal moves no
+# ledger row, so without forced paths the Codex and All views keep the old
+# grouping for the life of the process.
+
+_REGROUP_ROOT = "root-a"
+_REGROUP_ARM = 1000.0
+
+
+class _CodexRegroup:
+    """A real cache store whose thread cwds live in a regroup fixture tree,
+    read through the real qualified loader exactly as the dashboard wires it:
+    one observing memo per load."""
+
+    def __init__(self, tmp_path, monkeypatch):
+        from conftest import make_regroup_tree
+        self.ns = load_script()
+        redirect_paths(self.ns, monkeypatch, tmp_path / "data")
+        self.sc = self.ns["_lib_snapshot_cache"]
+        self.tui = self.ns["_load_sibling"]("_cctally_tui")
+        self.analytics = self.ns["_load_sibling"]("_cctally_source_analytics")
+        self.tree = make_regroup_tree(tmp_path / "tree")
+        self.conn = self.ns["open_cache_db"]()
+        self.offset = 0
+        for conv, native, cwd, git_json in (
+            ("c-feat", "n-feat", str(self.tree.feature), None),
+            ("c-main", "n-main", str(self.tree.main), None),
+            ("c-git", "n-git", None, '{"remote":"git@example:x"}'),
+            ("c-inh", "n-inh", None, None),
+            ("c-alias", "n-alias", str(self.tree.feature), None),
+        ):
+            self.conn.execute(
+                "INSERT INTO codex_conversation_threads "
+                "(conversation_key, source_root_key, native_thread_id, "
+                " root_thread_id, source_path, cwd, git_json) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (conv, _REGROUP_ROOT, native, native, f"/threads/{conv}.jsonl",
+                 cwd, git_json),
+            )
+        # The inherited-cwd path: its own thread has no cwd, and its file
+        # alias names the thread whose cwd is the worktree.
+        self.conn.execute(
+            "INSERT INTO codex_session_files "
+            "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+            " last_native_thread_id, source_root_key) VALUES (?,?,?,?,?,?,?)",
+            ("/rollouts/inh.jsonl", 1, 1, 1, START.isoformat(), "n-alias",
+             _REGROUP_ROOT),
+        )
+        for path, conv in self.PATHS.items():
+            self.entry(path, conv)
+        self.conn.commit()
+        self.sc.reset_codex_accounting_cache_state()
+        self.sc.reset_project_identity_state()
+
+    PATHS = {
+        "/rollouts/feat.jsonl": "c-feat",
+        "/rollouts/main.jsonl": "c-main",
+        "/rollouts/git.jsonl": "c-git",
+        "/rollouts/inh.jsonl": "c-inh",
+    }
+
+    def entry(self, path, conv):
+        self.offset += 1
+        _insert_entry(self.conn, path=path, root=_REGROUP_ROOT,
+                      offset=self.offset)
+        self.conn.execute(
+            "UPDATE codex_session_entries SET conversation_key=? "
+            "WHERE source_path=? AND line_offset=?", (conv, path, self.offset))
+        self.conn.commit()
+
+    def load(self, identities=None):
+        return self.analytics.load_qualified_codex_entries(
+            START, END, speed="standard", sync=False, cache_conn=self.conn,
+            source_identities=identities,
+            project_resolver_cache=self.sc.observing_project_memo(),
+        )
+
+    def build(self):
+        return self.sc.build_cached_codex_accounting(
+            cache_conn=self.conn, range_start=START, range_end=END,
+            extra_signature=("standard",),
+            load_all=self.load, load_paths=self.load,
+            path_of=lambda e: (str(e.source_root_key), str(e.source_path)),
+            account_of=lambda e: str(e.account_key),
+            order_key=lambda e: (e.timestamp, str(e.source_root_key),
+                                 str(e.conversation_key),
+                                 int(e.cache_entry_id)),
+            identity_of=lambda e: int(e.cache_entry_id),
+        )
+
+    def sweep(self, now):
+        return self.tui._tui_revalidate_project_identities(now_monotonic=now)
+
+    def key(self, path):
+        from _lib_source_analytics import opaque_project_key
+        return opaque_project_key("codex", _REGROUP_ROOT, str(path))
+
+    @staticmethod
+    def keys_by_path(result):
+        out = {}
+        for e in result.entries:
+            out.setdefault(e.source_path, set()).add(e.project_key)
+        return out
+
+    def cold_oracle(self):
+        self.sc.reset_codex_accounting_cache_state()
+        self.sc.reset_project_identity_state()
+        return self.keys_by_path(self.build())
+
+
+def test_codex_regroup_forces_a_filesystem_only_requalification(
+    tmp_path, monkeypatch,
+):
+    """Detects Codex rows that keep a removed worktree's project after the
+    sweep, an inherited cwd that escapes the requalification, and a
+    `git_json` identity reloaded for nothing."""
+    from conftest import remove_worktree
+    h = _CodexRegroup(tmp_path, monkeypatch)
+    sc = h.sc
+    try:
+        h.sweep(_REGROUP_ARM)
+        cold = h.build()
+        assert cold.cold is True
+        before = h.keys_by_path(cold)
+        assert before["/rollouts/feat.jsonl"] == {h.key(h.tree.feature)}
+        assert before["/rollouts/inh.jsonl"] == {h.key(h.tree.feature)}
+        git_entry = next(e for e in cold.entries
+                         if e.source_path == "/rollouts/git.jsonl")
+        assert h.build().dirty_paths == ()
+
+        remove_worktree(h.tree)
+        work = sc.project_work_stats()
+        assert h.build().dirty_paths == (), "no ledger row moved"
+        h.sweep(_REGROUP_ARM + 61)
+        assert sc.codex_accounting_work_outstanding()
+        warm = h.build()
+        assert warm.cold is False
+        assert set(warm.dirty_paths) == {
+            (_REGROUP_ROOT, "/rollouts/feat.jsonl"),
+            (_REGROUP_ROOT, "/rollouts/inh.jsonl"),
+        }, "exactly the stale-bucket paths are re-qualified"
+        after = h.keys_by_path(warm)
+        assert after["/rollouts/feat.jsonl"] == {h.key(h.tree.main)}, (
+            "stale grouping: the Codex row still names the removed worktree")
+        assert after["/rollouts/inh.jsonl"] == {h.key(h.tree.main)}
+        assert next(e for e in warm.entries
+                    if e.source_path == "/rollouts/git.jsonl") is git_entry
+        assert warm.provenance_token != cold.provenance_token
+        assert not sc.codex_accounting_work_outstanding()
+        assert sc.project_work_stats()["codexLoadPaths"] == (
+            work["codexLoadPaths"] + 1)
+        assert sum(e.total_tokens for e in warm.entries) == sum(
+            e.total_tokens for e in cold.entries)
+        assert h.cold_oracle() == after
+    finally:
+        sc.reset_codex_accounting_cache_state()
+        h.conn.close()
+
+
+@pytest.mark.parametrize("third", ["A", "C"])
+def test_codex_regroup_after_an_intermediate_ledger_reload(
+    tmp_path, monkeypatch, third,
+):
+    """A ledger-dirty reload between sweeps qualifies a path under an
+    intermediate identity B; when the filesystem returns to A (or moves on to
+    C) before the sweep, that B-qualified population must be forced too."""
+    from conftest import recreate_worktree, remove_worktree
+    h = _CodexRegroup(tmp_path, monkeypatch)
+    sc = h.sc
+    try:
+        h.sweep(_REGROUP_ARM)
+        h.build()
+        remove_worktree(h.tree)
+        h.entry("/rollouts/feat.jsonl", "c-feat")
+        mid = h.build()
+        assert mid.dirty_paths == ((_REGROUP_ROOT, "/rollouts/feat.jsonl"),)
+        assert h.keys_by_path(mid)["/rollouts/feat.jsonl"] == {
+            h.key(h.tree.main)}
+        if third == "A":
+            recreate_worktree(h.tree)
+        else:
+            h.tree.main.rename(h.tree.root / "elsewhere")
+        h.sweep(_REGROUP_ARM + 61)
+        warm = h.build()
+        result = h.keys_by_path(warm)
+        assert result == h.cold_oracle()
+        if third == "A":
+            assert result["/rollouts/feat.jsonl"] == {h.key(h.tree.feature)}
+    finally:
+        sc.reset_codex_accounting_cache_state()
+        h.conn.close()
+
+
+def test_codex_unchanged_sweep_reloads_nothing(tmp_path, monkeypatch):
+    """An unchanged due sweep that forced paths would reload Codex accounting
+    every minute on an idle dashboard."""
+    h = _CodexRegroup(tmp_path, monkeypatch)
+    sc = h.sc
+    try:
+        h.sweep(_REGROUP_ARM)
+        h.build()
+        work = sc.project_work_stats()
+        for step in (1, 2, 3):
+            h.sweep(_REGROUP_ARM + 61 * step)
+            assert h.build().dirty_paths == ()
+        after = sc.project_work_stats()
+        assert after["codexLoadAll"] == work["codexLoadAll"]
+        assert after["codexLoadPaths"] == work["codexLoadPaths"]
+        assert not sc.codex_accounting_work_outstanding()
+    finally:
+        sc.reset_codex_accounting_cache_state()
+        h.conn.close()
+
+
+@dataclass(frozen=True, order=True)
+class _PathEntry:
+    source_root_key: str
+    source_path: str
+
+
+def _fake_accounting(tmp_path, monkeypatch, *, paths):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    conn = ns["open_cache_db"]()
+    cache = ns["_lib_snapshot_cache"]
+    cache.reset_codex_accounting_cache_state()
+    cache.reset_project_identity_state()
+    rows = tuple(_PathEntry(_REGROUP_ROOT, f"/rollouts/{i}.jsonl")
+                 for i in range(paths))
+    loads = {"all": 0, "paths": [], "fail": False}
+
+    def load_all():
+        loads["all"] += 1
+        return tuple(rows)
+
+    def load_paths(identities):
+        if loads["fail"]:
+            raise RuntimeError("injected load failure")
+        loads["paths"].append(tuple(identities))
+        return tuple(_PathEntry(*identity) for identity in identities)
+
+    def build():
+        return cache.build_cached_codex_accounting(
+            cache_conn=conn, range_start=START, range_end=END,
+            extra_signature=("standard",), load_all=load_all,
+            load_paths=load_paths,
+            path_of=lambda entry: (entry.source_root_key, entry.source_path),
+            account_of=lambda _entry: "", order_key=lambda entry: entry,
+        )
+
+    return conn, cache, loads, build
+
+
+@pytest.mark.parametrize("forced, ledger, expect_cold", [
+    (160, 150, True),    # 310 > 300: the union crosses the bound
+    (100, 150, False),   # 250 stays warm
+])
+def test_forced_paths_count_toward_the_dirty_path_bound(
+    tmp_path, monkeypatch, forced, ledger, expect_cold,
+):
+    """Forced paths added after the bound check would issue a qualified path
+    read beyond the SQLite variable budget the bound protects."""
+    conn, cache, loads, build = _fake_accounting(
+        tmp_path, monkeypatch, paths=400)
+    try:
+        assert build().cold is True
+        added = cache.force_codex_accounting_paths(
+            lambda entry: int(
+                entry.source_path.split("/")[-1].split(".")[0]) < forced)
+        assert added == forced
+        conn.execute(
+            "UPDATE cache_meta SET value=? "
+            "WHERE key='codex_accounting_mutation_seq'", (str(ledger),))
+        conn.executemany(
+            "INSERT INTO codex_accounting_change_log "
+            "(mutation_seq, change_kind, source_root_key, source_path) "
+            "VALUES (?, 'path', ?, ?)",
+            ((i, _REGROUP_ROOT, f"/rollouts/{399 - i + 1}.jsonl")
+             for i in range(1, ledger + 1)),
+        )
+        conn.commit()
+        result = build()
+        assert result.cold is expect_cold
+        if not expect_cold:
+            assert len(result.dirty_paths) == forced + ledger
+        assert not cache.codex_accounting_work_outstanding()
+    finally:
+        cache.reset_codex_accounting_cache_state()
+        conn.close()
+
+
+def test_forced_paths_survive_checkpoint_restore_and_a_failed_load(
+    tmp_path, monkeypatch,
+):
+    """Pending forced paths dropped by a rolled-back source build or a failed
+    load would leave the regrouped Codex rows stale for the process life."""
+    conn, cache, loads, build = _fake_accounting(tmp_path, monkeypatch, paths=4)
+    try:
+        build()
+        cache.force_codex_accounting_paths(
+            lambda e: e.source_path == "/rollouts/1.jsonl")
+        expected = frozenset({(_REGROUP_ROOT, "/rollouts/1.jsonl")})
+        assert cache._CODEX_ACCOUNTING_CACHE_STATE["forced_paths"] == expected
+        checkpoint = cache.checkpoint_codex_accounting_cache_state()
+        loads["fail"] = True
+        with pytest.raises(RuntimeError):
+            build()
+        assert cache._CODEX_ACCOUNTING_CACHE_STATE["forced_paths"] == expected
+        cache.restore_codex_accounting_cache_state(checkpoint)
+        assert cache._CODEX_ACCOUNTING_CACHE_STATE["forced_paths"] == expected
+        assert cache.codex_accounting_cache_pending(conn)
+        loads["fail"] = False
+        result = build()
+        assert result.dirty_paths == tuple(sorted(expected))
+        assert not cache._CODEX_ACCOUNTING_CACHE_STATE.get("forced_paths")
+        assert not cache.codex_accounting_cache_pending(conn)
+    finally:
+        cache.reset_codex_accounting_cache_state()
+        conn.close()

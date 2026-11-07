@@ -1749,6 +1749,97 @@ class CodexWalkDeadline(Exception):
     identity instead of deferring the file."""
 
 
+def _codex_reset_anchor_summary_sql(key_count: int) -> str:
+    """The summary seed's ONE statement (#1033 spec §5.2).
+
+    One read snapshot returns a header row (``kind = 0``: the readiness value
+    and how many of the table and its three triggers exist) and the group's
+    summary rows (``kind = 1``), each a primary-key seek per candidate key.
+    UNION ALL and scalar subqueries build no temp structure.
+    """
+    db = _cctally_db_sib
+    names = [name for _kind, name in db.CODEX_RESET_ANCHOR_EVIDENCE_OBJECTS]
+    triggers = [name for kind, name in db.CODEX_RESET_ANCHOR_EVIDENCE_OBJECTS
+                if kind == "trigger"]
+    placeholders = ",".join("?" for _ in range(key_count))
+    return (
+        "SELECT 0, (SELECT value FROM cache_meta WHERE key = "
+        f"'{db.CODEX_RESET_ANCHOR_EVIDENCE_STATE_KEY}'), "
+        "(SELECT COUNT(*) FROM sqlite_master WHERE "
+        f"(type = 'table' AND name = '{names[0]}') OR (type = 'trigger' "
+        "AND tbl_name = 'quota_window_snapshots' AND name IN ("
+        + ", ".join(f"'{name}'" for name in triggers)
+        + "))), NULL, NULL, NULL, NULL "
+        "UNION ALL "
+        "SELECT 1, resets_at_utc, row_count, min_source_path, "
+        "min_line_offset, min_id, stale "
+        "FROM codex_reset_anchor_evidence "
+        "WHERE source_root_key = ? AND observed_slot = ? "
+        f"AND logical_limit_key IN ({placeholders})")
+
+
+def _codex_reset_anchor_summary_seed(
+    conn, root_key: str, slot: str, keys: "Sequence[str]", *,
+    deadline: "float | None", clock,
+) -> "_lib_quota.ResetAnchorComponents | None":
+    """Seed one anchor group from the evidence summary, or ``None``.
+
+    ``None`` means fall back to the full history read: the summary is not
+    ``ready``, its table or a trigger is missing, a returned bucket is stale,
+    the statement raised a database error (for example the table does not
+    exist yet, as during the pre-053 migration backfills), or a returned row
+    is corrupt (a ``ValueError`` or ``TypeError`` while folding it, such as a
+    count below one or a non-integer offset). The full read's
+    ``_seed_failed`` meaning is untouched. Inside a write transaction the
+    summary carries that transaction's own uncommitted rows, because the
+    triggers ran in it, exactly as the full read would see them.
+
+    A budgeted walk arms ``_codex_cancellable_read`` around the statement and
+    checks the deadline every ``_CODEX_FINALIZATION_CHECK_EVERY`` entries;
+    ``CodexWalkDeadline`` propagates and nothing is returned, so a partial
+    group is never cached.
+    """
+    sql = _codex_reset_anchor_summary_sql(len(keys))
+    params = (str(root_key), str(slot), *keys)
+    try:
+        if deadline is None:
+            rows = conn.execute(sql, params).fetchall()
+        else:
+            with _codex_cancellable_read(
+                    conn, deadline, clock, cancelled=CodexWalkDeadline):
+                rows = conn.execute(sql, params).fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    header = [row for row in rows if row[0] == 0]
+    if (len(header) != 1
+            or header[0][1] != _cctally_db_sib.CODEX_RESET_ANCHOR_EVIDENCE_READY
+            or header[0][2] != 4):
+        return None
+    entries = []
+    index = 0
+    try:
+        for row in rows:
+            if row[0] != 1:
+                continue
+            if row[6] != 0:
+                return None
+            if (deadline is not None and index
+                    and index % _CODEX_FINALIZATION_CHECK_EVERY == 0
+                    and clock() >= deadline):
+                raise CodexWalkDeadline("deadline")
+            index += 1
+            parsed = _parse_anchor_iso(row[1])
+            if parsed is not None:
+                entries.append((parsed, (str(row[3]), int(row[4]),
+                                         int(row[5])), int(row[2])))
+        return _lib_quota.ResetAnchorComponents.from_evidence(entries)
+    except (ValueError, TypeError):
+        # A corrupt row (the table's CHECKs bypassed) seeds nothing; the full
+        # read decides, as for a database error. `CodexWalkDeadline` is
+        # neither, so it propagates.
+        return None
+
+
 class CodexResetAnchorResolver:
     """Resolve one Codex quota observation's canonical reset anchor.
 
@@ -1818,10 +1909,20 @@ class CodexResetAnchorResolver:
             if components is not None:
                 self._groups[group] = components
                 return components
+        candidates = _lib_jsonl.codex_snap_equivalent_limit_keys(
+            str(logical_limit_key))
+        # #1033 spec §5.2: the exact evidence summary seeds the same
+        # components as the full read below from O(distinct raw resets) rows;
+        # `None` (not ready, an object missing, a stale bucket, a database
+        # error) falls back to that read unchanged.
+        components = _codex_reset_anchor_summary_seed(
+            self._conn, str(group[0]), group[1], candidates,
+            deadline=self._deadline, clock=self._clock)
+        if components is not None:
+            self._groups[group] = components
+            return components
         components = _lib_quota.ResetAnchorComponents()
         if not self._seed_failed:
-            candidates = _lib_jsonl.codex_snap_equivalent_limit_keys(
-                str(logical_limit_key))
             placeholders = ",".join("?" for _ in candidates)
             # #901 Q11: the unary `+` keeps the plan this read always had, a
             # walk of the `(source, source_path, line_offset, ...)` unique
@@ -5131,7 +5232,20 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
             "SELECT CAST(value AS INTEGER), 'full' FROM cache_meta "
             "WHERE key='codex_accounting_mutation_seq'"
         )
+    # #1033 spec §5.4: the per-row evidence triggers are no-ops while the
+    # state is not ``ready``; the cleared summary is then exact and empty.
+    _evidence = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (_cctally_db_sib.CODEX_RESET_ANCHOR_EVIDENCE_TABLE,)).fetchone()
+    if _evidence is not None:
+        _cctally_db_sib._set_codex_reset_anchor_evidence_state(
+            conn, _cctally_db_sib.CODEX_RESET_ANCHOR_EVIDENCE_BOOTSTRAP)
     conn.execute("DELETE FROM quota_window_snapshots WHERE source = 'codex'")
+    if _evidence is not None:
+        conn.execute("DELETE FROM codex_reset_anchor_evidence")
+        _cctally_db_sib._advance_codex_reset_anchor_evidence_generation(conn)
+        _cctally_db_sib._set_codex_reset_anchor_evidence_state(
+            conn, _cctally_db_sib.CODEX_RESET_ANCHOR_EVIDENCE_READY)
     conn.execute("DELETE FROM codex_conversation_threads")
     conn.execute("DELETE FROM codex_conversation_events")
     conn.execute("DELETE FROM codex_session_files")
@@ -7069,18 +7183,27 @@ def _codex_executor_next_unit(
     """The next non-prune unit the executor owes, re-read from the store.
 
     Finalization debt first (a refused projection waits on its model flag),
-    then the ingest catch-up a budgeted walk deferred at the anchor seed
-    deadline (#980 F4), then the accounting change-log prune, then one
+    then the reset-anchor evidence bootstrap (#1033, so a deferred catch-up
+    file seeds from a ready summary), then the ingest catch-up a budgeted walk
+    deferred at the anchor seed deadline (#980 F4), then the evidence repair
+    (it runs only once prune debt is empty, so one run's repairs are batched
+    after its pruning), then the accounting change-log prune, then one
     TRUNCATE attempt. A kind in ``blocked`` failed or stalled earlier in this
     run and waits for the next.
     """
     if ("finalization" not in blocked
             and not load_codex_finalization_debt(conn).empty):
         return "finalization"
+    evidence = _codex_reset_anchor_evidence_work(conn)
+    if (evidence == "bootstrap"
+            and CODEX_EVIDENCE_BOOTSTRAP_UNIT not in blocked):
+        return CODEX_EVIDENCE_BOOTSTRAP_UNIT
     if "ingest_catch_up" not in blocked:
         whole_tree, paths = load_codex_owed_catch_up(conn)
         if whole_tree or paths:
             return "ingest_catch_up"
+    if evidence == "repair" and CODEX_EVIDENCE_REPAIR_UNIT not in blocked:
+        return CODEX_EVIDENCE_REPAIR_UNIT
     owed = load_codex_owed_maintenance(conn)
     if owed.get("change_log_prune") and "change_log_prune" not in blocked:
         return "change_log_prune"
@@ -7219,6 +7342,298 @@ def _run_codex_ingest_catch_up_unit(conn: sqlite3.Connection, adm) -> str:
     return "done"
 
 
+# ── #1033 spec §5.3: bootstrap and repair of the reset-anchor evidence ───────
+
+CODEX_EVIDENCE_BOOTSTRAP_UNIT = "reset_anchor_evidence_bootstrap"
+CODEX_EVIDENCE_REPAIR_UNIT = "reset_anchor_evidence_repair"
+
+#: Prepare/publish attempts one unit kind may spend per run (one drain run,
+#: or one inline ``cache-sync`` run), shared across yields: a token mismatch,
+#: a ``None`` token and every admission refusal (the setup step's included)
+#: each spend one. Once spent, the unit is blocked for the rest of the run,
+#: its work still owed.
+_CODEX_EVIDENCE_ATTEMPTS = 3
+
+#: Private test seam: called after each prepare, before admission, as
+#: ``hook(kind, attempt)``.
+_CODEX_EVIDENCE_PREPUBLISH_HOOK: "Callable[[str, int], None] | None" = None
+
+
+def _codex_reset_anchor_evidence_columns_ok(conn: sqlite3.Connection) -> bool:
+    """The columns the triggers read exist (a legacy-shape cache whose schema
+    apply returned early never receives the summary, and owes nothing)."""
+    columns = {
+        str(row[0]) for row in conn.execute(
+            "SELECT name FROM pragma_table_info('quota_window_snapshots')")
+    }
+    return set(
+        _cctally_db_sib._CODEX_RESET_ANCHOR_EVIDENCE_UPDATE_OF) <= columns
+
+
+def _codex_reset_anchor_evidence_objects(conn: sqlite3.Connection) -> int:
+    names = [name for _kind, name
+             in _cctally_db_sib.CODEX_RESET_ANCHOR_EVIDENCE_OBJECTS]
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name IN "
+        f"({','.join('?' for _ in names)})", names).fetchone()[0])
+
+
+def _codex_reset_anchor_evidence_work(conn: sqlite3.Connection) -> "str | None":
+    """The evidence summary's owed work: ``"bootstrap"`` when any of its five
+    objects is missing or the state is not ``ready``, ``"repair"`` when a
+    stale bucket exists (served by the partial index), else ``None``."""
+    db = _cctally_db_sib
+    if not _codex_reset_anchor_evidence_columns_ok(conn):
+        return None
+    if _codex_reset_anchor_evidence_objects(conn) != len(
+            db.CODEX_RESET_ANCHOR_EVIDENCE_OBJECTS):
+        return "bootstrap"
+    state = conn.execute(
+        "SELECT value FROM cache_meta WHERE key=?",
+        (db.CODEX_RESET_ANCHOR_EVIDENCE_STATE_KEY,)).fetchone()
+    if state is None or state[0] != db.CODEX_RESET_ANCHOR_EVIDENCE_READY:
+        return "bootstrap"
+    if conn.execute(
+            "SELECT 1 FROM codex_reset_anchor_evidence WHERE stale = 1 "
+            "LIMIT 1").fetchone() is not None:
+        return "repair"
+    return None
+
+
+def _codex_reset_anchor_evidence_aggregate(rows) -> dict:
+    """``(root, slot, key, raw) -> [count, (path, offset, id)]`` with the
+    LEXICOGRAPHIC minimum tuple (never per-column minima), in one pass."""
+    out: dict = {}
+    for root, slot, key, raw, path, offset, row_id in rows:
+        bucket = (root, slot, key, raw)
+        order = (path, offset, row_id)
+        entry = out.get(bucket)
+        if entry is None:
+            out[bucket] = [1, order]
+        else:
+            entry[0] += 1
+            if order < entry[1]:
+                entry[1] = order
+    return out
+
+
+def _codex_reset_anchor_evidence_token(conn: sqlite3.Connection):
+    """The publication token, or ``None`` when publication cannot be trusted:
+    the walk-share token (store identity, schema version, the quota ledger's
+    sequence, the physical mutation sequence) plus the evidence generation,
+    the state value and how many of the five objects exist. Any insert or
+    delete moves the ledger sequence; a key or order UPDATE (``id`` included,
+    which the ledger cannot see) moves the generation."""
+    walk = _CodexWalkShare.token(conn)
+    if walk is None:
+        return None
+    db = _cctally_db_sib
+    meta = dict(conn.execute(
+        "SELECT key, value FROM cache_meta WHERE key IN (?, ?)",
+        (db.CODEX_RESET_ANCHOR_EVIDENCE_STATE_KEY,
+         db.CODEX_RESET_ANCHOR_EVIDENCE_GENERATION_KEY)).fetchall())
+    return (walk, meta.get(db.CODEX_RESET_ANCHOR_EVIDENCE_GENERATION_KEY),
+            meta.get(db.CODEX_RESET_ANCHOR_EVIDENCE_STATE_KEY),
+            _codex_reset_anchor_evidence_objects(conn))
+
+
+_EVIDENCE_SCAN_COLUMNS = (
+    "source_root_key, observed_slot, logical_limit_key, resets_at_utc, "
+    "source_path, line_offset, id")
+
+
+def _codex_reset_anchor_evidence_prepare(conn: sqlite3.Connection, kind: str):
+    """One read snapshot: the token and the aggregate (no locks, no
+    admission). Returns ``(token, payload)``; ``payload`` is the whole
+    aggregate for a bootstrap, ``{group: aggregate}`` for a repair."""
+    if conn.in_transaction:
+        conn.rollback()
+    conn.execute("BEGIN")
+    try:
+        token = _codex_reset_anchor_evidence_token(conn)
+        if kind == CODEX_EVIDENCE_BOOTSTRAP_UNIT:
+            payload = _codex_reset_anchor_evidence_aggregate(conn.execute(
+                f"SELECT {_EVIDENCE_SCAN_COLUMNS} FROM quota_window_snapshots "
+                "WHERE source = 'codex' AND observed_slot IS NOT NULL"))
+        else:
+            groups = {tuple(row) for row in conn.execute(
+                "SELECT source_root_key, observed_slot, logical_limit_key "
+                "FROM codex_reset_anchor_evidence WHERE stale = 1")}
+            payload = {
+                group: _codex_reset_anchor_evidence_aggregate(conn.execute(
+                    f"SELECT {_EVIDENCE_SCAN_COLUMNS} "
+                    "FROM quota_window_snapshots "
+                    "WHERE source = 'codex' AND source_root_key = ? "
+                    "AND logical_limit_key = ? AND observed_slot = ?",
+                    (group[0], group[2], group[1])))
+                for group in sorted(groups)}
+    finally:
+        conn.rollback()
+    return token, payload
+
+
+def _codex_reset_anchor_evidence_insert(conn, aggregate: dict) -> None:
+    conn.executemany(
+        "INSERT INTO codex_reset_anchor_evidence (source_root_key, "
+        "observed_slot, logical_limit_key, resets_at_utc, row_count, "
+        "min_source_path, min_line_offset, min_id, stale) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        [(*bucket, count, *minimum)
+         for bucket, (count, minimum) in sorted(aggregate.items())])
+
+
+def _run_codex_reset_anchor_evidence_unit(
+    conn: sqlite3.Connection, adm, kind: str, *,
+    budget: "dict[str, int] | None" = None,
+) -> str:
+    """Bootstrap or repair the reset-anchor evidence summary (#1033 §5.3).
+
+    Missing objects first get an admitted setup step: the shared schema
+    helper re-creates them, invalidates readiness and advances the
+    generation, and commits on its own. Then prepare/publish attempts:
+    prepare reads the token and the aggregate in one snapshot with no
+    admission and no store locks; publication admits through the global gate
+    with both writer locks, takes ``BEGIN IMMEDIATE``, re-reads the token and
+    publishes only when it is unchanged (a mismatch rolls back and
+    re-prepares). A bootstrap replaces the whole summary and records
+    ``ready``; a repair replaces each stale group's rows with exact,
+    non-stale ones. Neither touches stored canonical anchors or the physical
+    mutation sequence.
+
+    ``budget`` is the caller's per-run map of remaining attempts per kind
+    (``_CODEX_EVIDENCE_ATTEMPTS`` when absent; ``None`` makes this call its
+    own run). It is shared across yields, so a run that waits out requests
+    and calls again does not start over: a token mismatch, a ``None`` token
+    and an admission refusal (the setup step's included) each spend one.
+
+    Returns ``"published"``, ``"yielded"`` (admission refused with attempts
+    left), ``"blocked"`` (the run's attempts are spent, or an error; the work
+    stays owed for a later run) or ``"none"`` (nothing was owed). ``conn``
+    holds no transaction on entry or exit.
+    """
+    if conn.in_transaction:
+        conn.rollback()
+    work = _codex_reset_anchor_evidence_work(conn)
+    if work is None:
+        return "none"
+    expected = (CODEX_EVIDENCE_BOOTSTRAP_UNIT if work == "bootstrap"
+                else CODEX_EVIDENCE_REPAIR_UNIT)
+    if expected != kind:
+        return "none"
+    if budget is None:
+        budget = {}
+    budget.setdefault(kind, _CODEX_EVIDENCE_ATTEMPTS)
+
+    def spend() -> bool:
+        """Spend one attempt; True while attempts remain."""
+        budget[kind] -= 1
+        return budget[kind] > 0
+
+    if budget[kind] <= 0:
+        return "blocked"
+    db = _cctally_db_sib
+    if (kind == CODEX_EVIDENCE_BOOTSTRAP_UNIT
+            and _codex_reset_anchor_evidence_objects(conn)
+            != len(db.CODEX_RESET_ANCHOR_EVIDENCE_OBJECTS)):
+        admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
+                              _release_cache_store_locks)
+        if not admission.admitted:
+            return "yielded" if spend() else "blocked"
+        try:
+            db._apply_codex_reset_anchor_evidence(conn)
+        except sqlite3.Error as exc:
+            eprint(f"[codex] reset-anchor evidence setup failed: {exc}")
+            if conn.in_transaction:
+                conn.rollback()
+            return "blocked"
+        finally:
+            adm.finish(admission, _release_cache_store_locks)
+        if _codex_reset_anchor_evidence_work(conn) is None:
+            return "published"      # an empty store came back ready
+    while budget[kind] > 0:
+        attempt = _CODEX_EVIDENCE_ATTEMPTS - budget[kind] + 1
+        try:
+            token, payload = _codex_reset_anchor_evidence_prepare(conn, kind)
+        except sqlite3.Error as exc:
+            eprint(f"[codex] reset-anchor evidence {kind} failed: {exc}")
+            return "blocked"
+        if _CODEX_EVIDENCE_PREPUBLISH_HOOK is not None:
+            _CODEX_EVIDENCE_PREPUBLISH_HOOK(kind, attempt)
+        if token is None:
+            spend()
+            continue
+        admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
+                              _release_cache_store_locks)
+        if not admission.admitted:
+            return "yielded" if spend() else "blocked"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if _codex_reset_anchor_evidence_token(conn) != token:
+                conn.rollback()
+                spend()
+                continue
+            if kind == CODEX_EVIDENCE_BOOTSTRAP_UNIT:
+                conn.execute("DELETE FROM codex_reset_anchor_evidence")
+                _codex_reset_anchor_evidence_insert(conn, payload)
+                db._set_codex_reset_anchor_evidence_state(
+                    conn, db.CODEX_RESET_ANCHOR_EVIDENCE_READY)
+            else:
+                for (root, slot, key), aggregate in payload.items():
+                    conn.execute(
+                        "DELETE FROM codex_reset_anchor_evidence "
+                        "WHERE source_root_key = ? AND observed_slot = ? "
+                        "AND logical_limit_key = ?", (root, slot, key))
+                    _codex_reset_anchor_evidence_insert(conn, aggregate)
+            conn.commit()
+            return "published"
+        except sqlite3.Error as exc:
+            eprint(f"[codex] reset-anchor evidence {kind} failed: {exc}")
+            if conn.in_transaction:
+                conn.rollback()
+            return "blocked"
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            adm.finish(admission, _release_cache_store_locks)
+    return "blocked"
+
+
+def run_codex_reset_anchor_evidence(*, wait_for_requests: bool = True) -> int:
+    """Run the evidence units inline (``cache-sync``), with the drain's bounds.
+
+    The same function the drain runs, with one attempt budget per kind for
+    this run, shared across yields; a yield waits out the requests when
+    ``wait_for_requests`` and stops otherwise, and a kind whose budget is
+    spent is blocked. Returns the number of units published."""
+    import _lib_codex_drain_admission as adm
+    published = 0
+    blocked: "set[str]" = set()
+    budget: "dict[str, int]" = {}
+    while True:
+        conn = open_cache_db()
+        try:
+            work = _codex_reset_anchor_evidence_work(conn)
+            conn.rollback()
+            kind = {"bootstrap": CODEX_EVIDENCE_BOOTSTRAP_UNIT,
+                    "repair": CODEX_EVIDENCE_REPAIR_UNIT}.get(work)
+            if kind is None or kind in blocked:
+                return published
+            outcome = _run_codex_reset_anchor_evidence_unit(
+                conn, adm, kind, budget=budget)
+        finally:
+            conn.close()
+        if outcome == "published":
+            published += 1
+        elif outcome == "yielded":
+            if not wait_for_requests:
+                return published
+            _drain_backoff(adm)
+        else:
+            blocked.add(kind)
+
+
 def _next_codex_debt_row(conn: sqlite3.Connection, table: str,
                          after: "tuple[str, str] | None"):
     """The next debt row in key order, strictly past ``after`` when given.
@@ -7270,6 +7685,8 @@ def run_codex_prune_drain(*, wait_for_requests: bool = True,
     deleted = dropped = yielded = 0
     finalization_units = owed_units = wal_attempts = 0
     blocked: "set[str]" = set()
+    # #1033 §5.3: the evidence units' attempts per kind for this run.
+    evidence_budget: "dict[str, int]" = {}
     discovery = _CodexPruneDiscoveryCache()     # one discovery per pass (N10)
     # #970 spec 5.6: an identity whose absence is unknown keeps its debt and
     # is passed over for the rest of this run (keyset past it).
@@ -7290,6 +7707,21 @@ def run_codex_prune_drain(*, wait_for_requests: bool = True,
                 # admission, re-reads its state under the gate and commits.
                 unit = _codex_executor_next_unit(conn, blocked)
                 conn.rollback()
+                if unit == CODEX_EVIDENCE_BOOTSTRAP_UNIT:
+                    # #1033 §5.3: like the catch-up, special-cased ahead of
+                    # prune rows; its scan runs before its own admission.
+                    outcome = _run_codex_reset_anchor_evidence_unit(
+                        conn, adm, unit, budget=evidence_budget)
+                    if outcome == "yielded":
+                        yielded += 1
+                        if not wait_for_requests:
+                            break
+                        _drain_backoff(adm)
+                    elif outcome == "published":
+                        owed_units += 1
+                    elif outcome == "blocked":
+                        blocked.add(unit)
+                    continue
                 if unit == "ingest_catch_up":
                     # #980 F4: its sync owns the locks and its own admission.
                     caught = _run_codex_ingest_catch_up_unit(conn, adm)
@@ -7309,6 +7741,21 @@ def run_codex_prune_drain(*, wait_for_requests: bool = True,
                     conn.rollback()
                 if row is None and unit is None:
                     break
+                if row is None and unit == CODEX_EVIDENCE_REPAIR_UNIT:
+                    # #1033 §5.3: after pruning; prepare runs unadmitted, so
+                    # it never goes through the admitted-only executor body.
+                    outcome = _run_codex_reset_anchor_evidence_unit(
+                        conn, adm, unit, budget=evidence_budget)
+                    if outcome == "yielded":
+                        yielded += 1
+                        if not wait_for_requests:
+                            break
+                        _drain_backoff(adm)
+                    elif outcome == "published":
+                        owed_units += 1
+                    elif outcome == "blocked":
+                        blocked.add(unit)
+                    continue
                 if row is None:
                     admission = adm.admit(_cctally_core.APP_DIR,
                                           _cache_store_locks,
@@ -7323,11 +7770,15 @@ def run_codex_prune_drain(*, wait_for_requests: bool = True,
                     try:
                         unit = _codex_executor_next_unit(conn, blocked)
                         conn.rollback()
-                        if unit is None or unit == "ingest_catch_up":
+                        if unit is None or unit in (
+                                "ingest_catch_up",
+                                CODEX_EVIDENCE_BOOTSTRAP_UNIT,
+                                CODEX_EVIDENCE_REPAIR_UNIT):
                             # #981 R2: a catch-up a hook recorded since the
                             # unlocked read runs through its own path (its sync
                             # owns the locks): release this admission and let
-                            # the next pass dispatch it.
+                            # the next pass dispatch it. The #1033 evidence
+                            # units likewise run through their own path.
                             continue
                         ok, model_cleared = _run_codex_executor_unit(conn, unit)
                     except BaseException:
@@ -17356,7 +17807,11 @@ def load_codex_owed_catch_up(
 
 def _codex_owed_anything(conn: sqlite3.Connection) -> bool:
     flags, whole_tree, paths = _load_codex_owed_record(conn)
-    return any(flags.values()) or whole_tree or bool(paths)
+    if any(flags.values()) or whole_tree or bool(paths):
+        return True
+    # #1033 spec §5.3: the reset-anchor evidence work is derived from its
+    # state and an indexed stale probe, never from a second owed flag.
+    return _codex_reset_anchor_evidence_work(conn) is not None
 
 
 def _store_codex_owed_maintenance(
@@ -27138,6 +27593,9 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
         # identity inventory inline, through the same admitted executor the
         # detached worker runs (a no-op once it is ready).
         run_codex_inventory_bootstrap(wait_for_requests=True)
+        # #1033 spec §5.3: the reset-anchor evidence bootstrap/repair runs
+        # inline too, through the drain's own function and bounds.
+        run_codex_reset_anchor_evidence(wait_for_requests=True)
         prune_result = run_codex_prune_drain(wait_for_requests=True)
         verify_result = run_codex_container_verification_drain(wait_for_requests=True)
         run_codex_reset_drain(wait_for_requests=True)

@@ -1532,6 +1532,9 @@ def test_the_budget_key_is_settable_and_unsettable(root):
 _ANCHOR_SEED_READ = "SELECT source_path, line_offset, id, resets_at_utc"
 _ANCHOR_RESET = dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc)
 _ANCHOR_GROUP_ROWS = 1_600
+#: #1033: the summary seed's one statement reads the evidence table.
+_SUMMARY_SEED_READ = "FROM codex_reset_anchor_evidence"
+_EVIDENCE_STATE_KEY = "codex_reset_anchor_evidence"
 
 
 def _quota_event(minute: int, reset: dt.datetime) -> dict:
@@ -1545,11 +1548,17 @@ def _quota_event(minute: int, reset: dt.datetime) -> dict:
         }}}}
 
 
-def _large_anchor_group(ns, rollout) -> int:
+def _large_anchor_group(ns, rollout, *, summary: bool = False) -> int:
     """One real quota observation ingested unbudgeted, its weekly group grown
     to ``_ANCHOR_GROUP_ROWS`` rows (clones at later offsets of the same
     rollout, so they are retained history rather than prune orphans), then a
-    new observation 30 s later appended. Returns the committed offset."""
+    new observation 30 s later appended. Returns the committed offset.
+
+    By default the reset-anchor evidence summary is set to ``bootstrap`` so
+    every seed takes the full history read (#1033's fallback, whose deadline
+    behaviour these tests pin). With ``summary`` it stays ``ready`` and each
+    clone carries its own raw reset one second after the previous one, so the
+    summary holds ``_ANCHOR_GROUP_ROWS`` distinct entries of one component."""
     records = _records(1)
     records.append(_quota_event(0, _ANCHOR_RESET))
     _write_rollout(rollout, records)
@@ -1566,10 +1575,18 @@ def _large_anchor_group(ns, rollout) -> int:
         for index in range(_ANCHOR_GROUP_ROWS - 1):
             row = dict(original)
             row["line_offset"] = 10_000_000 + index
+            if summary:
+                row["resets_at_utc"] = (
+                    _ANCHOR_RESET + dt.timedelta(seconds=index + 1)
+                ).isoformat().replace("+00:00", "Z")
             clones.append(tuple(row[c] for c in columns))
         conn.executemany(
             f"INSERT INTO quota_window_snapshots ({', '.join(columns)}) "
             f"VALUES ({', '.join('?' for _ in columns)})", clones)
+        if not summary:
+            conn.execute(
+                "UPDATE cache_meta SET value='bootstrap' WHERE key=?",
+                (_EVIDENCE_STATE_KEY,))
         conn.commit()
         offset = int(conn.execute(
             "SELECT last_byte_offset FROM codex_session_files").fetchone()[0])
@@ -1681,6 +1698,89 @@ def test_the_anchor_seed_read_is_bounded_by_the_walk_deadline(
     # established anchor (a per-sync degrade would mint its own instead).
     assert _new_observation_anchor(ns) == "2026-07-27T00:00:00Z"
 
+
+
+@pytest.mark.parametrize("schedule", ["read_overruns", "slice_overruns"])
+def test_the_summary_seed_is_bounded_by_the_walk_deadline(
+        root, monkeypatch, schedule):
+    """#1033 spec §5.2: a hook stall or a lost catch-up from the summary
+    seed. With a ready summary of 1,600 distinct entries the budgeted walk
+    seeds from it (no full read). ``read_overruns``: the deadline passes when
+    the summary statement starts, and the progress-handler interrupt stops it
+    before any entry is folded. ``slice_overruns``: it passes on the first
+    folded entry, and the 500-entry check stops the fold within one slice.
+    Either way the walk ends as budget exhaustion before the file committed,
+    never as ``_seed_failed``, caches no partial group, records the file as
+    owed catch-up, and a later unbudgeted call stores the control anchor."""
+    ns, _provider_root, rollout = root
+    import _cctally_cache as cc
+    committed = _large_anchor_group(ns, rollout, summary=True)
+    deferred = _file_row(ns)["path"]
+    monkeypatch.setattr(cc, "_request_codex_drain_worker",
+                        lambda command: "throttled")
+    resolvers: list = []
+
+    class _Spy(cc.CodexResetAnchorResolver):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            resolvers.append(self)
+
+    monkeypatch.setattr(cc, "CodexResetAnchorResolver", _Spy)
+    state = {"late": False, "seen": False, "folded": 0, "full_reads": 0}
+    real_parse = cc._parse_anchor_iso
+
+    def parse(value):
+        if state["seen"]:
+            state["folded"] += 1
+            if schedule == "slice_overruns":
+                state["late"] = True
+        return real_parse(value)
+
+    monkeypatch.setattr(cc, "_parse_anchor_iso", parse)
+    monkeypatch.setattr(cc, "_walk_clock",
+                        lambda: 10.0 if state["late"] else 0.0)
+
+    def trace(sql):
+        if _SUMMARY_SEED_READ in sql:
+            state["seen"] = True
+            if schedule == "read_overruns":
+                state["late"] = True
+        if _ANCHOR_SEED_READ in sql:
+            state["full_reads"] += 1
+
+    conn = ns["open_cache_db"]()
+    try:
+        conn.set_trace_callback(trace)
+        stats = ns["sync_codex_cache"](conn, budget_seconds=5.0)
+        conn.set_trace_callback(None)
+        whole_tree, owed = cc.load_codex_owed_catch_up(conn)
+    finally:
+        conn.close()
+    assert state["seen"] and state["late"], (
+        "non-vacuity: the deadline passed inside the summary seed")
+    assert state["full_reads"] == 0, "the seed fell back to the full read"
+    if schedule == "read_overruns":
+        assert state["folded"] == 0, "the summary read ran to completion"
+    else:
+        assert 0 < state["folded"] <= 501, (
+            f"{state['folded']} entries folded past the deadline (one slice "
+            f"is 500 of {_ANCHOR_GROUP_ROWS})")
+    assert stats.budget_exhausted is True
+    assert stats.walk_certified is False
+    assert resolvers and resolvers[-1]._seed_failed is False
+    assert resolvers[-1]._groups == {}, "a partially folded group was cached"
+    assert int(_file_row(ns)["last_byte_offset"]) == committed
+    assert (whole_tree, owed) == (False, (deferred,))
+
+    monkeypatch.setattr(cc, "_walk_clock", lambda: 0.0)
+    monkeypatch.setattr(cc, "_parse_anchor_iso", real_parse)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    assert int(_file_row(ns)["last_byte_offset"]) > committed
+    assert _new_observation_anchor(ns) == "2026-07-27T00:00:00Z"
 
 
 def _catch_up_state(ns) -> dict:

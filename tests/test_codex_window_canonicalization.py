@@ -1406,3 +1406,384 @@ def test_r3_the_anchor_lookup_is_not_a_linear_scan():
     # timing-budget: retained beside the probe count, which bounds the lookup and not the 6,000 adds the same loop performs
     assert elapsed < 30.0, (
         f"6,000 anchors took {elapsed:.1f}s — the lookup is still linear")
+
+
+# --------------------------------------------------------------------------
+# #1033 spec §5.2 — the exact reset-anchor evidence summary seeds the same
+# components the full history read builds.
+#
+# The summary keeps, per raw reset spelling of a group, the row count and the
+# lexicographic minimum ``(source_path, line_offset, id)``. Within one group the
+# full read's members, member orders, anchors and iteration order depend only
+# on the ``(instant, minimum order key)`` pairs, and ``_next_order`` on the row
+# count; ``from_evidence`` must reproduce every one of them, or a later
+# ``resolve`` (an order-key-less add, the same-line ``(path, offset, -1)``
+# replay) picks another winner and stores a wrong anchor.
+# --------------------------------------------------------------------------
+
+_EVIDENCE_BASE = dt.datetime(2026, 8, 1, 19, 0, tzinfo=UTC)
+
+
+def _spell(instant: dt.datetime, style: int) -> str:
+    """One of three spellings of an instant (all parse to it)."""
+    if style == 0:
+        return instant.isoformat().replace("+00:00", "Z")
+    if style == 1:
+        return instant.isoformat()
+    return instant.astimezone(dt.timezone(dt.timedelta(hours=2))).isoformat()
+
+
+def _evidence_full_read(rows, root, slot, keys):
+    """Today's seed: one ``add`` per parseable group row in key order."""
+    components = _lq().ResetAnchorComponents()
+    selected = sorted(
+        (r for r in rows
+         if r["root"] == root and r["slot"] == slot and r["key"] in keys),
+        key=lambda r: (r["path"], r["offset"], r["id"]))
+    for r in selected:
+        parsed = _cache()._parse_anchor_iso(r["raw"])
+        if parsed is not None:
+            components.add(parsed, order_key=(r["path"], r["offset"], r["id"]))
+    return components
+
+
+def _evidence_aggregate(rows, *, per_column_min=False):
+    """The summary's content: count and minimum order tuple per raw bucket.
+
+    ``per_column_min`` builds the WRONG aggregate (each column minimized on its
+    own), used only to prove the comparison can tell the two apart."""
+    out: dict = {}
+    for r in rows:
+        if r["slot"] is None:
+            continue
+        bucket = (r["root"], r["slot"], r["key"], r["raw"])
+        order = (r["path"], r["offset"], r["id"])
+        if bucket not in out:
+            out[bucket] = [1, order]
+            continue
+        out[bucket][0] += 1
+        if per_column_min:
+            out[bucket][1] = tuple(
+                min(a, b) for a, b in zip(out[bucket][1], order))
+        else:
+            out[bucket][1] = min(out[bucket][1], order)
+    return out
+
+
+def _evidence_seeded(aggregate, root, slot, keys):
+    entries = []
+    for (b_root, b_slot, b_key, raw), (count, order) in aggregate.items():
+        if b_root != root or b_slot != slot or b_key not in keys:
+            continue
+        parsed = _cache()._parse_anchor_iso(raw)
+        if parsed is not None:
+            entries.append((parsed, order, count))
+    return _lq().ResetAnchorComponents.from_evidence(entries)
+
+
+def _components_state(components):
+    members = list(components)
+    return {
+        "members": members,
+        "len": len(components),
+        "anchors": [components.canonical(m) for m in members],
+        "member_orders": [components._member_order[m] for m in members],
+        "next_order": components._next_order,
+    }
+
+
+def _replay(components, additions):
+    """Subsequent resolves against an independent copy: their outcomes."""
+    copy = components.copy()
+    outcomes = [copy.add(instant, order_key=order_key)
+                for instant, order_key in additions]
+    return outcomes, _components_state(copy)
+
+
+def _evidence_additions(rows, rng):
+    """Later resolves: order-key-less adds, same-line ``-1`` replays of stored
+    rows, and new explicit keys, around and between the stored instants."""
+    additions = []
+    for _ in range(12):
+        instant = _EVIDENCE_BASE + dt.timedelta(
+            seconds=rng.randrange(-900, 6 * 3600, 37))
+        choice = rng.randrange(3)
+        if choice == 0:
+            additions.append((instant, None))
+        elif choice == 1 and rows:
+            row = rng.choice(rows)
+            additions.append((instant, (row["path"], row["offset"], -1)))
+        else:
+            additions.append(
+                (instant, (rng.choice(("/a", "/m", "/z")),
+                           rng.randrange(0, 50), -1)))
+    return additions
+
+
+def _assert_evidence_equivalent(rows, root, slot, keys, additions=()):
+    full = _evidence_full_read(rows, root, slot, keys)
+    seeded = _evidence_seeded(_evidence_aggregate(rows), root, slot, keys)
+    assert _components_state(seeded) == _components_state(full)
+    assert _replay(seeded, additions) == _replay(full, additions)
+    return full, seeded
+
+
+def _evidence_population(rng, *, size):
+    """Rows over two roots, three slots (one NULL), snap-equivalent keys plus an
+    unrelated key, chains of instants 400 s apart (longer than the 600 s
+    tolerance end to end), three spellings and an unparseable raw.
+    ``(path, offset, key)`` is unique, as the table's UNIQUE constraint makes
+    it."""
+    keys = (_key(10080), _key(10081), _key(300))
+    instants = [_EVIDENCE_BASE + dt.timedelta(seconds=400 * i)
+                for i in range(8)]
+    instants += [_EVIDENCE_BASE + dt.timedelta(hours=3, seconds=250 * i)
+                 for i in range(5)]
+    rows, seen = [], set()
+    next_id = 1
+    while len(rows) < size:
+        path = rng.choice(("/a", "/m", "/z"))
+        offset = rng.randrange(0, 60)
+        key = rng.choice(keys)
+        if (path, offset, key) in seen:
+            continue
+        seen.add((path, offset, key))
+        raw = ("not-a-reset" if rng.random() < 0.05
+               else _spell(rng.choice(instants), rng.randrange(3)))
+        next_id += rng.randrange(1, 4)
+        rows.append({
+            "root": rng.choice((ROOT, ROOT, "other")),
+            "slot": rng.choice(("primary", "primary", "secondary", None)),
+            "key": key, "raw": raw, "path": path, "offset": offset,
+            "id": next_id,
+        })
+    return rows
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_1033_evidence_seed_equals_the_full_read_over_generated_histories(seed):
+    """Wrong reset anchors or merges from the summary seed: over generated
+    histories, before and after random deletions (minimum-order rows, a raw's
+    last row, bridge members), the seeded components equal the full read's in
+    members, member orders, anchors, iteration order and ``_next_order``, and
+    every later resolve returns the same winner and retired anchors."""
+    import random
+    rng = random.Random(seed)
+    rows = _evidence_population(rng, size=rng.randrange(1, 120))
+    groups = [(root, slot, keys)
+              for root in (ROOT, "other")
+              for slot in ("primary", "secondary")
+              for keys in (
+                  _jsonl().codex_snap_equivalent_limit_keys(_key(10080)),
+                  _jsonl().codex_snap_equivalent_limit_keys(_key(300)))]
+    for root, slot, keys in groups:
+        _assert_evidence_equivalent(
+            rows, root, slot, keys, _evidence_additions(rows, rng))
+    survivors = [r for r in rows if rng.random() < 0.6]
+    for root, slot, keys in groups:
+        _assert_evidence_equivalent(
+            survivors, root, slot, keys, _evidence_additions(survivors, rng))
+
+
+def _row(raw, path, offset, row_id, *, key=None, root=ROOT, slot="primary"):
+    return {"root": root, "slot": slot, "key": key or _key(10080),
+            "raw": raw, "path": path, "offset": offset, "id": row_id}
+
+
+def _week_keys():
+    return _jsonl().codex_snap_equivalent_limit_keys(_key(10080))
+
+
+def test_1033_evidence_seed_covers_the_named_shapes():
+    """Each shape the spec names, pinned on its own: a chain longer than the
+    tolerance, mixed spellings of one instant, snap-equivalent keys, a NULL slot
+    (excluded), an unparseable raw (skipped), deletion of a minimum-order row,
+    of a raw's last row and of the bridge member that held two components
+    together, and root isolation."""
+    keys = _week_keys()
+    t = lambda seconds: _EVIDENCE_BASE + dt.timedelta(seconds=seconds)
+    rows = [
+        _row(_spell(t(0), 0), "/m", 5, 1),
+        _row(_spell(t(1200), 0), "/a", 9, 2),          # endpoint, earliest key
+        _row(_spell(t(600), 1), "/z", 1, 3),           # the bridge
+        _row(_spell(t(0), 2), "/b", 4, 4),             # another spelling of t0
+        _row(_spell(t(0), 0), "/c", 2, 5, key=_key(10081)),
+        _row(_spell(t(1800), 0), "/a", 1, 6, slot=None),
+        _row("not-a-reset", "/a", 2, 7),
+        _row(_spell(t(1800), 0), "/a", 3, 8, root="other"),
+        _row(_spell(t(2400), 0), "/d", 7, 9),
+    ]
+    bridge = rows[2]
+    full, _seeded = _assert_evidence_equivalent(
+        rows, ROOT, "primary", keys,
+        [(t(1800), None), (t(0), ("/a", 9, -1)), (t(2410), ("/0", 0, -1))])
+    assert full.canonical(t(0)) == full.canonical(t(1200)) == t(1200), (
+        "precondition: the bridge joins both endpoints under the earliest key")
+    assert t(1800) not in full, "a NULL slot or another root leaked in"
+    # The minimum-order row of t0, the last row of the t2400 raw, the bridge.
+    for removed in (rows[0], rows[8], bridge):
+        survivors = [r for r in rows if r is not removed]
+        _assert_evidence_equivalent(
+            survivors, ROOT, "primary", keys,
+            [(t(1800), None), (t(600), ("/z", 1, -1))])
+    split = _evidence_full_read(
+        [r for r in rows if r is not bridge], ROOT, "primary", keys)
+    assert split.canonical(t(0)) != split.canonical(t(1200)), (
+        "precondition: removing the bridge splits the component")
+    _assert_evidence_equivalent(rows, "other", "primary", keys)
+
+
+def test_1033_evidence_seed_needs_the_lexicographic_minimum():
+    """The independent-minimum counterexample: one raw's minimum path and its
+    minimum offset come from different rows. The exact (lexicographic) minimum
+    seeds the full read's member order; a per-column ``MIN()`` aggregate mints
+    an order key no row carries, and the comparison catches it."""
+    keys = _week_keys()
+    raw = _spell(_EVIDENCE_BASE, 0)
+    rows = [_row(raw, "/a", 50, 9), _row(raw, "/b", 1, 2),
+            _row(_spell(_EVIDENCE_BASE + dt.timedelta(seconds=300), 0),
+                 "/a", 20, 4)]
+    full, _seeded = _assert_evidence_equivalent(rows, ROOT, "primary", keys)
+    wrong = _evidence_seeded(
+        _evidence_aggregate(rows, per_column_min=True), ROOT, "primary", keys)
+    assert _components_state(wrong) != _components_state(full)
+
+
+@pytest.mark.parametrize("count", [0, -1, True])
+def test_1033_from_evidence_rejects_a_non_positive_row_count(count):
+    """A corrupt summary row (count below one) must never seed: it would set a
+    wrong ``_next_order`` and move every later order-key-less winner."""
+    with pytest.raises(ValueError):
+        _lq().ResetAnchorComponents.from_evidence(
+            [(_EVIDENCE_BASE, ("/a", 1, 1), count)])
+
+
+def _resolver_outcomes(conn, resolver, probes):
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        anchors = [resolver.resolve(
+            source_root_key=ROOT, observed_slot=slot,
+            logical_limit_key=_key(minutes), window_minutes=minutes,
+            resets_at_utc=reset, source_path=path, line_offset=offset)
+            for slot, minutes, reset, path, offset in probes]
+    finally:
+        conn.set_trace_callback(None)
+    full_reads = sum("FROM quota_window_snapshots" in s for s in statements)
+    return anchors, list(resolver._pending_merges), full_reads
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_1033_walk_and_applier_anchors_from_the_summary_equal_the_full_read(
+        cache_conn, seed):
+    """Wrong anchors end to end: on one store whose rows went through the
+    triggers (including deletions that the drain's repair would fix), a walk
+    resolver (budgeted) and the journal applier's resolver seeded from the
+    summary return the anchors and pending merges a full-read seed returns.
+    The summary path must actually run: no quota statement while it seeds."""
+    import random
+    import time
+    import _cctally_journal
+
+    rng = random.Random(seed)
+    writer = _resolver(cache_conn)
+    for _ in range(60):
+        _seed_anchored(
+            cache_conn, writer,
+            resets_at=_spell(_EVIDENCE_BASE + dt.timedelta(
+                seconds=rng.randrange(0, 3 * 3600, 30)), rng.randrange(3)),
+            window_minutes=rng.choice((10080, 10081)),
+            observed_slot=rng.choice(("primary", "secondary")),
+            source_path=rng.choice(("/r/a.jsonl", "/r/m.jsonl", "/r/z.jsonl")),
+            line_offset=None)
+    # Deletions only in the secondary slot: its group may hold stale buckets
+    # (and must fall back), the primary group must seed from the summary.
+    victims = [row[0] for row in cache_conn.execute(
+        "SELECT id FROM quota_window_snapshots WHERE source='codex' "
+        "AND observed_slot='secondary'")]
+    for victim in rng.sample(victims, min(6, len(victims))):
+        cache_conn.execute(
+            "DELETE FROM quota_window_snapshots WHERE id=?", (victim,))
+    cache_conn.commit()
+    stale = cache_conn.execute(
+        "SELECT source_root_key, observed_slot, logical_limit_key "
+        "FROM codex_reset_anchor_evidence WHERE stale=1").fetchall()
+    probes = [(rng.choice(("primary", "secondary")), rng.choice((10080, 10081)),
+               _spell(_EVIDENCE_BASE + dt.timedelta(
+                   seconds=rng.randrange(-600, 3 * 3600 + 600, 17)),
+                   rng.randrange(3)),
+               rng.choice(("/r/a.jsonl", "/r/q.jsonl")), rng.randrange(0, 9))
+              for _ in range(15)]
+    probes[0] = ("primary",) + probes[0][1:]
+    probes[1] = ("secondary",) + probes[1][1:]
+    walk = _cache().CodexResetAnchorResolver(
+        cache_conn, deadline=time.monotonic() + 3600, clock=time.monotonic)
+    applier = _cctally_journal._codex_anchor_resolver(cache_conn)
+    seeded = [_resolver_outcomes(cache_conn, r, probes)
+              for r in (walk, applier)]
+    cache_conn.execute("UPDATE cache_meta SET value='bootstrap' "
+                       "WHERE key='codex_reset_anchor_evidence'")
+    full = _resolver_outcomes(cache_conn, _resolver(cache_conn), probes)
+    cache_conn.rollback()
+    assert full[2] >= 1, "non-vacuity: the control used the full read"
+    assert {p[0] for p in probes} == {"primary", "secondary"}
+    assert all(slot == "secondary" for _root, slot, _key in stale)
+    for anchors, merges, full_reads in seeded:
+        assert (anchors, merges) == full[:2]
+        # The stale group falls back once; the primary group never reads
+        # quota history.
+        assert full_reads == (1 if stale else 0), (full_reads, stale)
+
+
+def test_1033_a_repaired_summary_seeds_the_full_read(cache_conn):
+    """Wrong anchors after a repair: deleting a bucket's minimum row stales
+    it, so the seed falls back; once the repair unit republishes the group,
+    the summary-seeded components equal the full read's again in members,
+    member orders, anchors, iteration order and ``_next_order``, and later
+    resolves return the same winners."""
+    import types
+    import _lib_codex_drain_admission as adm
+
+    cc = _cache()
+    t = lambda seconds: _EVIDENCE_BASE + dt.timedelta(seconds=seconds)
+    writer = _resolver(cache_conn)
+    for seconds, path, offset in ((0, "/r/m.jsonl", 5), (0, "/r/a.jsonl", 9),
+                                  (0, "/r/z.jsonl", 1), (420, "/r/b.jsonl", 2),
+                                  (840, "/r/a.jsonl", 3)):
+        _seed_anchored(cache_conn, writer, resets_at=_spell(t(seconds), 0),
+                       source_path=path, line_offset=offset)
+    cache_conn.commit()
+    # The t0 bucket's minimum is (/r/a.jsonl, 9); its survivors' minimum
+    # comes from another file.
+    cache_conn.execute("DELETE FROM quota_window_snapshots "
+                       "WHERE source_path='/r/a.jsonl' AND line_offset=9")
+    cache_conn.commit()
+    stale = "SELECT COUNT(*) FROM codex_reset_anchor_evidence WHERE stale=1"
+    assert cache_conn.execute(stale).fetchone() == (1,)
+    keys = _week_keys()
+
+    def summary_seed():
+        return cc._codex_reset_anchor_summary_seed(
+            cache_conn, ROOT, "primary", keys, deadline=None, clock=None)
+
+    assert summary_seed() is None, "a stale bucket must fall back"
+    admitted = types.SimpleNamespace(
+        admit=lambda *args, **kwargs: adm.Admission(True, None, None),
+        finish=lambda admission, release: None)
+    assert cc._run_codex_reset_anchor_evidence_unit(
+        cache_conn, admitted, "reset_anchor_evidence_repair") == "published"
+    assert cache_conn.execute(stale).fetchone() == (0,)
+    seeded = summary_seed()
+    assert seeded is not None, "the repaired group must seed from the summary"
+    # The control: the resolver's own full read, with the summary withheld.
+    cache_conn.execute("UPDATE cache_meta SET value='bootstrap' "
+                       "WHERE key='codex_reset_anchor_evidence'")
+    group = cc.CodexResetAnchorResolver.group_key(
+        ROOT, "primary", _key(10080), 10080)
+    full = _resolver(cache_conn)._components_for(group, _key(10080))
+    cache_conn.rollback()
+    assert len(full) == 3, "non-vacuity: three instants in one chain"
+    assert _components_state(seeded) == _components_state(full)
+    additions = [(t(1260), None), (t(0), ("/r/a.jsonl", 9, -1)),
+                 (t(210), ("/r/0.jsonl", 0, -1))]
+    assert _replay(seeded, additions) == _replay(full, additions)

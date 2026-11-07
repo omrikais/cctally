@@ -175,7 +175,11 @@ def _cache_dump(ns, *, across_a_clear=False) -> dict:
     one nothing interrupted: the clear legitimately moves the physical
     mutation sequence (and the certificate's copy of it), appends to the
     trigger-maintained change ledgers, and re-inserted rows get fresh
-    surrogate ids, so those, and only those, are set aside.
+    surrogate ids, so those, and only those, are set aside. Two #1033 copies
+    of the same facts go with them: the clear advances the reset-anchor
+    evidence invalidation generation by design, and the evidence summary's
+    ``min_id`` is the surrogate id of its minimum row. Its logical
+    coordinates (``min_source_path``, ``min_line_offset``) stay compared.
     """
     conn = ns["open_cache_db"]()
     try:
@@ -195,8 +199,13 @@ def _cache_dump(ns, *, across_a_clear=False) -> dict:
                 item = dict(zip(columns, row))
                 if across_a_clear:
                     item.pop("id", None)
+                    if table == "codex_reset_anchor_evidence":
+                        item.pop("min_id", None)
                     if table == "cache_meta":
                         if str(item.get("key")).endswith("_mutation_seq"):
+                            continue
+                        if item.get("key") == (
+                                "codex_reset_anchor_evidence_generation"):
                             continue
                         if item.get("key") == (
                                 "codex_journal_coverage_certificate"):

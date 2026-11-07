@@ -1652,3 +1652,264 @@ def test_cache_report_day_evict_before_noop_when_all_ge():
     sc.cache_report_day_evict_before("2026-07-01")
     assert sc.cache_report_day_get("2026-07-02") is not None
     assert sc.cache_report_day_get("2026-07-03") is not None
+
+
+# === #1059 — project-identity registry, sweep and invalidation helpers =====
+#
+# The sweep is the only thing that notices a filesystem change behind a warm
+# grouping. Each test below names the lost or false invalidation it detects.
+
+
+def _identity(bucket, *, git_root=None, no_git=False):
+    return (bucket, git_root, False, no_git)
+
+
+class _FakeResolver:
+    """`_resolve_project_key`'s signature over a mutable spelling→key map."""
+
+    def __init__(self, keys):
+        self.keys = dict(keys)
+        self.calls = 0
+        self.fail = None
+
+    def __call__(self, spelling, mode, cache):
+        assert mode == "git-root"
+        assert type(cache) is dict, "the sweep must use a fresh plain memo"
+        self.calls += 1
+        if self.fail is not None:
+            raise self.fail
+        return self.keys[spelling]
+
+
+def _key(bucket, *, label=None, git_root=None, no_git=False):
+    from _cctally_cache import ProjectKey
+    return ProjectKey(bucket_path=bucket,
+                      display_key=label or pathlib.PurePath(bucket).name,
+                      git_root=git_root, is_no_git=no_git)
+
+
+def _observe(spelling, key):
+    import _lib_snapshot_cache as sc
+    memo = sc.observing_project_memo()
+    memo[("raw", spelling)] = key
+    memo[spelling] = key  # a normalized entry is never recorded
+    return memo
+
+
+def test_identity_sweep_cadence_first_call_arms_then_runs_only_when_due():
+    """A sweep on every tick is the #269 warm-rebuild cost the issue forbids;
+    a sweep that never runs is the defect itself."""
+    import _lib_snapshot_cache as sc
+    sc.reset_project_identity_state()
+    resolver = _FakeResolver({"/r/a": _key("/r/a", git_root="/r/a")})
+    _observe("/r/a", resolver.keys["/r/a"])
+    assert sc.revalidate_project_identities(
+        resolve=resolver, now_monotonic=100.0) is None
+    assert sc._PROJECT_IDENTITY_STATE["next_due"] == 100.0 + 60.0
+    assert sc.revalidate_project_identities(
+        resolve=resolver, now_monotonic=159.0) is None
+    assert resolver.calls == 0
+    sweep = sc.revalidate_project_identities(
+        resolve=resolver, now_monotonic=160.0)
+    assert sweep is not None and sweep.flips == ()
+    assert resolver.calls == 1
+    assert sc._PROJECT_IDENTITY_STATE["next_due"] == 220.0
+    stats = sc.project_identity_stats()
+    assert stats["sweepSuccesses"] == 1 and stats["flipBatches"] == 0
+    assert stats["recentSweeps"][-1]["outcome"] == "ok"
+    assert stats["recentSweeps"][-1]["spellings"] == 1
+
+
+@pytest.mark.parametrize("later_fs, expected_stale", [
+    # A→B→A: the retained B-identity state must still be invalidated.
+    ("A", {"B"}),
+    # A→B→C: both earlier identities are stale.
+    ("C", {"A", "B"}),
+])
+def test_identity_sweep_keeps_every_observation_since_the_last_sweep(
+    later_fs, expected_stale,
+):
+    """Comparing only the first or the latest observation misses a consumer
+    that resolved and retained an intermediate identity between two sweeps."""
+    import _lib_snapshot_cache as sc
+    sc.reset_project_identity_state()
+    keys = {
+        "A": _key("/r/feature", git_root="/r/feature"),
+        "B": _key("/r", git_root="/r"),
+        "C": _key("/r/feature", no_git=True),
+    }
+    _observe("/r/feature", keys["A"])
+    _observe("/r/feature", keys["B"])  # a later consumer resolved after a change
+    observed = sc._PROJECT_IDENTITY_STATE["observed"]["/r/feature"]
+    assert observed == {sc.project_identity_fields(keys["A"]),
+                        sc.project_identity_fields(keys["B"])}
+    resolver = _FakeResolver({"/r/feature": keys[later_fs]})
+    sc.revalidate_project_identities(resolve=resolver, now_monotonic=0.0)
+    sweep = sc.revalidate_project_identities(
+        resolve=resolver, now_monotonic=60.0)
+    assert len(sweep.flips) == 1
+    flip = sweep.flips[0]
+    assert flip.spelling == "/r/feature"
+    assert flip.fresh == sc.project_identity_fields(keys[later_fs])
+    assert flip.stale == {sc.project_identity_fields(keys[name])
+                          for name in expected_stale}
+    assert sweep.old_buckets == {keys[name].bucket_path
+                                 for name in expected_stale}
+    assert sc._PROJECT_IDENTITY_STATE["observed"] == {
+        "/r/feature": {sc.project_identity_fields(keys[later_fs])}}
+
+
+def test_identity_sweep_opposite_alias_orders_do_not_flip(tmp_path):
+    """Two memos labelling one directory by whichever alias they saw first is
+    today's behaviour; treating that label as identity would regroup forever
+    on an unchanged filesystem."""
+    import _lib_snapshot_cache as sc
+    from _cctally_cache import _resolve_project_key
+    sc.reset_project_identity_state()
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "alias").symlink_to(real)
+    a, b = str(real), str(tmp_path / "alias")
+    first, second = sc.observing_project_memo(), sc.observing_project_memo()
+    label_first = [_resolve_project_key(p, "git-root", first).display_key
+                   for p in (a, b)]
+    label_second = [_resolve_project_key(p, "git-root", second).display_key
+                    for p in (b, a)]
+    assert label_first == ["real", "real"]
+    assert label_second == ["alias", "alias"]
+    sc.revalidate_project_identities(
+        resolve=_resolve_project_key, now_monotonic=0.0)
+    sweep = sc.revalidate_project_identities(
+        resolve=_resolve_project_key, now_monotonic=60.0)
+    assert sweep.flips == ()
+
+
+def test_identity_sweep_reports_a_same_bucket_metadata_flip(tmp_path):
+    """`ProjectKey` equality compares `bucket_path` only, so a `git init` in a
+    no-git directory would go unnoticed and keep its alias label."""
+    import _lib_snapshot_cache as sc
+    from _cctally_cache import _resolve_project_key
+    from conftest import git_init
+    sc.reset_project_identity_state()
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    spelling = str(solo.resolve())
+    before = _resolve_project_key(spelling, "git-root",
+                                  sc.observing_project_memo())
+    sc.revalidate_project_identities(
+        resolve=_resolve_project_key, now_monotonic=0.0)
+    git_init(solo)
+    sweep = sc.revalidate_project_identities(
+        resolve=_resolve_project_key, now_monotonic=60.0)
+    (flip,) = sweep.flips
+    assert flip.stale == {(spelling, None, False, True)}
+    assert flip.fresh == (spelling, spelling, False, False)
+    assert before.bucket_path == spelling
+    assert sweep.old_buckets == {spelling}
+
+
+@pytest.mark.parametrize("exc", [OSError("gone"), RuntimeError("x"),
+                                 ValueError("bad")])
+def test_identity_sweep_failure_keeps_registry_and_deadline(exc):
+    """A failed sweep that consumed its deadline or rewrote the registry would
+    drop a pending flip until the next interval, or forever."""
+    import _lib_snapshot_cache as sc
+    sc.reset_project_identity_state()
+    old = _key("/r/feature", git_root="/r/feature")
+    _observe("/r/feature", old)
+    resolver = _FakeResolver({"/r/feature": _key("/r", git_root="/r")})
+    sc.revalidate_project_identities(resolve=resolver, now_monotonic=0.0)
+    resolver.fail = exc
+    assert sc.revalidate_project_identities(
+        resolve=resolver, now_monotonic=60.0) is None
+    assert sc._PROJECT_IDENTITY_STATE["next_due"] == 60.0
+    assert sc._PROJECT_IDENTITY_STATE["observed"] == {
+        "/r/feature": {sc.project_identity_fields(old)}}
+    stats = sc.project_identity_stats()
+    assert stats["sweepFailures"] == 1
+    assert stats["recentSweeps"][-1]["outcome"] == "failed"
+    resolver.fail = None
+    sweep = sc.revalidate_project_identities(
+        resolve=resolver, now_monotonic=61.0)
+    assert [f.spelling for f in sweep.flips] == ["/r/feature"]
+    ids = [r["id"] for r in sc.project_identity_stats()["recentSweeps"]]
+    assert ids == sorted(ids) and len(set(ids)) == len(ids)
+
+
+def test_identity_registry_survives_every_cache_clear():
+    """Observation coverage that shrank on memory eviction, the prune-site
+    resets or an accounting reset would let a retained grouping escape the
+    next sweep."""
+    import _lib_snapshot_cache as sc
+    sc.reset_project_identity_state()
+    _observe("/r/feature", _key("/r/feature", git_root="/r/feature"))
+    sc.mark_project_regroup_pending(7)
+    sc._PROJECT_IDENTITY_STATE["next_due"] = 42.0
+    before = {k: (dict(v) if isinstance(v, dict) else v)
+              for k, v in sc._PROJECT_IDENTITY_STATE.items()}
+    assert all(root is not sc._PROJECT_IDENTITY_STATE
+               for root in sc._snapshot_accelerator_roots())
+    sc._clear_snapshot_accelerators()
+    sc.reset_projects_env_state()
+    sc.reset_weekref_cost_state()
+    sc.reset_codex_accounting_cache_state()
+    after = {k: (dict(v) if isinstance(v, dict) else v)
+             for k, v in sc._PROJECT_IDENTITY_STATE.items()}
+    assert after == before
+    assert sc.project_regroup_pending() == 7
+
+
+def test_evict_projects_env_weeks_evicts_whole_weeks_with_totals():
+    """Deleting the affected bucket rows without the week's totals entry
+    leaves a false HIT that silently lacks those rows."""
+    import _lib_snapshot_cache as sc
+    sc.reset_projects_env_state()
+    w1, w2, w3 = "w1|e1", "w2|e2", "w3|e3"
+    sc.projects_env_week_put(w1, {"/r/feature": "f1", "/o": "o1"}, 3.0)
+    sc.projects_env_week_put(w2, {"/o": "o2"}, 1.0)
+    sc.projects_env_week_put(w3, {"/r/feature": "f3"}, 2.0)
+    assert sc.evict_projects_env_weeks_for_buckets(
+        frozenset({"/r/feature"})) == 2
+    assert sc.projects_env_week_get(w1) is None
+    assert sc.projects_env_week_get(w3) is None
+    assert sc.projects_env_week_get(w2) == ({"/o": "o2"}, 1.0)
+    assert ("/o", w1) not in sc._PROJECTS_ENV_WEEK_CACHE
+    sc.reset_projects_env_state()
+
+
+@pytest.mark.parametrize("held, expected", [
+    ({"/r/feature": {}}, True),
+    ({"/o": {}}, False),
+])
+def test_reset_projects_env_current_if_holds(held, expected):
+    """A current-week slot holding a stale bucket keeps splitting the project
+    until a cold refold; resetting an unaffected slot is a needless refold."""
+    import _lib_snapshot_cache as sc
+    sc._PROJECTS_ENV_CURRENT["state"] = {"label": "w", "mut": held}
+    assert sc.reset_projects_env_current_if_holds(
+        frozenset({"/r/feature"})) is expected
+    assert (sc._PROJECTS_ENV_CURRENT["state"] is None) is expected
+    sc.reset_projects_env_current_state()
+
+
+def test_observing_memo_refuses_a_foreign_thread_when_the_owner_is_armed():
+    """A request-thread resolution feeding the owner's registry would race
+    the sweep that rewrites it."""
+    import threading
+    import _lib_snapshot_cache as sc
+    sc.mark_owner_thread()
+    errors = []
+
+    def foreign():
+        try:
+            sc.observing_project_memo()
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    try:
+        thread = threading.Thread(target=foreign)
+        thread.start()
+        thread.join()
+    finally:
+        sc.reset_owner_thread()
+    assert len(errors) == 1

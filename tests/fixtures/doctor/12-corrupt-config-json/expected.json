@@ -229,7 +229,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 52,
+                            "registry_size": 53,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -348,7 +348,8 @@
                                     "049_codex_rollout_containers",
                                     "050_preserve_claude_cost_attribution",
                                     "051_codex_retained_identities",
-                                    "052_codex_delete_trigger_plans"
+                                    "052_codex_delete_trigger_plans",
+                                    "053_codex_reset_anchor_evidence"
                                 ],
                                 "skipped": []
                             },
@@ -376,7 +377,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/65 applied",
+                    "summary": "0/66 applied",
                     "title": "Migrations"
                 },
                 {
@@ -641,13 +642,17 @@
                             [
                                 "cache.db",
                                 "052_codex_delete_trigger_plans"
+                            ],
+                            [
+                                "cache.db",
+                                "053_codex_reset_anchor_evidence"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "65 pending",
+                    "summary": "66 pending",
                     "title": "Pending migrations"
                 },
                 {

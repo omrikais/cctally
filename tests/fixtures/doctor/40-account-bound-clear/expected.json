@@ -189,12 +189,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 52,
-                        "user_version": 52
+                        "registry_size": 53,
+                        "user_version": 53
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 52 / 52 known",
+                    "summary": "version 53 / 53 known",
                     "title": "cache.db"
                 },
                 {
@@ -212,8 +212,8 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 52,
-                            "user_version": 52
+                            "registry_size": 53,
+                            "user_version": 53
                         },
                         "stats.db": {
                             "epoch": 1024,
@@ -329,7 +329,8 @@
                                     "049_codex_rollout_containers",
                                     "050_preserve_claude_cost_attribution",
                                     "051_codex_retained_identities",
-                                    "052_codex_delete_trigger_plans"
+                                    "052_codex_delete_trigger_plans",
+                                    "053_codex_reset_anchor_evidence"
                                 ],
                                 "failed": [],
                                 "pending": [],
@@ -359,7 +360,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "65/65 applied",
+                    "summary": "66/66 applied",
                     "title": "Migrations"
                 },
                 {
@@ -406,7 +407,7 @@
                     "details": {
                         "cache_db_free_ratio": 0.0,
                         "cache_db_freelist_count": 0,
-                        "cache_db_page_count": 151,
+                        "cache_db_page_count": 155,
                         "warn_ratio": 0.25
                     },
                     "id": "db.reclaimable",

@@ -2823,3 +2823,86 @@ def test_legacy_daily_panel_still_returns_nothing_when_empty(
     finally:
         conn.close()
     assert panel == []
+
+
+# === #1059 — the range fold regroups after a filesystem change =============
+
+
+def test_range_fold_regroups_after_a_worktree_removal_without_a_manual_clear(
+    tmp_path,
+):
+    """Detects the All-providers range fold keeping a removed worktree as its
+    own project (its retained `project_mut` and `resolver_cache` carry the old
+    identity forward on every incremental tick), and an unchanged sweep that
+    refolds the whole range for nothing."""
+    import _lib_snapshot_cache as sc
+    from conftest import make_regroup_tree, remove_worktree
+    ns = sys.modules["cctally"]
+    tui = sys.modules["_cctally_tui"]
+    tree = make_regroup_tree(tmp_path / "tree")
+    conn = _open_store(tmp_path / "regroup.db")
+    for label, path, ts in (
+        ("main", tree.main, _WEEK_A),
+        ("feat-a", tree.feature, _WEEK_B),
+        ("feat-b", tree.feature / "src", _WEEK_C),
+    ):
+        _seed(conn, ts=ts, project_path=str(path), session_id=label)
+    # The later append's session file exists from the start: a new
+    # `session_files` row moves the range base and would refold anyway.
+    conn.execute(
+        "INSERT INTO session_files (path, size_bytes, mtime_ns, "
+        "last_byte_offset, last_ingested_at, session_id, project_path) "
+        "VALUES (?, 0, 0, 0, ?, 'plain', ?)",
+        ("/fake/projects/plain.jsonl", fb.FIXED_LAST_INGESTED_AT,
+         str(tree.plain_sub)),
+    )
+    conn.commit()
+    ns.reset_claude_range_aggregate_memo()
+    sc.reset_project_identity_state()
+
+    def fold():
+        payload, outcomes = tui._tui_build_claude_aggregates(
+            conn, shared_start=START, shared_end_exclusive=END_EXCLUSIVE,
+            now_utc=NOW, display_tz_name="UTC", legacy_labels={},
+            generation=sc.current_generation(),
+        )
+        assert outcomes["projects"] == {"state": "ok"}
+        return {row["label"]: row["cost_usd"] for row in payload["projects"]}
+
+    def refolds():
+        return sc.project_work_stats()["rangeFullRefolds"]
+
+    tui._tui_revalidate_project_identities(now_monotonic=1000.0)
+    before = fold()
+    assert set(before) == {"mainrepo", "feature"}
+
+    # An unchanged due sweep: no bump, and the next tick stays incremental —
+    # including a spelling first resolved on that incremental tick.
+    tui._tui_revalidate_project_identities(now_monotonic=1061.0)
+    start_refolds = refolds()
+    _seed(conn, ts=NOW - dt.timedelta(hours=1),
+          project_path=str(tree.plain_sub), session_id="plain")
+    conn.commit()
+    appended = fold()
+    assert refolds() == start_refolds, "an unchanged sweep must not refold"
+    assert str(tree.plain_sub) in sc._PROJECT_IDENTITY_STATE["observed"], (
+        "a spelling first seen on an incremental tick must be registered")
+
+    remove_worktree(tree)
+    tui._tui_revalidate_project_identities(now_monotonic=1122.0)
+    pending = sc.project_regroup_pending()
+    after = fold()
+    assert "feature" not in after, "stale grouping: the worktree is still a row"
+    assert pending is not None
+    assert after["mainrepo"] == pytest.approx(
+        before["mainrepo"] + before["feature"], abs=1e-9)
+    assert sum(after.values()) == pytest.approx(sum(appended.values()), abs=1e-9)
+    assert refolds() == start_refolds + 1
+    state = sys.modules["_cctally_dashboard"]._CLAUDE_RANGE_AGGREGATE_MEMO[
+        "state"]
+    assert state["base"][3] >= pending, "the range state committed under G"
+
+    ns.reset_claude_range_aggregate_memo()
+    sc.reset_project_identity_state()
+    assert fold() == after, "warm regroup equals an independent cold oracle"
+    conn.close()
