@@ -4,11 +4,14 @@ Loads the main script (which has no .py extension and is not a
 package) into a throwaway namespace so tests can exercise its
 internals without running the CLI.
 """
+import json
 import os
 import pathlib
 import shutil
 import sys
+import threading
 import types
+import weakref
 
 import pytest
 
@@ -167,6 +170,7 @@ import _temp_hygiene as _hyg  # noqa: E402  -- tests/ is on sys.path for conftes
 
 _iso.install()
 _iso.install_popen_interceptor()
+_iso.install_thread_origin_tracker()  # #1110: a late thread's write names its starter
 _iso.install_retention_launch_audit()  # #965: the retention arm judges this worker's launches
 # #963 spec 5.2: every pytest temp allocation is registered with its owner from
 # here on; the guard's hooks are registered in pytest_configure below.
@@ -227,7 +231,110 @@ def _isolation_detector(request):
     """
     node_id = request.node.nodeid
     _iso.set_node_id_getter(lambda: node_id)
+    _thread_census(node_id, "at_setup_of", _threads_alive_at_setup_of(node_id))
     yield
+    _thread_census(node_id, "outlived", _iso.threads_started_by_test(node_id))
+
+
+#: The bound of the wait below. Thirty seconds is the estate's load-safe
+#: presence backstop (tests/_support_http.PRESENCE_BACKSTOP_SECONDS); the
+#: variable exists so the contract's own nested runs need not spend it.
+_THREAD_EXIT_WAIT_S = float(os.environ.get("CCTALLY_ISOLATION_THREAD_WAIT_S", "30"))
+
+
+@pytest.fixture(autouse=True)
+def _no_thread_outlives_its_test(request, monkeypatch):
+    """Join every thread this test started before its path pins are undone (#1110).
+
+    A thread a test starts and does not join keeps running into the next test
+    on the worker. `monkeypatch` undoes `redirect_paths` and the LOG_DIR pin
+    at teardown, and `load_script()` evicts every `_cctally_*` sibling, so such
+    a thread then resolves the default data directory and writes there (the
+    violation lands on a bystander test, or on the session), or re-imports a
+    sibling the next test is loading and leaves it partially initialized.
+
+    Requesting `monkeypatch` makes this teardown run BEFORE the shared
+    monkeypatch's undo, and a fixture the test requests tears down before this
+    one, so the wait happens while pins made through the shared `monkeypatch`,
+    or by a fixture the test requests, still hold. It does not hold for a test
+    that calls `monkeypatch.undo()` in its body or pins through its own
+    `MonkeyPatch`: those pins are already gone, though a late write is still
+    charged to the test that started the thread. Defined second among the
+    autouse fixtures, it also runs after every later fixture's teardown (the
+    W9 timer reset among them). A thread still alive after the bound fails
+    THIS test, naming the thread and the stack that started it, so the culprit
+    fails rather than a random later test. A thread started by a thread
+    inherits its starter's test. Not awaited: a thread started before
+    `_isolation_detector` sets this test's node getter, one started after this
+    wait, and one whose parent was never stamped.
+    """
+    yield
+    _thread_census(request.node.nodeid, "joined_at_teardown", [
+        t for t in _iso.threads_started_by_test(request.node.nodeid)
+        if t.name not in _iso.PROCESS_LIFETIME_THREADS])
+    survivors = _iso.await_threads_started_by_test(
+        request.node.nodeid, _THREAD_EXIT_WAIT_S)
+    if survivors:
+        pytest.fail(
+            "this test left %d thread(s) running %.0fs after its teardown; a "
+            "thread that outlives its test writes into the default data directory "
+            "once the test's path pins are undone (#1110). Stop and join it:\n  "
+            % (len(survivors), _THREAD_EXIT_WAIT_S)
+            + "\n  ".join(f"{t.name!r}: {_iso.thread_origin(t)}" for t in survivors),
+            pytrace=False)
+
+
+_CENSUSED_THREADS = weakref.WeakSet()
+
+#: pytest-timeout's per-test Timer under --timeout-method=thread, named
+#: "pytest_timeout <nodeid>". It starts before `_isolation_detector` sets the
+#: node getter, so it is charged to the previous test, and pytest-timeout
+#: cancels and joins it after the test's protocol: it is nobody's leftover.
+_PYTEST_TIMEOUT_THREAD_PREFIX = "pytest_timeout"
+
+
+def _threads_alive_at_setup_of(node_id):
+    """Every live non-main thread not charged to ``node_id``: the ones another
+    test started, and the unstamped ones, so a leftover the tracker never saw
+    shows up too."""
+    if not os.environ.get("CCTALLY_ISOLATION_THREAD_CENSUS"):
+        return []
+    main = threading.main_thread()
+    own = set(_iso.threads_started_by_test(node_id))
+    return [
+        thread for thread in threading.enumerate()
+        if thread is not main and thread.is_alive() and thread not in own
+    ]
+
+
+def _thread_census(node_id, phase, threads):
+    """#1110 diagnostic, off unless CCTALLY_ISOLATION_THREAD_CENSUS names a
+    directory: record every thread `_no_thread_outlives_its_test` had to wait
+    for, every thread still alive after its starting test's
+    teardown (after every monkeypatch is undone, since this fixture tears
+    down last), and once per thread every one still alive when a LATER test
+    starts, with the test and stack that started it (an empty origin marks a
+    thread the tracker never stamped). pytest-timeout's own timer is left
+    out."""
+    target = os.environ.get("CCTALLY_ISOLATION_THREAD_CENSUS")
+    if not target:
+        return
+    lines = []
+    for thread in threads:
+        if thread.name.startswith(_PYTEST_TIMEOUT_THREAD_PREFIX):
+            continue
+        if phase == "at_setup_of":
+            if thread in _CENSUSED_THREADS:
+                continue
+            _CENSUSED_THREADS.add(thread)
+        lines.append(json.dumps({
+            phase: node_id, "thread": thread.name,
+            "daemon": thread.daemon, "origin": _iso.thread_origin(thread)}))
+    if lines:
+        os.makedirs(target, exist_ok=True)
+        worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+        with open(os.path.join(target, f"{worker}.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
 
 
 @pytest.fixture
@@ -1110,6 +1217,13 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         # epoch-transition coordinator, record-usage/statusline stamping) hit the
         # per-test fake HOME, never the developer's real ~/.claude.json.
         "CLAUDE_JSON_PATH": tmp_path / ".claude.json",
+        # Claude session JSONL root, pinned under the same fake HOME. The
+        # constant is derived when the namespace loads, BEFORE this fixture
+        # sets HOME, so unpinned it kept the real ~/.claude/projects: a test
+        # that seeded a JSONL there (test_block_detail_states[retained]) wrote
+        # into the developer's real projects dir, and the hosted Linux matrix
+        # (whose HOME is the protected real home) refused it.
+        "CLAUDE_PROJECTS_DIR": tmp_path / ".claude" / "projects",
         "CONFIG_LOCK_PATH": share / "config.json.lock",
         "CONFIG_PATH": share / "config.json",
         "MIGRATION_ERROR_LOG_PATH": share / "logs" / "migration-errors.log",

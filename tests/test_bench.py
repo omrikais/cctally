@@ -2193,7 +2193,14 @@ def test_acquire_host_lock_bounded_wait_and_missing_inode(tmp_path):
     """A full-size run must never start beside another runner job: a held
     lock is retried every retry_s and refused after at most wait_s, and a
     missing lock inode refuses at once without being created (the runner's
-    own opener)."""
+    own opener).
+
+    The public mirror ships this module but not the private runner
+    (`bin/_lib_runner_host.py` is outside the allowlist), so there the opener
+    cannot be loaded at all. The contract is the same in both trees: one
+    immediate refusal, no retry and no lock inode created. Only the text
+    differs: the runner's own "lock inode missing" where the runner exists,
+    and the import failure naming the absent runner where it does not."""
     si = _load_soak_image()
     sleeps = []
     with pytest.raises(si.ImageRefusal, match="still held"):
@@ -2205,9 +2212,14 @@ def test_acquire_host_lock_bounded_wait_and_missing_inode(tmp_path):
                                 opener=lambda: next(answers),
                                 sleep=lambda _s: None) == 7
     absent = tmp_path / "absent-host.lock"
-    with pytest.raises(si.ImageRefusal, match="lock inode missing"):
+    runner_present = (BIN / "_lib_runner_host.py").is_file()
+    expected = ("lock inode missing" if runner_present
+                else "No module named '_lib_runner_host'")
+    absent_sleeps = []
+    with pytest.raises(si.ImageRefusal, match=expected):
         si.acquire_host_lock(opener=si.host_lock_opener(absent),
-                             sleep=lambda _s: None)
+                             sleep=absent_sleeps.append)
+    assert absent_sleeps == []
     assert not absent.exists()
 
 

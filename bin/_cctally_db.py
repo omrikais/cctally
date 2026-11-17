@@ -8865,7 +8865,14 @@ def _eagerly_apply_cache_migrations_under_writer_lock() -> None:
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     try:
         conn = sqlite3.connect(cache_db_path)
-        conn.execute("SELECT 1").fetchone()
+        # The probe must read the file. `SELECT 1` touches no database page,
+        # and older SQLite (3.45.1, Ubuntu 24.04's system library) prepares
+        # it without reading the header, so a corrupt file passed the probe
+        # and the #566 preflight's `PRAGMA user_version`
+        # (`_refuse_prod_migration_before_schema_write`) raised a bare
+        # DatabaseError outside this boundary instead of deferring. Reading
+        # the schema table opens a read transaction on every version.
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
     except sqlite3.DatabaseError as exc:
         # #787 / #861 section 11: never unlink here. A bare unlink skipped
         # the guarded quarantine (repair marker, maintenance drain of live

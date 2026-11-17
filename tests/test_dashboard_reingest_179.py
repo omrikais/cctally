@@ -467,6 +467,17 @@ def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, mon
         # `--dist load`, where an unrelated thread can start at any moment, is
         # the load-fragile red this session removes.
         owner = getattr(getattr(parked, "_target", None), "__self__", None)
+        if isinstance(owner, dash._StartupHeapFreeze):
+            # #1110: the heap-freeze worker starts before the server is built
+            # and waits for a first complete frame that never comes, and the
+            # bind abort skips the shutdown that would stop it. Left alone it
+            # waits for the rest of the worker's life; the leaked-thread
+            # teardown fails this test 30 s later for it.
+            owner.stop()
+            # timing-budget: `run` returns as soon as `stop` sets its wake event
+            parked.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+            assert not parked.is_alive(), "the heap-freeze worker did not exit after stop()"
+            continue
         stop_event = getattr(owner, "_stop", None)
         if not isinstance(stop_event, threading.Event):
             continue

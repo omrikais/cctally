@@ -4111,21 +4111,31 @@ def _seed_usage_journal(env):
 
 def _epoch_worker_in_thread(env, monkeypatch):
     """Stand in for the detached epoch worker AD12 lets the owner `open_db`
-    launch: the real worker body, on a thread of this process."""
+    launch: the real worker body, on a thread of this process. Returns the
+    worker results and a function that joins every worker it started."""
     import types
     store = env["store"]
     ran: list = []
+    workers: list = []
 
     def spawn(_command, _launch_id):
         def body():
             with env["core"].establish_authority("process"):
                 ran.append(store.cmd_stats_epoch_rebuild_internal(
                     types.SimpleNamespace()))
-        threading.Thread(target=body, daemon=True).start()
+        worker = threading.Thread(target=body, daemon=True)
+        workers.append(worker)
+        worker.start()
         return os.getpid()
 
+    def join_workers():
+        for worker in workers:
+            # timing-budget: the presence backstop; a worker that finished its
+            # rebuild returns at once
+            worker.join(30)
+
     monkeypatch.setattr(store, "_spawn_rebuild_worker", spawn)
-    return ran
+    return ran, join_workers
 
 
 def test_no_sync_owner_heals_a_stats_index_that_went_version_ahead(
@@ -4138,7 +4148,7 @@ def test_no_sync_owner_heals_a_stats_index_that_went_version_ahead(
     refused, where `main`'s request opener rebuilt the index."""
     core, access = env["core"], env["access"]
     _seed_usage_journal(env)
-    ran = _epoch_worker_in_thread(env, monkeypatch)
+    ran, join_epoch_workers = _epoch_worker_in_thread(env, monkeypatch)
     passes, _attention, halt = _start_no_sync_owner(env, monkeypatch)
     try:
         _settle(passes)
@@ -4158,6 +4168,7 @@ def test_no_sync_owner_heals_a_stats_index_that_went_version_ahead(
             ran)
     finally:
         halt()
+        join_epoch_workers()
 
 
 @pytest.mark.parametrize("store", ["stats", "cache"])

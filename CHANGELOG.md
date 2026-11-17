@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.120.1] - 2026-11-17
+
+### Fixed
+- With an older SQLite, as many Linux distributions ship, upgrading an old install whose `cache.db` is damaged no longer shows a database migration error; the upgrade waits until the cache is repaired, as it already did with newer SQLite.
+
 ## [1.120.0] - 2026-11-16
 
 ### Added

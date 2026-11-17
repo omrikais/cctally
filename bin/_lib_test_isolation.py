@@ -61,6 +61,10 @@ import re
 import sys
 import threading
 import time
+# #1110 review: the thread-exit wait's own clock, bound at import. Tests freeze
+# `time.monotonic` with monkeypatch, and the teardown wait runs before that
+# patch is undone; a wait reading the patched clock never reaches its deadline.
+from time import monotonic as _monotonic
 
 try:  # `F_GETPATH` names a directory descriptor's path on Darwin.
     import fcntl as _fcntl
@@ -108,15 +112,29 @@ class Violation:
     path: str
     kind: str = "write"
     detail: str = ""
+    # #1110: which thread made the write, and, for a thread other than the main
+    # one, which test started it and where. A late thread charges its write to
+    # whichever test is active (or last finished) on the worker, so without
+    # these the report names the victim rather than the culprit.
+    thread: str = ""
+    origin: str = ""
+    stack: str = ""
 
     def describe(self) -> str:
         if self.kind == "temp-hygiene":
             # #963 spec section 8: the wording the temp hygiene guard reports.
             return f"temp hygiene: {self.path} left {self.detail} by {self.node_id}"
-        return (
+        text = (
             f"{self.kind} violation: {self.event} -> {self.path} "
             f"(node={self.node_id} worker={self.worker_id} pid={self.pid})"
         )
+        if self.thread:
+            text += f"\n    written by thread {self.thread}"
+            if self.origin:
+                text += f"\n    {self.origin}"
+            if self.stack:
+                text += f"\n    write stack: {self.stack}"
+        return text
 
 
 # --- pure predicates ------------------------------------------------------
@@ -534,6 +552,9 @@ def _violations(records) -> list[Violation]:
             path=r.get("path", ""),
             kind=r.get("kind", "write"),
             detail=r.get("detail", ""),
+            thread=r.get("thread", ""),
+            origin=r.get("origin", ""),
+            stack=r.get("stack", ""),
         )
         for r in records
     ]
@@ -559,6 +580,7 @@ def _current_node_id() -> str:
 
 
 def _record(event: str, path: str, kind: str = "write") -> Violation:
+    thread, origin, stack = _writer_thread_evidence()
     violation = Violation(
         node_id=_current_node_id(),
         worker_id=_WORKER_ID or worker_id(),
@@ -566,6 +588,9 @@ def _record(event: str, path: str, kind: str = "write") -> Violation:
         event=event,
         path=path,
         kind=kind,
+        thread=thread,
+        origin=origin,
+        stack=stack,
     )
     _append_json_line(
         _LEDGER_PATH,
@@ -576,11 +601,154 @@ def _record(event: str, path: str, kind: str = "write") -> Violation:
             "event": violation.event,
             "path": violation.path,
             "kind": violation.kind,
+            "thread": violation.thread,
+            "origin": violation.origin,
+            "stack": violation.stack,
             "at": time.time(),
         },
     )
     return violation
 
+
+# --- thread provenance (#1110) --------------------------------------------
+#
+# A thread one test starts and never joins keeps running into later tests on
+# the same worker. When it writes, `_current_node_id` names whichever test is
+# active then, or the last one to finish, so the report blames a bystander.
+# `install_thread_origin_tracker` stamps every started thread with the test
+# that was active when it started and a compact stack of where, and `_record`
+# copies that stamp into the violation. Only frames under this checkout's
+# `bin/` and `tests/` are kept, so the stamp stays a few hundred bytes.
+
+_THREAD_ORIGIN_ATTR = "_cctally_isolation_origin"
+_THREAD_NODE_ATTR = "_cctally_isolation_origin_node"
+_ORIGINAL_THREAD_START = None
+_CHECKOUT_ROOT = str(pathlib.Path(__file__).resolve().parent.parent) + os.sep
+_STACK_FRAMES = 10
+
+#: The origin a violation carries for a thread the tracker never stamped: one
+#: started before `install_thread_origin_tracker` ran in this process, or any
+#: thread of a process that never installs it (every child process).
+ORIGIN_STARTED_BEFORE_TRACKER = "started before the origin tracker was installed"
+ORIGIN_NO_TRACKER_IN_PROCESS = "this process has no thread origin tracker"
+
+
+def _compact_stack(skip: int = 0) -> str:
+    """The innermost checkout frames of the caller's stack, innermost first."""
+    import traceback
+    frame = sys._getframe(1 + skip)
+    summary = traceback.StackSummary.extract(
+        traceback.walk_stack(frame), lookup_lines=False)
+    kept = []
+    for entry in summary:
+        filename = entry.filename
+        if not filename.startswith(_CHECKOUT_ROOT):
+            continue
+        rel = filename[len(_CHECKOUT_ROOT):]
+        if rel == "bin/_lib_test_isolation.py" or not rel.startswith(("bin/", "tests/")):
+            continue
+        kept.append(f"{rel}:{entry.lineno} {entry.name}")
+        if len(kept) >= _STACK_FRAMES:
+            break
+    return " <- ".join(kept)
+
+
+def thread_origin(thread) -> str:
+    """The provenance stamp of ``thread``, or "" when it was never stamped."""
+    return getattr(thread, _THREAD_ORIGIN_ATTR, "") or ""
+
+
+def _writer_thread_evidence() -> tuple[str, str, str]:
+    try:
+        current = threading.current_thread()
+        if current is threading.main_thread():
+            return "", "", ""
+        return (
+            f"{current.name!r} ident={current.ident} daemon={current.daemon}",
+            thread_origin(current) or (
+                ORIGIN_STARTED_BEFORE_TRACKER if _ORIGINAL_THREAD_START is not None
+                else ORIGIN_NO_TRACKER_IN_PROCESS),
+            _compact_stack(skip=2),
+        )
+    except Exception:
+        return "", "", ""
+
+
+def threads_started_by_test(node_id: str) -> list:
+    """Live threads charged to ``node_id``.
+
+    A thread started by a thread inherits that thread's test, so a worker a
+    leftover dashboard spawns later is still charged to the test that started
+    the dashboard.
+    """
+    return [
+        thread for thread in threading.enumerate()
+        if getattr(thread, _THREAD_NODE_ATTR, "") == node_id and thread.is_alive()
+    ]
+
+
+#: Threads that live for the whole process by design: started lazily by
+#: whichever test first needs them and reused by every later one. They are
+#: not a test's leftovers, and they write nothing under a data directory.
+PROCESS_LIFETIME_THREADS = frozenset({
+    "cctally-snapshot-memory",  # _lib_snapshot_cache._SnapshotMemoryWorker
+})
+
+
+def await_threads_started_by_test(node_id: str, timeout: float) -> list:
+    """Wait up to ``timeout`` seconds for ``node_id``'s threads to exit (#1110).
+
+    Returns the ones still alive at the deadline, ignoring
+    ``PROCESS_LIFETIME_THREADS``. A presence wait: it returns as soon as the
+    last one is gone, so a test whose threads are already stopped pays nothing.
+    """
+    deadline = _monotonic() + max(0.0, float(timeout))
+    current = threading.current_thread()
+    while True:
+        alive = [
+            thread for thread in threads_started_by_test(node_id)
+            if thread is not current and thread.name not in PROCESS_LIFETIME_THREADS
+        ]
+        remaining = deadline - _monotonic()
+        if not alive or remaining <= 0:
+            return alive
+        alive[0].join(min(0.05, remaining))
+
+
+def install_thread_origin_tracker() -> None:
+    """Stamp every thread started from here on with its starting test (#1110).
+
+    Idempotent. The wrapper is a pure observer: it never changes whether or how
+    a thread starts, and a failure to stamp is swallowed.
+    """
+    global _ORIGINAL_THREAD_START
+    with _LOCK:
+        if _ORIGINAL_THREAD_START is not None:
+            return
+        original = threading.Thread.start
+
+        def start(self, *args, **kwargs):
+            try:
+                # A second start raises in `original` and starts nothing; it
+                # must not replace the stamp of the start that did.
+                if not self._started.is_set():
+                    parent = threading.current_thread()
+                    inherited = thread_origin(parent)
+                    node = getattr(parent, _THREAD_NODE_ATTR, "") or _current_node_id()
+                    setattr(self, _THREAD_NODE_ATTR, node)
+                    origin = (
+                        f"started by test {_current_node_id()} from thread "
+                        f"{parent.name!r} at: {_compact_stack()}"
+                    )
+                    if inherited:
+                        origin += f"\n      whose thread was {inherited}"
+                    setattr(self, _THREAD_ORIGIN_ATTR, origin)
+            except Exception:
+                pass
+            return original(self, *args, **kwargs)
+
+        _ORIGINAL_THREAD_START = original
+        threading.Thread.start = start
 
 
 def record_finding(node_id: str, kind: str, event: str, path: str, detail: str = "") -> Violation:

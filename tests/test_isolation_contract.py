@@ -318,6 +318,93 @@ def test_a_write_open_into_a_guarded_root_is_blocked(guarded):
     assert not (guarded.root / "new.txt").exists()
 
 
+def test_a_write_from_another_thread_names_the_thread_and_its_starting_test(guarded):
+    """#1110. Failure it detects: a late thread's write reported only against
+    whichever test is active when it lands. A thread one test starts and never
+    joins keeps writing into later tests on the same worker, and a report that
+    names neither the thread nor the test and stack that started it sends the
+    diagnosis to the bystander."""
+    import threading
+    import _lib_test_isolation as iso
+
+    caught = []
+
+    def write():
+        try:
+            open(guarded.root / "from-a-thread.txt", "w")
+        except iso.ProductionWriteBlocked as exc:
+            caught.append(str(exc))
+
+    worker = threading.Thread(target=write, name="t1110-late-writer")
+    worker.start()
+    worker.join(PRESENCE_BACKSTOP_SECONDS)
+    assert caught, "the write from the thread was not blocked"
+    [violation] = [v for v in iso.read_ledger() if v.node_id == guarded.node_id]
+    assert "t1110-late-writer" in violation.thread
+    assert guarded.node_id in violation.origin
+    assert "tests/test_isolation_contract.py" in violation.origin
+    assert " write" in violation.stack
+    described = violation.describe()
+    assert "t1110-late-writer" in described and violation.origin in described
+
+
+def test_the_thread_exit_wait_is_bounded_under_a_frozen_monotonic_clock(
+        monkeypatch, request):
+    """#1110 review. Failure it detects: the teardown wait hanging a worker.
+    Several tests freeze `time.monotonic` with monkeypatch, and the teardown
+    wait runs before that patch is undone; a wait that reads the patched clock
+    never reaches its deadline, so one leftover thread spins the worker until
+    pytest-timeout kills it."""
+    import threading
+    import _lib_test_isolation as iso
+
+    release = threading.Event()
+    stuck = threading.Thread(target=release.wait, daemon=True, name="t1110-frozen-clock")
+    stuck.start()
+    returned = []
+    waiter = threading.Thread(
+        target=lambda: returned.append(
+            iso.await_threads_started_by_test(request.node.nodeid, 0.2)),
+        daemon=True, name="t1110-frozen-clock-waiter")
+    try:
+        assert stuck in iso.threads_started_by_test(request.node.nodeid), "premise"
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+        waiter.start()
+        # timing-budget: a bounded wait returns after its 0.2 s timeout; an
+        # unbounded one never does, so any bound far above 0.2 s separates them
+        waiter.join(PRESENCE_BACKSTOP_SECONDS)
+        bounded = not waiter.is_alive()
+    finally:
+        release.set()
+        stuck.join(PRESENCE_BACKSTOP_SECONDS)
+        if waiter.ident is not None:
+            waiter.join(PRESENCE_BACKSTOP_SECONDS)
+    assert bounded, "the wait never returned under a frozen time.monotonic"
+    assert returned == [[stuck]]
+
+
+def test_a_second_start_keeps_the_threads_first_stamp():
+    """#1110 review. Failure it detects: provenance overwritten by a call that
+    starts nothing. `Thread.start` on a started thread raises, so a stamp the
+    wrapper writes before delegating would replace where the thread was really
+    started with where the failed call was made."""
+    import threading
+    import _lib_test_isolation as iso
+
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait, daemon=True, name="t1110-restart")
+    worker.start()
+    try:
+        first = iso.thread_origin(worker)
+        assert first, "premise: the tracker stamped the thread"
+        with pytest.raises(RuntimeError):
+            worker.start()
+        assert iso.thread_origin(worker) == first
+    finally:
+        release.set()
+        worker.join(PRESENCE_BACKSTOP_SECONDS)
+
+
 def test_a_nested_descendant_is_blocked(guarded):
     """Guarding the root must guard everything under it, at any depth, even
     when the intermediate directories do not exist yet."""
@@ -657,6 +744,32 @@ def test_a_fresh_env_child_is_still_covered(guarded, tmp_path):
     assert rows, "the child's violation never reached the ledger"
     assert rows[-1].pid != os.getpid(), "the violation was not attributed to the child"
     assert rows[-1].node_id == guarded.node_id
+
+
+def test_a_child_thread_write_says_the_child_has_no_origin_tracker(guarded, tmp_path):
+    """#1110 review. Failure it detects: a misleading provenance in a child
+    process. A child never installs the thread origin tracker, so a write from
+    one of its threads must say the process has none, not that the thread
+    started before the tracker was installed, which sends the diagnosis looking
+    for a start-up ordering bug that does not exist."""
+    import _lib_test_isolation as iso
+
+    victim = guarded.root / "child-thread-write"
+    env = _fresh_env(tmp_path, CCTALLY_DATA_DIR=str(guarded.root))
+    code = (
+        "import threading\n"
+        f"t = threading.Thread(target=lambda: open({str(victim)!r}, 'w'), name='t1110-child')\n"
+        "t.start(); t.join()\n"
+    )
+    subprocess.run([sys.executable, "-c", code], env=env,
+                   capture_output=True, text=True, timeout=120)
+
+    assert not victim.exists(), "the child wrote into a protected root"
+    rows = [v for v in iso.read_ledger()
+            if v.path == os.path.realpath(str(victim))]
+    assert rows, "the child's violation never reached the ledger"
+    assert "t1110-child" in rows[-1].thread
+    assert rows[-1].origin == iso.ORIGIN_NO_TRACKER_IN_PROCESS
 
 
 def test_the_child_keeps_the_layout_its_caller_asked_for(guarded, tmp_path):
@@ -1430,13 +1543,14 @@ def test_the_ledger_is_worker_private(guarded):
     assert pathlib.Path(path).parent.parent == iso.session_dir()
 
 
-def _nested_pytest(module_path, tmp_path, synthetic, extra_args=()):
+def _nested_pytest(module_path, tmp_path, synthetic, extra_args=(), **env_extra):
     env = _fresh_env(
         tmp_path,
         CCTALLY_DATA_DIR=str(synthetic),
         PYTHONPATH=os.pathsep.join(
             [str(REPO_ROOT / "tests"), str(REPO_ROOT / "bin")]
         ),
+        **env_extra,
     )
     return subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "conftest", "-q",
@@ -1444,6 +1558,79 @@ def _nested_pytest(module_path, tmp_path, synthetic, extra_args=()):
          *extra_args, str(module_path)],
         env=env, capture_output=True, text=True, timeout=110,
     )
+
+
+_LATE_THREAD_MODULE = """\
+import pathlib
+import threading
+import time
+
+TARGET = {{"dir": {victim_dir!r}}}
+
+
+def test_a_leaves_a_late_writer(monkeypatch, tmp_path):
+    # The shape of redirect_paths: a module-level path pinned for the test and
+    # restored by monkeypatch at teardown.
+    monkeypatch.setitem(TARGET, "dir", str(tmp_path))
+
+    def late():
+        time.sleep(1.0)
+        pathlib.Path(TARGET["dir"], "late.txt").write_text("x")
+
+    threading.Thread(target=late, daemon=True, name="t1110-late-writer").start()
+
+
+def test_b_bystander():
+    # Keep the process alive until the late writer is done, so a write the
+    # teardown did not wait for still lands (in the restored directory).
+    for thread in threading.enumerate():
+        if thread.name == "t1110-late-writer":
+            thread.join(30)
+"""
+
+_STUCK_THREAD_MODULE = """\
+import threading
+
+NEVER = threading.Event()
+
+
+def test_leaves_a_thread_running():
+    threading.Thread(target=NEVER.wait, daemon=True, name="t1110-stuck").start()
+"""
+
+
+def test_a_thread_still_running_at_teardown_finishes_under_the_tests_own_pins(tmp_path):
+    """#1110. Failure it detects: a thread a test leaves running writes into
+    the default data directory once monkeypatch undoes the test's path pins,
+    and the violation lands on a bystander test or on the session. The
+    teardown must wait for the thread while the pins still hold, so the late
+    write lands in the test's own tmp directory and the run stays clean."""
+    synthetic = tmp_path / "nested-prod"
+    synthetic.mkdir()
+    module = tmp_path / "test_nested_late_thread.py"
+    module.write_text(_LATE_THREAD_MODULE.format(victim_dir=str(synthetic)))
+    proc = _nested_pytest(module, tmp_path, synthetic)
+    output = proc.stdout + proc.stderr
+    assert not list(synthetic.iterdir()), output
+    assert "write violation" not in output, output
+    assert proc.returncode == 0, output
+
+
+def test_a_thread_that_never_exits_fails_the_test_that_started_it(tmp_path):
+    """#1110. Failure it detects: a leftover thread blamed on nobody. A thread
+    still alive after the bounded wait must fail the test that started it,
+    naming the thread and the test and stack that started it, rather than
+    surfacing later as a random victim's violation or AttributeError."""
+    synthetic = tmp_path / "nested-prod"
+    synthetic.mkdir()
+    module = tmp_path / "test_nested_stuck_thread.py"
+    module.write_text(_STUCK_THREAD_MODULE)
+    proc = _nested_pytest(module, tmp_path, synthetic,
+                          CCTALLY_ISOLATION_THREAD_WAIT_S="0.5")
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "t1110-stuck" in output, output
+    assert "test_nested_stuck_thread.py::test_leaves_a_thread_running" in output, output
 
 
 _LATE_VIOLATION_MODULE = """\
