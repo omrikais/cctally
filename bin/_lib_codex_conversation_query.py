@@ -2818,6 +2818,12 @@ def _read_snapshot(conn: sqlite3.Connection):
     one snapshot opens it through this same helper, which nests without issuing
     the second ``BEGIN`` SQLite would refuse.
 
+    The one foreign transaction that is borrowed is a query session's
+    (#787 spec 5.13): its connection is ``mode=ro`` under a permanent
+    authorizer and says so with ``query_session_snapshot``, so its transaction
+    can only be a read snapshot. The envelope reads in it and leaves its end to
+    the session.
+
     The caller sweep behind that decision, pinned by
     ``test_every_outline_caller_arrives_outside_a_transaction``: the three call
     paths into ``get_codex_conversation_outline`` are
@@ -2828,6 +2834,12 @@ def _read_snapshot(conn: sqlite3.Connection):
     """
     token = id(conn)
     if token in _OWNED_READ_SNAPSHOTS:
+        yield
+        return
+    if (conn.in_transaction
+            and getattr(conn, "query_session_snapshot", False) is True):
+        # A query session's transaction (#787): read-only by construction,
+        # so it is a snapshot, and the session ends it.
         yield
         return
     if conn.in_transaction:

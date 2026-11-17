@@ -1349,7 +1349,15 @@ def _sync_failure_envelope(
             "detail": "A stale cache repair owner is blocking server sync.",
             "action": "cctally cache-sync --rebuild",
         }
-    if "maintenance is in progress" in text:
+    # #787 / #861 spec 5.11: a query session refuses cache.db while a repair
+    # holds its marker as "cache.db recovery is pending" (only the query
+    # layer's precheck writes that text). The owner resolves it itself, so it
+    # is the repair in progress, not the rebuild the generic "cache.db
+    # recovery" match below asks for. The ingesting tick reaches this state
+    # through its ingest's maintenance text; a no-ingest rebuild only through
+    # this one.
+    if ("maintenance is in progress" in text
+            or "cache.db recovery is pending" in text):
         return {
             "kind": "maintenance_active",
             "label": "cache repair in progress",
@@ -2251,6 +2259,18 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     _doctor_payload = getattr(snap, "doctor_payload", None)
     if _doctor_payload is not None:
         doctor_envelope: "dict" = _doctor_payload
+    elif not sys.modules["_cctally_core"].has_capability("STARTUP"):
+        # #787 / #861 AD28 backstop: the Doctor gather is owner work, so a
+        # request route (or any reader outside an owner) never runs it. It
+        # renders the deferred placeholder and hands the recomputation to
+        # the owner (the `--no-sync` obligation thread, or the next build).
+        # Reachable only through a defect: the owner always publishes a block.
+        doctor_envelope = sys.modules["cctally"]._cctally_tui \
+            ._deferred_doctor_placeholder(now_utc)
+        _core = sys.modules["_cctally_core"]
+        _core.notify_owner(_core.DOCTOR_OWNER_STORE, _core.Readiness(
+            _core.DOCTOR_OWNER_STORE, True, None,
+            frozenset({_core.DOCTOR_OWNER_OBLIGATION})))
     else:
         try:
             _ld = sys.modules["cctally"]._load_sibling("_lib_doctor")

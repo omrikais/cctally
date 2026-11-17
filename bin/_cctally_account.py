@@ -30,6 +30,7 @@ import json
 import sqlite3
 
 import _cctally_core
+import _cctally_store_access as _store_access
 import _lib_accounts
 
 
@@ -224,7 +225,11 @@ def resolve_account_filter(args, provider: str = "claude", *,
     ref = getattr(args, "account", None)
     if ref is None:
         return (None, None)
-    conn = _cctally_core.open_db()
+    # #787 / #861 (X6, D7): the reference resolves in a `query(command)`
+    # stats session after the startup phase; the cache leg below stays the
+    # existing owner open (the startup phase that establishes attribution).
+    _session, _phase = _store_access.open_command_session("stats")
+    conn = _session.conn
     try:
         try:
             key = _lib_accounts.resolve_account_ref(conn, ref, provider)
@@ -233,7 +238,7 @@ def resolve_account_filter(args, provider: str = "claude", *,
             print_ref_candidates(conn, exc.candidates)
             return (None, 2)
     finally:
-        conn.close()
+        _phase.close()
     if needs_cache:
         try:
             import _cctally_cache
@@ -253,11 +258,8 @@ def account_json_fields(account_key: "str | None") -> dict:
     byte-identical (R8). camelCase + additive; no ``schemaVersion`` bump."""
     if account_key is None:
         return {}
-    conn = _cctally_core.open_db()
-    try:
-        label = display_account_label(conn, account_key)
-    finally:
-        conn.close()
+    with _store_access.command_session("stats") as _session:
+        label = display_account_label(_session.conn, account_key)
     return {"accountKey": account_key, "accountLabel": label}
 
 
@@ -331,11 +333,8 @@ def cmd_account(args: argparse.Namespace) -> int:
 
 
 def _cmd_account_list(args: argparse.Namespace) -> int:
-    conn = _cctally_core.open_db()
-    try:
-        accounts = load_accounts(conn)
-    finally:
-        conn.close()
+    with _store_access.command_session("stats") as _session:
+        accounts = load_accounts(_session.conn)
     active = resolve_active_account_keys()
     if getattr(args, "emit_json", False):
         payload = {
@@ -434,7 +433,8 @@ def _resolve_ref_or_exit(conn, ref: str) -> "str | None":
 
 def _cmd_account_show(args: argparse.Namespace) -> int:
     ref = getattr(args, "ref", None)
-    conn = _cctally_core.open_db()
+    _session, _phase = _store_access.open_command_session("stats")
+    conn = _session.conn
     try:
         key = _resolve_ref_or_exit(conn, ref)
         if key is None:
@@ -457,7 +457,7 @@ def _cmd_account_show(args: argparse.Namespace) -> int:
         # `account_label_from_row` it replaces.
         display = display_account_label(conn, key) if a is not None else None
     finally:
-        conn.close()
+        _phase.close()
     active = resolve_active_account_keys()
     is_active = key in active
     if getattr(args, "emit_json", False):
@@ -518,7 +518,10 @@ def _stats_index_not_current():
 def _cmd_account_label(args: argparse.Namespace) -> int:
     ref = getattr(args, "ref", None)
     label = getattr(args, "label", None)
-    conn = _cctally_core.open_db()
+    # #787 / #861: the snapshot read is one `query(command)` read unit; the
+    # journal append and ingest below run after it closes.
+    _session, _phase = _store_access.open_command_session("stats")
+    conn = _session.conn
     try:
         # #825/#832 spec 6: the reference and provider serialized into the op
         # come from one snapshot proven to be the current interpretation.
@@ -538,7 +541,7 @@ def _cmd_account_label(args: argparse.Namespace) -> int:
             return 2
         provider = provider_row[0] if provider_row is not None else None
     finally:
-        conn.close()
+        _phase.close()
 
     import _cctally_journal as _jr
     import _lib_journal as _lj
@@ -1415,6 +1418,10 @@ def _attribute_publish_projection() -> "str | None":
     resolution is therefore settled first, unbudgeted, through the cache
     writer flocks an unbudgeted sync takes; when the projection still refuses
     (those flocks were contended) the caller reports ``recordedPending``.
+
+    #1069 spec §5.4: only ``current`` and ``published`` finish. A deferred,
+    contended or unavailable projection applied nothing, so its status is
+    handed back the same way and the caller reports ``recordedPending``.
     """
     import _cctally_cache as _cache_mod
     import _cctally_quota as _quota
@@ -1428,9 +1435,10 @@ def _attribute_publish_projection() -> "str | None":
             and not settled):
         _cache_mod.settle_codex_finalization_unbudgeted()
         result = _quota.reconcile_codex_quota_projection()
-    if getattr(result, "status", None) == _quota.PROJECTION_DEFERRED_MODEL:
-        return _quota.PROJECTION_DEFERRED_MODEL
-    return None
+    status = getattr(result, "status", None) or _quota.PROJECTION_PUBLISHED
+    if status in (_quota.PROJECTION_PUBLISHED, _quota.PROJECTION_CURRENT):
+        return None
+    return status
 
 
 def _cmd_account_attribute(args: argparse.Namespace) -> int:
@@ -1457,7 +1465,10 @@ def _cmd_account_attribute(args: argparse.Namespace) -> int:
             raise _AttributeUsage(
                 "account attribute: --until must be strictly after --since; "
                 "the range is half-open [since, until)")
-        conn = _cctally_core.open_db()
+        # #787 / #861: the validated snapshot read is one `query(command)`
+        # read unit.
+        _session, _phase = _store_access.open_command_session("stats")
+        conn = _session.conn
         try:
             # #825/#832 spec 6: resolved on one validated current snapshot.
             try:
@@ -1472,7 +1483,7 @@ def _cmd_account_attribute(args: argparse.Namespace) -> int:
                     "republishing the stats index — restart it and retry"
                 ) from exc
         finally:
-            conn.close()
+            _phase.close()
     except _AttributeUsage as exc:
         message = str(exc)
         if message != "unresolvable ref":
@@ -1494,13 +1505,14 @@ def _cmd_account_attribute(args: argparse.Namespace) -> int:
     until_iso = until.isoformat().replace("+00:00", "Z")
 
     requested_apply = bool(getattr(args, "yes", False))
-    cache = _cache_mod.open_cache_db()
-    try:
+    # #787 / #861: the plan is a read in a `query(command)` cache session;
+    # the apply below stays the owner entry point at `process`.
+    with _store_access.command_session("cache") as _session:
         planned = _attribute_plan(
-            cache, account_key=account_key, mode=mode, since=since, until=until)
-        completion = requested_apply and _attribute_tail_pending(cache)
-    finally:
-        cache.close()
+            _session.conn, account_key=account_key, mode=mode, since=since,
+            until=until)
+        completion = requested_apply and _attribute_tail_pending(
+            _session.conn)
 
     actions = dict(_ATTRIBUTE_NO_ACTIONS)
     errors: list = []

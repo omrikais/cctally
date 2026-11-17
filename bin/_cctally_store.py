@@ -1076,6 +1076,9 @@ def active_stats_recovery_deferral() -> "_cctally_db.StatsRebuildDeferred | None
 #: (#825/#832 Codex fix-round-4 Q3): ``contention`` when the lock stayed
 #: held, ``error`` for an OS error no holder caused.
 _GUARD_FAILURE = contextvars.ContextVar("stats_guard_failure", default=None)
+#: The OS error behind an ``error`` expiry (#787 spec AD18): its ``str()`` is
+#: what ``_maintenance_busy_error`` names instead of claiming maintenance.
+_GUARD_OS_ERROR = contextvars.ContextVar("stats_guard_os_error", default=None)
 
 
 def _maintenance_busy_error(mode: str) -> "_cctally_db.StatsDbMaintenanceError":
@@ -1083,11 +1086,14 @@ def _maintenance_busy_error(mode: str) -> "_cctally_db.StatsDbMaintenanceError":
     failed acquisition lost to (``blocked_by``: a `_cctally_journal.LockBlock`
     for ``maintenance`` in the requested ``mode``) so a deferred statusline
     reduction can leave an obligation for exactly that release (Q3). An
-    expiry an I/O error caused is not contention and wakes nobody."""
+    expiry an I/O error caused is not contention and wakes nobody, and its
+    message names that error rather than claiming maintenance (spec AD18)."""
     import _cctally_journal
 
+    os_error = _GUARD_OS_ERROR.get() if _GUARD_FAILURE.get() == "error" else None
     exc = _cctally_db.StatsDbMaintenanceError(
-        _stats_open_maintenance_timeout_message())
+        _stats_open_maintenance_timeout_message() if os_error is None
+        else f"stats.db maintenance lock could not be acquired: {os_error}")
     exc.blocked_by = _cctally_journal.LockBlock(
         "maintenance", mode, _GUARD_FAILURE.get() != "error")
     return exc
@@ -1106,10 +1112,12 @@ def diagnostic_flock(fh, operation: int, timeout_s: float) -> bool:
     makes exactly one ``LOCK_NB`` attempt.
 
     ``_GUARD_FAILURE`` is set exactly as before, so ``_maintenance_busy_error``
-    still tells contention from an OS error.
+    still tells contention from an OS error; ``_GUARD_OS_ERROR`` keeps the
+    last OS error it saw (AD18).
     """
     allowance = _DIAGNOSTIC_ALLOWANCE.get()
     _GUARD_FAILURE.set(None)
+    _GUARD_OS_ERROR.set(None)
     if allowance is None:
         deadline = time.monotonic() + timeout_s
         while True:
@@ -1121,6 +1129,7 @@ def diagnostic_flock(fh, operation: int, timeout_s: float) -> bool:
                     _GUARD_FAILURE.set(
                         "contention" if isinstance(exc, BlockingIOError)
                         else "error")
+                    _GUARD_OS_ERROR.set(exc)
                     return False
                 time.sleep(0.02)
     start = time.monotonic()
@@ -1136,11 +1145,58 @@ def diagnostic_flock(fh, operation: int, timeout_s: float) -> bool:
                     _GUARD_FAILURE.set(
                         "contention" if isinstance(exc, BlockingIOError)
                         else "error")
+                    _GUARD_OS_ERROR.set(exc)
                     return False
                 time.sleep(min(0.02, deadline - now))
     finally:
         elapsed = max(0.0, time.monotonic() - start)
         allowance.remaining_s = max(0.0, allowance.remaining_s - elapsed)
+
+
+def admission_flock(fh, operation: int,
+                    deadline: float) -> "BlockingIOError | None":
+    """Poll for ``operation`` on ``fh`` until the absolute monotonic
+    ``deadline`` (#787 spec AD7, the CLI owner admission bound).
+
+    ``None`` once the lock is held. On contention that outlasts the deadline
+    it returns the final attempt's ``BlockingIOError`` (nothing acquired), and
+    the caller translates it into the store's sentence, chained from it.
+    Only ``BlockingIOError`` and ``InterruptedError`` are retried: any other
+    ``OSError`` propagates unchanged at once, as today's blocking ``flock``
+    raises it, so an I/O failure is never reported as maintenance. When
+    interruption outlasts the deadline the last ``InterruptedError`` is
+    raised. Polls are at most 0.02 s apart, no sleep passes the deadline,
+    and a deadline already passed makes exactly one ``LOCK_NB`` attempt.
+
+    Inside a ``bounded_diagnostic_waits`` scope the effective deadline is the
+    earlier of ``deadline`` and the remaining allowance, and the elapsed time
+    is charged in ``finally`` however the call ends, as in
+    ``diagnostic_flock``.
+    """
+    allowance = _DIAGNOSTIC_ALLOWANCE.get()
+    start = time.monotonic()
+    effective = float(deadline)
+    if allowance is not None:
+        effective = min(effective, start + max(0.0, allowance.remaining_s))
+    try:
+        while True:
+            try:
+                fcntl.flock(fh, operation | fcntl.LOCK_NB)
+                return None
+            except BlockingIOError as exc:
+                last: "BaseException" = exc
+            except InterruptedError as exc:
+                last = exc
+            now = time.monotonic()
+            if now >= effective:
+                if isinstance(last, BlockingIOError):
+                    return last
+                raise last
+            time.sleep(min(0.02, effective - now))
+    finally:
+        if allowance is not None:
+            elapsed = max(0.0, time.monotonic() - start)
+            allowance.remaining_s = max(0.0, allowance.remaining_s - elapsed)
 
 
 def _flock_bounded(lock_fh, operation: int, timeout_s: float) -> bool:
@@ -1629,6 +1685,8 @@ def _recover_or_reclaim_interrupted_stats_rebuild(
     prebuild-quarantine incident that distinguishes the legacy interruption
     from an unrelated file.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="_recover_or_reclaim_interrupted_stats_rebuild")
     if not artifacts:
         return False
     import _cctally_journal
@@ -1745,6 +1803,9 @@ def stats_open_guarded(
     receives the path and ``cached_statements=0`` (see ``_STATS_CONNECT_KWARGS``)
     and returns the connection. Defaults to ``sqlite3.connect``.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    if recover_interruptions:
+        _cctally_core.require_capability("MAINTENANCE", entry="stats_open_guarded")
     db_path = pathlib.Path(
         db_path if db_path is not None else _cctally_core.DB_PATH
     )
@@ -1985,9 +2046,11 @@ def stats_open_readonly_failfast() -> "sqlite3.Connection | None":
     this)."""
     db_path = pathlib.Path(_cctally_core.DB_PATH)
     lock_path = pathlib.Path(_cctally_core.STATS_LOCK_MAINTENANCE_PATH)
+    # #787 spec 5.4 (X13): the lock is opened O_RDONLY and never created; a
+    # missing lock (or data directory) means no owner has established the
+    # store, which this reader reports as unavailable rather than creating.
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_fh = open(lock_path, "a+")
+        lock_fh = open(lock_path, "r")
     except OSError:
         return None
     try:
@@ -2300,6 +2363,8 @@ def _stats_heal_hook(
     the user the database "is never auto-recreated" — false once replacement
     has occurred."""
     global _HEAL_ACTIVE
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="_stats_heal_hook")
     if store != "stats":
         return False
     if not _cctally_db._is_sqlite_corruption_error(exc):
@@ -2791,6 +2856,8 @@ def reserve_stats_corruption_heal(
     request: dict, *, admission_event: "dict | None" = None,
 ) -> str:
     """Compatibility wrapper returning only the admission status."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("LAUNCH", entry="reserve_stats_corruption_heal")
     status, _elected = _reserve_stats_corruption_heal(
         request, admission_event=admission_event,
     )
@@ -4588,6 +4655,8 @@ def _worker_version() -> "str | None":
 
 def defer_stats_epoch_rebuild() -> str:
     """Schedule one retryable detached epoch worker without blocking callers."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("LAUNCH", entry="defer_stats_epoch_rebuild")
     try:
         pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
         admission_fd = os.open(

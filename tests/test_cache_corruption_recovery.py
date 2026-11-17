@@ -36,7 +36,11 @@ POST_OPEN_RECOVERY_ORIGINS = (
     "claude.session_entries.sync",
     "codex.entries.sync",
     "codex.quota.sync",
-    "dashboard.conversation.codex_sync",
+    # #787 / #861 Task 3 (0aee74b28): the live-tail Codex ingest left its
+    # owner `open_cache_db()` + recovery wrapper for the request-writer
+    # entries (5.9), which hold no MAINTENANCE; a corrupt cache is the
+    # owner threads' to recover, so `dashboard.conversation.codex_sync` is
+    # no longer a recovery origin.
     "dashboard.refresh.claude_sync",
     "dashboard.refresh.codex_sync",
     "dashboard.refresh.frontier_commit",
@@ -2089,3 +2093,519 @@ def test_guarded_open_detects_schema_readable_session_tree_corruption(
     )
     assert trigger_conn is not None
     cache_mod._close_cache_trigger_connection_best_effort(trigger_conn)
+
+
+# ── #787 / #861 AD7 (O5): the CLI owner admission bound ──────────────────
+#
+# A user command's owner-side cache/conversations maintenance admission is
+# bounded at `_CLI_OWNER_MAINTENANCE_WAIT_S` per open; internal owners keep
+# today's unbounded wait. Each test detects a concrete hang or misreport: a
+# CLI command blocked forever behind maintenance, a bound restarted per wait
+# (so it never expires on time), an I/O failure reported as maintenance, or a
+# background owner that gives up and leaves its obligation undrained.
+
+_AD7_STORES = ("cache", "conversations")
+
+
+def _ad7_env(tmp_path, monkeypatch, bound=0.2):
+    ns, core, store = _load(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "_CLI_OWNER_MAINTENANCE_WAIT_S", bound)
+    cache_mod = sys.modules["_cctally_cache"]
+    with core.establish_authority("process"):
+        cache_mod.open_cache_db().close()
+        cache_mod.open_conversations_db().close()
+    return ns, core, store, cache_mod, sys.modules["_cctally_db"]
+
+
+def _ad7_paths(core, which):
+    if which == "cache":
+        return (pathlib.Path(core.CACHE_DB_PATH),
+                pathlib.Path(core.CACHE_LOCK_MAINTENANCE_PATH))
+    return (pathlib.Path(core.CONVERSATIONS_DB_PATH),
+            pathlib.Path(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH))
+
+
+def _ad7_open(cache_mod, which):
+    if which == "cache":
+        return cache_mod._cache_open_guarded()
+    return cache_mod._conversations_open_guarded(attach_cache=False)
+
+
+def _ad7_family(path):
+    """Bytes and stat identity of the store family (lock file excluded)."""
+    out = {}
+    for suffix in ("", "-wal", "-shm"):
+        member = pathlib.Path(f"{path}{suffix}")
+        if member.exists():
+            st = member.stat()
+            out[member.name] = (st.st_ino, st.st_size, st.st_mtime_ns,
+                                hashlib.sha256(member.read_bytes()).hexdigest())
+    return out
+
+
+class _ForeignLock:
+    """The maintenance lock held through a second open file description, as
+    another process's maintenance owner would hold it."""
+
+    def __init__(self, lock_path):
+        self.fh = open(lock_path, "a+")
+
+    def take(self, op):
+        import fcntl
+        fcntl.flock(self.fh, op | fcntl.LOCK_NB)
+
+    def release_after(self, seconds):
+        import fcntl
+        timer = threading.Timer(seconds, fcntl.flock, (self.fh, fcntl.LOCK_UN))
+        timer.daemon = True
+        timer.start()
+        return timer
+
+    def close(self):
+        self.fh.close()
+
+
+def _ad7_hook_unlock(monkeypatch, cache_mod, actions):
+    """Run ``actions[n]()`` right after the guarded opener's n-th (1-based)
+    explicit LOCK_UN on the maintenance lock. The bounded waits go through
+    `_cctally_store.admission_flock`, so this sees only the opener's UNs."""
+    import fcntl as real_fcntl
+    shim = types.SimpleNamespace(**{
+        k: getattr(real_fcntl, k) for k in dir(real_fcntl)
+        if not k.startswith("__")})
+    count = {"n": 0}
+    lock_inodes = {
+        os.stat(p).st_ino for p in (
+            sys.modules["_cctally_core"].CACHE_LOCK_MAINTENANCE_PATH,
+            sys.modules["_cctally_core"].CONVERSATIONS_LOCK_MAINTENANCE_PATH)
+        if os.path.exists(p)}
+
+    def flock(fh, op):
+        real_fcntl.flock(fh, op)
+        fd = fh if isinstance(fh, int) else fh.fileno()
+        if op == real_fcntl.LOCK_UN and os.fstat(fd).st_ino in lock_inodes:
+            count["n"] += 1
+            action = actions.get(count["n"])
+            if action is not None:
+                action()
+
+    shim.flock = flock
+    monkeypatch.setattr(cache_mod, "fcntl", shim)
+    return count
+
+
+def _ad7_dead_marker(db_mod, path):
+    marker = db_mod._repair_marker_path(path)
+    _write_owner_marker(marker, "999999999\n", "file")
+    return marker
+
+
+@pytest.mark.parametrize("which", _AD7_STORES)
+def test_cli_owner_admission_bounded(tmp_path, monkeypatch, which):
+    ns, core, _s, cache_mod, _db = _ad7_env(tmp_path, monkeypatch)
+    path, lock = _ad7_paths(core, which)
+    before = _ad7_family(path)
+    foreign = _ForeignLock(lock)
+    import fcntl
+    foreign.take(fcntl.LOCK_EX)
+    try:
+        with core.establish_authority("process", owner_wait_s=0.2):
+            started = time.monotonic()
+            with pytest.raises(sqlite3.DatabaseError) as info:
+                _ad7_open(cache_mod, which)
+            elapsed = time.monotonic() - started
+    finally:
+        foreign.close()
+    assert str(info.value) == f"{which}.db maintenance is in progress"
+    assert isinstance(info.value.__cause__, BlockingIOError)
+    assert 0.2 <= elapsed < 1.5
+    assert _ad7_family(path) == before
+
+
+@pytest.mark.parametrize("which", _AD7_STORES)
+@pytest.mark.parametrize("point", ["gap", "second_attempt"])
+def test_owner_admission_one_deadline_per_open(tmp_path, monkeypatch, which,
+                                               point):
+    """Round 6 P1: one deadline bounds the shared wait, the exclusive upgrade
+    and the second attempt. The first acquisition consumes 0.8 s of a 1.0 s
+    bound; a bound restarted per wait would expire at 1.8 s or later."""
+    ns, core, _s, cache_mod, db_mod = _ad7_env(tmp_path, monkeypatch,
+                                               bound=1.0)
+    path, lock = _ad7_paths(core, which)
+    _ad7_dead_marker(db_mod, path)
+    import fcntl
+    holder = _ForeignLock(lock)
+    holder.take(fcntl.LOCK_EX)
+    holder.release_after(0.8)
+    late = _ForeignLock(lock)
+    if point == "gap":
+        # Contention starts in the shared-to-exclusive gap of the reclaim.
+        actions = {1: lambda: late.take(fcntl.LOCK_SH)}
+        expected = ("cache.db stale maintenance marker could not be reclaimed"
+                    if which == "cache" else
+                    "conversations.db stale recovery state could not be "
+                    "reclaimed")
+    else:
+        # The reclaim completes; contention spans the second attempt.
+        actions = {2: lambda: late.take(fcntl.LOCK_EX)}
+        expected = f"{which}.db maintenance is in progress"
+    _ad7_hook_unlock(monkeypatch, cache_mod, actions)
+    try:
+        with core.establish_authority("process", owner_wait_s=1.0):
+            started = time.monotonic()
+            with pytest.raises(sqlite3.DatabaseError) as info:
+                _ad7_open(cache_mod, which)
+            elapsed = time.monotonic() - started
+    finally:
+        late.close()
+        holder.close()
+    assert str(info.value) == expected
+    assert 0.8 <= elapsed < 1.3, elapsed
+
+
+def test_owner_admission_recovery_outlasts_deadline(tmp_path, monkeypatch):
+    """A pending-quarantine resume whose drain outlasts the admission deadline
+    completes; the second attempt then makes one non-blocking acquisition."""
+    ns, core, store, cache_mod, db_mod = _ad7_env(tmp_path, monkeypatch)
+    path = pathlib.Path(core.CACHE_DB_PATH)
+    pending = db_mod._quarantine_pending_path(path)
+    real_drained = db_mod._await_family_drained
+
+    def slow_drain(p, deadline):
+        time.sleep(0.4)
+        return real_drained(p, deadline)
+
+    monkeypatch.setattr(db_mod, "_await_family_drained", slow_drain)
+    monkeypatch.setattr(db_mod, "quarantine_db_family",
+                        lambda p, strict=True: pending.unlink())
+    pending.write_text("{}")
+    calls = []
+    real_admission = store.admission_flock
+
+    def spy(fh, op, deadline):
+        calls.append((op, deadline - time.monotonic()))
+        return real_admission(fh, op, deadline)
+
+    monkeypatch.setattr(store, "admission_flock", spy)
+    with core.establish_authority("process", owner_wait_s=0.2):
+        started = time.monotonic()
+        conn = cache_mod._cache_open_guarded()
+        elapsed = time.monotonic() - started
+    conn.close()
+    assert not pending.exists()
+    assert elapsed >= 0.4
+    import fcntl
+    # shared, exclusive upgrade, then the second attempt's shared acquisition
+    # with the deadline already passed: exactly one immediate attempt.
+    assert [op for op, _r in calls] == [fcntl.LOCK_SH, fcntl.LOCK_EX,
+                                       fcntl.LOCK_SH]
+    assert calls[-1][1] <= 0
+
+
+@pytest.mark.parametrize("which", _AD7_STORES)
+def test_cli_owner_admission_released_in_time(tmp_path, monkeypatch, which):
+    ns, core, _s, cache_mod, _db = _ad7_env(tmp_path, monkeypatch, bound=2.0)
+    _path, lock = _ad7_paths(core, which)
+    import fcntl
+    foreign = _ForeignLock(lock)
+    foreign.take(fcntl.LOCK_EX)
+    foreign.release_after(0.2)
+    try:
+        with core.establish_authority("process", owner_wait_s=2.0):
+            conn = _ad7_open(cache_mod, which)
+        conn.close()
+    finally:
+        foreign.close()
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+@pytest.mark.parametrize("case", [
+    "eintr", "eintr_until_deadline", "eio", "allowance_exhausted",
+    "positive_allowance_eio", "positive_allowance_eintr"])
+def test_admission_flock_failure_is_not_contention(tmp_path, monkeypatch,
+                                                   case):
+    """AD7-3: only contention expires admission; EINTR is retried and an I/O
+    error propagates unchanged, never reported as maintenance. Inside a
+    #1005 allowance the deadline is capped and the elapsed time charged."""
+    _ns, _core, store, _c, _db = _ad7_env(tmp_path, monkeypatch)
+    import fcntl as real_fcntl
+    clock = _FakeClock()
+    monkeypatch.setattr(store, "time", types.SimpleNamespace(
+        monotonic=clock.monotonic, sleep=clock.sleep))
+    script = {
+        "eintr": [InterruptedError(), None],
+        "eintr_until_deadline": [InterruptedError()] * 1000,
+        "eio": [OSError(errno.EIO, "injected I/O error")],
+        "allowance_exhausted": [BlockingIOError()] * 1000,
+        "positive_allowance_eio": [BlockingIOError()] * 3
+        + [OSError(errno.EIO, "injected I/O error")],
+        "positive_allowance_eintr": [InterruptedError()] * 1000,
+    }[case]
+    attempts = {"n": 0}
+
+    def flock(fh, op):
+        assert op & real_fcntl.LOCK_NB
+        step = script[attempts["n"]]
+        attempts["n"] += 1
+        if step is not None:
+            raise step
+
+    monkeypatch.setattr(store, "fcntl", types.SimpleNamespace(
+        flock=flock, LOCK_NB=real_fcntl.LOCK_NB, LOCK_SH=real_fcntl.LOCK_SH))
+    op = real_fcntl.LOCK_SH
+    if case == "eintr":
+        assert store.admission_flock(0, op, clock.now + 5.0) is None
+        assert attempts["n"] == 2
+    elif case == "eintr_until_deadline":
+        with pytest.raises(InterruptedError):
+            store.admission_flock(0, op, clock.now + 0.1)
+        assert clock.now >= 1000.1
+    elif case == "eio":
+        with pytest.raises(OSError) as info:
+            store.admission_flock(0, op, clock.now + 5.0)
+        assert info.value.errno == errno.EIO
+        assert attempts["n"] == 1
+    elif case == "allowance_exhausted":
+        with store.bounded_diagnostic_waits(0.0):
+            result = store.admission_flock(0, op, clock.now + 5.0)
+        assert isinstance(result, BlockingIOError)
+        assert attempts["n"] == 1
+    else:
+        deadline = (clock.now + 5.0 if case == "positive_allowance_eio"
+                    else clock.now + 0.06)
+        with store.bounded_diagnostic_waits(1.0):
+            allowance = store._DIAGNOSTIC_ALLOWANCE.get()
+            started = clock.now
+            with pytest.raises(OSError):
+                store.admission_flock(0, op, deadline)
+            elapsed = clock.now - started
+            assert elapsed > 0
+            assert allowance.remaining_s == pytest.approx(1.0 - elapsed,
+                                                          abs=1e-9)
+
+
+@pytest.mark.parametrize("which", _AD7_STORES)
+@pytest.mark.parametrize("cause", [
+    "shared", "exclusive_marker", "exclusive_pending",
+    "state_changed_during_wait"])
+def test_owner_admission_expiry_sentence(tmp_path, monkeypatch, which, cause):
+    """Round 7: the sentence follows the wait that expired and, for the
+    exclusive upgrade, the recovery cause captured under the initial shared
+    lock, never a re-inspection after the unlocked wait."""
+    ns, core, _s, cache_mod, db_mod = _ad7_env(tmp_path, monkeypatch)
+    path, lock = _ad7_paths(core, which)
+    import fcntl
+    foreign = _ForeignLock(lock)
+    marker = db_mod._repair_marker_path(path)
+    pending = db_mod._quarantine_pending_path(path)
+    if cause == "shared":
+        foreign.take(fcntl.LOCK_EX)
+    else:
+        if cause == "exclusive_pending":
+            pending.write_text("{}")
+        else:
+            _ad7_dead_marker(db_mod, path)
+
+        def contend():
+            foreign.take(fcntl.LOCK_SH)
+            if cause == "state_changed_during_wait":
+                # Another owner turns the marker into a pending quarantine.
+                os.unlink(marker)
+                pending.write_text("{}")
+
+        _ad7_hook_unlock(monkeypatch, cache_mod, {1: contend})
+    try:
+        with core.establish_authority("process", owner_wait_s=0.2):
+            with pytest.raises(sqlite3.DatabaseError) as info:
+                _ad7_open(cache_mod, which)
+    finally:
+        foreign.close()
+    exc = info.value
+    assert isinstance(exc.__cause__, BlockingIOError)
+    if cause == "shared":
+        assert str(exc) == f"{which}.db maintenance is in progress"
+    elif which == "conversations":
+        assert str(exc) == ("conversations.db stale recovery state could not "
+                            "be reclaimed")
+    elif cause == "exclusive_pending":
+        assert str(exc) == (
+            f"cache.db pending quarantine could not resume: {exc.__cause__}")
+        assert str(exc.__cause__)
+    else:
+        assert str(exc) == ("cache.db stale maintenance marker could not be "
+                            "reclaimed")
+
+
+def _ad7_wrap_open(monkeypatch, cache_mod, record):
+    real = cache_mod._cache_open_guarded
+
+    def wrapped():
+        a = sys.modules["_cctally_core"].current_authority()
+        record.append(("enter", time.monotonic(),
+                       None if a is None else a.owner_wait_s))
+        conn = real()
+        record.append(("return", time.monotonic(), None))
+        return conn
+
+    monkeypatch.setattr(cache_mod, "_cache_open_guarded", wrapped)
+
+
+@pytest.mark.parametrize("owner", [
+    "codex_replay_drain", "hook_tick", "thread", "fork"])
+def test_internal_owners_wait(tmp_path, monkeypatch, owner):
+    """AD7-1: hooks, detached workers, owner threads and forked children keep
+    today's wait; were they bounded, a background owner would give up after
+    the bound and leave its obligation undrained."""
+    ns, core, _s, cache_mod, _db = _ad7_env(tmp_path, monkeypatch)
+    _path, lock = _ad7_paths(core, "cache")
+    import fcntl
+    foreign = _ForeignLock(lock)
+    foreign.take(fcntl.LOCK_EX)
+    hold_s = 0.6
+    started = time.monotonic()
+    foreign.release_after(hold_s)
+    try:
+        if owner == "fork":
+            if not hasattr(os, "fork"):
+                pytest.skip("os.fork unavailable")
+            with core.establish_authority("process", owner_wait_s=0.2):
+                pid = os.fork()
+                if pid == 0:  # pragma: no cover - child
+                    code = 1
+                    try:
+                        conn = cache_mod._cache_open_guarded()
+                        conn.close()
+                        code = 0 if time.monotonic() - started >= hold_s \
+                            else 2
+                    finally:
+                        os._exit(code)
+            _pid, status = os.waitpid(pid, 0)
+            assert os.waitstatus_to_exitcode(status) == 0
+            return
+        record = []
+        _ad7_wrap_open(monkeypatch, cache_mod, record)
+        if owner == "thread":
+            box = {}
+
+            def target():
+                with core.establish_authority("process"):
+                    cache_mod._cache_open_guarded().close()
+                box["done"] = True
+
+            with core.establish_authority("process", owner_wait_s=0.2):
+                t = threading.Thread(target=target)
+                t.start()
+                t.join(10)
+            assert box.get("done")
+        elif owner == "codex_replay_drain":
+            monkeypatch.setattr(sys, "argv", ["cctally"])
+            assert ns["main"](["_codex-replay-drain"]) == 0
+        else:
+            import io
+            monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(
+                io.BytesIO(b"{}"), encoding="utf-8"))
+            assert ns["main"](["hook-tick", "--foreground", "--no-oauth"]) == 0
+    finally:
+        foreign.close()
+    enters = [r for r in record if r[0] == "enter"]
+    returns = [r for r in record if r[0] == "return"]
+    assert enters and returns, record
+    assert enters[0][2] is None
+    assert returns[0][1] - started >= hold_s
+
+
+def test_owner_wait_classification_over_registry(tmp_path, monkeypatch):
+    """Round 6: every registered `_`-prefixed command, `hook-tick` and
+    `record-usage` are unbounded, every other registered command gets the
+    bound, and every hook command `setup` installs is exempt."""
+    import argparse
+    ns, core, _s, _c, _db = _ad7_env(tmp_path, monkeypatch)
+    parser = ns["build_parser"]()
+    names = set()
+
+    def walk(p):
+        for action in p._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for name, sub in action.choices.items():
+                    names.add(name)
+                    walk(sub)
+
+    walk(parser)
+    assert {"hook-tick", "record-usage", "daily", "doctor"} <= names
+    assert any(n.startswith("_") for n in names)
+    for name in sorted(names):
+        expected = (None if name.startswith("_")
+                    or name in ("hook-tick", "record-usage") else 0.2)
+        assert ns["_cli_owner_wait_s"](name) == expected, name
+    setup = sys.modules["_cctally_setup"]
+    import _lib_codex_hooks
+    import shlex
+    merged = setup._settings_merge_install({}, "/x/cctally")
+    hook_commands = [
+        h["command"] for groups in merged["hooks"].values()
+        for group in groups for h in group.get("hooks", [])
+        if isinstance(h, dict) and "command" in h]
+    assert hook_commands
+    hook_commands.append(_lib_codex_hooks.codex_hook_command("/x/cctally"))
+    for command in hook_commands:
+        argv = shlex.split(command.replace(" &", ""))[1:]
+        args = parser.parse_args(argv)
+        assert ns["_cli_owner_wait_s"](args.command) is None, command
+    # The dispatcher establishes exactly that classification.
+    seen = []
+    monkeypatch.setitem(ns, "_dispatch_parsed_command", lambda args: seen.append(
+        core.current_authority()) or 0)
+    assert ns["main"](["daily"]) == 0
+    assert seen[0].kind == "process" and seen[0].owner_wait_s == 0.2
+
+
+def test_owner_wait_never_loosens(tmp_path, monkeypatch):
+    _ns, core, _s, _c, _db = _ad7_env(tmp_path, monkeypatch)
+    with core.establish_authority("process", owner_wait_s=0.2):
+        with core.authority_scope("process", owner_wait_s=None):
+            assert core.current_authority().owner_wait_s == 0.2
+        with core.establish_authority("process", owner_wait_s=None):
+            assert core.current_authority().owner_wait_s == 0.2
+        with core.authority_scope("process", owner_wait_s=0.1):
+            assert core.current_authority().owner_wait_s == 0.1
+
+
+@pytest.mark.parametrize("branch", ["uncaught", "account", "facade_fallback"])
+def test_cli_owner_admission_exit_branches(tmp_path, monkeypatch, capsys,
+                                           branch):
+    """Round 6: the exit status stays conditional under the bound."""
+    ns, core, _s, cache_mod, _db = _ad7_env(tmp_path, monkeypatch)
+    which = "conversations" if branch == "uncaught" else "cache"
+    _path, lock = _ad7_paths(core, which)
+    import fcntl
+    foreign = _ForeignLock(lock)
+    foreign.take(fcntl.LOCK_EX)
+    try:
+        if branch == "uncaught":
+            rc = ns["main"](["transcript", "search", "anything"])
+        elif branch == "account":
+            rc = ns["main"](["daily", "--account", "unattributed"])
+        else:
+            rc = ns["main"](["daily"])
+    finally:
+        foreign.close()
+    err = capsys.readouterr().err
+    if branch == "uncaught":
+        assert rc == 1
+        assert "conversations.db maintenance is in progress" in err
+    elif branch == "account":
+        assert rc == 3
+        assert "account attribution unavailable (cache required)" in err
+    else:
+        assert rc == 0
+        assert "falling back to direct JSONL parse" in err

@@ -84,6 +84,9 @@ def _source_bundle(now):
 def test_debug_backend_shape_over_loopback(monkeypatch, tmp_path):
     ns = load_script()
     srv = _boot(ns, tmp_path, monkeypatch)
+    # #787 / #861: the diagnostic route never creates a store, so the
+    # known-empty one is an owner's (test_diagnostic_routes_never_recover).
+    ns["open_cache_db"]().close()
     try:
         port = srv.server_address[1]
         status, body = _get(port, "/api/debug/backend")
@@ -171,10 +174,13 @@ def test_debug_backend_reports_safe_source_counts_and_never_raw_open_errors(
         assert json.loads(body)["cache_state"]["signature"] == {"status": "unavailable"}
         assert "private/root" not in body.decode("utf-8")
 
-        def source_open_failure():
+        def source_open_failure(**_kwargs):
             raise RuntimeError("/private/root source-fingerprint logical-limit native-conversation-id")
 
-        monkeypatch.setattr(sys.modules["_cctally_dashboard"], "open_cache_db", source_open_failure)
+        # #787 / #861: the route's cache read is the counted diagnostic
+        # session, no longer the owner opener.
+        monkeypatch.setattr(sys.modules["_cctally_dashboard"],
+                            "open_cache_query_counted", source_open_failure)
         status, body = _get(port, "/api/debug/backend")
         assert status == 200
         failure = json.loads(body)
@@ -618,3 +624,64 @@ def test_debug_backend_project_identity_block_reports_the_sweep(
                            "retryBump"}
     assert record["outcome"] == "ok" and record["retryBump"] is False
     assert record["spellings"] == 1
+
+
+# ── #787 / #861 I3b: diagnostic routes never recover (AD6, spec 5.12) ──────
+
+import os
+import pathlib
+
+import pytest
+
+
+@pytest.mark.parametrize("route", [
+    ("GET", "/api/debug/backend"),
+    ("GET", "/api/debug/backend/write-io"),
+    ("POST", "/api/alerts/test"),
+])
+def test_diagnostic_routes_never_recover(monkeypatch, tmp_path, route):
+    """Detects a diagnostic route that creates, migrates or recovers a store
+    from a request thread (before #787 the debug backend's cache read was the
+    owner `open_cache_db()`, and the alert-test label read the owner stats
+    open), and a route that takes a capability beyond its `diagnostic`
+    ceiling: over absent stores each route answers and leaves the data
+    directory exactly as it found it."""
+    ns = load_script()
+    monkeypatch.setenv("CCTALLY_DISABLE_UPDATE_CHECK", "1")
+    monkeypatch.setenv("CCTALLY_DISABLE_TELEMETRY", "1")
+    import _cctally_alerts
+    monkeypatch.setattr(_cctally_alerts, "_dispatch_alert_notification",
+                        lambda payload, **_k: "queued")
+    dash = sys.modules["_cctally_dashboard"]
+    monkeypatch.setattr(dash, "_dispatch_alert_notification",
+                        lambda payload, **_k: "queued", raising=False)
+    srv = _boot(ns, tmp_path, monkeypatch)
+    core = ns["_cctally_core"]
+    app = pathlib.Path(core.APP_DIR)
+    app.mkdir(parents=True, exist_ok=True)
+    os.chmod(app, 0o700)
+    stores = [pathlib.Path(p) for p in (
+        core.DB_PATH, core.CACHE_DB_PATH, core.CONVERSATIONS_DB_PATH)]
+    for p in stores:
+        assert not p.exists(), p
+    events = []
+    monkeypatch.setattr(core, "CAPABILITY_OBSERVERS", [events.append])
+    method, path = route
+    port = srv.server_address[1]
+    try:
+        if method == "GET":
+            status, body = _get(port, path)
+        else:
+            status, body = _post(port, path, {"axis": "weekly"},
+                                 origin=f"http://127.0.0.1:{port}")
+    finally:
+        stop(srv, srv._test_thread)
+    assert status == 200, body
+    created = [str(p) for p in stores if p.exists()]
+    assert created == [], f"{path} created {created}"
+    route_events = [e for e in events if e.authority is not None]
+    assert all(e.permitted for e in route_events), [
+        (e.entry, e.capability, e.authority) for e in route_events
+        if not e.permitted]
+    assert {e.authority for e in route_events} <= {"diagnostic", "query"}, (
+        sorted({(e.entry, e.authority) for e in route_events}))

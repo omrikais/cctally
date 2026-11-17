@@ -2653,6 +2653,16 @@ def _build(name: str, factory, source: str, out_root: Path) -> None:
     out_dir = out_root / name
     app_dir = out_dir / ".local" / "share" / "cctally"
     app_dir.mkdir(parents=True, exist_ok=True)
+    # The install an owner open leaves (#787 / #861 AD20, AD22): a private
+    # data dir and the maintenance locks. Explain reads through query
+    # sessions and the conversations read admission, which never create a
+    # lock and treat a missing one as an absent store (a scenario with no
+    # conversations.db still reads as not present: the admission checks the
+    # main file first).
+    app_dir.chmod(0o700)
+    for lock in ("stats.db.maintenance.lock", "cache.db.maintenance.lock",
+                 "conversations.db.maintenance.lock"):
+        (app_dir / lock).touch()
     seed = factory()
     if source == "codex" and seed.conversation_rows:
         # A Codex oracle cannot read a Claude transcript store, so a Codex

@@ -20,7 +20,7 @@ import time
 
 import pytest
 
-from conftest import copy_shared_corpus, load_script, redirect_paths
+from conftest import load_script, redirect_paths
 
 from tests._support_http import (
     PRESENCE_BACKSTOP_SECONDS,
@@ -176,9 +176,14 @@ def test_passive_sse_reflects_statusline_reducer_without_oauth(
         return captured
 
     monkeypatch.setattr(statusline, "_capture_arrival", phase_locked)
-    workers = [threading.Thread(
-        target=statusline._statusline_persist, args=(candidate,), kwargs={"sync_for_test": True},
-    ) for candidate in parsed]
+    def persist(candidate):
+        # #787 / #861 spec 5.1: a statusline render runs on the CLI main
+        # thread at `process`; a thread the test starts establishes it.
+        with sys.modules["_cctally_core"].establish_authority("process"):
+            statusline._statusline_persist(candidate, sync_for_test=True)
+
+    workers = [threading.Thread(target=persist, args=(candidate,))
+               for candidate in parsed]
     for worker in workers:
         worker.start()
     deadline = time.monotonic() + 30
@@ -1029,27 +1034,8 @@ def _corpus_envelope(data_dir, bbf):
         ), encode_bytes
 
 
-def _private_corpus(data_dir, tmp_path):
-    """Copy every corpus axis so this test owns cache.db and its flock.
-
-    #630 S2: the session-scoped corpus is built once per run and read by every
-    other consumer, so a test that syncs into it hands the next test a
-    different corpus than the one it was promised. Copied in the shape
-    `tests/test_tick_stats_integration.py` established at 7706a7038: SQLite
-    readers can create and remove the WAL sidecars between copytree's directory
-    scan and its copy2 call, and the built corpus is checkpointed, so those
-    sidecars are neither fixture inputs nor safe copy candidates.
-
-    #741: the copy itself goes through `conftest.copy_shared_corpus`, the ONE
-    copier, which owns the source-root resolution and the sidecar exclusions
-    above and additionally holds the scale's build lock SHARED for the whole
-    walk — so a copy can no longer race `_clear_previous_corpus`.
-    """
-    return copy_shared_corpus(data_dir, tmp_path / "corpus")
-
-
 def test_compressed_update_is_at_most_a_quarter_of_the_legacy_frame(
-    small_corpus, tmp_path,
+    private_corpus,
 ):
     """#583 S3 §9 acceptance 5. Bytes, not time, and a same-process ratio.
 
@@ -1063,9 +1049,10 @@ def test_compressed_update_is_at_most_a_quarter_of_the_legacy_frame(
     import zlib
     bbf = _load_build_bench()
     # #630 S2: `_corpus_envelope` builds with `skip_sync=False`, so it runs a
-    # real ingest over whatever data dir it is given.
-    env, encode_bytes = _corpus_envelope(
-        _private_corpus(small_corpus, tmp_path), bbf)
+    # real ingest over whatever data dir it is given; #1099: over a corpus
+    # BUILT at its own root, so that ingest is the corpus's own unchanged walk
+    # and the frame measures the corpus rather than a doubled Codex half.
+    env, encode_bytes = _corpus_envelope(private_corpus("small"), bbf)
 
     sources = env["sources"]
     assert sources["all"]["data"]["providers"] == {"claude": None, "codex": None}

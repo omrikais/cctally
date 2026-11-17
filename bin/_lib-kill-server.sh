@@ -1,58 +1,56 @@
-# Shared bounded server-teardown helper for the golden harnesses (issue #153).
+# Shared bounded server-teardown helper for the golden harnesses (issues #153,
+# #1087).
 #
 # Several harnesses (cctally-dashboard-test, cctally-conversation-test,
-# cctally-settings-api-test) background a real `cctally dashboard` server on
-# an ephemeral port and tear it down at the end of each scenario. The old
-# idiom was an UNBOUNDED `kill "$pid"; wait "$pid"`.
+# cctally-settings-api-test, cctally-explain-test) run a real `cctally
+# dashboard` server on an ephemeral port and tear it down at the end of each
+# scenario.
 #
-# That is unsafe: CPython can lose a single SIGTERM that races the dashboard
-# server's main-thread `threading.Event.wait()` (the server is woken only by
-# its SIGTERM/SIGINT handler via `stop.set()`). Empirically ~0.04-0.07% of
-# single signals are dropped — the Python-level handler never runs, or its
-# `set()` notify fires before the waiter registers — and recovery needs a
-# *second* signal. Interactive Ctrl-C never wedges (the user sends more than
-# one), but a harness that sends exactly one SIGTERM then `wait`s forever
-# hangs the entire suite (issue #153: a `--host 0.0.0.0` banner-scenario
-# server survived 30+ minutes; SIGTERM was "ignored", only SIGKILL cleared it).
+# #153: CPython can lose a single SIGTERM that races the dashboard server's
+# main-thread wait (~0.04-0.07% of single signals), so a teardown that sends
+# one SIGTERM and then waits without a bound can hang the whole suite. The stop
+# is therefore bounded: SIGTERM, a grace of `--grace` seconds (5 by default),
+# then SIGKILL, with a non-fatal WARN on stderr rather than a test failure, so
+# the rare race cannot reintroduce flakiness.
 #
-# `kill_server_bounded` makes teardown guaranteed: SIGTERM, poll for a
-# graceful exit up to `grace` seconds, then escalate to SIGKILL (uncatchable
-# at the kernel level — no signal-handling state can defeat it). A wedge is
-# surfaced via a non-fatal WARN on stderr (visible in harness logs) rather
-# than failing the run, so the rare race can't reintroduce flakiness.
+# #1087: the harness itself never signals the server. Bash reaps a finished
+# background job on its own, so `kill -0 "$pid"` followed by `kill -TERM
+# "$pid"` can reach whichever process was given that number in between. Each
+# server is started under a child-scope holder (bin/_lib-hold.sh), the
+# server's parent and only reaper, which sends the TERM and the KILL while it
+# holds the server unreaped:
 #
-# Usage:  kill_server_bounded <pid> [grace_seconds]   # grace defaults to 5
+#   hold_start "$dir" child -- "$BIN" dashboard … >"$log" 2>&1
+#   hold_alive "$HOLD_PID"          # readiness loops: is the server running?
+#   stop_server_bounded "$dir"      # teardown
 #
-# `wait "$pid"` reaps the process when it is a child of the calling shell
-# (always the case at the harness teardown sites); for a non-child pid it
-# returns immediately and is harmless. Always returns 0.
+# Child scope keeps the server in the harness's own process group, so an
+# enclosing bin/cctally-test-all pool holder still covers it when the pool is
+# cancelled. stop_server_bounded must run in the shell that started the
+# holder (it waits for its own child). A second call, or a call for a
+# directory whose server was never started, does nothing. Always returns 0.
 
-kill_server_bounded() {
-    local pid="$1" grace="${2:-5}"
+# shellcheck source=bin/_lib-hold.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-hold.sh"
+
+stop_server_bounded() {   # DIR
+    local dir="${1:-}" pid grace label
+    [ -n "$dir" ] && [ -r "$dir/holder" ] || return 0
+    pid=$(cat "$dir/holder" 2>/dev/null) || pid=""
+    grace=$(cat "$dir/grace" 2>/dev/null) || grace=5
+    label=$(cat "$dir/label" 2>/dev/null) || label=server
+    rm -f "$dir/holder"
     [ -n "$pid" ] || return 0
-
-    # Already gone? Reap if it's a finished child, then we're done.
-    if ! kill -0 "$pid" 2>/dev/null; then
-        wait "$pid" 2>/dev/null || true
+    hold_stop "$pid" "$dir"
+    if [ "$HOLD_PUBLISHED" != 1 ]; then
+        echo "WARN: server $label (holder $dir) exited without publishing its settlement" >&2
         return 0
     fi
-
-    kill -TERM "$pid" 2>/dev/null || true
-
-    # Poll for a graceful exit at 0.1s granularity.
-    local ticks=$(( grace * 10 )) waited=0
-    while [ "$waited" -lt "$ticks" ]; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.1
-        waited=$(( waited + 1 ))
-    done
-
-    # Still alive after the grace window — escalate to the uncatchable SIGKILL.
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "WARN: server pid $pid ignored SIGTERM after ${grace}s; escalating to SIGKILL (issue #153)" >&2
-        kill -KILL "$pid" 2>/dev/null || true
+    if [ "$HOLD_KILLED" = 1 ]; then
+        echo "WARN: server $label (holder $dir) ignored SIGTERM after ${grace}s; its holder sent SIGKILL (issue #153)" >&2
     fi
-
-    wait "$pid" 2>/dev/null || true
+    if [ "$HOLD_COMPLETE" != 1 ]; then
+        echo "WARN: server $label (holder $dir) did not exit after SIGKILL" >&2
+    fi
     return 0
 }

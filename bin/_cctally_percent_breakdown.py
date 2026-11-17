@@ -29,6 +29,7 @@ from _cctally_core import (
     parse_date_str,
     parse_iso_datetime,
 )
+import _cctally_store_access as _store_access
 
 
 def _cctally():
@@ -342,7 +343,7 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
     args._resolved_tz = tz
     week_start_name = get_week_start_name(config, args.week_start_name)
 
-    conn = open_db()
+    conn = _store_access.statement_reader("stats")
     try:
         if args.week_start:
             week_start = parse_date_str(args.week_start, "--week-start")

@@ -2454,9 +2454,10 @@ def _setup_progress_enabled(*, json_mode: bool) -> bool:
 class _SetupProgressReporter:
     """Best-effort stderr progress for setup's cold-sync bootstrap.
 
-    Coordinates the per-file ``sync_cache(progress=)`` callback with a
-    background heartbeat so neither a single giant JSONL nor a slow OAuth
-    fetch leaves a silent gap > ~2s. All emissions throttle off one shared
+    Coordinates the ``sync_cache(progress=)`` callback, which runs after each
+    batch commit (at most every 512 files or 256 MiB of JSONL, #1042) and at
+    the end of the walk, with a background heartbeat so neither a long batch
+    nor a slow OAuth fetch leaves a silent gap > ~2s. All emissions throttle off one shared
     monotonic ``last_emit`` under a lock; ``force=True`` bypasses the
     throttle (used for the pre-sync and pre-OAuth notices). A no-op (and no
     thread) when disabled — so it is inert in the golden harness / non-TTY
@@ -2482,12 +2483,13 @@ class _SetupProgressReporter:
 
     def sync_callback(self, stats) -> None:
         # `stats` is a duck-typed cache.IngestStats (reads files_processed /
-        # files_total). sync_cache invokes this per file; emit() throttles.
+        # files_total). sync_cache invokes this after each batch commit (at
+        # most every 512 files or 256 MiB) and at the end; emit() throttles.
         self.emit(f"  … synced {stats.files_processed}/{stats.files_total} session files")
 
     def _heartbeat_loop(self) -> None:
-        # Fires only when no per-file line / notice emitted in the last
-        # interval, bounding intra-file and intra-fetch silence.
+        # Fires only when no progress line / notice emitted in the last
+        # interval, bounding intra-batch and intra-fetch silence.
         while not self._stop.wait(_SETUP_PROGRESS_HEARTBEAT_POLL_SECONDS):
             self.emit("  … still working…")
 

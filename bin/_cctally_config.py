@@ -203,6 +203,13 @@ def _load_config_from_explicit_path(path: "str | Path") -> dict[str, Any]:
     return data
 
 
+def _reader_may_create() -> bool:
+    """Whether a config read may take the owner's first-run branch
+    (`ensure_dirs()`, the writer lock, saving defaults): only under an
+    authority holding `STARTUP` (#787 / #861 spec rev 24-25, RC-3)."""
+    return _cctally_core.has_capability("STARTUP")
+
+
 def load_config(path: "str | Path | None" = None) -> dict[str, Any]:
     """Read config.json, falling back to in-memory defaults on corruption.
 
@@ -231,6 +238,13 @@ def load_config(path: "str | Path | None" = None) -> dict[str, Any]:
     if path is not None:
         return _load_config_from_explicit_path(path)
     c = _cctally()
+    if not _reader_may_create():
+        # #787 / #861 RC-3: a reader outside an owner (a request route, a
+        # query or diagnostic scope) creates, changes and removes nothing:
+        # no `ensure_dirs()`, no writer lock file, no saved defaults. An
+        # absent directory or config.json reads as in-memory defaults.
+        parsed = _try_read_config()
+        return parsed if parsed is not None else _default_config_data()
     ensure_dirs()
     parsed = _try_read_config()
     if parsed is not None:
@@ -263,7 +277,8 @@ def _load_config_unlocked() -> dict[str, Any]:
     do its own save_config call atomically. Corrupt-file path returns
     in-memory defaults (caller's save will overwrite cleanly).
     """
-    ensure_dirs()
+    if _reader_may_create():
+        ensure_dirs()
     parsed = _try_read_config()
     if parsed is not None:
         return parsed
@@ -674,13 +689,16 @@ def _normalize_account_budget_refs(raw_obj: dict, provider: str,
             # told that no accounts have been observed.
             import _cctally_store
             import _cctally_db
+            # #787 / #861: per-statement stats query sessions after the
+            # reader's startup phase (item 6, AD2); the first read runs here
+            # so a maintenance refusal is reported where the guarded open
+            # reported it.
+            import _cctally_store_access as _store_access
             try:
-                conn = _cctally_store.stats_open_guarded(
-                    db_path,
-                    # #778: forward the opener's `cached_statements=0`.
-                    connect=lambda p, **kw: sqlite3.connect(
-                        f"file:{p}?mode=ro", uri=True, **kw),
-                )
+                conn = _store_access.statement_reader(
+                    "stats", startup=False,
+                    policy=_store_access.reader_startup("stats"))
+                conn.execute("SELECT 1").fetchall()
             except _cctally_db.StatsDbMaintenanceError:
                 stats_maintenance_unavailable = True
                 conn = None

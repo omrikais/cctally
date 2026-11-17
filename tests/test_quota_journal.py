@@ -57,6 +57,9 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
+import types
+import uuid
 from pathlib import Path
 
 import pytest
@@ -3766,6 +3769,110 @@ def _tear_index(path):
         handle.write(b"o:0123")
 
 
+#: #1080: an arbitrary device renumbering (a remount through a spacer) and a
+#: volume UUID no real device of the test machine maps to.
+REMOUNT_OFFSET = 7919
+OTHER_VOLUME = str(uuid.UUID(int=(0xBEEF << 96) | 1))
+#: Transitions applied through `_QuotaIdentitySeams.arm` (spec §7.1).
+IDENTITY_TRANSITIONS = {
+    "remount": {"dev_offset": REMOUNT_OFFSET},
+    "device-reused-other-volume": {"volume": OTHER_VOLUME},
+    "birth-differs": {"birth_delta": 1.5},
+    "cross-volume-same-birth": {"dev_offset": REMOUNT_OFFSET, "volume": OTHER_VOLUME},
+}
+
+
+class _QuotaIdentitySeams:
+    """#1080: wrap the quota index's identity seams on every platform.
+
+    Over the real ``_quota_stat``/``_quota_fstat``/``_quota_volume_of`` the
+    wrappers supply a stable birth per real file (its real ``st_birthtime``
+    where the platform has one, else a value assigned at first sight) and a
+    stable volume UUID per real device, so a published sidecar carries both
+    fields wherever the suite runs. ``arm`` then applies one transition to one
+    inode (or to every file) for path calls, descriptor calls or both:
+    a device offset (a remount), a birth change, or another volume. With
+    ``report_birth``/``report_volume`` off the code sees the genuine fallback.
+    """
+
+    def __init__(self, jr, monkeypatch):
+        self.real_stat = jr._quota_stat
+        self.real_fstat = jr._quota_fstat
+        self.births: dict = {}
+        self.report_birth = True
+        self.report_volume = True
+        self.disarm()
+        monkeypatch.setattr(jr, "_quota_stat", self.stat)
+        monkeypatch.setattr(jr, "_quota_fstat", self.fstat)
+        monkeypatch.setattr(jr, "_quota_volume_of", self.volume_of)
+
+    def arm(self, ino=None, *, paths=True, fds=True, dev_offset=0,
+            volume=None, birth_delta=0.0):
+        """Apply a transition from now on to ``ino`` (``None``: every file)."""
+        self.target = ino
+        self.kinds = {kind for kind, on in (("path", paths), ("fd", fds)) if on}
+        self.dev_offset, self.volume, self.birth_delta = (
+            dev_offset, volume, birth_delta)
+
+    def disarm(self):
+        self.arm(paths=False, fds=False)
+
+    def _applies(self, kind, real):
+        return kind in self.kinds and self.target in (None, real.st_ino)
+
+    def _base_birth(self, real):
+        birth = getattr(real, "st_birthtime", None)
+        if birth is None:
+            birth = self.births.setdefault(
+                (real.st_dev, real.st_ino), 1_700_000_000.25 + len(self.births))
+        return birth
+
+    @staticmethod
+    def _base_volume(real_dev):
+        return str(uuid.UUID(int=(0x1080 << 96) | (real_dev & (2**64 - 1))))
+
+    def _project(self, kind, real):
+        applies = self._applies(kind, real)
+        out = types.SimpleNamespace(
+            st_dev=real.st_dev + (self.dev_offset if applies else 0),
+            st_ino=real.st_ino, st_size=real.st_size, st_mode=real.st_mode,
+            st_mtime=real.st_mtime)
+        if self.report_birth:
+            out.st_birthtime = self._base_birth(real) + (
+                self.birth_delta if applies else 0.0)
+        return out
+
+    def stat(self, path):
+        return self._project("path", self.real_stat(path))
+
+    def fstat(self, fd):
+        return self._project("fd", self.real_fstat(fd))
+
+    def volume_of(self, target):
+        if not self.report_volume:
+            return None
+        kind = "fd" if isinstance(target, int) else "path"
+        try:
+            real = (self.real_fstat(target) if kind == "fd"
+                    else self.real_stat(target))
+        except OSError:
+            return None
+        if self._applies(kind, real) and self.volume is not None:
+            return self.volume
+        return self._base_volume(real.st_dev)
+
+    def identity_of(self, path):
+        """``(dev, ino, birth, volume)`` the wrappers report for ``path`` now."""
+        st = self.stat(path)
+        return (st.st_dev, st.st_ino, getattr(st, "st_birthtime", None),
+                self.volume_of(path))
+
+
+def _coverage_identity(meta, segment):
+    entry = next(e for e in meta["coverage"] if e["segment"] == segment)
+    return (entry["dev"], entry["ino"], entry.get("birth"), entry.get("volume"))
+
+
 def _assert_budgeted_sync_defers_without_scan(tmp_path, monkeypatch, damage):
     """Shared body of the three T-C1 budgeted cases.
 
@@ -3864,9 +3971,49 @@ def test_budgeted_append_torn_index_raises_without_scan(tmp_path, monkeypatch):
     _assert_budgeted_sync_defers_without_scan(tmp_path, monkeypatch, _tear_index)
 
 
+#: #1080 identity cases (spec §7.1 item 1), each applied separately to the
+#: keys file and to a covered segment: ``case -> index valid afterwards``.
+#: ``remount`` detects the #1080 rebuild after a device-only remount;
+#: ``device-reused-other-volume`` the device-reuse false acceptance (§4.3);
+#: ``birth-differs`` an inode number reused on one volume;
+#: ``cross-volume-same-birth`` review P1's same-birth cross-volume acceptance;
+#: the ``no-volume-*`` pair the fallback losing its device rule.
+_IDENTITY_VERDICTS = {
+    "remount": True,
+    "device-reused-other-volume": False,
+    "birth-differs": False,
+    "cross-volume-same-birth": False,
+    "no-volume-remount": False,
+    "no-volume-same-device": True,
+}
+#: Present but unusable sidecar values: each must invalidate without raising.
+_MALFORMED_BIRTHS = (None, "1700000000.5", 0, -1, True, 10**400, "NaN-token")
+_MALFORMED_VOLUMES = (
+    True, 7, "not-a-uuid", str(uuid.UUID(int=(0xBEEF << 96) | 0xABC)).upper(),
+    "00000000-0000-0000-0000-000000000000")
+
+
+def _identity_damage_cases():
+    cases = []
+    for target in ("keys", "segment"):
+        cases += [f"{target}:{name}" for name in _IDENTITY_VERDICTS]
+        cases += [f"{target}:legacy-sidecar", f"{target}:malformed"]
+    return cases
+
+
+def _write_meta_with(meta_path, original, where, field, value):
+    """Rewrite the sidecar with one field replaced (a non-finite float is
+    written as the raw JSON token ``NaN``, as a hand-edited file would)."""
+    meta = json.loads(original)
+    holder = meta if where == "keys" else meta["coverage"][0]
+    holder[field] = "__TOKEN__" if value == "NaN-token" else value
+    meta_path.write_text(json.dumps(meta).replace('"__TOKEN__"', "NaN"))
+
+
 @pytest.mark.parametrize("damage", [
     "legacy", "replaced", "shrunk",
     "segment-replaced", "segment-shrunk", "uncovered-before-covered",
+    *_identity_damage_cases(),
 ])
 def test_index_validity_rejects_legacy_replaced_shrunk(
     tmp_path, monkeypatch, damage,
@@ -3879,9 +4026,18 @@ def test_index_validity_rejects_legacy_replaced_shrunk(
     shrunk keys file and a replaced or shrunk segment no longer match their
     publication, and an uncovered segment that sorts before a covered one was
     written outside the appender protocol (the cutover bootstrap).
+
+    #1080: the ``keys:``/``segment:`` cases apply an identity transition to
+    that one file through `_QuotaIdentitySeams` (see `_IDENTITY_VERDICTS`).
+    A sidecar written before #1080 (no birth or volume) keeps the device rule;
+    a present malformed birth or volume invalidates the index, never raises.
     """
     ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
     core = importlib.import_module("_cctally_core")
+    target, _, case = damage.partition(":")
+    seams = _QuotaIdentitySeams(jr, monkeypatch) if case else None
+    if case.startswith("no-volume"):
+        seams.report_volume = False
     for offset in (10, 11):
         jr.append_record(_quota_obs_at(jl, offset), now_utc=FIXED)
     assert jr.rebuild_quota_index() == "published"
@@ -3897,7 +4053,58 @@ def test_index_validity_rejects_legacy_replaced_shrunk(
     assert jr.quota_index_valid()
 
     july = core.JOURNAL_DIR / "observations-2026-07.jsonl"
-    if damage == "legacy":
+    if case:
+        meta = json.loads(meta_path.read_text())
+        assert meta["coverage"][0]["segment"] == july.name
+        published = {"keys": keys_path, "segment": july}[target]
+        recorded = ((meta["index_dev"], meta["index_ino"],
+                     meta.get("index_birth"), meta.get("index_volume"))
+                    if target == "keys" else _coverage_identity(meta, july.name))
+        reported = seams.identity_of(published)
+        ino = published.stat().st_ino
+        if case in IDENTITY_TRANSITIONS:
+            seams.arm(ino, **IDENTITY_TRANSITIONS[case])
+        elif case == "no-volume-remount":
+            seams.arm(ino, dev_offset=REMOUNT_OFFSET)
+        elif case == "legacy-sidecar":
+            meta.pop("index_birth", None)
+            meta.pop("index_volume", None)
+            for entry in meta["coverage"]:
+                entry.pop("birth", None)
+                entry.pop("volume", None)
+            meta_path.write_text(json.dumps(meta))
+            assert jr.quota_index_valid(), (
+                "a valid pre-#1080 sidecar was rejected on the same device")
+            seams.arm(ino, dev_offset=REMOUNT_OFFSET)
+        elif case == "malformed":
+            original = meta_path.read_text()
+            for field, values in ((("index_birth" if target == "keys"
+                                    else "birth"), _MALFORMED_BIRTHS),
+                                  (("index_volume" if target == "keys"
+                                    else "volume"), _MALFORMED_VOLUMES)):
+                for value in values:
+                    _write_meta_with(meta_path, original, target, field, value)
+                    assert jr._read_quota_index_meta(core.JOURNAL_DIR) is None, (
+                        f"{field}={value!r} was accepted")
+                    assert not jr.quota_index_valid()
+            meta_path.write_text(original)
+            assert jr.quota_index_valid()
+            # Leave one malformed value for the rebuild below to replace.
+            _write_meta_with(meta_path, original, target,
+                             "index_birth" if target == "keys" else "birth",
+                             "NaN-token")
+        verdict = _IDENTITY_VERDICTS.get(case, False)
+        assert jr.quota_index_valid() is verdict, (
+            f"{damage}: expected the index {'valid' if verdict else 'invalid'}")
+        # The publication recorded exactly what the wrappers reported.
+        assert recorded == reported
+        if verdict:
+            # The consumers take the verdict: no rebuild is requested or run.
+            _forget_quota_index(jr)
+            jr.ensure_quota_index(budgeted=True)
+            assert jr.rebuild_quota_index() == "already_valid"
+            return
+    elif damage == "legacy":
         meta_path.unlink()
     elif damage == "replaced":
         copy = keys_path.with_name("replacement")
@@ -3924,14 +4131,229 @@ def test_index_validity_rejects_legacy_replaced_shrunk(
     assert jr.quota_index_valid()
 
 
-def test_process_local_set_detects_shrink_and_foreign_growth(tmp_path, monkeypatch):
+_VOL_A = str(uuid.UUID(int=(0xA << 96) | 1))
+_VOL_B = str(uuid.UUID(int=(0xB << 96) | 1))
+
+
+def _stat_standin(dev, ino, birth=None):
+    st = types.SimpleNamespace(st_dev=dev, st_ino=ino, st_size=0)
+    if birth is not None:
+        st.st_birthtime = birth
+    return st
+
+
+@pytest.mark.parametrize("recorded,current,volume,same", [
+    # Inode equality is mandatory, whatever else matches.
+    ((1, 5, 10.5, _VOL_A), (1, 6, 10.5), _VOL_A, False),
+    # Known births that differ: another file.
+    ((1, 5, 10.5, _VOL_A), (1, 5, 11.5), _VOL_A, False),
+    # Both volumes known: the volume decides, the device is ignored.
+    ((1, 5, 10.5, _VOL_A), (2, 5, 10.5), _VOL_A, True),
+    ((1, 5, 10.5, _VOL_A), (1, 5, 10.5), _VOL_B, False),
+    # One or both volumes unknown: the device decides.
+    ((1, 5, 10.5, None), (1, 5, 10.5), _VOL_A, True),
+    ((1, 5, 10.5, None), (2, 5, 10.5), _VOL_A, False),
+    ((1, 5, 10.5, _VOL_A), (2, 5, 10.5), None, False),
+    ((1, 5, 10.5, None), (1, 5, 10.5), None, True),
+    # Births unknown on either side: no birth rule.
+    ((1, 5, None, _VOL_A), (2, 5, 99.5), _VOL_A, True),
+    ((1, 5, 10.5, _VOL_A), (2, 5, None), _VOL_A, True),
+    # An int and a float birth of one value are the same birth.
+    ((1, 5, 10, _VOL_A), (1, 5, 10.0), _VOL_A, True),
+])
+def test_quota_same_file_rule(tmp_path, monkeypatch, recorded, current,
+                              volume, same):
+    """#1080 §3.2 as a table on stat stand-ins, so the rule cannot depend on
+    the platform the suite happens to run on."""
+    _ns, _quota, jr, _jl = _load(tmp_path, monkeypatch)
+    assert jr._quota_same_file(recorded, _stat_standin(*current), volume) is same
+
+
+@pytest.mark.parametrize("value,usable", [
+    (1, True), (2**53, True), (1.5, True), (1e-300, True),
+    (0, False), (-1, False), (2**53 + 1, False), (10**400, False),
+    (0.0, False), (-0.5, False), (float("nan"), False), (float("inf"), False),
+    (True, False), (None, False), ("1.5", False),
+])
+def test_usable_quota_birth(tmp_path, monkeypatch, value, usable):
+    """#1080: a birth is a positive finite number; ``10**400`` must not reach
+    ``math.isfinite`` (it raises OverflowError) and a bool is not a number."""
+    _ns, _quota, jr, _jl = _load(tmp_path, monkeypatch)
+    assert jr._usable_quota_birth(value) is usable
+
+
+def test_load_race_check_follows_the_volume_rule(tmp_path, monkeypatch):
+    """#1080: the load compares its descriptor with what validation observed.
+
+    After a remount the keys file must load (otherwise every remount costs a
+    rebuild); a descriptor on another volume than the validated path is a
+    replaced file and must not be loaded.
+    """
+    _ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    seams = _QuotaIdentitySeams(jr, monkeypatch)
+    assert jr.append_record(_quota_obs_at(jl, 10), now_utc=FIXED,
+                            dedupe_codex_quota=True)
+    keys_path, _meta_path = _quota_index_paths()
+    keys_ino = keys_path.stat().st_ino
+
+    seams.arm(keys_ino, dev_offset=REMOUNT_OFFSET)
+    _forget_quota_index(jr)
+    jr._load_quota_dedup_keys()
+    assert jr._QUOTA_DEDUP_LOADED
+
+    seams.arm(keys_ino, paths=False, volume=OTHER_VOLUME)
+    _forget_quota_index(jr)
+    with pytest.raises(jr.QuotaIndexUnavailable, match="was replaced"):
+        jr._load_quota_dedup_keys()
+
+
+@pytest.mark.parametrize("form", ["path", "fd"])
+def test_quota_identity_takes_one_observation_of_one_target(
+    tmp_path, monkeypatch, form,
+):
+    """#1080: an identity is one stat and one volume lookup of the SAME target.
+
+    A second stat could pair the size of one file with the inode of its
+    replacement; a volume read from another target than the stat would
+    validate a file by someone else's volume.
+    """
+    _ns, _quota, jr, _jl = _load(tmp_path, monkeypatch)
+    calls: list = []
+    serial = {"n": 0}
+
+    def scripted(kind):
+        def call(target):
+            serial["n"] += 1
+            calls.append((kind, target))
+            if kind == "volume":
+                return str(uuid.UUID(int=(0xC << 96) | serial["n"]))
+            return _stat_standin(100 + serial["n"], 200 + serial["n"],
+                                 300.5 + serial["n"])
+        return call
+
+    monkeypatch.setattr(jr, "_quota_stat", scripted("stat"))
+    monkeypatch.setattr(jr, "_quota_fstat", scripted("fstat"))
+    monkeypatch.setattr(jr, "_quota_volume_of", scripted("volume"))
+    target = tmp_path / "keys" if form == "path" else 11
+    st, identity = (jr._quota_identity(path=target) if form == "path"
+                    else jr._quota_identity(fd=target))
+    stat_kind = "stat" if form == "path" else "fstat"
+    assert calls == [(stat_kind, target), ("volume", target)]
+    assert identity == (101, 201, 301.5, str(uuid.UUID(int=(0xC << 96) | 2)))
+    assert (st.st_dev, st.st_ino) == identity[:2]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="getattrlist is Darwin-only")
+def test_quota_volume_of_real_binding(tmp_path, monkeypatch):
+    """#1080: the real ``getattrlist``/``fgetattrlist`` binding, which every
+    seam-driven case hides: path, descriptor and symlink name one volume, and
+    a missing path or a closed descriptor gives no volume, never an error."""
+    _ns, _quota, jr, _jl = _load(tmp_path, monkeypatch)
+    target = tmp_path / "file"
+    target.write_bytes(b"x")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    volume = jr._quota_volume_of(str(target))
+    assert volume is not None and str(uuid.UUID(volume)) == volume
+    assert volume != "00000000-0000-0000-0000-000000000000"
+    fd = os.open(target, os.O_RDONLY)
+    try:
+        assert jr._quota_volume_of(fd) == volume
+    finally:
+        os.close(fd)
+    assert jr._quota_volume_of(link) == volume
+    assert jr._quota_volume_of(tmp_path / "missing") is None
+    # Not a just-closed descriptor, which another thread could reuse: 2**30 is
+    # above every per-process descriptor limit macOS and Linux allow (EBADF).
+    assert jr._quota_volume_of(2**30) is None
+
+
+def test_quota_volume_of_rejects_bad_replies_and_caches_binding_failure(
+    tmp_path, monkeypatch,
+):
+    """#1080: on every platform, through stand-ins for the libc binding.
+
+    A non-zero return, a reply length outside 20..64 (a short buffer returns
+    0 with a truncated length) or the all-zero UUID is no volume; a binding
+    that cannot be made is tried once per process; off Darwin the binding is
+    never touched. A wrong answer here would validate an index by garbage.
+    """
+    import ctypes
+
+    _ns, _quota, jr, _jl = _load(tmp_path, monkeypatch)
+    real_libc = jr._quota_libc
+    monkeypatch.setattr(jr, "_QUOTA_PLATFORM", "darwin")
+    good = uuid.UUID(int=(0xD << 96) | 42)
+    received: list = []
+
+    def binding(rc, length, raw):
+        reply = length.to_bytes(4, sys.byteorder) + raw
+
+        def call(target, _attrs, buf, size, options):
+            received.append((target, size, options))
+            ctypes.memmove(buf, reply, len(reply))
+            return rc
+        return types.SimpleNamespace(attrlist=None, getattrlist=call,
+                                     fgetattrlist=call)
+
+    def lookup(rc, length, raw, target):
+        monkeypatch.setattr(jr, "_quota_libc", lambda: binding(rc, length, raw))
+        return jr._quota_volume_of(target)
+
+    assert lookup(0, 20, good.bytes, str(tmp_path)) == str(good)
+    assert received[-1] == (os.fsencode(str(tmp_path)), 64, 0)
+    assert lookup(0, 20, good.bytes, 5) == str(good)
+    assert received[-1] == (5, 64, 0)
+    assert lookup(-1, 20, good.bytes, 5) is None
+    assert lookup(0, 19, good.bytes, 5) is None
+    assert lookup(0, 65, good.bytes, 5) is None
+    assert lookup(0, 20, bytes(16), 5) is None
+
+    # A binding that cannot be made: one attempt, then cached unavailability.
+    for broken in (OSError("no libc"), None):
+        attempts = {"n": 0}
+
+        def cdll(*_args, broken=broken, **_kwargs):
+            attempts["n"] += 1
+            if broken is not None:
+                raise broken
+            return object()  # no getattrlist symbol: AttributeError
+
+        # A fresh process: the real binding, nothing bound yet.
+        monkeypatch.setattr(jr, "_quota_libc", real_libc)
+        monkeypatch.setattr(jr, "_QUOTA_LIBC_BINDING", jr._QUOTA_LIBC_UNBOUND)
+        monkeypatch.setattr(ctypes, "CDLL", cdll)
+        assert jr._quota_volume_of(str(tmp_path)) is None
+        assert jr._quota_volume_of(str(tmp_path)) is None
+        assert attempts["n"] == 1
+
+    monkeypatch.setattr(jr, "_QUOTA_PLATFORM", "linux")
+    touched: list = []
+    monkeypatch.setattr(jr, "_quota_libc", lambda: touched.append(1))
+    assert jr._quota_volume_of(str(tmp_path)) is None
+    assert touched == []
+
+
+@pytest.mark.parametrize("transition", [
+    "remount", "birth-differs", "device-reused-other-volume",
+])
+def test_process_local_set_detects_shrink_and_foreign_growth(
+    tmp_path, monkeypatch, transition,
+):
     """C3: a long-lived process must follow the keys file, not a stale copy.
 
     Missing foreign growth re-journals an observation another process already
     retained; reading growth from a stale offset after a shrink parses keys
     from the middle of the file.
+
+    #1080: the same file seen after a device-only remount must be followed
+    incrementally (a reload would be a rebuild-sized cost for nothing), while
+    a file with another birth or on another volume is another file whose set
+    must be dropped. The append path compares on its own, so its transition
+    is armed only after catch-up has run, at its own descriptor stat.
     """
     ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    seams = _QuotaIdentitySeams(jr, monkeypatch)
     first, foreign, later = (_quota_obs_at(jl, n) for n in (10, 11, 12))
     assert jr.append_record(first, now_utc=FIXED, dedupe_codex_quota=True)
     keys_path, _meta_path = _quota_index_paths()
@@ -3954,6 +4376,67 @@ def test_process_local_set_detects_shrink_and_foreign_growth(tmp_path, monkeypat
     assert {jr._codex_quota_natural_key(first),
             jr._codex_quota_natural_key(later)} <= jr._QUOTA_DEDUP_KEYS
 
+    # Catch-up: a fresh load, then the transition and a foreign key.
+    _forget_quota_index(jr)
+    jr._load_quota_dedup_keys()
+    loaded = jr._QUOTA_DEDUP_IDENTITY
+    consumed = loaded[-1]
+    keys_ino = keys_path.stat().st_ino
+    seams.arm(keys_ino, **IDENTITY_TRANSITIONS[transition])
+    grown_key = jr._codex_quota_natural_key(_quota_obs_at(jl, 13))
+    with open(keys_path, "ab") as handle:
+        handle.write(f"{grown_key}\n".encode("ascii"))
+    preads: list = []
+    validations = {"n": 0}
+    real_pread, real_validation = os.pread, jr._quota_index_validation
+
+    def pread(fd, length, offset):
+        preads.append((length, offset))
+        return real_pread(fd, length, offset)
+
+    def validation(journal_dir):
+        validations["n"] += 1
+        return real_validation(journal_dir)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(jr.os, "pread", pread)
+        patched.setattr(jr, "_quota_index_validation", validation)
+        if transition == "remount":
+            jr._load_quota_dedup_keys()
+        else:
+            with pytest.raises(jr.QuotaIndexUnavailable):
+                jr._load_quota_dedup_keys()
+    if transition == "remount":
+        assert validations["n"] == 0 and preads == [(19, consumed)], (
+            "the remounted keys file was reloaded instead of followed")
+        assert grown_key in jr._QUOTA_DEDUP_KEYS
+        assert jr._QUOTA_DEDUP_IDENTITY == (
+            *seams.identity_of(keys_path), consumed + 19)
+    else:
+        assert validations["n"] == 1, "the set was not re-validated"
+        assert not jr._QUOTA_DEDUP_LOADED and grown_key not in jr._QUOTA_DEDUP_KEYS, (
+            "a set loaded from another file survived")
+
+    # Append, independently of catch-up: load and catch up untransitioned,
+    # then arm the transition at the append's own descriptor stat only.
+    seams.disarm()
+    _forget_quota_index(jr)
+    jr._load_quota_dedup_keys()
+    jr._load_quota_dedup_keys()
+    before = jr._QUOTA_DEDUP_IDENTITY
+    seams.arm(keys_ino, paths=False, **IDENTITY_TRANSITIONS[transition])
+    jr._append_quota_dedup_key(jr._codex_quota_natural_key(_quota_obs_at(jl, 14)))
+    size = keys_path.stat().st_size
+    if transition == "remount":
+        assert jr._QUOTA_DEDUP_IDENTITY == (
+            before[0] + REMOUNT_OFFSET, *before[1:4], size), (
+            "the append did not adopt the remounted keys file")
+        assert jr._catch_up_loaded_quota_keys(keys_path)
+    else:
+        assert jr._QUOTA_DEDUP_IDENTITY == before, (
+            "the append adopted another file's identity")
+        assert not jr._catch_up_loaded_quota_keys(keys_path)
+
 
 class _InjectedCrash(Exception):
     """A process death at an injected point."""
@@ -3961,6 +4444,44 @@ class _InjectedCrash(Exception):
 
 def _full_scan_oracle(jr, jl):
     return set(_journal_quota_multiplicity(jr, jl))
+
+
+def test_rebuild_publishes_the_identity_of_a_segment_it_discovers(
+    tmp_path, monkeypatch,
+):
+    """#1080: a segment created after the capture (a month rollover during a
+    single rebuild attempt) enters through the discovery branch of
+    `_quota_uncovered`, and its published coverage entry must carry that
+    segment's birth and volume. A dropped field would leave the segment on
+    the device rule, so the next remount would rebuild the index again."""
+    _ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    seams = _QuotaIdentitySeams(jr, monkeypatch)
+    core = importlib.import_module("_cctally_core")
+    update = importlib.import_module("_cctally_update")
+    monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+    observations = [_quota_obs_at(jl, n) for n in range(3)]
+    for obs in observations[:2]:
+        jr.append_record(obs, now_utc=FIXED)
+    july = core.JOURNAL_DIR / "observations-2026-07.jsonl"
+    august = core.JOURNAL_DIR / "observations-2026-08.jsonl"
+    assert july.exists() and not august.exists()
+
+    def rollover_after_capture(name):
+        if name == "captured" and not august.exists():
+            jr.append_record(observations[2], now_utc=AUGUST)
+
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK",
+                        rollover_after_capture)
+    # One attempt, so the publication is the one that discovered August.
+    assert jr.rebuild_quota_index(max_attempts=1) == "published"
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK", None)
+    assert august.exists()
+    _keys_path, meta_path = _quota_index_paths()
+    meta = json.loads(meta_path.read_text())
+    assert [e["segment"] for e in meta["coverage"]] == [july.name, august.name]
+    for segment in (july, august):
+        assert _coverage_identity(meta, segment.name) == seams.identity_of(segment)
+    assert jr.quota_index_valid()
 
 
 def test_rebuild_concurrent_appends_rollover_torn_tail_crash_between_renames(
@@ -3973,8 +4494,16 @@ def test_rebuild_concurrent_appends_rollover_torn_tail_crash_between_renames(
     the lock-free scan, at rollover, or in the publication race) re-journals an
     observation. Journal multiplicity is counted in the journal itself, and
     only C2's two named allowances may exceed one.
+
+    #1080: every file has a stable birth and volume through the seams, so the
+    publication must record them for the keys file, the initially captured
+    segments and the segment the rollover creates (a dropped field would make
+    the index fall back to the device rule). A device-only remount during a
+    single attempt must still publish, and a volume change must still fail:
+    the rebuild's descriptor and coverage checks use the identity rule.
     """
     ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    seams = _QuotaIdentitySeams(jr, monkeypatch)
     core = importlib.import_module("_cctally_core")
     update = importlib.import_module("_cctally_update")
     spawned: list[str] = []
@@ -3992,6 +4521,30 @@ def test_rebuild_concurrent_appends_rollover_torn_tail_crash_between_renames(
         jr.append_record(obs, now_utc=FIXED)
     assert jr.rebuild_quota_index() == "published"
     keys_path, meta_path = _quota_index_paths()
+    _tear_index(keys_path)
+    _forget_quota_index(jr)
+    assert not jr.quota_index_valid()
+
+    # One attempt with a transition of every file right after the capture.
+    def armed_at_captured(**transition):
+        def hook(name):
+            if name == "captured":
+                seams.arm(None, **transition)
+        return hook
+
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK",
+                        armed_at_captured(volume=OTHER_VOLUME))
+    assert jr.rebuild_quota_index(max_attempts=1) == "failed", (
+        "a rebuild accepted a segment that moved to another volume")
+    assert not jr.quota_index_valid()
+    seams.disarm()
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK",
+                        armed_at_captured(dev_offset=REMOUNT_OFFSET))
+    assert jr.rebuild_quota_index(max_attempts=1) == "published", (
+        "a device-only remount during the rebuild failed it")
+    assert jr.quota_index_valid()
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK", None)
+    seams.disarm()
     _tear_index(keys_path)
     _forget_quota_index(jr)
     assert not jr.quota_index_valid()
@@ -4026,6 +4579,13 @@ def test_rebuild_concurrent_appends_rollover_torn_tail_crash_between_renames(
     assert jr.rebuild_quota_index() == "published"
     monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK", None)
     assert jr.quota_index_valid()
+    meta = json.loads(meta_path.read_text())
+    assert (meta["index_dev"], meta["index_ino"], meta.get("index_birth"),
+            meta.get("index_volume")) == seams.identity_of(keys_path)
+    august = core.JOURNAL_DIR / "observations-2026-08.jsonl"
+    assert [e["segment"] for e in meta["coverage"]] == [july.name, august.name]
+    for segment in (july, august):
+        assert _coverage_identity(meta, segment.name) == seams.identity_of(segment)
     lines = keys_path.read_text(encoding="ascii").splitlines()
     assert set(lines) == _full_scan_oracle(jr, jl) == set(key[:9])
     assert len(lines) == len(set(lines))
@@ -4101,9 +4661,15 @@ def test_rebuild_concurrent_appends_rollover_torn_tail_crash_between_renames(
     assert jr.request_quota_index_rebuild() is True
     assert spawned == ["_quota-index-rebuild"]
 
+    # With no birth and no volume reported, none is written (the fallback).
+    seams.report_birth = seams.report_volume = False
     assert jr.rebuild_quota_index() == "published"
     lines = keys_path.read_text(encoding="ascii").splitlines()
     assert set(lines) == _full_scan_oracle(jr, jl)
+    meta = json.loads(meta_path.read_text())
+    assert not {"index_birth", "index_volume"} & set(meta)
+    assert all(not {"birth", "volume"} & set(e) for e in meta["coverage"])
+    assert jr.quota_index_valid()
 
 
 @pytest.mark.parametrize("population,catchup", [

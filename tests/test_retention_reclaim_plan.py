@@ -60,6 +60,22 @@ def _env(tmp_path, monkeypatch):
     return ns, conn, retention, pathlib.Path(retention._resolve_main_db_path(conn))
 
 
+#: #990 (spec D1): the planner helper's real-time floor for the tests whose
+#: subject is a chunk's outcome, never the helper's own failure or deadline.
+_PLANNER_FLOOR_SECONDS = 30.0
+
+
+def _floor_planner_budget(monkeypatch, retention) -> None:
+    """Give every planner helper of this test 30 s of its own deadline, and
+    31 s of subprocess timeout with the 1.0 s start-up slack, instead of a
+    direct chunk's 1.5 s default, so a multi-second host stall cannot turn
+    the chunk under test into a ``helper_timeout`` refusal (#990). The
+    product constants are unchanged, and a passing run never waits on the
+    floor: a helper returns in about 0.05 s."""
+    monkeypatch.setattr(retention, "_PLANNER_MIN_DEADLINE_SECONDS",
+                        _PLANNER_FLOOR_SECONDS)
+
+
 def _ledger_total(db_path, retention):
     conn = sqlite3.connect(db_path)
     try:
@@ -219,6 +235,7 @@ def test_an_interior_relocation_chunk_is_covered_by_its_own_charge(
     template, geometry = interior_template
     ns, retention, db_path, page_size = _store_from(template, tmp_path,
                                                     monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     plans = []
     _capture_plans(monkeypatch, retention, plans)
     [chunk] = _run_chunks(retention, db_path, count=1, max_steps=1)
@@ -241,6 +258,7 @@ def test_a_sixteen_step_chunk_over_the_interior_tail_is_bounded(
     template, _geometry = interior_template
     ns, retention, db_path, page_size = _store_from(template, tmp_path,
                                                     monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     plans = []
     _capture_plans(monkeypatch, retention, plans)
     chunks = _run_chunks(retention, db_path, count=6)
@@ -263,6 +281,7 @@ def test_every_chunk_of_a_fragmented_drain_is_bounded_on_its_own(
     lands on its destination), chunks across an hour boundary that roll the
     ledger, and pointer-map pages inside the tail."""
     ns, conn, retention, db_path = _env(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     marks = {}
 
     def normalize(c):
@@ -319,6 +338,7 @@ def test_the_first_chunk_after_a_legacy_record_is_normalized_separately(
     template, _geometry = interior_template
     ns, retention, db_path, page_size = _store_from(template, tmp_path,
                                                     monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("UPDATE cache_meta SET value=? WHERE key=?",
@@ -358,6 +378,7 @@ def test_the_runtime_sqlite_is_audited_and_recorded(tmp_path, monkeypatch):
     records `sqlite_source_id()`; the compile options are recorded here."""
     planner = importlib.import_module("_lib_reclaim_planner")
     ns, conn, retention, db_path = _env(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     try:
         runtime = sqlite3.sqlite_version_info
         source_id = conn.execute("SELECT sqlite_source_id()").fetchone()[0]
@@ -420,6 +441,8 @@ import datetime as dt, json, os, sys
 sys.path.insert(0, sys.argv[1])
 import _lib_conversation_retention as r
 db, point = sys.argv[2], sys.argv[3]
+# #990: the parent's planner floor; a monkeypatch cannot reach this process.
+r._PLANNER_MIN_DEADLINE_SECONDS = float(sys.argv[4])
 real_write = r._write_reclaim_state_in_chunk
 real_plan = r._request_plan
 
@@ -470,6 +493,7 @@ def test_a_crash_at_each_point_of_the_chunk(tmp_path, monkeypatch, point):
     import _cctally_core
 
     ns, conn, retention, db_path = _env(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     try:
         conn.execute("CREATE TABLE c_fill(payload BLOB)")
         conn.executemany("INSERT INTO c_fill VALUES (?)",
@@ -485,7 +509,8 @@ def test_a_crash_at_each_point_of_the_chunk(tmp_path, monkeypatch, point):
            "CCTALLY_DATA_DIR": str(_cctally_core.APP_DIR),
            "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
     child = subprocess.run(
-        [sys.executable, "-c", _CRASH_CHILD, str(_BIN), str(db_path), point],
+        [sys.executable, "-c", _CRASH_CHILD, str(_BIN), str(db_path), point,
+         repr(retention._PLANNER_MIN_DEADLINE_SECONDS)],
         env=env, capture_output=True, text=True, timeout=120)
     assert child.returncode == 17, child.stderr
     planned = json.loads(child.stdout.strip().splitlines()[0])

@@ -60,6 +60,9 @@ def copy_aggregator(bindir, *, capabilities=(), durations_validator=None):
     for kernel in sorted(BIN.glob("_lib_test_*.py")):
         shutil.copy2(kernel, bindir / kernel.name)
     shutil.copy2(BIN / "_lib_quarantine.py", bindir / "_lib_quarantine.py")
+    # The shell holder the pool and the pytest legs run under (#1087); the
+    # `_lib-*.sh` glob above already carries its shell interface.
+    shutil.copy2(BIN / "_lib_hold.py", bindir / "_lib_hold.py")
     # The mirror matcher is what marks the private tree to the aggregator's
     # disclosure facts: without it the published tree vouches for no word and
     # redacts every detail. A copy taken from the private tree keeps it, so the
@@ -73,6 +76,22 @@ def copy_aggregator(bindir, *, capabilities=(), durations_validator=None):
     else:
         target.write_text(durations_validator, encoding="utf-8")
     return runner
+
+
+def copy_pytest_plugins(testsdir):
+    """Copy the `-p` plugins every suite-built pytest leg loads into ``testsdir``.
+
+    The aggregator's bulk leg loads tests/_xdist_recovery.py on every xdist
+    leg (bin/_lib_test_selection.py `_xdist`, #1086), and even
+    `CCTALLY_TEST_JOBS=1` gives `-n 1` when xdist is installed; an evidence run
+    also loads tests/_pytest_durations_plugin.py. Both are imported as
+    `tests.<name>` from the scratch root, so a scratch tree without them fails
+    to start pytest at all.
+    """
+    testsdir = pathlib.Path(testsdir)
+    testsdir.mkdir(parents=True, exist_ok=True)
+    for name in ("_pytest_durations_plugin.py", "_xdist_recovery.py"):
+        shutil.copy2(REPO / "tests" / name, testsdir / name)
 
 
 def write_harness(bindir, name, body="#!/usr/bin/env bash\nexit 0\n", mode=0o755):

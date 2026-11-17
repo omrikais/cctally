@@ -32,6 +32,8 @@ spec = importlib.util.spec_from_loader("cctally", loader)
 c = importlib.util.module_from_spec(spec)
 sys.modules["cctally"] = c
 loader.exec_module(c)
+# The seeding script is its own process owner (#787 / #861).
+sys.modules["_cctally_core"].establish_script_owner()
 
 import _cctally_core  # noqa: E402
 import _lib_quota_model as qm  # noqa: E402

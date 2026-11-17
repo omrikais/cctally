@@ -32,6 +32,12 @@ def _start_share_dashboard_server(ns, tmp_path, monkeypatch):
     """
     redirect_paths(ns, monkeypatch, tmp_path)
     sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
+    # #787 / #861: the dashboard's startup owner creates its stores before
+    # any route serves; a share request no longer creates one.
+    core = ns["_cctally_core"]
+    with core.establish_authority("process"):
+        core.open_db().close()
+        ns["_cctally_cache"].open_cache_db().close()
 
     import socketserver
     HandlerCls = ns["DashboardHTTPHandler"]

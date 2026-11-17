@@ -92,6 +92,13 @@ class CounterSample:
     publications: int = 0
 
 
+#: The kinds of excluded interval: an expired-transcript deletion, and the
+#: conversation FTS verification's index check and rebuild (#1094 F1). Both
+#: are subtracted from the steady statistic; only deletions are reported as
+#: deletions.
+EXCLUSION_KINDS = ("deletion", "index_maintenance")
+
+
 @dataclasses.dataclass(frozen=True)
 class DeletionInterval:
     start_ns: int
@@ -100,6 +107,7 @@ class DeletionInterval:
     end_bytes: "int | None"
     rows: int = 0
     ended_wall_s: "int | None" = None
+    kind: str = "deletion"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,6 +127,11 @@ class SteadyStatistic:
     excluded_seconds: float = 0.0
     last_excluded_wall_s: "int | None" = None
     sample_count: int = 0
+    #: #1094 F1: index-maintenance intervals, excluded like deletions but
+    #: counted apart (the ``excluded_*`` deletion fields above exclude them).
+    excluded_maintenance_operations: int = 0
+    excluded_maintenance_bytes: int = 0
+    last_excluded_maintenance_wall_s: "int | None" = None
 
 
 def steady_statistic(samples, deletions=(), *, now_ns, warm_admitted_ns,
@@ -155,6 +168,9 @@ def steady_statistic(samples, deletions=(), *, now_ns, warm_admitted_ns,
     operations = 0
     rows = 0
     last_wall = None
+    maintenance_operations = 0
+    maintenance_bytes = 0
+    maintenance_wall = None
     for d in deletions:
         overlap_ns = max(0, min(d.end_ns, end.t_ns) - max(d.start_ns, base.t_ns))
         if d.start_bytes is not None and d.end_bytes is not None:
@@ -164,14 +180,21 @@ def steady_statistic(samples, deletions=(), *, now_ns, warm_admitted_ns,
             overlap_bytes = 0
         if overlap_ns <= 0 and overlap_bytes <= 0:
             continue
+        excluded_ns += overlap_ns
+        if getattr(d, "kind", "deletion") == "index_maintenance":
+            maintenance_operations += 1
+            maintenance_bytes += overlap_bytes
+            if d.ended_wall_s is not None:
+                maintenance_wall = max(maintenance_wall or 0,
+                                       int(d.ended_wall_s))
+            continue
         operations += 1
         rows += max(0, int(d.rows))
-        excluded_ns += overlap_ns
         excluded_bytes += overlap_bytes
         if d.ended_wall_s is not None:
             last_wall = max(last_wall or 0, int(d.ended_wall_s))
     elapsed_ns = end.t_ns - base.t_ns
-    written = end.bytes - base.bytes - excluded_bytes
+    written = end.bytes - base.bytes - excluded_bytes - maintenance_bytes
     publications = end.publications - base.publications
     common = dict(
         window_seconds=elapsed_ns / _NS,
@@ -186,6 +209,9 @@ def steady_statistic(samples, deletions=(), *, now_ns, warm_admitted_ns,
         excluded_seconds=excluded_ns / _NS,
         last_excluded_wall_s=last_wall,
         sample_count=len(span),
+        excluded_maintenance_operations=maintenance_operations,
+        excluded_maintenance_bytes=maintenance_bytes,
+        last_excluded_maintenance_wall_s=maintenance_wall,
     )
     if excluded_ns > EXCLUDED_TIME_MAX_FRACTION * elapsed_ns:
         return SteadyStatistic("insufficient", ("excluded_time_over_limit",),

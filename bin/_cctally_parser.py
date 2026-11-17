@@ -2372,7 +2372,7 @@ def _build_diff_parser(subparsers, name, *, help_text, xref=None, fixed_source=N
         choices=["delta", "cost-a", "cost-b", "name", "status"], default="delta")
     diff_p.add_argument("--top", type=int, help="Cap rows per section after filter+sort")
     diff_p.add_argument("--sync", action="store_true",
-        help="Run sync_cache + sync-week before computing")
+        help="Refresh the selected providers' cached usage data before computing")
     diff_p.add_argument("--tz", default=None, type=_argparse_tz, metavar="TZ",
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.")
@@ -3339,6 +3339,23 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
         help="Which DB to VACUUM (default: cache)",
     )
     db_vacuum.set_defaults(func=c.cmd_db_vacuum)
+    db_reindex = db_sub.add_parser(
+        "reindex-search",
+        help="Check the conversation search indexes against their messages "
+             "and rebuild any that disagree",
+    )
+    db_reindex.add_argument(
+        "--check",
+        action="store_true",
+        help="Only check: exit 1 when an index is out of date, rebuild "
+             "nothing",
+    )
+    db_reindex.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON to stdout",
+    )
+    db_reindex.set_defaults(func=c.cmd_db_reindex_search)
 
 
 def _build_dashboard_perf_parser(subparsers, name, *, help_text, xref=None):

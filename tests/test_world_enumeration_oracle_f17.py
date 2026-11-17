@@ -278,6 +278,20 @@ FAMILIES = {skel.name: skel for skel in _families()}
 # worker, so at most four of this module's cases run at once, and xdist's
 # default reorder dispatches the large units first, so the tail is ordinary
 # short tests.
+#
+# The world shard (#996). Under 21 workers (run 5afb86dffbdd8b11) the
+# certified-recovery calls reached 56.4 s against the 120 s cap. Each case is
+# now also split by the interpretation of its traces' first excluded reading
+# (`first`, `WE.worlds`): it runs the same mixed runs and only that shard's
+# reference worlds, so in the gate a call runs 5 traces instead of 17 (under
+# `CCTALLY_F17_FULL=1`, 8 mixed runs and 32 worlds instead of 8 and 128), and
+# the four shards together make exactly the former case's comparisons
+# (`test_f17_splits_partition_the_former_pairs` pins the partition).
+#
+# T1's placement (#996). `test_t1_finite_continuous_recovery` runs in the
+# serial leg (`SERIAL` in bin/_lib_test_selection.py), not under xdist: in
+# the same run three of its cases died at their 360 s budget under the
+# loaded bulk leg and took their workers with them.
 SPLITS = (0, 1)
 XDIST_GROUP_COUNT = 4
 XDIST_GROUP_PREFIX = "f17"
@@ -286,10 +300,12 @@ XDIST_GROUP_PREFIX = "f17"
 #: October, before the split, with every F17 node present): `test_f17_family`
 #: 2,326 s over 104 cases and the recovery cases 1,295 s over 26, each halved
 #: by the split; the singletons as measured. The figures only balance the
-#: groups; a wrong one costs balance, never coverage.
+#: groups; a wrong one costs balance, never coverage. The recovery figure is
+#: 5/17 of the former case's, from #996's measurements: a `first` shard runs
+#: its traces' mixed runs and four of their sixteen worlds.
 _CASE_COST_S = {
     "test_f17_family": 11.0,
-    "test_f17_certified_recovery_mints_the_genuine_outcome": 25.0,
+    "test_f17_certified_recovery_mints_the_genuine_outcome": 7.0,
     "test_f17_lazy_reference_horizon_is_exact": 50.0,
     "test_f17_trie_execution_matches_fresh_stores": 47.0,
     "test_f17_rejects_restored_confirmation_state_across_a_rebuild": 36.0,
@@ -331,7 +347,11 @@ def _recovery_pairs(split, count):
 @pytest.mark.parametrize("full", [False, True])
 def test_f17_splits_partition_the_former_pairs(monkeypatch, full):
     """The union of the halves is exactly what one former case ran, with no
-    pair run twice, and the non-vacuity pair (0, 0) is in half 0."""
+    pair run twice, and the non-vacuity pair (0, 0) is in half 0. The four
+    `first` shards of every certified-recovery trace partition its reference
+    worlds (#996); the unsharded default still yields a trace without an
+    excluded reading its one empty world, and a shard of it, or by an unknown
+    interpretation, is refused."""
     if full:
         monkeypatch.setenv("CCTALLY_F17_FULL", "1")
     else:
@@ -351,6 +371,35 @@ def test_f17_splits_partition_the_former_pairs(monkeypatch, full):
         assert len(set(recovery)) == len(recovery), count
         assert all(_family_pairs(split, count) and _recovery_pairs(split, count)
                    for split in SPLITS), count
+    # The certified-recovery shards (#996): every recovery trace carries two
+    # excluded readings, and the four `first` shards partition its worlds.
+    for skel in FAMILIES.values():
+        for variant in RECOVERY_VARIANTS:
+            for split in SPLITS:
+                traces = WE.mixed_traces(
+                    skel, variant, recovery=True,
+                    pairs=_recovery_pairs(split, len(skel.values)))
+                for label, steps in traces.items():
+                    assert sum(1 for kind, _ in steps if kind == "legacy") == 2, label
+                    shards = {first: list(WE.worlds(steps, first=first))
+                              for first in WE.INTERPRETATIONS}
+                    for first, shard in shards.items():
+                        assert shard, (label, first)
+                        assert all(world[0] == first for world in shard), (label, first)
+                    union = [world for shard in shards.values() for world in shard]
+                    assert len(set(union)) == len(union), label
+                    assert (sorted(union, key=repr)
+                            == sorted(WE.worlds(steps), key=repr)), label
+                    assert len(union) == 16, label
+    # A trace with no excluded reading keeps its one empty world by default,
+    # and a requested shard of it is refused.
+    no_exclusion = [("current", {})]
+    assert list(WE.worlds(no_exclusion)) == [()]
+    assert list(WE.worlds(no_exclusion, first=WE.ALL)) == [()]
+    with pytest.raises(ValueError):
+        WE.worlds(no_exclusion, first="A")
+    with pytest.raises(ValueError):
+        WE.worlds([("legacy", {})], first="Z")
     if full:
         assert len(_family_pairs(0, 5)) + len(_family_pairs(1, 5)) == 25
 
@@ -401,20 +450,23 @@ def test_f17_family(store, family, variant, split):
 RECOVERY_VARIANTS = (WE.Variant(0, "api", 0), WE.Variant(1, "statusline", -1))
 
 
+@pytest.mark.parametrize("first", WE.INTERPRETATIONS, ids=lambda w: f"first-{w or 'absent'}")
 @pytest.mark.parametrize("split", SPLITS, ids=lambda split: f"half{split}")
 @pytest.mark.parametrize("variant", RECOVERY_VARIANTS, ids=_vid)
 @pytest.mark.parametrize("family", sorted(FAMILIES))
-def test_f17_certified_recovery_mints_the_genuine_outcome(store, family, variant, split):
+def test_f17_certified_recovery_mints_the_genuine_outcome(store, family, variant, split, first):
     """The mixed trace, quarantined by its first excluded reading, recovers at
     the idle-gap witness and then mints the genuine credit — which every
-    reference world mints too (`check`)."""
+    reference world mints too (`check`). A case checks the reference worlds of
+    one interpretation of the first excluded reading (`first`); the four
+    shards together check all sixteen (#996)."""
     skel = FAMILIES[family]
     # Two of the gate pairs (the no-exclusion pair and one with both slots
     # non-trivial) carry the recovery suffix, one per half; `CCTALLY_F17_FULL=1`
     # runs every pair, half in each (`_recovery_pairs`).
     traces = WE.mixed_traces(skel, variant, recovery=True,
                              pairs=_recovery_pairs(split, len(skel.values)))
-    results = WE.run_and_check(store, traces)
+    results = WE.run_and_check(store, traces, first=first)
     recovery_start = len(skel.steps)
     for label, (mixed, _worlds) in results.items():
         before = collections.Counter(mixed[recovery_start - 1]["five_hour"])
@@ -1000,9 +1052,11 @@ def _run_t1(store, *, full, interpretations=None):
     return mixed, worlds
 
 
-# Off the merge path (BROAD_RUN_ONLY in bin/_lib_quick_gate.py); one case
-# measured 46-97 s on the runner, so it carries its own 360 s budget instead
-# of the broad run's 120 s default rather than flake on a loaded host.
+# Off the merge path (BROAD_RUN_ONLY in bin/_lib_quick_gate.py). It runs in
+# the serial leg (`SERIAL` in bin/_lib_test_selection.py, #996): under 21
+# workers (run 5afb86dffbdd8b11) three of its cases died at the 360 s budget,
+# while re-runs at that leg's eased tail took 89-109 s and one idle profiled
+# case 78 s. The budget stays, above the broad run's 120 s default.
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("world", WE.RENDER_INTERPRETATIONS,
                          ids=lambda w: f"legacy-{w or 'absent'}")

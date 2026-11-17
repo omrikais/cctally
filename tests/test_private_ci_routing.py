@@ -14,6 +14,7 @@ per-workflow reading would miss a second workflow that a trigger also starts.
 """
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -748,3 +749,518 @@ def test_doc_lint_takes_no_runner_admission():
         command = str(step.get("run", ""))
         assert RETIRED_RESERVATION_HELPER not in command, step
         assert "CCTALLY_RUNNER_" not in command, step
+
+
+# #923: a persistent evidence path grows a self-hosted runner's disk without
+# bound — lan's internal disk for a home path, the runner store for a path
+# outside the job temp — until the disk fills or the supervisor's free-space
+# refusal stops every run. Two fail-closed static checks over every self-hosted
+# job (spec 2026-11-10-923-s1 §5). They read YAML and strings only and run no
+# workflow command; they are no shell interpreter, so a form they do not
+# recognize fails rather than being interpreted. Kept apart from the privacy
+# check above, which covers only the mirrored runner workflows.
+
+
+def _all_workflow_docs():
+    """Every workflow, `.yml` and `.yaml` (`_workflow_docs` stays `.yml`-only)."""
+    paths = sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
+    return {path.name: yaml.safe_load(path.read_text()) for path in paths}
+
+
+def _maybe_self_hosted(runs_on):
+    """True when `runs-on` names `self-hosted` or is not a literal label: an
+    expression (`${{ matrix.os }}`), a mapping (a runner group), or a list with
+    a non-string or expression element may all select a self-hosted runner."""
+    if runs_on is None:
+        return False
+    labels = [runs_on] if isinstance(runs_on, str) else runs_on if isinstance(runs_on, list) else None
+    return labels is None or any(not isinstance(label, str) or label == "self-hosted" or "${{" in label
+                                 for label in labels)
+
+
+def _self_hosted_jobs(docs=None):
+    """``(workflow file, job name, workflow doc, job)`` for every job whose
+    `runs-on` may select a self-hosted runner (`_maybe_self_hosted`)."""
+    docs = _all_workflow_docs() if docs is None else docs
+    return [(workflow, name, doc, job)
+            for workflow, doc in sorted(docs.items())
+            for name, job in ((doc or {}).get("jobs") or {}).items()
+            if isinstance(job, dict) and _maybe_self_hosted(job.get("runs-on"))]
+
+
+def _step_label(index, step):
+    return repr(str(step.get("name") or step.get("uses") or f"step {index + 1}"))
+
+
+def _strings(mapping):
+    return [(key, value) for key, value in (mapping or {}).items() if isinstance(value, str)]
+
+
+def _text_units(workflow, job):
+    """``(where, text, kind, step index)`` for every text the checks read:
+    workflow and job `env` values, and each step's `run`, `env` and `with`
+    values. ``kind`` is "run" for shell text and "yaml" otherwise."""
+    units = [(f"workflow env {key}", value, "yaml", None) for key, value in _strings(workflow.get("env"))]
+    units += [(f"job env {key}", value, "yaml", None) for key, value in _strings(job.get("env"))]
+    for index, step in enumerate(job.get("steps") or []):
+        label = _step_label(index, step)
+        if isinstance(step.get("run"), str):
+            units.append((f"step {label} run", step["run"], "run", index))
+        for part in ("env", "with"):
+            units += [(f"step {label} {part} {key}", value, "yaml", index)
+                      for key, value in _strings(step.get(part))]
+    return units
+
+
+def _line_at(text, offset):
+    start = text.rfind("\n", 0, offset) + 1
+    end = text.find("\n", offset)
+    return text[start:end if end >= 0 else len(text)].strip()
+
+
+# 5.1: any HOME expansion (`$HOME`, `"${HOME}"`, `${HOME:-…}`); a `~` that
+# starts a word (not after a word character, `~` or `/`) and is followed by
+# `/`, whitespace, a quote or the end, except `=~ ` (the regex operator); or
+# a literal `/Users/` path.
+_HOME_PATH = re.compile(r"""\$\{?HOME\b|(?<![\w~/=])~(?=[/\s"']|\Z)|(?<==)~/|/Users/""")
+
+
+def _home_path_findings(workflow, job):
+    units = [(where, text) for where, text, _kind, _index in _text_units(workflow, job)]
+    for scope, owner in (("workflow", workflow), ("job", job)):
+        directory = (((owner.get("defaults") or {}).get("run")) or {}).get("working-directory")
+        if isinstance(directory, str):
+            units.append((f"{scope} defaults working-directory", directory))
+    for index, step in enumerate(job.get("steps") or []):
+        if isinstance(step.get("working-directory"), str):
+            units.append((f"step {_step_label(index, step)} working-directory", step["working-directory"]))
+    return [f"{where}: home path {match.group(0)!r} in {_line_at(text, match.start())!r}"
+            for where, text in units
+            for match in _HOME_PATH.finditer(text)]
+
+
+# 5.2. The job-temp and run-directory roots and the opaque segment are
+# placeholders no literal can spell, so only a recognized read produces them.
+_JOB_TEMP, _RUN_DIR, _OPAQUE = "/\0job-temp", "/\0run-dir", "\0opaque"
+_EVIDENCE_ROOT_NAMES = ("BROAD_OUT", "CCTALLY_SUITE_OUT", "CCTALLY_TEST_EVIDENCE_ROOT",
+                        "CCTALLY_E2E_EVIDENCE_DIR", "CCTALLY_E2E_RUNTIME_DIR")
+_ROOT_NAMES = {"RUNNER_TEMP": _JOB_TEMP, "CCTALLY_RUNNER_RUN_DIR": _RUN_DIR}
+_OPAQUE_NAMES = ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")
+_RUNNER_PROVIDED = {*_ROOT_NAMES, *_OPAQUE_NAMES, "GITHUB_ENV"}
+_EXPRESSION_VALUES = {"runner.temp": _JOB_TEMP, "github.run_id": _OPAQUE, "github.run_attempt": _OPAQUE}
+_ALLOWED_ACTION = re.compile(r"(?:actions/checkout|actions/upload-artifact)(?:@\S*)?")
+# A whole option: `--export-failure` is not a sink.
+_SINK = re.compile(r"(?<![\w-])--(export|out)(?=[\s=])")
+_SINK_VALUE = re.compile(r"""[ \t]+(?:"([^"\\`]*)"|([^\s"'\\`;&|()<>]+))(?=\s|$|[;&|)'])""")
+# A recognized supervisor invocation: `"${CCTALLY_RUNNER_TOOL:?…}" local` or
+# `"$CCTALLY_RUNNER_TOOL" local`; group 1 is the exempt `local` subcommand.
+_SUPERVISOR_INVOCATION = re.compile(
+    r'"\$(?:\{CCTALLY_RUNNER_TOOL(?::\?[^}"]*)?\}|CCTALLY_RUNNER_TOOL)"[ \t]+(local)(?![\w-])')
+_TEST_REMOTE_INVOCATION = re.compile(r"(?<![\w./-])(?:\./)?bin/cctally-test-remote(?![\w-])")
+_SEPARATOR = re.compile(r"(?<=\s)--(?=\s|$)")
+# The one recognized env-file write; group 1 is the name, 2 the value, 3 the file.
+_ENV_FILE_WRITE = re.compile(
+    r"""^[ \t]*printf '([A-Za-z_][A-Za-z0-9_]*)=%s\\n' "([^"\\`\n]*)" >> "\$(GITHUB_ENV)"[ \t]*$""",
+    re.MULTILINE)
+_NAME = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])")
+_REFERENCE = re.compile(r"\$\{\{\s*env\.([A-Za-z_]\w*)\s*\}\}|\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+# Commands that can change a variable without its name in the text. A word is
+# bounded by characters other than letters, digits, `_` and `-`.
+_MUTATION_WORD = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:eval|source|declare|typeset|export|readonly|local|read|mapfile|readarray"
+    r"|printf[ \t]+-v)(?![A-Za-z0-9_-])")
+# A lone `.` word at a command position: line start, after `;&|({`, or after
+# a word that starts a command (`then`, `do`, `else`, `elif`, `!`, `time`).
+_DOT_COMMAND = re.compile(
+    r"(?:^|[;&|({]|(?<![A-Za-z0-9_-])(?:then|do|else|elif|time|!)(?=[ \t]))[ \t]*\.(?=[ \t]|$)")
+# The parts of a value the resolver recognizes; any other `$` is unresolved.
+_VALUE_PART = re.compile(
+    r"\$\{\{\s*([^}]*?)\s*\}\}|\$\{([A-Za-z_][A-Za-z0-9_]*)(?::\?[^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)|\$")
+_SAFE_LITERAL = re.compile(r"[A-Za-z0-9_./=:@%+,-]*")
+
+
+def _is_read(text, start, end):
+    before, after = text[:start], text[end:]
+    if before.endswith("$") and not before.endswith(("\\$", "$$")):
+        return True
+    if (before.endswith("${") and not before.endswith("\\${")
+            and re.match(r"\}|:[-?+][^}]*\}", after)):
+        return True
+    return bool(re.search(r"\$\{\{\s*env\.$", before) and re.match(r"\s*\}\}", after))
+
+
+class _Evidence:
+    """One self-hosted job's evidence check (spec 5.2)."""
+
+    def __init__(self, workflow, job):
+        self.steps = job.get("steps") or []
+        self.units = _text_units(workflow, job)
+        self.findings = []
+        self.census = {"sinks": 0, "names": 0}
+        # name -> [(raw value, shell?, first step it applies to, last, where)]
+        self.candidates = {}
+        last = len(self.steps) - 1
+        for scope, mapping in (("workflow env", workflow.get("env")), ("job env", job.get("env"))):
+            for key, value in (mapping or {}).items():
+                self._candidate(key, str(value), False, 0, last, f"{scope} {key}")
+        for index, step in enumerate(self.steps):
+            label = _step_label(index, step)
+            for key, value in (step.get("env") or {}).items():
+                self._candidate(key, str(value), False, index, index, f"step {label} env {key}")
+            run = step.get("run")
+            if isinstance(run, str):
+                for match in _ENV_FILE_WRITE.finditer(run):
+                    # Applies from the next step on; the value is evaluated here.
+                    self._candidate(match.group(1), match.group(2), True, index + 1, last,
+                                    f"step {label} run", context=index)
+
+    def _candidate(self, name, value, shell, first, last, where, context=None):
+        if name in _RUNNER_PROVIDED:
+            self.findings.append(f"{where}: redefines the runner-provided {name}")
+        self.candidates.setdefault(name, []).append(
+            (value, shell, first, last, where, first if context is None else context))
+
+    def values_at(self, name, index):
+        return [c for c in self.candidates.get(name, []) if c[2] <= index <= c[3]]
+
+    def resolve(self, value, index, shell, depth=0):
+        """Every value ``value`` may take at step ``index``, or None when any
+        part of it is unresolved."""
+        if depth > 8:
+            return None
+        results, pos = [""], 0
+        for match in _VALUE_PART.finditer(value):
+            literal = value[pos:match.start()]
+            if not _SAFE_LITERAL.fullmatch(literal):
+                return None
+            pos = match.end()
+            expression, name = match.group(1), match.group(2) or match.group(3)
+            if expression is not None:
+                if expression in _EXPRESSION_VALUES:
+                    options = [_EXPRESSION_VALUES[expression]]
+                elif re.fullmatch(r"env\.[A-Za-z_]\w*", expression):
+                    # The `env` context holds only workflow, job, step and
+                    # env-file values: `${{ env.RUNNER_TEMP }}` evaluates empty.
+                    if expression[4:] in _ROOT_NAMES or expression[4:] in _OPAQUE_NAMES:
+                        return None
+                    options = self._name_values(expression[4:], index, depth)
+                else:
+                    return None
+            elif name is not None and shell:
+                options = self._name_values(name, index, depth)
+            else:
+                return None
+            if options is None:
+                return None
+            results = [done + literal + option for done in results for option in options]
+        tail = value[pos:]
+        if not _SAFE_LITERAL.fullmatch(tail):
+            return None
+        return [done + tail for done in results]
+
+    def _name_values(self, name, index, depth):
+        if name in _ROOT_NAMES:
+            return [_ROOT_NAMES[name]]
+        if name in _OPAQUE_NAMES:
+            return [_OPAQUE]
+        found = self.values_at(name, index)
+        if not found:
+            return None
+        options = []
+        for value, shell, _first, _last, _where, context in found:
+            resolved = self.resolve(value, context, shell, depth + 1)
+            if resolved is None:
+                return None
+            options += resolved
+        return options
+
+    def run(self):
+        self.sink_steps = set()
+        sinks = self._sinks()
+        self._evidence_roots()
+        watched = self._watched(sinks)
+        for where, text, kind, _index in self.units:
+            self._name_census(where, text, watched, kind == "run")
+        for index, step in enumerate(self.steps):
+            label = _step_label(index, step)
+            if "uses" in step and not _ALLOWED_ACTION.fullmatch(str(step["uses"])):
+                self.findings.append(f"step {label}: action {step['uses']!r} is not on the allowlist")
+            run = step.get("run")
+            if isinstance(run, str) and (index in self.sink_steps or _ENV_FILE_WRITE.search(run)):
+                self._mutation_words(label, run)
+        return self.findings, self.census
+
+    def _sinks(self):
+        """Check every sink occurrence; return ``(step index, value)`` pairs."""
+        sinks = []
+        for where, text, kind, index in self.units:
+            commands = _commands(text) if kind == "run" else [text]
+            for command in commands:
+                invocation = (_SUPERVISOR_INVOCATION.search(command)
+                              or _TEST_REMOTE_INVOCATION.search(command))
+                separator = None
+                if invocation:
+                    found = _SEPARATOR.search(command, invocation.end())
+                    separator = found.start() if found else len(command)
+                for match in _SINK.finditer(command):
+                    self.census["sinks"] += 1
+                    if kind == "run":
+                        self.sink_steps.add(index)
+                    option = match.group(1)
+                    argument = invocation and invocation.end() <= match.start() < separator
+                    payload = invocation and match.start() >= separator
+                    value = _SINK_VALUE.match(command, match.end())
+                    shown = command[match.start():match.start() + 120]
+                    if not value or (option == "export" and not argument):
+                        self.findings.append(f"{where}: unrecognized sink {shown!r}")
+                        continue
+                    value = value.group(1) if value.group(1) is not None else value.group(2)
+                    sinks.append((index, value))
+                    self._sink(where, option, value, index, kind == "run", bool(payload), shown)
+        return sinks
+
+    def _sink(self, where, option, value, index, shell, payload, shown):
+        if option == "export":
+            source, equals, dest = value.partition("=")
+            if not equals:
+                self.findings.append(f"{where}: export without SRC=DEST {shown!r}")
+                return
+            sources = self.resolve(source, index, shell)
+            if sources is None or not all(map(self._contained, sources)):
+                self.findings.append(f"{where}: export source is not relative and contained {shown!r}")
+            value = dest
+        resolved = self.resolve(value, index, shell)
+        if resolved is None:
+            self.findings.append(f"{where}: unresolved sink value {shown!r}")
+        elif payload:
+            if not all(self._beneath(path, _RUN_DIR) or self._contained(path) for path in resolved):
+                self.findings.append(f"{where}: payload --out outside the run directory {shown!r}")
+        elif not all(self._beneath(path, _JOB_TEMP) for path in resolved):
+            self.findings.append(f"{where}: --{option} outside the job temp {shown!r}")
+
+    @staticmethod
+    def _beneath(path, root):
+        return posixpath.normpath(path).startswith(root + "/")
+
+    @staticmethod
+    def _contained(path):
+        normal = posixpath.normpath(path)
+        return not (normal.startswith("/") or normal == ".." or normal.startswith("../")
+                    or _JOB_TEMP[1:] in normal or _RUN_DIR[1:] in normal)
+
+    def _evidence_roots(self):
+        for name in _EVIDENCE_ROOT_NAMES:
+            for value, shell, _first, _last, where, context in self.candidates.get(name, []):
+                resolved = self.resolve(value, context, shell)
+                if resolved is None or not all(self._beneath(path, _JOB_TEMP) for path in resolved):
+                    self.findings.append(f"{where}: {name} is not beneath the job temp ({value!r})")
+
+    def _watched(self, sinks):
+        """The watched names: the fixed ones, then the closure over every name a
+        sink value or a watched name's candidate value references."""
+        watched = {*_EVIDENCE_ROOT_NAMES, *_RUNNER_PROVIDED}
+        values = [value for _index, value in sinks]
+        while True:
+            values += [candidate[0] for name in watched for candidate in self.candidates.get(name, [])]
+            found = {match.group(1) or match.group(2) for value in values for match in _REFERENCE.finditer(value)}
+            if found <= watched:
+                return watched
+            watched |= found
+
+    def _name_census(self, where, text, watched, shell):
+        claimed = set()
+        for match in _ENV_FILE_WRITE.finditer(text):
+            claimed |= {match.span(1), match.span(3)}
+        for match in _NAME.finditer(text):
+            name = match.group(0)
+            if name not in watched:
+                continue
+            # A full-line shell comment, as the mutation rule skips.
+            if shell and text[text.rfind("\n", 0, match.start()) + 1:].lstrip(" \t").startswith("#"):
+                continue
+            if match.span() in claimed or (name != "GITHUB_ENV" and _is_read(text, *match.span())):
+                self.census["names"] += 1
+                continue
+            self.findings.append(
+                f"{where}: {name} outside a read or a recognized write in {_line_at(text, match.start())!r}")
+
+    def _mutation_words(self, label, run):
+        exempt = {match.span(1) for match in _SUPERVISOR_INVOCATION.finditer(run)}
+        offset = 0
+        for line in run.splitlines(keepends=True):
+            if not line.lstrip().startswith("#"):
+                for pattern in (_MUTATION_WORD, _DOT_COMMAND):
+                    for match in pattern.finditer(line.rstrip("\n")):
+                        span = (offset + match.start(), offset + match.end())
+                        if pattern is _MUTATION_WORD and span in exempt:
+                            continue
+                        self.findings.append(
+                            f"step {label} run: {match.group(0).strip()!r} can change a variable"
+                            f" without naming it, in {line.strip()!r}")
+            offset += len(line)
+
+
+def _evidence_findings(workflow, job):
+    """Spec 5.2's findings for one self-hosted job, and its census counts."""
+    return _Evidence(workflow, job).run()
+
+
+def test_self_hosted_jobs_name_no_runner_home_path():
+    """A persistent evidence path grows a self-hosted runner's disk without
+    bound: a runner-home path fills lan's internal disk (#923)."""
+    jobs = _self_hosted_jobs()
+    assert jobs, "no self-hosted job found; the check would be vacuous"
+    found = {(workflow, name): _home_path_findings(doc, job) for workflow, name, doc, job in jobs}
+    assert not any(found.values()), found
+
+
+def test_self_hosted_evidence_and_exports_stay_under_runner_temp():
+    """A persistent evidence path grows a self-hosted runner's disk without
+    bound: an export or evidence root outside the job temp fills the runner
+    store until the supervisor's free-space refusal stops every run (#923)."""
+    # Both exporting workflows are mirror-private (.githooks/_match.py), so the
+    # public tree expects none; every self-hosted job there must still pass.
+    expected = {(workflow, name) for workflow, name in (("broad-run.yml", "broad-run"),
+                                                        ("release-candidate.yml", "release-verify"))
+                if (WORKFLOWS / workflow).exists()}
+    exporting = []
+    for workflow, name, doc, job in _self_hosted_jobs():
+        findings, census = _evidence_findings(doc, job)
+        assert not findings, (workflow, name, findings)
+        runs = [step["run"] for step in job.get("steps") or [] if isinstance(step.get("run"), str)]
+        if any(_SUPERVISOR_INVOCATION.search(run) and re.search(r"--export\s", run) for run in runs):
+            exporting.append((workflow, name))
+            # Non-vacuity from the raw census, not from parser matches.
+            assert census["sinks"] > 0 and census["names"] > 0, (workflow, name, census)
+    assert set(exporting) == expected, (exporting, expected)
+
+
+_SAFE_WRITE = """printf 'BROAD_OUT=%s\\n' "$RUNNER_TEMP/broad-run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"\n"""
+_LOCAL = ('exec "${CCTALLY_RUNNER_PYTHON:?unset}" -I -B "${CCTALLY_RUNNER_TOOL:?unset}" local --sha "$GITHUB_SHA" \\\n'
+          '  --export %s \\\n  -- true\n')
+_SAFE_EXPORT = _LOCAL % '"out/broad=$BROAD_OUT"'
+
+
+def _synthetic(*steps, runs_on=("self-hosted", "macOS")):
+    """A one-job self-hosted workflow: a safe BROAD_OUT write, then ``steps``
+    (each a run text, or a step mapping), every one named ``control``."""
+    named = [step if isinstance(step, dict) else {"name": "control", "run": step} for step in steps]
+    job = {"runs-on": list(runs_on), "steps": [{"uses": "actions/checkout@v5"},
+                                               {"name": "setup", "run": _SAFE_WRITE}, *named]}
+    return {"synthetic.yml": {"jobs": {"job": job}}}
+
+
+def _non_literal_runs_on(runs_on):
+    """A `.yaml` job whose `runs-on` names no literal label, with an unsafe export."""
+    doc = _synthetic({"name": "control", "run": _LOCAL % '"out/x=/Volumes/x/persistent/x"'})["synthetic.yml"]
+    doc["jobs"]["job"]["runs-on"] = runs_on
+    return {"synthetic.yaml": doc}
+
+
+def _real_broad_run_with_an_unsafe_export():
+    path = WORKFLOWS / "broad-run.yml"
+    if not path.exists():
+        pytest.skip("broad-run.yml is not in this tree")
+    doc = yaml.safe_load(path.read_text())
+    step = next(s for s in doc["jobs"]["broad-run"]["steps"]
+                if _SUPERVISOR_INVOCATION.search(str(s.get("run", ""))))
+    invocation = _SUPERVISOR_INVOCATION.search(step["run"])
+    unsafe, count = re.subn(r"[ \t]--(?=[ \t\n])", r' --export "out/broad=/Volumes/x/persistent/x" --',
+                            step["run"][invocation.end():], count=1)
+    assert count == 1, step["run"]
+    step["run"] = step["run"][:invocation.end()] + unsafe
+    return {"broad-run.yml": doc}, step["name"]
+
+
+_EVIDENCE_CONTROLS = [
+    ("export to home", lambda: _synthetic(_LOCAL % '"out/x=$HOME/x"')),
+    ("export escaping the job temp", lambda: _synthetic(_LOCAL % '"out/x=$RUNNER_TEMP/../x"')),
+    ("export through an unknown variable", lambda: _synthetic(_LOCAL % '"out/x=$SOMEWHERE/x"')),
+    ("export with an absolute source", lambda: _synthetic(_LOCAL % '"/etc=$BROAD_OUT"')),
+    ("export with a source outside the run", lambda: _synthetic(_LOCAL % '"../x=$BROAD_OUT"')),
+    ("evidence root written outside the job temp", lambda: _synthetic(
+        """printf 'BROAD_OUT=%s\\n' "/Volumes/x/persistent/$GITHUB_RUN_ID" >> "$GITHUB_ENV"\n""",
+        {"name": "execute", "run": _SAFE_EXPORT})),
+    ("plain reassignment before the export", lambda: _synthetic(
+        "BROAD_OUT=/Volumes/x/$GITHUB_RUN_ID\n" + _SAFE_EXPORT)),
+    ("read before the export", lambda: _synthetic(
+        "read -r BROAD_OUT <<< '/Volumes/x/persistent/x'\n" + _SAFE_EXPORT)),
+    ("runner temp reassigned", lambda: _synthetic("RUNNER_TEMP=/Volumes/x\ntrue\n")),
+    ("echo to the env file", lambda: _synthetic('echo "BROAD_OUT=$RUNNER_TEMP/x" >> "$GITHUB_ENV"\n')),
+    ("a mention in a string", lambda: _synthetic('echo "::warning::BROAD_OUT=${BROAD_OUT}"\n')),
+    ("cat to the env file", lambda: _synthetic('cat evidence.env >> "$GITHUB_ENV"\n')),
+    ("tee to the env file", lambda: _synthetic("""printf 'X\\n' | tee -a "$GITHUB_ENV"\n""")),
+    ("source", lambda: _synthetic("source ./env.sh\n" + _SAFE_EXPORT)),
+    ("dot", lambda: _synthetic(". ./env.sh\n" + _SAFE_EXPORT)),
+    ("dot after then", lambda: _synthetic("if [ -f env.sh ]; then . ./env.sh; fi\n" + _SAFE_EXPORT)),
+    ("dot after do", lambda: _synthetic('for f in env.sh; do . "./$f"; done\n' + _SAFE_EXPORT)),
+    ("export through env.RUNNER_TEMP, which GitHub evaluates empty",
+     lambda: _synthetic(_LOCAL % '"out/x=${{ env.RUNNER_TEMP }}/x"')),
+    ("matrix runs-on", lambda: _non_literal_runs_on("${{ matrix.os }}")),
+    ("mapping runs-on", lambda: _non_literal_runs_on({"group": "large"})),
+    ("runs-on list with an expression", lambda: _non_literal_runs_on(["macOS", "${{ matrix.label }}"])),
+    ("eval", lambda: _synthetic('eval "$x"\n' + _SAFE_EXPORT)),
+    ("declare", lambda: _synthetic('declare "$n=/Volumes/x"\n' + _SAFE_EXPORT)),
+    ("unlisted action", lambda: _synthetic({"name": "control", "uses": "some-org/some-action@v1"})),
+    ("test-remote export outside the job temp", lambda: _synthetic(
+        "bin/cctally-test-remote --export out/x=/Volumes/x -- true\n")),
+    ("real broad-run with an unsafe export", _real_broad_run_with_an_unsafe_export),
+]
+
+
+@pytest.mark.parametrize("make", [make for _label, make in _EVIDENCE_CONTROLS],
+                         ids=[label for label, _make in _EVIDENCE_CONTROLS])
+def test_the_evidence_check_refuses_each_unsafe_form(make):
+    """A persistent evidence path grows a self-hosted runner's disk without
+    bound: each form here would let an export or evidence root leave the job
+    temp unseen (#923)."""
+    made = make()
+    docs, step = made if isinstance(made, tuple) else (made, "control")
+    jobs = _self_hosted_jobs(docs)
+    assert jobs, docs
+    findings = [finding for _w, _n, doc, job in jobs for finding in _evidence_findings(doc, job)[0]]
+    assert any(repr(step) in finding for finding in findings), findings
+
+
+@pytest.mark.parametrize("run", [_SAFE_EXPORT, "# BROAD_OUT is set by setup\n" + _SAFE_EXPORT],
+                         ids=["base", "a full-line comment naming BROAD_OUT"])
+def test_the_evidence_check_accepts_the_safe_synthetic_base(run):
+    """The negative controls differ from this base only in their unsafe form."""
+    jobs = _self_hosted_jobs(_synthetic({"name": "execute", "run": run}))
+    assert jobs
+    for _w, _n, doc, job in jobs:
+        findings, census = _evidence_findings(doc, job)
+        assert not findings and census["sinks"] > 0, (findings, census)
+
+
+def _home_job(text=None, *, job_directory=None, step_directory=None):
+    step = {"name": "control", "run": "true" if text is None else text}
+    job = {"runs-on": "self-hosted", "steps": [step]}
+    if job_directory is not None:
+        job["defaults"] = {"run": {"working-directory": job_directory}}
+    if step_directory is not None:
+        step["working-directory"] = step_directory
+    return job
+
+
+@pytest.mark.parametrize("job,refused", [
+    (_home_job("cp a $HOME/x"), True), (_home_job("cp a ${HOME}/x"), True), (_home_job("cp a ~/x"), True),
+    (_home_job('cp a "$HOME"/.cache/x'), True), (_home_job('cp a "${HOME}"/.cache/x'), True),
+    (_home_job("cp a ${HOME:-/tmp}/x"), True), (_home_job('cd "$HOME" && cp -r out .cache/x'), True),
+    (_home_job("cd ~"), True), (_home_job("cd ~ && cp -r out .cache/x"), True), (_home_job('cp a "~/x"'), True),
+    (_home_job("cp a /Users/runner/.cache/x"), True), (_home_job("D=~/x; cp a $D"), True),
+    (_home_job('[[ "$r" =~ ^a ]]'), False),
+    (_home_job(step_directory="~/work"), True), (_home_job(step_directory="$HOME/work"), True),
+    (_home_job(job_directory="/Users/runner/work"), True),
+    (_home_job("cp a x~/y"), False), (_home_job("cp a a/~/b"), False), (_home_job("echo $HOMEBREW_PREFIX"), False),
+    (_home_job(job_directory="dashboard/web", step_directory="dashboard/web"), False),
+])
+def test_the_home_path_check_refuses_each_home_form(job, refused):
+    """A persistent evidence path grows a self-hosted runner's disk without
+    bound: a runner-home path fills lan's internal disk (#923)."""
+    jobs = _self_hosted_jobs({"h.yaml": {"jobs": {"job": job}}})
+    assert len(jobs) == 1
+    findings = _home_path_findings(jobs[0][2], jobs[0][3])
+    assert bool(findings) is refused, findings
+    where = "job defaults" if "defaults" in job else "'control'"
+    assert all(where in finding for finding in findings), findings

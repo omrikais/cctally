@@ -2,11 +2,16 @@
 
 `peakHeapBytes` is a `tracemalloc` peak, zero unless tracing, and it never saw
 the memory that pushed the October 22 rebuild into hours of compression.
-`peakResidentBytes` is `getrusage(RUSAGE_SELF).ru_maxrss`, the process
-lifetime peak: bytes on macOS, KiB on Linux.
+`peakResidentBytes` is the measuring process's own resident peak since its
+exec: `getrusage(RUSAGE_SELF).ru_maxrss` in bytes on macOS, and on Linux
+`VmHWM` from `/proc/self/status` (#1017), because Linux's `ru_maxrss` keeps
+the peak of the address space the process replaced at `execve`, which for a
+detached rebuild worker is the peak of the process that launched it. When
+`VmHWM` is unavailable or malformed, Linux falls back to `ru_maxrss` in KiB.
 """
 from __future__ import annotations
 
+import builtins
 import importlib
 import json
 import os
@@ -14,6 +19,8 @@ import pathlib
 import subprocess
 import sys
 import types
+
+import pytest
 
 from conftest import load_script, redirect_paths
 
@@ -37,53 +44,160 @@ print(json.dumps({"peak": progress.peak_resident_bytes(),
 """
 
 
-# Linux keeps a process's `ru_maxrss` across `execve`, and a child forked or
-# vforked from this test process starts from this process's resident peak (a
-# pytest worker reported 0.8 GB as the peak of a 100 MB driver on the public
-# matrix). A small intermediate interpreter launches the driver, so the
-# driver's peak starts from that interpreter's, not from the test runner's.
-_LAUNCHER = r"""
-import subprocess, sys
-sys.exit(subprocess.run(sys.argv[1:]).returncode)
+# The defect this test guards (#1017): Linux keeps a process's `ru_maxrss`
+# across `execve`, so a child launched from a large process reports that
+# process's peak as its own (a pytest worker's 0.8 GB showed up as the peak
+# of a 100 MB driver on the public matrix, and a small rebuild worker started
+# by a large dashboard reports the dashboard's peak). The spawner below is
+# that large process, made explicit: it maps and touches more than either
+# driver, releases it, records its own peak, and then launches each driver
+# with the rebuild worker's launch flags. A reading that includes the
+# launcher's peak makes both drivers report the spawner's peak.
+_SPAWNER = "DRIVER = " + repr(_DRIVER) + r"""
+import json, mmap, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+import _lib_rebuild_progress as progress
+size = int(sys.argv[2]) * 1024 * 1024
+block = mmap.mmap(-1, size)
+for page in range(0, size, mmap.PAGESIZE):
+    block[page] = 1
+block.close()
+spawner_peak = progress.peak_resident_bytes()
+drivers = {}
+for mb in sys.argv[3:]:
+    out = subprocess.run(
+        [sys.executable, "-c", DRIVER, sys.argv[1], mb],
+        capture_output=True, text=True, timeout=120,
+        start_new_session=True, close_fds=True)
+    if out.returncode != 0:
+        sys.stderr.write(f"driver {mb} MiB exited {out.returncode}:\n"
+                         f"{out.stderr}")
+        sys.exit(1)
+    drivers[mb] = json.loads(out.stdout)
+print(json.dumps({"spawnerPeak": spawner_peak, "drivers": drivers}))
 """
 
 
-def _drive(megabytes: int) -> dict:
+def _drive_from_spawner(spawner_mb: int, driver_mbs: tuple) -> dict:
     out = subprocess.run(
-        [sys.executable, "-c", _LAUNCHER,
-         sys.executable, "-c", _DRIVER, str(BIN), str(megabytes)],
-        check=True, capture_output=True, text=True, timeout=120)
-    return json.loads(out.stdout)
+        [sys.executable, "-c", _SPAWNER, str(BIN), str(spawner_mb),
+         *(str(mb) for mb in driver_mbs)],
+        capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, (
+        f"spawner exited {out.returncode}:\n{out.stderr}")
+    raw = json.loads(out.stdout)
+    return {"spawnerPeak": raw["spawnerPeak"],
+            "drivers": {int(mb): reading
+                        for mb, reading in raw["drivers"].items()}}
 
 
 def test_peak_resident_bytes_tracks_allocation():
-    """Spec T9: each peak is at least its allocation and at most its
-    allocation plus 1 GiB (interpreter baseline and tolerance), the 400 MB
-    peak exceeds the 100 MB one by at least 250 MB, and the current resident value taken
-    after the release is well below the peak. A constant, a current-RSS
-    substitute or a wrong unit fails one of these."""
-    big = _drive(400)
-    small = _drive(100)
+    """Spec T9, #1017 T2: from a 600 MiB spawner, each driver's peak is at
+    least its allocation and at most its allocation plus 1 GiB (interpreter
+    baseline and tolerance), the 400 MiB peak exceeds the 100 MiB one by at
+    least 250 MiB, the current resident value taken after the release is
+    well below the peak, and the spawner's own peak is at least 600 MiB and
+    above each driver's. Detects a worker's peak that includes the peak of
+    the process that launched it (on Linux both drivers would report the
+    spawner's), a constant, a current-RSS substitute and a gross unit error.
+    """
+    readings = _drive_from_spawner(600, (400, 100))
+    print(json.dumps(readings, sort_keys=True))
+    spawner = readings["spawnerPeak"]
+    big = readings["drivers"][400]
+    small = readings["drivers"][100]
     assert big["peak"] >= 400 * MB, big
     assert small["peak"] >= 100 * MB, small
     assert big["peak"] <= 400 * MB + 1024 * MB, big
     assert small["peak"] <= 100 * MB + 1024 * MB, small
     assert big["peak"] - small["peak"] >= 250 * MB, (big, small)
+    assert spawner >= 600 * MB, readings
+    assert spawner > big["peak"], readings
+    assert spawner > small["peak"], readings
     assert big["current"] is not None and small["current"] is not None
     assert big["current"] <= big["peak"] - 250 * MB, big
     assert small["current"] <= small["peak"] - 50 * MB, small
 
 
-def test_peak_resident_bytes_linux_units(monkeypatch):
-    """Spec D11: `ru_maxrss` is KiB on Linux and bytes on macOS."""
+_INHERITED_KIB = 819200  # an 800 MiB spawner peak, as Linux reports it
+_FALLBACK = _INHERITED_KIB * 1024
+_MISSING = object()
+
+
+def _status_excerpt(hwm_line: "str | None") -> str:
+    """A realistic `/proc/self/status` excerpt around the `VmHWM` line."""
+    lines = ["Name:\tpython3", "Umask:\t0022", "State:\tR (running)",
+             "Tgid:\t4242", "VmPeak:\t  912340 kB", "VmSize:\t  861200 kB",
+             "VmLck:\t       0 kB", "VmPin:\t       0 kB"]
+    if hwm_line is not None:
+        lines.append(hwm_line)
+    lines += ["VmRSS:\t   10240 kB", "RssAnon:\t    4096 kB", "Threads:\t1"]
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize(("platform", "ru_maxrss", "hwm_line", "expected",
+                          "guard_open"), [
+    pytest.param("linux", _INHERITED_KIB, "VmHWM:\t   51200 kB", 52428800,
+                 False, id="linux-inherited-spawner"),
+    pytest.param("linux", 3145728, "VmHWM:\t 3145728 kB", 3221225472,
+                 False, id="linux-own-peak-above-spawner"),
+    pytest.param("linux", _INHERITED_KIB, "VmHWM:\t       0 kB", 0,
+                 False, id="linux-explicit-zero"),
+    pytest.param("linux", _INHERITED_KIB, _MISSING, _FALLBACK,
+                 False, id="linux-fallback-missing-file"),
+    pytest.param("linux", _INHERITED_KIB, None, _FALLBACK,
+                 False, id="linux-fallback-no-line"),
+    pytest.param("linux", _INHERITED_KIB, "VmHWM:\t  -51200 kB", _FALLBACK,
+                 False, id="linux-fallback-negative"),
+    pytest.param("linux", _INHERITED_KIB, "VmHWM:\t 51200.5 kB", _FALLBACK,
+                 False, id="linux-fallback-fractional"),
+    pytest.param("linux", _INHERITED_KIB, "VmHWM:\t   51200", _FALLBACK,
+                 False, id="linux-fallback-no-unit"),
+    pytest.param("linux", _INHERITED_KIB, "VmHWM:\t   51200 MB", _FALLBACK,
+                 False, id="linux-fallback-wrong-unit"),
+    pytest.param("linux", _INHERITED_KIB, "VmHWM:\t   51200 kB 7",
+                 _FALLBACK, False, id="linux-fallback-four-tokens"),
+    pytest.param("linux", _INHERITED_KIB, "VmHWM:\t  0051200 kB", 52428800,
+                 False, id="linux-whitespace-leading-zeros"),
+    pytest.param("darwin", 1000, "VmHWM:\t   51200 kB", 1000,
+                 True, id="darwin-unchanged"),
+    pytest.param("freebsd14", 1000, "VmHWM:\t   51200 kB", 1024000,
+                 True, id="other-platform-kib"),
+])
+def test_peak_resident_bytes_platform_readings(
+        tmp_path, monkeypatch, platform, ru_maxrss, hwm_line, expected,
+        guard_open):
+    """#1017 T1, the reader's seam: on Linux a worker whose `ru_maxrss`
+    carries its launcher's 800 MiB peak reports its own 50 MiB `VmHWM`.
+    Detects an inherited spawner peak recorded as the worker's, a genuine
+    larger own peak lost, a missing or malformed reading turned into zero
+    (each falls back to `ru_maxrss` KiB), a wrong unit, and the macOS or
+    other-platform reading altered or made to read the status file."""
     sys.path.insert(0, str(BIN))
     progress = importlib.import_module("_lib_rebuild_progress")
-    usage = types.SimpleNamespace(ru_maxrss=1000)
+    status = tmp_path / "status"
+    if hwm_line is not _MISSING:
+        status.write_text(_status_excerpt(hwm_line))
+    # raising=False: `main`'s module has no such constant, so this test
+    # reaches its numeric assertion there instead of failing at setup.
+    monkeypatch.setattr(progress, "_PROC_SELF_STATUS", str(status),
+                        raising=False)
+    usage = types.SimpleNamespace(ru_maxrss=ru_maxrss)
     monkeypatch.setattr(progress.resource, "getrusage", lambda who: usage)
-    monkeypatch.setattr(progress.sys, "platform", "linux")
-    assert progress.peak_resident_bytes() == 1000 * 1024
-    monkeypatch.setattr(progress.sys, "platform", "darwin")
-    assert progress.peak_resident_bytes() == 1000
+    monkeypatch.setattr(progress.sys, "platform", platform)
+    if guard_open:
+        guarded = {str(status), "/proc/self/status"}
+        real_open = builtins.open
+
+        def open_guard(file, *args, **kwargs):
+            # pytest.fail, not an OSError: the fallback would swallow that.
+            if (isinstance(file, (str, bytes, os.PathLike))
+                    and os.fsdecode(file) in guarded):
+                pytest.fail(f"{platform} opened the status file {file!r}")
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", open_guard)
+    assert progress.peak_resident_bytes() == expected
 
 
 def test_rebuild_record_carries_peak_resident_bytes(tmp_path, monkeypatch):

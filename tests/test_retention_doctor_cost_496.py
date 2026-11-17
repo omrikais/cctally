@@ -9,11 +9,20 @@ Three separate claims, each with its own failure mode:
 * `plan_artifact_retention` is no longer quadratic in the root count, which is
   what let a corpus at the walk's own 5000-entry cap reach most of a second.
 
-The scaling claim is checked here by counting the planner's reads of the
-reference graph's inverse index, which is deterministic: re-deriving the
-deletion closure once per selected root (the pre-fix `_Selection`) reads it
-quadratically often. The wall-clock ratio of the same claim is a resource
-measurement and runs serially, off the merge path, in
+The scaling claim has two merge-path detectors here. The planner's reads of
+the reference graph's inverse index are counted, which is deterministic:
+re-deriving the deletion closure once per selected root (the pre-fix
+`_Selection`) reads it quadratically often. The CPU instructions the planner
+retires are counted too, in a single-threaded child process on macOS
+(`test_the_planner_executes_linearly_in_the_root_count`, #964), over an age and
+a count workload; that count also sees the regressions the inverse index does
+not (re-freezing the closure per addition, rebuilding the surviving-root tally
+per count-phase candidate), and a loaded runner does not move it. A shared
+candidate list with a `list.remove` per selected root is not distinguished
+from the current kernel at these sizes, by this count or by the wall-clock
+ratio. It skips off macOS. The wall-clock ratio of
+the same claim is the portable elapsed-time backstop, including on public CI's
+Ubuntu lane; it runs serially, off the merge path, in
 `tests/test_retention_planner_scaling.py`.
 """
 from __future__ import annotations
@@ -21,6 +30,11 @@ from __future__ import annotations
 import collections.abc
 import dataclasses
 import datetime as dt
+import inspect
+import json
+import pathlib
+import subprocess
+import sys
 
 import pytest
 
@@ -116,6 +130,110 @@ def _synthetic_members(kern, count):
     return members
 
 
+#: The two scaling workloads (keyword arguments of `RetentionPolicy`). `age`
+#: expires nearly every root in the age phase and so never reaches the count
+#: phase; `count` has no age, byte or free-space bound, so every selection is
+#: made by the count phase's surviving-root tally.
+_WORKLOAD_POLICIES = {
+    "age": dict(max_age_seconds=1, max_count_per_family=20,
+                max_total_bytes=1, min_free_bytes=None,
+                max_shape_examples=8),
+    "count": dict(max_age_seconds=None, max_count_per_family=20,
+                  max_total_bytes=None, min_free_bytes=None,
+                  max_shape_examples=8),
+}
+
+
+def _workload_policy(kern, workload):
+    return kern.RetentionPolicy(**_WORKLOAD_POLICIES[workload])
+
+
+_BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
+
+#: The instruction-count child (#964). It runs in its own interpreter so the
+#: process-wide counter sees no other thread (the pytest worker's own threads
+#: would add to it), builds the graph with this module's `_synthetic_members`
+#: (its source is inlined below), and reads `ri_instructions` from
+#: `proc_pid_rusage(RUSAGE_INFO_V4)` immediately before and after each
+#: planning call. Its only stdout is one JSON line.
+_CHILD_SOURCE = """
+import ctypes, json, os, sys
+args = json.loads(sys.argv[1])
+sys.path.insert(0, args["bin"])
+import _lib_artifact_retention as kern
+
+# The named RUSAGE_INFO_V4 layout of bench/write-attribution/rusage.py.
+_V2 = ("user", "sys", "idle_wk", "int_wk", "pageins", "wired", "resident",
+       "footprint", "start", "exit", "c_user", "c_sys", "c_idle", "c_int",
+       "c_pageins", "c_elapsed", "dread", "dwrite")
+_V3 = ("qos_default", "qos_maintenance", "qos_background", "qos_utility",
+       "qos_legacy", "qos_user_initiated", "qos_user_interactive",
+       "billed_system", "serviced_system")
+_V4 = ("logical_writes", "lifetime_max_footprint", "instructions", "cycles",
+       "billed_energy", "serviced_energy", "interval_max_footprint",
+       "runnable_time")
+
+
+class RU(ctypes.Structure):
+    _fields_ = ([("uuid", ctypes.c_uint8 * 16)]
+                + [(n, ctypes.c_uint64) for n in _V2 + _V3 + _V4])
+
+
+libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_void_p]
+libproc.proc_pid_rusage.restype = ctypes.c_int
+
+
+def instructions():
+    usage = RU()
+    if libproc.proc_pid_rusage(os.getpid(), 4, ctypes.byref(usage)) != 0:
+        print(json.dumps({"error": "proc_pid_rusage",
+                          "errno": ctypes.get_errno()}))
+        sys.exit(2)
+    return usage.instructions
+
+
+%(members)s
+
+policy = kern.RetentionPolicy(**%(policies)r[args["workload"]])
+counts, deleted = [], []
+for size in args["sizes"]:
+    state = kern.RetentionState(
+        graph=kern.build_graph(_synthetic_members(kern, size)),
+        now_epoch=10 ** 9, free_disk_bytes=10 ** 12)
+    plan = kern.plan_artifact_retention(state, policy)       # warm-up
+    best = None
+    for _ in range(3):
+        before = instructions()
+        kern.plan_artifact_retention(state, policy)
+        spent = instructions() - before
+        best = spent if best is None else min(best, spent)
+    counts.append(best)
+    deleted.append(len(plan.delete_ids))
+print(json.dumps({"instructions": counts, "deleted": deleted}))
+""" % {"members": inspect.getsource(_synthetic_members),
+       "policies": _WORKLOAD_POLICIES}
+
+
+def _plan_instructions(workload: str) -> "tuple[list[int], list[int]]":
+    """(instructions, deleted) at 400 and 3,200 roots, from the child. A
+    child that fails or prints anything but its one JSON line fails the
+    test; it never skips it."""
+    request = json.dumps({"bin": str(_BIN), "workload": workload,
+                          "sizes": [400, 3200]})
+    child = subprocess.run([sys.executable, "-c", _CHILD_SOURCE, request],
+                           capture_output=True, text=True, timeout=60)
+    assert child.returncode == 0, (
+        "the instruction-count child failed", child.returncode,
+        child.stdout, child.stderr)
+    lines = child.stdout.splitlines()
+    assert len(lines) == 1, ("the child did not print exactly one line",
+                             child.stdout)
+    answer = json.loads(lines[0])
+    return answer["instructions"], answer["deleted"]
+
+
 class _CountingIndex(collections.abc.Mapping):
     """`RetentionGraph.inbound_roots`, counting every entry it hands out:
     each lookup and each key an iteration yields."""
@@ -176,6 +294,40 @@ def test_the_planner_reads_the_reference_graph_linearly_in_the_root_count(
     assert large < 8 * small, (
         f"the planner read the inverse index {large} times for 400 roots "
         f"against {small} for 100: re-derived closures per selected root")
+
+
+@pytest.mark.parametrize("workload", ["age", "count"])
+def test_the_planner_executes_linearly_in_the_root_count(workload):
+    """An 8x root increase executes well under 16x the CPU instructions.
+
+    Detects a planner that has become superlinear in the root count, which on
+    the periodic doctor gather at the walk's 5000-entry cap pegs the CPU
+    (#496 S6, #964). Each shape below is caught by both workloads unless
+    noted: re-deriving the closure after every addition (about 61x and 66x),
+    rebuilding the surviving-root tally per count-phase candidate (`count`
+    only, about 61x; the age workload never reaches the count phase), and
+    re-freezing the closure after every addition (about 31x). The current
+    planner executes about 8.2-8.6x, idle and under 2 x ncpu CPU burners
+    alike, because the count is of instructions this process retires, not of
+    elapsed time. It needs macOS's `proc_pid_rusage` instruction counter, so
+    it skips elsewhere; the serial wall-clock backstop
+    (`tests/test_retention_planner_scaling.py`) keeps the contract checked
+    there.
+    """
+    if sys.platform != "darwin":
+        pytest.skip("needs macOS proc_pid_rusage instruction counts")
+    instructions, deleted = _plan_instructions(workload)
+    if 0 in instructions:
+        pytest.skip("the instruction counter reads zero (no performance "
+                    "counters, e.g. a VM)")
+    # Non-vacuity: the selection grows with the roots.
+    assert deleted[1] > 3 * deleted[0] > 0, deleted
+    small, large = instructions
+    ratio = large / small
+    assert ratio < 16, (
+        f"the planner executed {large} instructions for 3200 roots against "
+        f"{small} for 400 ({ratio:.2f}x over an 8x root increase, "
+        f"{workload} workload): superlinear in the root count")
 
 
 def test_the_incremental_selection_matches_the_pure_closure_at_every_step(

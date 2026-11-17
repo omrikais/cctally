@@ -82,8 +82,8 @@ for (const viewport of MATRIX) {
     const projects = page.getByRole('dialog', { name: /Projects/ });
     await expect(projects).toBeVisible();
     const projectRows = projects.getByTestId('projects-table-row');
-    const firstProject = projectRows.filter({ hasText: 'repo (1)' });
-    const secondProject = projectRows.filter({ hasText: 'repo (2)' });
+    const firstProject = projectRows.filter({ hasText: 'customer-analytics-pipeline-service (1)' });
+    const secondProject = projectRows.filter({ hasText: 'customer-analytics-pipeline-service (2)' });
     await expect(firstProject).toHaveCount(1);
     await expect(secondProject).toHaveCount(1);
     await projects.screenshot({ path: screenshotPath(viewport, 'codex-partial-projects') });
@@ -92,7 +92,7 @@ for (const viewport of MATRIX) {
     page.on('request', (request) => {
       if (request.url().includes('/api/source/codex/project/')) detailUrls.push(request.url());
     });
-    for (const [row, label] of [[firstProject, 'repo (1)'], [secondProject, 'repo (2)']] as const) {
+    for (const [row, label] of [[firstProject, 'customer-analytics-pipeline-service (1)'], [secondProject, 'customer-analytics-pipeline-service (2)']] as const) {
       await row.click();
       const detail = page.getByRole('dialog', { name: 'Project detail' });
       await expect(detail).toBeVisible();

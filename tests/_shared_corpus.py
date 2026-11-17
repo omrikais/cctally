@@ -11,6 +11,16 @@ all. :func:`copy_shared_corpus` is now the only copier, and it holds the
 scale's build lock SHARED for the whole walk, so concurrent copies still run
 together while a rebuild excludes every one of them.
 
+The copier copies a DATABASE DIRECTORY only (#1099). Every store in a built
+corpus records the absolute paths and root keys of the tree it was built in,
+so a copy of the whole scale root kept describing the SHARED tree: its first
+ingest re-read every file under the copy's own identities, doubled the Codex
+rows and quota history, and its snapshots lost the Codex project metadata. A
+consumer that walks provider roots or builds a snapshot therefore gets a corpus
+BUILT at its own root, through :func:`build_private_corpus` (the
+``private_corpus`` fixture), and only a consumer that opens the stores and
+walks no tree takes a copy.
+
 **A write INTO the corpus.** A test that ingests, ticks or mutates in place
 hands the next test a different corpus than the one it was promised — and when
 the changed thing is a directory mtime, the victim is whichever frontier
@@ -25,10 +35,10 @@ At module scope this file imports nothing from ``pytest`` and nothing from
 ``bin/``, so a separate process can import it to exercise the lock (which is
 how ``tests/test_tick_stats_integration.py`` proves the copier actually waits).
 The two exceptions are deliberate and lazy. The copier loads
-``bin/_lib_clone_copy.py`` (stdlib only) by path to copy by APFS clone. And a
-root-scope copy re-stamps each copied Codex root's hook trust record, and it
-loads ``bin/build-bench-fixtures.py`` by path at that moment rather than reimplement
-the one writer of that record. The generator's own module-level imports are
+``bin/_lib_clone_copy.py`` (stdlib only) by path to copy by APFS clone. And
+:func:`build_private_corpus` loads ``bin/build-bench-fixtures.py`` by path at
+the moment it builds, so a private corpus and the shared one come from the one
+authoritative build sequence. The generator's own module-level imports are
 stdlib only, so a child process pays a parse and keeps working.
 ``tests/conftest.py`` re-exports the public names.
 """
@@ -55,6 +65,9 @@ CORPUS_SIDECAR_PATTERNS = ("*.db-shm", "*.db-wal")
 #: The fingerprint's own exclusion list. ``*.db-journal`` joins the two sidecar
 #: suffixes because a rollback journal is transient in exactly the same way.
 _FINGERPRINT_EXCLUDED_SUFFIXES = (".db-wal", ".db-shm", ".db-journal")
+
+#: The seed every bench corpus in this estate is built with (#1099).
+CORPUS_SEED = 42
 
 #: Lazily loaded `bin/build-bench-fixtures.py`, cached for the process.
 _BENCH_GENERATOR = None
@@ -84,43 +97,24 @@ def scale_root_of(data_dir) -> pathlib.Path:
     return pathlib.Path(data_dir).parent
 
 
-def copy_shared_corpus(data_dir, destination, *, scope="root") -> pathlib.Path:
-    """Copy a built corpus under its build lock, held SHARED.
+def copy_shared_corpus(data_dir, destination) -> pathlib.Path:
+    """Copy a built corpus's DATA DIRECTORY under its build lock, held SHARED.
 
-    Returns the copy's data directory.
-
-    ``scope="root"`` copies the whole scale root — ``data/``, ``claude/``, the
-    ``codex-*`` roots and ``home/`` — which is what any consumer that pins the
-    four provider axes needs, because ``sync_cache`` prunes cached rows whose
-    source JSONL has gone. ``scope="data"`` copies the data directory alone,
-    which is what a consumer that only opens the two databases needs.
-
-    ``destination`` is the copy's ROOT under ``scope="root"`` and the copy's
-    DATA DIR under ``scope="data"``; the returned path is the data directory in
-    both cases.
+    Copies ``data_dir`` — the three stores and the data files beside them — to
+    ``destination`` and returns ``destination``. SQLite's sidecars are left
+    behind. No provider root (``claude/``, ``codex-*``, ``home/``) is copied,
+    so the copy's stores still describe the tree ``data_dir`` was built in.
+    That is exactly right for a consumer that opens the stores and walks no
+    tree, and wrong for any other: a consumer that walks provider roots or
+    builds a snapshot takes :func:`build_private_corpus` instead (#1099).
 
     The lock is derived from ``data_dir``'s own location, so copying a tree
     that is already private takes a private lock nobody else holds — a
     deliberate no-op rather than a special case.
-
-    Under ``scope="root"`` every copied ``codex-*`` root is re-stamped with a
-    Codex hook trust record (#719). The key of a ``[hooks.state]`` entry embeds
-    the RESOLVED ``hooks.json`` path, so a copied record names the SOURCE tree
-    and certifies nothing about the copy — exactly as a relocated real Codex
-    home would. ``codex_hook_roots_all_enabled`` reads that table, so without
-    the re-stamp every copy silently reads as untrusted and the frontier
-    refuses to seed. ``scope="data"`` carries no ``codex-*`` root, so the walk
-    finds nothing there and the re-stamp is a no-op.
     """
     data_dir = pathlib.Path(data_dir)
     destination = pathlib.Path(destination)
     scale_root = scale_root_of(data_dir)
-    if scope == "root":
-        source, result = scale_root, destination / data_dir.name
-    elif scope == "data":
-        source, result = data_dir, destination
-    else:
-        raise ValueError(f"unknown copy scope {scope!r}; use 'root' or 'data'")
 
     lock_path = corpus_lock_path(scale_root.parent, scale_root.name)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,20 +127,32 @@ def copy_shared_corpus(data_dir, destination, *, scope="root") -> pathlib.Path:
             # clone, so a corpus copy writes no data; elsewhere a real copy.
             # The result equals shutil.copytree's for the same arguments.
             _load_clone_copy().copytree(
-                source, destination,
+                data_dir, destination,
                 ignore=shutil.ignore_patterns(*CORPUS_SIDECAR_PATTERNS),
             )
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    if scope == "root":
-        restamp_codex_hook_trust(destination)
-    return result
+    return destination
+
+
+def build_private_corpus(scale, root) -> pathlib.Path:
+    """A private corpus at ``root``, BUILT there rather than copied (#1099).
+
+    Returns the build's data directory. A build at the private root is the
+    corpus at that root by construction: every stored path, root key, file
+    key, identity, journal record and activity ticket names the private tree,
+    and its first refresh is the source's own unchanged walk. The seed is
+    :data:`CORPUS_SEED`, the shared corpus's own, and ``on_mismatch="refuse"``
+    because the root must be fresh.
+    """
+    return _load_bench_generator().build_fixture_isolated(
+        scale=scale, seed=CORPUS_SEED, root=root, on_mismatch="refuse")
 
 
 def _load_bench_generator():
     """Load ``bin/build-bench-fixtures.py`` by path, without touching sys.path.
 
-    Called lazily and only from :func:`restamp_codex_hook_trust`, so importing
+    Called lazily and only from :func:`build_private_corpus`, so importing
     this module still pulls in neither pytest nor anything from ``bin/``, which
     is what lets a separate process import it to exercise the copier's lock.
     The generator's own module-level imports are stdlib only, so loading it
@@ -178,24 +184,6 @@ def _load_clone_copy():
         spec.loader.exec_module(module)
         _CLONE_COPY = module
     return _CLONE_COPY
-
-
-def restamp_codex_hook_trust(corpus_root) -> None:
-    """Re-record Codex's hook trust decision for every copied ``codex-*`` root.
-
-    The stamp itself is ``build-bench-fixtures.stamp_codex_hook_trust``, the
-    one writer of that record, so a copy and a fresh build agree by
-    construction rather than by two implementations happening to match.
-    """
-    corpus_root = pathlib.Path(corpus_root)
-    roots = [
-        root for root in sorted(corpus_root.glob("codex-*")) if root.is_dir()
-    ]
-    if not roots:
-        return
-    stamp = _load_bench_generator().stamp_codex_hook_trust
-    for root in roots:
-        stamp(root)
 
 
 def _quoted(identifier: str) -> str:

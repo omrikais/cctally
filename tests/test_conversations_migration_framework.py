@@ -25,6 +25,11 @@ from conftest import load_script, redirect_paths
 def ns(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
+    # #787: an owner-established (0700) data dir, as on every install; the
+    # `db status` metadata reader reads only a private data dir.
+    app = pathlib.Path(ns["_cctally_core"].APP_DIR)
+    app.mkdir(parents=True, exist_ok=True)
+    os.chmod(app, 0o700)
     return ns
 
 
@@ -141,6 +146,52 @@ def test_existing_conversations_db_adds_render_revision_columns(ns):
         upgraded.close()
 
 
+def test_ordinary_open_of_v12_store_delivers_input_fingerprint(ns):
+    """#1068 (T5). Stored-data failure detected: a current store never gets
+    the rollup fingerprint column (its schema apply returns early on the
+    marker), or migration 013's ALTERs run outside the migration fence."""
+    migration = "013_conversation_sessions_input_fingerprint"
+    tables = ("conversation_sessions", "conversation_sessions_staging")
+    ns["open_conversations_db"](attach_cache=False).close()
+    path = ns["_cctally_core"].CONVERSATIONS_DB_PATH
+    raw = sqlite3.connect(path)
+    for table in tables:
+        raw.execute(f"ALTER TABLE {table} DROP COLUMN input_fingerprint")
+    raw.execute("DELETE FROM schema_migrations WHERE name=?", (migration,))
+    raw.execute("PRAGMA user_version = 12")
+    raw.commit()
+    raw.close()
+
+    registry = ns["_CONVERSATIONS_MIGRATIONS"]
+    index = next(i for i, m in enumerate(registry) if m.name == migration)
+    original = registry[index]
+    seen = {}
+
+    def spy(conn):
+        seen["fence_rows"] = conn.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key LIKE 'migration_fence:%'").fetchone()[0]
+        original.handler(conn)
+
+    registry[index] = ns["Migration"](
+        seq=original.seq, name=original.name, handler=spy)
+    try:
+        conn = ns["open_conversations_db"](attach_cache=False)
+    finally:
+        registry[index] = original
+    try:
+        assert seen["fence_rows"] == 1
+        assert _user_version(conn) == _head(ns) == 13
+        for table in tables:
+            assert "input_fingerprint" in {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key LIKE 'migration_fence:%'").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_db_status_json_lists_conversations_registry(ns, capsys):
     """``db status --json`` enumerates conversations.db alongside stats/cache."""
     rc = ns["cmd_db_status"](argparse.Namespace(json=True))
@@ -169,15 +220,172 @@ def test_db_skip_unskip_round_trips_a_conversations_migration(ns, capsys):
     assert ns["cmd_db_unskip"](argparse.Namespace(name=qname)) == 0
 
 
+def _meta_value(path, key):
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _remove_family(path) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        pathlib.Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+
+def test_unskip_rotates_incarnation(ns, capsys):
+    """#1068 D3. Stored-data failure detected: `db unskip` deletes a ledger
+    row, so the ledger digest can return to an earlier value; without a new
+    incarnation id a rollup fingerprint certified before the skip would be
+    current again after it."""
+    newest = ns["_CONVERSATIONS_MIGRATIONS"][-1].name
+    ns["open_conversations_db"](attach_cache=False).close()
+    path = ns["_cctally_core"].CONVERSATIONS_DB_PATH
+    raw = sqlite3.connect(path)
+    raw.execute("DELETE FROM schema_migrations WHERE name=?", (newest,))
+    raw.commit()
+    raw.close()
+    qname = f"conversations.db:{newest}"
+    assert ns["cmd_db_skip"](argparse.Namespace(name=qname, reason="t")) == 0
+    before = _meta_value(path, "conversations_incarnation_id")
+    assert before
+    assert ns["cmd_db_unskip"](argparse.Namespace(name=qname)) == 0
+    after = _meta_value(path, "conversations_incarnation_id")
+    assert after and after != before
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("store", ["cache.db", "conversations.db"])
+def test_incarnation_id_inserted_once_and_new_store_gets_new_id(ns, store):
+    """#1068 D2. Stored-data failure detected: a re-created store whose ledger
+    timestamps and counters happen to match the old one would let an old
+    fingerprint verify against different data. Each store carries one random
+    id, stable across writer opens, and a re-created file gets a new one."""
+    core = ns["_cctally_core"]
+    if store == "cache.db":
+        path, key = core.CACHE_DB_PATH, "cache_incarnation_id"
+
+        def write():
+            conn = ns["open_cache_db"]()
+            try:
+                ns["sync_cache"](conn)
+            finally:
+                conn.close()
+    else:
+        path, key = core.CONVERSATIONS_DB_PATH, "conversations_incarnation_id"
+
+        def write():
+            ns["open_conversations_db"](attach_cache=False).close()
+
+    write()
+    first = _meta_value(path, key)
+    assert first
+    write()
+    assert _meta_value(path, key) == first
+    _remove_family(path)
+    write()
+    second = _meta_value(path, key)
+    assert second and second != first
+
+
+@pytest.mark.parametrize("failure", ["row_write", "token"])
+def test_fence_setup_failure_releases_the_shared_fence_lock(ns, monkeypatch, failure):
+    """#1068 D3 (review F2, recheck A4). Failure detected: a run whose setup
+    fails after it took the shared fence lock (the fence row write or commit
+    raising ``database is locked``, or the token creation raising) kept that
+    lock until its process exited, so no exclusive cleanup could remove
+    leftover fence rows and reuse and certification stayed off. A failed
+    setup must release the lock it took."""
+    import fcntl
+    import os
+    import sys
+    import types
+    db = sys.modules["_cctally_db"]
+    ns["open_conversations_db"](attach_cache=False).close()
+    path = ns["_cctally_core"].CONVERSATIONS_DB_PATH
+    conn = sqlite3.connect(path)
+    try:
+        if failure == "row_write":
+            def locked(*_a, **_k):
+                raise sqlite3.OperationalError("database is locked")
+            monkeypatch.setattr(db, "_set_cache_meta", locked)
+            expected = sqlite3.OperationalError
+        else:
+            def no_entropy():
+                raise OSError("no randomness source")
+            monkeypatch.setattr(db, "uuid", types.SimpleNamespace(uuid4=no_entropy))
+            expected = OSError
+        run = db._MigrationFenceRun(conn, "conversations.db")
+        with pytest.raises(expected):
+            run.begin()
+        lock_path = db._fence_lock_path(conn)
+        assert lock_path is not None
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("store", ["cache.db", "conversations.db"])
+def test_current_store_open_releases_a_dead_runs_fence_row(ns, store):
+    """#1068 D3. Failure detected: a migration run that died leaves its fence
+    row, and a current store's open never reaches the dispatcher walk. Unless
+    that open makes the exclusive cleanup itself, reuse stays off on the store
+    for good. The cleanup must also rotate the store's incarnation id."""
+    core = ns["_cctally_core"]
+    if store == "cache.db":
+        path, key = core.CACHE_DB_PATH, "cache_incarnation_id"
+
+        def open_store():
+            return ns["open_cache_db"]()
+
+        conn = open_store()
+        try:
+            ns["sync_cache"](conn)
+        finally:
+            conn.close()
+    else:
+        path, key = core.CONVERSATIONS_DB_PATH, "conversations_incarnation_id"
+
+        def open_store():
+            return ns["open_conversations_db"](attach_cache=False)
+
+        open_store().close()
+    raw = sqlite3.connect(path)
+    try:
+        raw.execute("INSERT INTO cache_meta(key, value) "
+                    "VALUES('migration_fence:dead-run', 'x')")
+        raw.commit()
+    finally:
+        raw.close()
+    before = _meta_value(path, key)
+    assert before
+    open_store().close()
+    raw = sqlite3.connect(path)
+    try:
+        assert raw.execute(
+            "SELECT COUNT(*) FROM cache_meta WHERE key LIKE 'migration_fence:%'"
+        ).fetchone()[0] == 0
+    finally:
+        raw.close()
+    assert _meta_value(path, key) not in (None, before)
+
+
 def test_db_status_reports_an_unopenable_admission_as_a_decline(ns, capsys):
     """Diagnostic robustness (#1000 spec 5.10, review finding 8): when the
-    conversation maintenance lock file cannot be opened (an unwritable data
-    folder, here a directory in its place), `db status` reports the
-    conversations leg as unreadable instead of failing with a traceback."""
+    conversation maintenance lock file cannot be opened (here an unreadable
+    lock: the #787 metadata reader opens it read-only, so a directory in its
+    place no longer refuses), `db status` reports the conversations leg as
+    unreadable instead of failing with a traceback."""
     ns["open_conversations_db"](attach_cache=False).close()
     lock = pathlib.Path(ns["_cctally_core"].CONVERSATIONS_LOCK_MAINTENANCE_PATH)
-    lock.unlink(missing_ok=True)
-    lock.mkdir()
+    lock.touch()
+    os.chmod(lock, 0)
     payload = json.loads(_db_status_json(ns, capsys))
     conv = payload["databases"]["conversations.db"]
     assert conv["_open_error"]

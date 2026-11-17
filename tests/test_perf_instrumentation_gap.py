@@ -151,13 +151,16 @@ def test_reconcile_cache_open_attributes_the_connection_cost(monkeypatch, tmp_pa
     """The short-lived reconcile connection is measured by its own phase."""
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
-    real_open = ns["open_cache_db"]
+    # #787 / #861 spec 5.12: the narrowed build opens its reconcile handle
+    # through the snapshot builders' cache-read seam (a query session).
+    tui = sys.modules["_cctally_tui"]
+    real_open = tui._tui_open_cache_read
 
     def slow_open():
         time.sleep(_INJECTED_S)
         return real_open()
 
-    monkeypatch.setitem(ns, "open_cache_db", slow_open)
+    monkeypatch.setattr(tui, "_tui_open_cache_read", slow_open)
     perf = _perf_mod()
     perf.set_enabled(True)
     try:
@@ -250,6 +253,12 @@ _ALLOWLISTED_UNPHASED_CALLS = {
         "builder runs; it has no phase of its own and giving it one would "
         "change the published phase tree, which S1 may not do."
     ),
+    "_tui_build_owner_phase": (
+        "#787 / #861: the build's owner phase, the same owner stats open as "
+        "`open_db` (plus the owner cache open of a build that ingests "
+        "nothing), before any builder runs. Like `open_db` it has no phase "
+        "of its own; giving it one would change the published phase tree."
+    ),
     "_tui_capture_sync_failure": (
         "The body of the `capture_failure` closure. It runs only on an "
         "already-failing leg, so its cost is bounded by the failure it is "
@@ -263,6 +272,12 @@ _ALLOWLISTED_UNPHASED_CALLS = {
     "_snapshot_data_version": (
         "Pure string derivation from the dispatch signature already computed "
         "inside the `signature` phase."
+    ),
+    "_tui_render_key": (
+        "#787 / #861 round 9: the idle gate's render key, a tuple of the "
+        "display-tz override and one `json.dumps` of the already-loaded "
+        "config, built before the idle decision opens its phase (the same "
+        "expression it replaced inline)."
     ),
     "_snapshot_period_rolled_over": (
         "Pure calendar comparison between the prior snapshot and `now_utc`, "
@@ -312,6 +327,19 @@ _ALLOWLISTED_UNPHASED_CALLS = {
         "#1059: compares the build generation with the pending regroup "
         "generation and, on the dashboard, reads the retained range memo's "
         "base tuple. In-memory comparisons only; no query and no I/O."
+    ),
+    "_tui_is_stats_query_maintenance": (
+        "#787 / #861 I5d N2: runs only on an already-failing build, and "
+        "inspects the exception and its `__cause__` for a stats query "
+        "refusal for maintenance. Attribute reads only; no query and no I/O."
+    ),
+    "_tui_kept_frame_precomputes": (
+        "#787 / #861 spec 5.11: runs only in the build's "
+        "`_TuiStoreRefusalPending` handler, which this audit does not "
+        "descend into, and opens the same `doctor` and "
+        "`envelope.precompute` phases around its whole body that the "
+        "build's own precompute call opens at its call site. Phased at "
+        "run time; listed only because the phases are inside the helper."
     ),
 }
 

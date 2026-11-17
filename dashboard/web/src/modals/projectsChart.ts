@@ -33,6 +33,11 @@ export interface PreparedSeries {
   bucket_path: string;
   weekly: number[];
   cost: number;
+  // #923 S2 — an explicit display label, read only by ProjectsRankedBars. A
+  // source row's label is not a path (`app (a/b)` has the basename `b)`), so
+  // the Projects modal passes it here; the trend chart's genuine paths leave
+  // it unset and keep their basename. Geometry, colour and bucketing ignore it.
+  label?: string;
 }
 
 export interface BucketedProjects {

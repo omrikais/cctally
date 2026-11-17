@@ -1173,3 +1173,63 @@ def test_1062_scoped_anonymized_export_header_carries_the_scrubbed_ai_title(
     assert header.startswith("# Fix findings in ")
     assert "/home/u/proj" not in out
     assert "prompt ta2" not in header
+
+
+# ---- #787 / #861 store authority (spec 5.11, D7) ---------------------------
+
+def test_transcript_search_absent_install_parity(tmp_path, monkeypatch,
+                                                 capsys):
+    """On an install with no stores, `transcript search` still creates cache
+    and conversations in its startup phase, exactly as before, and answers
+    the same empty result (detects a query phase that refuses an absent
+    install instead of letting the startup phase create it)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    core = __import__("sys").modules["_cctally_core"]
+    assert not pathlib.Path(core.CACHE_DB_PATH).exists()
+    assert not pathlib.Path(core.CONVERSATIONS_DB_PATH).exists()
+    with core.establish_authority("process"):
+        rc = ns["cmd_transcript"](_ns_search("zzznomatchxyz", json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hits"] == [] and payload["total"] == 0
+    assert pathlib.Path(core.CACHE_DB_PATH).exists()
+    assert pathlib.Path(core.CONVERSATIONS_DB_PATH).exists()
+
+
+def test_transcript_on_pending_bridge(tmp_path, monkeypatch, capsys):
+    """RED D7: transcript search read through the full conversations owner
+    opener, so the read itself could create, migrate and run the legacy
+    bridge. The bridge now runs in the startup phase at `process`, and the
+    search kernel reads through a conversations query session that still
+    sees the bridged rows."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import sys as _sys
+    core = _sys.modules["_cctally_core"]
+    _seed(ns, session_id="sbridge", text="the bridged needle text",
+          entry_type="assistant")
+    cq = _sys.modules.get("_lib_conversation_query") or __import__(
+        "_lib_conversation_query")
+    seen = []
+    real = cq.search_conversations
+
+    def spy(conn, *a, **kw):
+        auth = core.current_authority()
+        seen.append((type(conn).__name__, auth.kind if auth else None))
+        return real(conn, *a, **kw)
+
+    monkeypatch.setattr(cq, "search_conversations", spy)
+    owner_opens = []
+    observer = (lambda e: owner_opens.append(e.authority)
+                if e.entry == "open_conversations_db" else None)
+    core.CAPABILITY_OBSERVERS.append(observer)
+    try:
+        rc = ns["main"](["transcript", "search", "needle", "--json"])
+    finally:
+        core.CAPABILITY_OBSERVERS.remove(observer)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["total"] >= 1
+    assert seen == [("_QueryConnection", "query")]
+    assert owner_opens and set(owner_opens) == {"process"}

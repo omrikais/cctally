@@ -2510,6 +2510,7 @@ def _storm_worker(bin_dir, home_dir, data_dir, worker_id, mode, q):
         mod = importlib.util.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
         import _lib_journal as lj
         import _cctally_journal as _cjr
         base = int(_dt.datetime(2026, 1, 8, tzinfo=_dt.timezone.utc).timestamp())
@@ -2544,6 +2545,7 @@ def _storm_drain_count(bin_dir, home_dir, data_dir, q):
         mod = importlib.util.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
         import _cctally_core
         import _cctally_journal as _cjr
         # A couple of authoritative drains consume every remaining line.

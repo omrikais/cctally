@@ -1222,6 +1222,8 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   font-family: var(--font-mono);
 }
 .panel-header h2 .sub { color: var(--text-dim); font-weight: 500; margin-left: 6px; }
+/* Layout-transparent unless a header opts in (the desktop Projects header, #1111). */
+.panel-title-main { display: contents; }
 
 /* #762 — title content is the yielding side of a header. The wrapper around
    icon + heading + an optional degraded chip used to keep its automatic
@@ -4460,7 +4462,14 @@ mark.current {
   color: var(--text);
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35); /* lint-allow: box-shadow bespoke neutral drop */
   max-width: 320px;
-  z-index: 1000;
+  /* #933 — a passive first-run hint, so it paints below every overlay layer
+     that can cover its bottom-right corner: the reader's menus (30, 40), the
+     sticky phone topbar (50), the reader's outline sheet (60/61), the modal
+     roots (100-210), the status/alert toast (200) and the help overlay (1000).
+     It stays above in-flow board content and the reader's floating controls
+     (at most 10), including the find bar, which is pinned to the reader's top
+     edge and cannot reach this corner. */
+  z-index: 20;
 }
 /* #855 — author display rules outrank the user-agent [hidden] rule. Keep the
    mounted node/timer contract from #207 D8 while removing its physical box. */
@@ -5944,9 +5953,10 @@ mark.current {
     text-overflow: clip;
     white-space: normal;
   }
-  /* Phones only: the fixed onboarding toast otherwise covers the lower edge
-     of Current Usage. On wider viewports it sits in the bottom-right corner,
-     at most grazing the dialog card, so it stays visible there. */
+  /* Phones only: the fixed onboarding toast sits in the lower edge of
+     Current Usage; hiding it here predates #933 and is kept with its e2e. On
+     wider viewports the toast is still displayed, now beneath the dialog's
+     backdrop, by #933's general rule (see .onboarding-toast). */
   body:has(.current-usage-modal) .onboarding-toast { display: none; }
   .modal-header .share-icon,
   .modal-header .provider-section-status,
@@ -7002,17 +7012,41 @@ mark.current {
 }
 
 /* Counts are useful content: let these longer titles wrap before the action
-   cluster rather than ellipsizing their distinguishing count. */
+   cluster rather than ellipsizing their distinguishing count. The Projects
+   status subs, "(loading)", "(withheld)" and "(unavailable)", do the same
+   (#787 / #861 rounds 9 and 9b): the degraded "partial" chip can take 74px of
+   the title group in any of those states, and the one-line heading read
+   "Projects (…" at 1440 ("(unavailable)" was cut even without the chip). */
 @media (min-width: 641px) {
   #panel-projects .panel-header h2.has-count,
+  #panel-projects .panel-header h2.is-status,
   #panel-sessions .panel-header h2 {
     white-space: normal;
     overflow: visible;
   }
   #panel-projects .panel-header h2.has-count .sub,
+  #panel-projects .panel-header h2.is-status .sub,
   #panel-sessions .panel-header h2 .sub {
     display: inline-block;
     white-space: nowrap;
+  }
+  /* The sub is one unbreakable inline-block, but #762's `min-width: 0` let
+     the h2 shrink below it in the 1200-1440px board band, so a Projects sub
+     painted under the "partial" chip (a 52px h2 against a 120px
+     "(unavailable)" at 1200). The icon and heading form one nowrap row whose
+     flex basis is its min-content (icon plus the sub), and the title row
+     wraps, so the chip takes its own line exactly when the row cannot hold
+     the heading's longest word beside it. Neither the heading nor its icon
+     ever wraps away from the other (#1111). An engine without an intrinsic
+     flex-basis keeps `auto`: the chip then wraps more often, never overlaps. */
+  #panel-projects > .panel-header > div:first-child { flex-wrap: wrap; }
+  #panel-projects .panel-title-main {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1 1 auto;
+    flex-basis: min-content;
+    min-width: 0;
   }
   #panel-projects .panel-header .icon,
   #panel-sessions .panel-header .icon { flex-shrink: 0; }
@@ -7175,6 +7209,32 @@ mark.current {
     padding: 4px;
     font-size: var(--fs-data);
   }
+}
+
+/* #923 S2: truncate the base, never the suffix. A disambiguated project label
+ * (`ProjectLabel`: optional source prefix, base, suffix) shrinks its base with
+ * an ellipsis down to 4ch (or its own width when shorter); the source prefix
+ * and the suffix that tells same-name projects apart never shrink. The minimum
+ * comes from line breaking, not min-width: a flex line breaks on the items'
+ * hypothetical sizes (the base's is its 4ch basis, capped by max-content), so
+ * prefix, minimum base and suffix share a line only when all three fit; then
+ * the base grows toward its full width and nothing on that line shrinks. When
+ * they do not fit, the suffix starts the next line of the same cell, and a
+ * suffix wider than the cell wraps its own text there. An ambiguous label
+ * (unbalanced parentheses) wraps whole. A plain label keeps today's single-line
+ * ellipsis. Sites opt in by selector; the containing cells keep their
+ * `overflow: hidden` as a safety net that never clips once the label fits. */
+:is(.projects-row, [data-testid="codex-project-detail"] .sd-project-label) .project-label { display: flex; flex-wrap: wrap; align-items: baseline; min-width: 0; max-width: 100%; }
+:is(.projects-row, [data-testid="codex-project-detail"] .sd-project-label) .project-label .pl-source { flex: none; white-space: pre; }
+:is(.projects-row, [data-testid="codex-project-detail"] .sd-project-label) .project-label .pl-base {
+  flex: 1 1 4ch; min-width: 0; max-width: max-content;
+  overflow: hidden; text-overflow: ellipsis; white-space: pre;
+}
+:is(.projects-row, [data-testid="codex-project-detail"] .sd-project-label) .project-label .pl-suffix { flex: 0 1 auto; min-width: 0; white-space: pre; }
+:is(.projects-row, [data-testid="codex-project-detail"] .sd-project-label) .project-label .pl-qual { white-space: pre-wrap; overflow-wrap: anywhere; }
+:is(.projects-row, [data-testid="codex-project-detail"] .sd-project-label) .project-label[data-label-kind="ambiguous"] .pl-base {
+  flex: 1 1 4ch; max-width: 100%; overflow: visible; text-overflow: clip;
+  white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
 /* ---- Sessions panel: clickable project cell (cross-nav, spec §4.1) -
@@ -7342,6 +7402,22 @@ mark.current {
 .rk-val {
   font-size: 12px; color: var(--text-dim);
   font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+/* #923 S2: the fitted project label above 640px only (see the Projects panel
+ * rule group); below it `#root .rk-label` wraps the whole label instead. */
+@media (min-width: 641px) {
+  .rk-label .project-label { display: flex; flex-wrap: wrap; align-items: baseline; min-width: 0; max-width: 100%; }
+  .rk-label .project-label .pl-source { flex: none; white-space: pre; }
+  .rk-label .project-label .pl-base {
+    flex: 1 1 4ch; min-width: 0; max-width: max-content;
+    overflow: hidden; text-overflow: ellipsis; white-space: pre;
+  }
+  .rk-label .project-label .pl-suffix { flex: 0 1 auto; min-width: 0; white-space: pre; }
+  .rk-label .project-label .pl-qual { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .rk-label .project-label[data-label-kind="ambiguous"] .pl-base {
+    flex: 1 1 4ch; max-width: 100%; overflow: visible; text-overflow: clip;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
 }
 
 .projects-table {
@@ -7600,7 +7676,10 @@ mark.current {
     line-height: 1.25;
   }
 
-  /* Table → stacked-card reflow. */
+  /* Table → stacked-card reflow. A fixed layout keeps the table at the
+   * modal's width: in auto layout an unbreakable project name set the table's
+   * minimum width and pushed the label's suffix and chip off the card (#923 S2). */
+  #root .projects-table { table-layout: fixed; }
   #root .projects-table thead { display: none; }
   #root .projects-table tbody,
   #root .projects-table tr { display: block; width: 100%; }
@@ -7629,6 +7708,33 @@ mark.current {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* #923 S2: the card's project cell is a flex row whose label shrinks (base
+   * first, never the suffix) and whose source chip does not, instead of one
+   * nowrap ellipsis that clipped the label's suffix and the chip together.
+   * The desktop table keeps wrapping. */
+  #root .projects-table td.project {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+  /* The label takes its own width (shrinking when the cell is narrower), so
+   * the chip stays right after it, as before, instead of at the cell's end. */
+  #root .projects-table td.project .project-label {
+    flex: 0 1 auto; display: flex; flex-wrap: wrap; align-items: baseline;
+    min-width: 0; max-width: 100%;
+  }
+  #root .projects-table td.project .source-chip { flex: none; }
+  #root .projects-table td.project .project-label .pl-source { flex: none; white-space: pre; }
+  #root .projects-table td.project .project-label .pl-base {
+    flex: 1 1 4ch; min-width: 0; max-width: max-content;
+    overflow: hidden; text-overflow: ellipsis; white-space: pre;
+  }
+  #root .projects-table td.project .project-label .pl-suffix { flex: 0 1 auto; min-width: 0; white-space: pre; }
+  #root .projects-table td.project .project-label .pl-qual { white-space: pre-wrap; overflow-wrap: anywhere; }
+  #root .projects-table td.project .project-label[data-label-kind="ambiguous"] .pl-base {
+    flex: 1 1 4ch; max-width: 100%; overflow: visible; text-overflow: clip;
+    white-space: pre-wrap; overflow-wrap: anywhere;
   }
   /* Row 1 right: cost. Use the cost-class hooks already applied
    * by costClass() in ProjectsModal.tsx (incl. cost-none for unknown
@@ -9162,12 +9268,9 @@ mark.current {
   font-size: var(--fs-meta);
   cursor: pointer;
 }
-.sd-bounded-collection.is-expanded .sd-collection-list {
-  max-height: 240px;
-  overflow: auto;
-  padding-right: var(--space-2);
-  overscroll-behavior: contain;
-}
+/* #1075 — an expanded list grows in `.modal-body`'s flow, the modal's one
+   scrollport. Do not cap it: a height-limited inner scroll box inside the
+   scrolling body hid the added rows, so on a phone "+N more" looked inert. */
 .sd-subsection-title {
   margin: var(--space-3) 0 var(--space-2);
   color: var(--text-dim);

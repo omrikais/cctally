@@ -26,6 +26,7 @@ from _codex_zstd_fixtures import (  # noqa: E402
     conversation_records, snapshot_tables, write_rollout)
 
 import _lib_ingest_frontier as frontier  # noqa: E402
+from conftest import as_process_owner  # noqa: E402
 
 _base_conversation_records = conversation_records
 
@@ -515,7 +516,7 @@ def test_the_conversations_prune_cannot_commit_under_a_paused_writer(env, monkey
         finally:
             conv_w.close()
 
-    thread = threading.Thread(target=writer, daemon=True)
+    thread = threading.Thread(target=as_process_owner(writer), daemon=True)
     thread.start()
     assert prepared.wait(30)
     victim.unlink()                   # gone again while the tuples are buffered
@@ -660,8 +661,9 @@ def test_a_stale_maintenance_marker_never_hangs_the_conversations_prune(env, mon
     monkeypatch.setattr(adm, "admit", admit_after_a_crashed_repair)
     outcome: list[object] = []
     worker = threading.Thread(
-        target=lambda: outcome.append(cache_mod.run_codex_conversation_prune_drain(
-            wait_for_requests=False)), daemon=True)
+        target=as_process_owner(lambda: outcome.append(
+            cache_mod.run_codex_conversation_prune_drain(
+                wait_for_requests=False))), daemon=True)
     worker.start()
     worker.join(60)
     assert not worker.is_alive(), "the prune executor hung on a stale marker"

@@ -32,7 +32,7 @@ import time
 import pytest
 
 import _cctally_core  # preserved across load_script(), safe at module top
-from conftest import load_script, redirect_paths
+from conftest import as_process_owner, load_script, redirect_paths
 
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
 
@@ -444,8 +444,9 @@ def test_authoritative_blocks_opportunistic_skips(tmp_path, monkeypatch):
             except BaseException as exc:
                 auth_errors.append(exc)
 
+        # The authoritative ingest is a `cctally` process owner (#787).
         authoritative = threading.Thread(
-            target=run_authoritative,
+            target=as_process_owner(run_authoritative),
             name="authoritative-ingest-test",
         )
         authoritative.start()
@@ -789,6 +790,7 @@ def _mrc_race_load(bin_dir, home_dir, data_dir):
     mod = importlib.util.module_from_spec(spec)
     sys.modules["cctally"] = mod
     loader.exec_module(mod)
+    sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
     _core._init_paths_from_env()
     return mod
 

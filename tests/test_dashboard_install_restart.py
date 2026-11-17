@@ -19,7 +19,9 @@ import pytest
 import _cctally_core
 from conftest import load_script, redirect_paths
 from test_update import _link, _make_brew_keg, _make_npm_install
-from tests._support_http import PRESENCE_BACKSTOP_SECONDS, serve_dashboard, stop
+from tests._support_http import (PRESENCE_BACKSTOP_SECONDS,
+                                 inert_startup_heap_freeze, serve_dashboard,
+                                 stop)
 
 pytestmark = pytest.mark.usefixtures("isolated_home")
 
@@ -529,6 +531,7 @@ def _run_dashboard(ns, tmp_path, monkeypatch, *, no_sync, while_serving):
     monkeypatch.setattr(_cctally_core, "_is_dev_checkout", lambda: False)
     monkeypatch.setattr(dash, "_DashboardUpdateCheckThread", _NoopThread)
     monkeypatch.setattr(dash, "_INSTALL_WATCH", None)
+    inert_startup_heap_freeze(monkeypatch, dash)
 
     started = []
     real_start = dash._start_install_watch

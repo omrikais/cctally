@@ -170,6 +170,7 @@ cctally cache-sync --source claude
   while any cctally process may still have it open.
 - Cost is **not** stored in the cache; pricing-dict updates are visible
   on the next read with no rebuild required.
+- After the transcript sync (or `--rebuild`'s transcript rebuild), `cache-sync` checks the conversation search indexes against their messages when they have not been verified with this SQLite's tokenizer (after an upgrade, or after a write by a build that splits text into words differently) or were last verified more than 30 days ago, at most one attempt a day, and rebuilds only an index that disagrees; the check never changes the exit code, and [`cctally db reindex-search`](db.md#cctally-db-reindex-search---check---json) runs it on demand.
 
 ## See also
 

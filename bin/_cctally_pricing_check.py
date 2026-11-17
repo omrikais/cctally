@@ -176,7 +176,28 @@ def _pricing_existence_check() -> dict:
 _PRICING_SCAN_DEFAULT_WINDOW = object()
 
 
-def _pricing_observed_models(now_utc, *, since=_PRICING_SCAN_DEFAULT_WINDOW):
+class _CacheUnreadable(Exception):
+    """cache.db exists but could not be read, so the coverage scan saw
+    nothing it can vouch for (#787 / #861)."""
+
+
+def _cache_read_failed(exc: BaseException) -> bool:
+    """True when EXC means cache.db could not be read now. False when the
+    store is absent or only lacks a table or column (an older schema), which
+    the scan reads as "no observed models", as it always has."""
+    if (getattr(exc, "reason", None) == "absent"
+            and not os.path.lexists(_cctally_core.CACHE_DB_PATH)):
+        return False
+    if isinstance(exc, _cctally_core.StoreUnavailable):
+        return True
+    if isinstance(exc, sqlite3.OperationalError) and str(exc).startswith(
+            ("no such table", "no such column")):
+        return False
+    return True
+
+
+def _pricing_observed_models(now_utc, *, since=_PRICING_SCAN_DEFAULT_WINDOW,
+                             report_unreadable=False):
     """Read-only scan of the session-entry cache for observed models.
 
     Returns a list of ``(provider, model, entry_count, token_total)`` tuples,
@@ -193,6 +214,12 @@ def _pricing_observed_models(now_utc, *, since=_PRICING_SCAN_DEFAULT_WINDOW):
     "no observed models" rather than crashing. ``doctor --json`` on a virgin
     HOME must not create ``APP_DIR`` — regression
     ``test_pricing_observed_models_no_mutation_on_fresh_home``.
+
+    ``report_unreadable=True`` (`pricing-check`) raises ``_CacheUnreadable``
+    when cache.db exists but cannot be read (corrupt, under maintenance,
+    busy, refused), instead of returning the empty list that would read as
+    "all observed models priced". An absent store, or one without a table,
+    still returns what it found.
     """
     out: list = []
     if not _cctally_core.CACHE_DB_PATH.exists():
@@ -206,9 +233,17 @@ def _pricing_observed_models(now_utc, *, since=_PRICING_SCAN_DEFAULT_WINDOW):
         cutoff_iso = None  # all-history
     else:
         cutoff_iso = since.isoformat()
+    # #787 / #861: each statement is one diagnostic cache session with no
+    # startup phase, so the scan never creates, migrates or writes cache.db
+    # (the owner connect it replaces created a missing file) and reads
+    # whatever schema the store has, as that connect did.
+    import _cctally_store_access as _store_access
     try:
-        conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
-    except sqlite3.Error:
+        conn = _store_access.statement_reader(
+            "cache", startup=False, policy="diagnostic")
+    except sqlite3.Error as exc:
+        if report_unreadable and _cache_read_failed(exc):
+            raise _CacheUnreadable(str(exc)) from exc
         return out
     try:
         # Token-sum expressions use the ACTUAL cache column names from
@@ -233,8 +268,12 @@ def _pricing_observed_models(now_utc, *, since=_PRICING_SCAN_DEFAULT_WINDOW):
                     f"WHERE {where} GROUP BY model",
                     params,
                 ).fetchall()
-            except sqlite3.OperationalError:
-                rows = []  # table/column missing — treat as none
+            except sqlite3.DatabaseError as exc:
+                # A missing table/column, or a cache.db that is absent or
+                # not readable now: treat as none, as a failed open did.
+                if report_unreadable and _cache_read_failed(exc):
+                    raise _CacheUnreadable(str(exc)) from exc
+                rows = []
             for model, cnt, toks in rows:
                 out.append((provider, model, int(cnt or 0), int(toks or 0)))
     finally:
@@ -270,14 +309,21 @@ def cmd_pricing_check(args: argparse.Namespace) -> int:
     degraded: list[str] = []
 
     # 1. Coverage — offline, all-history (since=None). Read-only scan; any
-    #    failure degrades to [] (the scan itself swallows DB errors).
+    #    failure degrades to [] (the scan itself swallows DB errors). A
+    #    cache.db that exists but cannot be read degrades the check (`cache`)
+    #    rather than reporting every observed model as priced (#787 / #861).
     try:
-        observed = _pricing_observed_models(now_utc, since=None)
+        observed = _pricing_observed_models(
+            now_utc, since=None, report_unreadable=True)
         coverage = _lib_pricing_check.classify_coverage(
             observed,
             lambda m: c._resolve_model_pricing(m, warn=False),
             c._is_codex_fallback,
         )
+    except _CacheUnreadable:
+        coverage = []
+        status = "degraded"
+        degraded.append("cache")
     except Exception:
         coverage = []
 
@@ -377,6 +423,8 @@ def _render_pricing_check_text(payload: dict, *, offline: bool, actionable: bool
             noun = "entry" if entries == 1 else "entries"
             out(f"    • {g['model']} ({g['provider']}): {entries} "
                 f"{noun} / {g['token_total']} tokens — {kind}\n")
+    elif "cache" in payload["degraded_components"]:
+        out("\n  Coverage: unavailable (cache.db could not be read).\n")
     else:
         out("\n  Coverage: all observed models priced.\n")
 

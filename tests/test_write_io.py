@@ -936,6 +936,28 @@ def test_passes_count_only_after_the_first_census_complete_accounting_tick():
     assert (last["seq"], last["counted"], last["censusComplete"]) == (3, True, True)
 
 
+@pytest.mark.parametrize("kind", ["drained", "settled"])
+def test_a_pending_fts_step_vetoes_both_release_reasons(kind):
+    """Detects (#1094 D6): writeIo releasing the startup hold while the
+    conversation FTS verification it is waiting for is still pending, so the
+    verification's repair writes are judged as steady state. The veto must
+    not break the comparison chain: the first pass after the step settles
+    releases."""
+    clock = _hold_clock()
+    _complete_tick(clock)
+    residual = () if kind == "drained" else _res(failed_paths={"/bad"})
+    verdicts = []
+    for seq, pending in enumerate((True, True, False), start=1):
+        clock.advance(1)
+        info = _pass(certifiable=kind == "drained", claude=residual)
+        info["fts_pending"] = pending
+        verdicts.append(wio.observe_conversation_pass(
+            info, started_ns=clock.ns, seq=seq))
+    assert verdicts == [None, None, kind]
+    last = wio.write_io_payload()["coldStartup"]["lastPass"]
+    assert (last["seq"], last["counted"]) == (3, True)
+
+
 def test_a_catch_up_longer_than_any_time_bound_keeps_the_hold():
     """Detects: a time-based release judging a long catch-up as steady."""
     clock = _hold_clock()

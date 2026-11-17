@@ -56,6 +56,9 @@ scenario_setup () {
     HARNESS_HOME="${HARNESS_FAKE_HOME_BASE}/${scenario_name}"
     rm -rf "$HARNESS_HOME"
     mkdir -p "$HARNESS_HOME/.local/share/cctally/logs"
+    # Every install's data dir is 0700 (ensure_dirs); `db status` reads
+    # through the #787 metadata reader, which reads only a private dir.
+    chmod 700 "$HARNESS_HOME/.local/share/cctally"
     if [ -f "$scenario_dir/input.stats.db" ]; then
         cp "$scenario_dir/input.stats.db" "$HARNESS_HOME/.local/share/cctally/stats.db"
     fi
@@ -549,6 +552,10 @@ scenario_09_both_dbs () {
 # report all three migrations as `· pending` even though they're applied.
 # Test asserts the alias path treats legacy rows as applied without
 # mutating the DB (no bootstrap rename until a real open_db() runs).
+# #787 AD22: this fixture is a pre-cutover store (a WAL main header and no
+# maintenance lock), which `db status` no longer opens: it shows the leg's
+# existing unreadable state until the next owner open converts the store,
+# and the state dump still proves nothing was mutated.
 scenario_10_legacy_marker_recognized () {
     local scenario_dir="$HARNESS_FIXTURES_DIR/10-legacy-marker-recognized-by-db-status"
     scenario_setup "$scenario_dir"

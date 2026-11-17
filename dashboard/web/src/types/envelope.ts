@@ -6,8 +6,10 @@ export type Verdict = 'ok' | 'cap' | 'capped';
 export interface SyncFailure {
   // `quota_projection_incomplete` is #496 S5b's refusal to serve a quota view
   // published over an interrupted cache recovery. `cache_busy` is #583 S2's
-  // typed SQLITE_BUSY/SQLITE_LOCKED branch. Type-only: SyncChip renders
-  // `label` and joins `detail` + `action`, and nothing switches on `kind`.
+  // typed SQLITE_BUSY/SQLITE_LOCKED branch. SyncChip renders `label` and
+  // joins `detail` + `action`; the one reader of `kind` is ProjectsPanel,
+  // which shows its loading skeleton for a null envelope during
+  // `maintenance_active` (#787 / #861 revision 35).
   kind: 'cache_corruption' | 'stats_corruption' | 'cache_busy' | 'maintenance_active' | 'maintenance_stale' | 'quota_projection_incomplete' | 'server_sync';
   label: string;
   detail: string;

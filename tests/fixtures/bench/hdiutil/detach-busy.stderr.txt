@@ -1,0 +1,2 @@
+hdiutil: WARNING: 'hdiutil detach ...' is deprecated. Please use 'diskutil eject ...' instead.
+hdiutil: couldn't unmount "@VOLUME_WHOLE@" - Resource busy

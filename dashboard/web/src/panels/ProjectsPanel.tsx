@@ -17,7 +17,13 @@
 // every tab (§4.2): a share of the week's quota under Claude, a share of the
 // ranked cost otherwise.
 //
-// States:
+// States, in precedence order:
+//   - hydrating                → loading skeleton (#278 §1.4).
+//   - projects envelope null, or a withheld aggregate, during a cache repair
+//     (`sync_failure.kind` is `maintenance_active`) → the same loading
+//     skeleton, no text: the repair forbids reading cache.db, the one store
+//     the leg reads, and it finishes by itself (#787 / #861 revision 35,
+//     round 10).
 //   - projects envelope null   → "Projects data unavailable" panel-empty.
 //   - a withheld aggregate     → its own copy, naming what is missing (§3.7).
 //   - rows array empty         → "No project activity ..." panel-empty.
@@ -42,6 +48,7 @@ import { warningForDomain } from '../lib/sourceGating';
 import { providerIsDecorated } from '../store/accountFocus';
 import { PROJECTS_MERGED_ACCOUNTS_NOTE } from '../lib/projectsColumns';
 import { DegradedChip } from './sourcePanel';
+import { ProjectLabel } from '../components/ProjectLabel';
 
 const TOP_N = 5;
 
@@ -102,7 +109,19 @@ export function ProjectsPanel() {
   // with no data yet, the sub-label reads "(loading)" instead of the misleading
   // final-state "(unavailable)" (which re-implies a broken instance) or
   // "(0 this week)". Flips off automatically once the panel hydrates.
-  const showLoadingSub = hydrating && rows.length === 0;
+  // #787 / #861 revision 35: a dashboard started during a cache repair has no
+  // Projects envelope until the repair ends, and the published sync status
+  // already names the repair (the header chip renders it). The panel waits on
+  // it like a first paint rather than telling the user to restart a dashboard
+  // that will fill in by itself. A withheld aggregate waits the same way
+  // (round 10): on a dashboard started during a repair the All aggregate is
+  // withheld because the Claude projects envelope is absent, and its copy
+  // ("...does not publish the combined ranking. Reload...") named the wrong
+  // cause and an action that cannot help until the repair ends. Empty rows
+  // keep their own copy, and outside a repair a withheld aggregate keeps its.
+  const awaitingRepair = (isUnavailable || withheld != null)
+    && env?.sync_failure?.kind === 'maintenance_active';
+  const showLoadingSub = (hydrating && rows.length === 0) || awaitingRepair;
 
   // ShareIcon + PanelGrip render in BOTH the populated and the
   // unavailable-envelope branches per spec §2.6 ("ShareIcon still
@@ -112,34 +131,46 @@ export function ProjectsPanel() {
   const header = (
     <div className="panel-header" style={{ justifyContent: 'space-between' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-        <svg className="icon" aria-hidden="true">
-          <use href="/static/icons.svg#folder" />
-        </svg>
-        {/* The h2 carries the COUNT and nothing else under a shared range.
-            Measured at 390px, with the range and the composition inside it:
-            clientWidth 174px against scrollWidth 385px, under the mobile
-            `white-space: nowrap` / `text-overflow: ellipsis` rule — so it
-            rendered "Projects (41 projects…" and cut away the resolved range,
-            which is the entire point of this change. The range and the
-            composition moved to `.panel-range-note` below, a full-width
-            line that wraps. Neither was shortened; the h2 was. Weekly,
-            Monthly, Blocks and Daily now use the SAME class for the same
-            reason, which is why it is named for panels and not for this
-            panel. */}
-        <h2 className={projected.state === 'available' && !showLoadingSub ? 'has-count' : undefined}>
-          Projects{' '}
-          <span className="sub">
-            {showLoadingSub
-              ? '(loading)'
-              : withheld
-                ? '(withheld)'
-                : isUnavailable
-                  ? '(unavailable)'
-                  : activeSource === 'claude'
-                    ? `(${rows.length} this week)`
-                    : `(${rows.length} ${rows.length === 1 ? 'project' : 'projects'})`}
-          </span>
-        </h2>
+        {/* `panel-title-main` keeps the icon and the heading on one line. It
+            is `display: contents` except in the desktop Projects header, where
+            it is a nowrap row, so when the title row wraps only the degraded
+            chip moves to the next line, never the heading away from its icon
+            (#1111). */}
+        <span className="panel-title-main">
+          <svg className="icon" aria-hidden="true">
+            <use href="/static/icons.svg#folder" />
+          </svg>
+          {/* The h2 carries the COUNT and nothing else under a shared range.
+              Measured at 390px, with the range and the composition inside it:
+              clientWidth 174px against scrollWidth 385px, under the mobile
+              `white-space: nowrap` / `text-overflow: ellipsis` rule — so it
+              rendered "Projects (41 projects…" and cut away the resolved range,
+              which is the entire point of this change. The range and the
+              composition moved to `.panel-range-note` below, a full-width
+              line that wraps. Neither was shortened; the h2 was. Weekly,
+              Monthly, Blocks and Daily now use the SAME class for the same
+              reason, which is why it is named for panels and not for this
+              panel. */}
+          {/* `is-status` (#787 / #861 rounds 9 and 9b): every non-count sub,
+              "(loading)", "(withheld)" and "(unavailable)", wraps like a count
+              above 640px. The "partial" chip renders beside any of them, and at
+              1440 the one-line heading read "Projects (…"; "(unavailable)" was
+              cut even without the chip. */}
+          <h2 className={showLoadingSub || projected.state !== 'available' ? 'is-status' : 'has-count'}>
+            Projects{' '}
+            <span className="sub">
+              {showLoadingSub
+                ? '(loading)'
+                : withheld
+                  ? '(withheld)'
+                  : isUnavailable
+                    ? '(unavailable)'
+                    : activeSource === 'claude'
+                      ? `(${rows.length} this week)`
+                      : `(${rows.length} ${rows.length === 1 ? 'project' : 'projects'})`}
+            </span>
+          </h2>
+        </span>
         {projectWarning && <DegradedChip gate={{ mode: 'degraded', warning: projectWarning, noSuccessYet: false }} />}
       </div>
       <div className="panel-header-actions">
@@ -183,7 +214,7 @@ export function ProjectsPanel() {
               that does not exist and prescribing an action. #278 §1.4 added
               this branch precisely so a first paint shows a skeleton rather
               than copy implying a broken instance. */}
-          {hydrating ? (
+          {hydrating || awaitingRepair ? (
             <PanelSkeleton />
           ) : withheld ? (
             <div className="panel-empty panel-withheld" data-withheld-code={withheld.code}>
@@ -323,7 +354,12 @@ export function ProjectsPanel() {
               const barStyle = { '--w': `${widthPct}%` } as CSSProperties;
               const body = (
                 <>
-                  <span className="name">{activeSource === 'all' ? `${r.source === 'claude' ? 'Claude' : 'Codex'} · ${r.label}` : r.label}</span>
+                  {/* #923 S2 — base, suffix and (under All) source prefix as
+                      spans, so the base truncates and the suffix that tells
+                      same-name projects apart never does. Same text as before. */}
+                  <span className="name">
+                    <ProjectLabel label={r.label} source={activeSource === 'all' ? r.source : undefined} />
+                  </span>
                   {/* A5 — decorative cost-relative bar, deliberately hidden.
                       The row's accessible name carries the project, the cost
                       and the NAMED percentage (built above), so the bar

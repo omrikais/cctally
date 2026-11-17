@@ -70,7 +70,8 @@ def test_the_write_io_object_matches_its_golden():
     assert list(payload) == [
         "status", "reason", "source", "scope", "instanceId", "sampledAt",
         "windowSeconds", "bytesWritten", "bytesPerMinute", "tickCount",
-        "meanBytesPerTick", "excludedDeletions", "coldStartup",
+        "meanBytesPerTick", "excludedDeletions", "excludedIndexMaintenance",
+        "coldStartup",
         "maintenance", "reclaimRefusal", "budget"]
 
 

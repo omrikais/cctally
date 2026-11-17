@@ -466,6 +466,17 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     fireEvent.click(within(detail).getByRole('button', { name: 'Show all 14 models' }));
     expect(within(detail).getAllByTestId('codex-project-model-row')).toHaveLength(14);
     expect(detail.querySelector('.sd-bounded-collection')).not.toBeNull();
+
+    // #1075 — collapsing runs the toggle's scroll-anchor path (the toggle sits
+    // in `.modal-body`, so the anchor is recorded); a throw there would replace
+    // the dialog with the error boundary instead of collapsing the list.
+    const showLess = within(detail).getByRole('button', { name: 'Show first 6 models' });
+    expect(showLess.closest('.modal-body')).not.toBeNull();
+    fireEvent.click(showLess);
+    expect(within(detail).getAllByTestId('codex-project-model-row')).toHaveLength(6);
+    const collapsed = within(detail).getByRole('button', { name: 'Show all 14 models' });
+    expect(collapsed).toHaveTextContent('+8 more');
+    expect(collapsed).toHaveAttribute('aria-expanded', 'false');
   });
 
   it('renders a localized, bounded Codex quota progression from retained observations and milestones', async () => {

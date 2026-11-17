@@ -527,8 +527,8 @@ def test_witness_codec_round_trips_and_rejects_malformed(pa, tmp_path, cache):
 # --- the carrier: render intake ---------------------------------------------
 
 
-def _status(app, *, transcript, percent=20, session="sess-797"):
-    now = int(time.time())
+def _status(app, *, transcript, percent=20, session="sess-797", now=None):
+    now = int(time.time()) if now is None else now
     payload = {"session_id": session, "rate_limits": {"seven_day": {
         "used_percentage": percent,
         "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 3 * 86400)),
@@ -680,19 +680,23 @@ def test_duplicate_intake_reuses_first_evidence(app, tmp_path):
     sl = sys.modules["_cctally_statusline"]
     main = _write(tmp_path / "proj" / "s.jsonl", [_assistant("2026-10-26T10:00:00Z")])
     now = int(time.time())
-    first = sl._candidate_from_input(_status(app, transcript=main), received_at=now)
+    # Every render input is built from this one second. A render input that
+    # read the clock again could land in the next second, and its different
+    # raw reset would rightly be a distinct arrival (#1067).
+    first = sl._candidate_from_input(_status(app, transcript=main, now=now), received_at=now)
     assert sl._capture_arrival(first) is not None
     # Same contributor, same second, same reading: the transcript moved on,
     # so a fresh capture differs, but the arrival is the same immutable one.
     _append(main, [_assistant("2026-10-26T10:09:00Z")])
-    again = sl._candidate_from_input(_status(app, transcript=main), received_at=now)
+    again = sl._candidate_from_input(_status(app, transcript=main, now=now), received_at=now)
     assert again.activity != first.activity
     assert sl._capture_arrival(again) is None
     assert _slot(sl, first).activity == first.activity
     tail = sl._intake_tail_evaluation(first.binding.account_key)
     assert [m.activity for m in tail.members] == [first.activity]
     # A later second is a distinct arrival and carries its own evidence.
-    later = sl._candidate_from_input(_status(app, transcript=main), received_at=now + 1)
+    later = sl._candidate_from_input(_status(app, transcript=main, now=now),
+                                     received_at=now + 1)
     assert sl._capture_arrival(later) is not None
     assert _slot(sl, later).activity.instant_utc == "2026-10-26T10:09:00Z"
 

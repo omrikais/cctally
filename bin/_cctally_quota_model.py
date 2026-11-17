@@ -21,6 +21,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pathlib
 import sqlite3
 import sys
 import textwrap
@@ -244,20 +245,26 @@ def _account_clause(column: str, account_key):
 def _store_probe(conn, path) -> str:
     """A cheap fingerprint of one store's current state.
 
-    `PRAGMA data_version` advances when ANOTHER connection commits, which is
-    exactly the event that would make two reads describe two different states.
-    The file size is folded in so a change the pragma cannot see on a fresh
-    connection is still visible.
+    #787 / #861: the bracket reads through query sessions of one statement
+    each, so no connection outlives a statement and `PRAGMA data_version`
+    (which advances only on the connection that observes another's commit)
+    can no longer see a commit. The fingerprint is therefore what any
+    session can observe: the size and modification time of the main file and
+    of its `-wal`. A rollback-journal commit rewrites main-file pages and a
+    WAL commit appends frames, so a commit between the two probes moves it.
+    Only `stat` is used: opening a store's file in-process and closing it
+    would drop SQLite's POSIX locks on it. `conn` is kept for the call shape.
     """
-    try:
-        version = conn.execute("PRAGMA data_version").fetchone()[0]
-    except (sqlite3.Error, IndexError, TypeError):
-        version = "?"
-    try:
-        size = path.stat().st_size
-    except OSError:
-        size = -1
-    return f"{version}:{size}"
+    del conn
+    parts = []
+    for candidate in (path, pathlib.Path(f"{path}-wal")):
+        try:
+            st = candidate.stat()
+        except OSError:
+            parts.append("-")
+        else:
+            parts.append(f"{st.st_size}/{st.st_mtime_ns}")
+    return ":".join(parts)
 
 
 def _probe_bundle(stats_conn, cache_conn) -> tuple:
@@ -535,10 +542,19 @@ def load_population(account_key, *, since, now, era) -> LoadResult:
     era_end = qm.era_bounds(era)[1]
     stats_conn = None
     cache_conn = None
+    # #787 / #861 AD21, 5.13: the bracket's reads were per-statement reads
+    # on two autocommit connections, so each statement is one query session
+    # and nothing holds stats.db's SHARED lock across the bracket. The two
+    # stores are two sessions, so the bracket keeps its own bounded
+    # validate-and-retry; `_store_probe` observes commits across sessions.
+    import _cctally_store_access as _store_access
+    phases = contextlib.ExitStack()
     try:
         try:
-            stats_conn = _cctally_core.open_db()
-            cache_conn = _cctally().open_cache_db()
+            stats_conn = phases.enter_context(
+                _store_access.statement_reader("stats"))
+            cache_conn = phases.enter_context(
+                _store_access.statement_reader("cache"))
         except Exception:
             return LoadResult(analysis_start=start,
                               status=CalibrationStatus.UNAVAILABLE,
@@ -596,12 +612,10 @@ def load_population(account_key, *, since, now, era) -> LoadResult:
                               status=CalibrationStatus.UNAVAILABLE,
                               cause="generation-incoherent")
     finally:
-        for conn in (stats_conn, cache_conn):
-            if conn is not None:
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
+        try:
+            phases.close()
+        except sqlite3.Error:
+            pass
 
     earliest, snapshots, credits, diagnostics, entries, newest, \
         fast_excluded, facts = payload
@@ -649,7 +663,8 @@ def accounts_are_decorated() -> bool:
     """
     import _cctally_account
     try:
-        conn = _cctally_core.open_db()
+        import _cctally_store_access as _store_access  # #787 AD21
+        conn = _store_access.statement_reader("stats")
     except Exception:
         return False
     try:
@@ -664,7 +679,8 @@ def _real_account_keys() -> list:
     import _cctally_account
     import _lib_accounts
     try:
-        conn = _cctally_core.open_db()
+        import _cctally_store_access as _store_access  # #787 AD21
+        conn = _store_access.statement_reader("stats")
     except Exception:
         return []
     try:
@@ -681,7 +697,8 @@ def _real_account_keys() -> list:
 def _unattributed_bucket_has_rows() -> bool:
     import _lib_accounts
     try:
-        conn = _cctally_core.open_db()
+        import _cctally_store_access as _store_access  # #787 AD21
+        conn = _store_access.statement_reader("stats")
     except Exception:
         return False
     try:
@@ -740,7 +757,8 @@ def account_display_label(account_key) -> "str | None":
         return None
     import _cctally_account
     try:
-        conn = _cctally_core.open_db()
+        import _cctally_store_access as _store_access  # #787 AD21
+        conn = _store_access.statement_reader("stats")
     except Exception:
         return str(account_key)[:8]
     try:
@@ -1062,7 +1080,8 @@ def recorded_rate_change_identities(account_keys=None) -> tuple:
         return ()
     conn = None
     try:
-        conn = _cctally_core.open_db()
+        import _cctally_store_access as _store_access  # #787 AD21
+        conn = _store_access.statement_reader("stats")
         if keys is None:
             rows = conn.execute(
                 "SELECT provider, account_key, effective_from "
@@ -2199,7 +2218,8 @@ def unrecorded_rate_change_transitions(transitions) -> tuple:
     mrc = _cctally()._load_sibling("_lib_meter_rate_change")
     conn = None
     try:
-        conn = _cctally_core.open_db()
+        import _cctally_store_access as _store_access  # #787 AD21
+        conn = _store_access.statement_reader("stats")
         recorded: set = set()
         for i in range(0, len(candidates), _PRESENCE_CHUNK):
             chunk = candidates[i:i + _PRESENCE_CHUNK]
@@ -2479,7 +2499,8 @@ def _superseded_identities(account_keys) -> frozenset:
     from _cctally_db import StatsRebuildDeferred
     conn = None
     try:
-        conn = _cctally_core.open_db()
+        import _cctally_store_access as _store_access  # #787 AD21
+        conn = _store_access.statement_reader("stats")
         state = qcg.read_rate_change_supersessions(
             conn, account_keys=account_keys)
         return frozenset(state.by_identity)

@@ -58,6 +58,8 @@ def _load_cli():
         module = importlib.util.module_from_spec(spec)
         sys.modules["cctally"] = module
         loader.exec_module(module)
+        # The measurement is its own process owner (#787 / #861).
+        sys.modules["_cctally_core"].establish_script_owner()
     return sys.modules["cctally"]
 
 

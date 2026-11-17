@@ -22,6 +22,7 @@ import pathlib
 import re
 import shutil
 import sqlite3
+import sys
 
 import pytest
 
@@ -293,6 +294,10 @@ def test_a_stale_cursor_reconciliation_streams_every_shard(
     store = importlib.import_module("_cctally_store")
     quota = importlib.import_module("_cctally_quota")
     monkeypatch.setattr(store, "WRITER_TEMP_STORE", temp_store)
+    # #787 / #861: the loader's cache reads are query sessions, which apply
+    # their own temp store at open; pin it to the selected one as well.
+    monkeypatch.setattr(importlib.import_module("_cctally_store_access"),
+                        "QUERY_TEMP_STORE", temp_store)
     deferred = []
     monkeypatch.setattr(quota, "_defer_codex_quota_verification",
                         lambda: deferred.append(1) or "throttled")
@@ -327,9 +332,17 @@ def test_a_stale_cursor_reconciliation_streams_every_shard(
         ns["reconcile_codex_quota_projection"](now=now, full_pass="defer")
         recorder.phase = "stale-cursor-inline"
         ns["reconcile_codex_quota_projection"](now=now)
+    def _consumer_sites(statement):
+        # #787 / #861: a statement reader's own frames lead the stack; the
+        # consumer is the first frame outside the query-session transport.
+        sites = statement.call_sites
+        while sites and sites[0].startswith("_cctally_store_access."):
+            sites = sites[1:]
+        return sites
+
     loads = [
         statement for statement in recorder.statements
-        if statement.call_sites[:2] == (
+        if _consumer_sites(statement)[:2] == (
             "_cctally_quota._iter_shard_rows",
             "_cctally_quota.load_codex_quota_observations")
         and "_cctally_quota.reconcile_codex_quota_projection"
@@ -607,9 +620,31 @@ def test_both_codex_cycle_ordering_branches_stream_without_a_sorter(
 
 
 def test_capture_refuses_a_custom_connection_factory(tmp_path):
+    """A factory the recorder cannot sit beneath is refused; a Connection
+    subclass (a #787 query session's class) keeps its own overrides and its
+    statements are still recorded."""
     with guard.capture_sql_plans():
-        with pytest.raises(AssertionError, match="custom factory"):
-            sqlite3.connect(tmp_path / "x.db", factory=sqlite3.Connection)
+        with pytest.raises(AssertionError, match="factory"):
+            sqlite3.connect(tmp_path / "x.db", factory=lambda *a, **k: None)
+
+    seen = []
+
+    class Refusing(sqlite3.Connection):
+        def execute(self, sql, *args):
+            seen.append(sql)
+            return super().execute(sql, *args)
+
+    here = pathlib.Path(__file__).resolve().parent
+    with guard.capture_sql_plans(roots=(here,)) as recorder:
+        conn = sqlite3.connect(tmp_path / "y.db", factory=Refusing)
+        try:
+            assert isinstance(conn, Refusing)
+            conn.execute("CREATE TABLE t (a)")
+            conn.execute("SELECT a FROM t WHERE a = 1").fetchall()
+        finally:
+            conn.close()
+    assert "SELECT a FROM t WHERE a = 1" in seen
+    assert any("SELECT a FROM t" in s.sql for s in recorder.statements)
 
 
 def test_no_pending_rule_remains():
@@ -805,10 +840,15 @@ def test_the_weekly_reading_selector_runs_on_full_and_idle_ticks(
                 assert snap.current_week.weekly_reading_scope is not None
     finally:
         sc.reset_dispatch_state()
+    # #787 / #861: the build reads stats through per-statement query
+    # sessions, so the session's own admission probe also runs beneath the
+    # selector's frame; only the selector's statement is judged here.
+    selector_sql = guard.normalize_sql(
+        sys.modules["_cctally_oauth_samples"]._LATEST_WEEKLY_READING)
     for phase, builder in WEEKLY_READING_PHASES:
         lookups = [s for s in recorder.statements
                    if s.phase == phase and WEEKLY_READING_SITE in s.call_sites
-                   and builder in s.call_sites]
+                   and builder in s.call_sites and s.sql == selector_sql]
         assert lookups, f"the selector never ran under {builder} in {phase}"
         for statement in lookups:
             assert any(WEEKLY_READING_INDEX in detail

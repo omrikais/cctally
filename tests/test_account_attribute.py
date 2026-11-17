@@ -1523,3 +1523,31 @@ def test_a_heal_fence_defers_the_apply_as_recorded_pending(store, capsys):
     assert payload["status"] in ("applied", "recovered"), payload
     assert store.account in {
         account for _ts, account in store.entry_accounts()}
+
+
+@pytest.mark.parametrize("status", ["contended", "unavailable"])
+def test_attribute_reports_pending_for_an_unapplied_projection(
+    monkeypatch, status,
+):
+    """Detects an attribution reported ``applied`` over a projection that
+    never ran: only ``current`` and ``published`` finish; any other status is
+    handed back so the caller reports ``recordedPending`` with that status in
+    its existing message (a rerun completes it)."""
+    from conftest import load_script
+
+    load_script()
+    import _cctally_account
+    import _cctally_cache
+    import _cctally_quota
+
+    monkeypatch.setattr(
+        _cctally_cache, "codex_model_resolution_pending_now", lambda: False)
+    results = iter([status, "published", "current"])
+    monkeypatch.setattr(
+        _cctally_quota, "reconcile_codex_quota_projection",
+        lambda: _cctally_quota.QuotaProjectionResult(
+            None, 0, 0, 0, 0, 0, 0, status=next(results)))
+
+    assert _cctally_account._attribute_publish_projection() == status
+    assert _cctally_account._attribute_publish_projection() is None
+    assert _cctally_account._attribute_publish_projection() is None

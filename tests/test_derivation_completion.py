@@ -31,7 +31,7 @@ import types
 import pytest
 
 import _statusline_continuation as D
-from conftest import load_script, redirect_paths
+from conftest import as_process_owner, load_script, redirect_paths
 
 _W1 = int(dt.datetime(2026, 1, 8, tzinfo=dt.timezone.utc).timestamp())
 
@@ -864,7 +864,9 @@ def _recorder_process(ns, monkeypatch, at, pct, ingests):
             outcome["unexpected"] = exc
         outcome["ingests"] = list(ingests.get(threading.get_ident(), ()))
 
-    thread = threading.Thread(target=contextvars.Context().run, args=(run,))
+    # The recorder is its own `cctally record-usage` process owner (#787).
+    thread = threading.Thread(target=contextvars.Context().run,
+                              args=(as_process_owner(run),))
     thread.start()
     thread.join(30)
     assert not thread.is_alive(), "the recorder did not exit"

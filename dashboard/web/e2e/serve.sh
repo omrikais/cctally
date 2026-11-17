@@ -1,13 +1,27 @@
 #!/usr/bin/env bash
 # #281 S3 — Playwright reader smoke-net launcher. Playwright's `webServer` runs
-# this; it owns the fixture state + the dashboard server on the dedicated e2e
-# port 8797 (never 8789 dev / 8799 ui-qa).
+# this; it owns the fixture state + the dashboard server on the per-run port
+# that playwright.config.ts resolves into CCTALLY_E2E_PORT (#923).
 #
 # Every cctally invocation here runs under FULL isolation (spec §5): the scratch
 # CCTALLY_DATA_DIR / CLAUDE_CONFIG_DIR / CODEX_HOME plus the dev-autodetect and
 # telemetry suppressors, so the suite NEVER reads or writes the operator's real
 # ~/.claude, ~/.codex, or ~/.local/share/cctally*.
 set -euo pipefail
+
+# 1) The port, validated before anything touches the runtime directory, with
+#    builtins only, so a refusal changes nothing on disk and launches nothing.
+#    No default: playwright.config.ts always sets it (#923).
+E2E_PORT="${CCTALLY_E2E_PORT-}"
+case "$E2E_PORT" in
+  [1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]) ;;
+  *) E2E_PORT=invalid ;;
+esac
+# Fail closed: a `[` that errors refuses rather than falling through.
+if ! { [ "$E2E_PORT" != invalid ] && [ "$E2E_PORT" -ge 1024 ] && [ "$E2E_PORT" -le 65535 ]; }; then
+  echo "e2e/serve.sh: CCTALLY_E2E_PORT must be a decimal port in 1024-65535 (got '${CCTALLY_E2E_PORT-}'); playwright.config.ts sets it" >&2
+  exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # dashboard/web/e2e
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
@@ -166,5 +180,7 @@ cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/claude-seed/334-claude-thinking-re
 
 # 7) Serve. Sync stays ENABLED (no --no-sync) so the open reader live-tails via
 #    the targeted per-conversation ingest (scenario 3). exec so Playwright's
-#    teardown signal reaches the server directly.
-exec "$REPO_ROOT/bin/cctally" dashboard --port 8797 --host 127.0.0.1 --no-browser
+#    teardown signal reaches the server directly. The launch line proves an
+#    attempted launch only; the dashboard's own post-bind line proves the bind.
+echo "e2e/serve.sh: pid $$ launching the dashboard on 127.0.0.1:$CCTALLY_E2E_PORT"
+exec "$REPO_ROOT/bin/cctally" dashboard --port "$CCTALLY_E2E_PORT" --host 127.0.0.1 --no-browser

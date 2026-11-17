@@ -739,6 +739,11 @@ def create_cache_db(path: Path) -> None:
         _apply_cache_schema,
         add_column_if_missing,
     )
+    # #787 / #861 spec 5.1: `_apply_cache_schema` is a guarded STARTUP
+    # entry; a fixture builder is a process owner (a no-op on a test thread,
+    # which already runs at `process`).
+    import _cctally_core  # noqa: PLC0415
+    _cctally_core.establish_script_owner()
     with sqlite3.connect(path) as conn:
         # Match production's open_cache_db(): fixtures must be WAL so a
         # first open by the harness doesn't flip bytes 18/19 of the DB

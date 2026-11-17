@@ -290,9 +290,10 @@ def _pid_alive(pid):
 def test_test_all_removes_its_suite_dir_after_reaping(tmp_path):
     """Session 4 (spec C8): the suite directory is ``cs.XXXXXX`` beneath the
     TMPDIR the run inherits, holding PYTEST_DEBUG_TEMPROOT. At exit the run
-    TERMs every process group it started, KILLs what outlives the grace and
-    removes the directory: a harness that leaves a TERM-ignoring descendant
-    behind in the pool's group neither keeps it alive nor keeps the directory."""
+    stops every holder it started (#1087: each holder TERMs, then KILLs, the
+    group it holds, and publishes whether it is empty) and removes the
+    directory: a harness that leaves a TERM-ignoring descendant behind in the
+    pool's group neither keeps it alive nor keeps the directory."""
     record = tmp_path / "lingering.txt"
     body = (
         "#!/usr/bin/env bash\n"

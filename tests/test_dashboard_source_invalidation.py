@@ -4688,6 +4688,9 @@ def test_1015_an_unchanged_settled_tick_scans_no_lineage_relation(
         _857_tick(ns, _857_AFTER + _857_TICK)
         calls = _857_spy(monkeypatch, tui)
         monkeypatch.setattr(tui, "open_db", traced_open)
+        # #787 / #861: the build reads through query sessions, whose
+        # connections carry the store module's trace hook.
+        monkeypatch.setattr(store, "_TRACE_HOOK", statements.append)
         monkeypatch.setattr(store, "stats_open_readonly_failfast",
                             counted_failfast)
         _857_tick(ns, _857_AFTER + _857_TICK * 2)

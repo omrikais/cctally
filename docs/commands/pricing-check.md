@@ -53,7 +53,7 @@ must act; `status` reports whether the check was complete.
 | Code | Meaning |
 | --- | --- |
 | `1` | **Any actionable finding** — a coverage gap, value drift, a missing-from-us model, an existence gap, **or a stale/expired `PRICING_DRIFT_ALLOWLIST` suppression** — **even if a network leg degraded**. Findings always win over degradation. |
-| `0` | **No actionable findings** — a fully clean run **or** a partially/fully network-degraded run that surfaced nothing actionable. The `--json` payload still carries `"status": "degraded"` so a caller can tell "clean" from "couldn't fully check." |
+| `0` | **No actionable findings** — a fully clean run **or** a partially/fully degraded run (a failed network leg, or a `cache.db` that could not be read) that surfaced nothing actionable. The `--json` payload still carries `"status": "degraded"` so a caller can tell "clean" from "couldn't fully check." |
 | `2` | Argument/usage error (argparse convention). |
 
 `ahead_of_litellm` (a model we price that LiteLLM lacks) is **never**
@@ -109,8 +109,8 @@ only and does not affect the exit code.
 | Field | Shape | Notes |
 | --- | --- | --- |
 | `schemaVersion` | `1` | Bumped on a breaking change; adding optional keys does not bump. |
-| `status` | `"ok"` \| `"degraded"` | `degraded` whenever ≥1 network leg failed. Orthogonal to the exit code. |
-| `degraded_components` | `string[]` | Which legs degraded: `"litellm"` and/or `"models_api"`. Empty when complete (and always empty under `--offline`). |
+| `status` | `"ok"` \| `"degraded"` | `degraded` whenever ≥1 leg could not complete: a network leg failed, or `cache.db` exists but could not be read. Orthogonal to the exit code. |
+| `degraded_components` | `string[]` | Which legs degraded: `"cache"` (`cache.db` exists but could not be read, so the coverage leg is unavailable and the text output says `Coverage: unavailable (cache.db could not be read).`), `"litellm"` and/or `"models_api"`. Empty when complete. Under `--offline` only `"cache"` can appear. A missing `cache.db` is not a degradation: there is no cached usage to assess. |
 | `snapshotDate` | ISO date | `PRICING_SNAPSHOT_DATE` — the date of the latest pricing sync of the embedded tables. A targeted sync re-verifies only the models it changes. |
 | `litellmSource` | URL | The LiteLLM snapshot the drift leg compares against. |
 | `coverage` | `CoverageGap[]` | `{provider, model, kind, entry_count, token_total}`. `kind` ∈ `{"unpriced", "fallback"}`. |

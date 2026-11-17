@@ -24,6 +24,7 @@ import { Fragment, useEffect, useMemo, useState, useSyncExternalStore } from 're
 import { Modal } from './Modal';
 import { ProjectsTrendChart } from './ProjectsTrendChart';
 import { ProjectsRankedBars } from './ProjectsRankedBars';
+import { ProjectLabel } from '../components/ProjectLabel';
 import { ProjectsDrillPanel } from './ProjectsDrillPanel';
 import { useProjectDetail } from '../hooks/useProjectDetail';
 import { ShareIcon } from '../components/ShareIcon';
@@ -511,6 +512,7 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
             series={sourceRows.slice(0, 6).map((row) => ({
               key: row.key,
               bucket_path: row.label,
+              label: row.label,
               weekly: [row.cost],
               cost: row.cost,
             }))}
@@ -567,7 +569,7 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
                   }}
                 >
                   <td className="project">
-                    {r.displayKey ?? r.key}
+                    <ProjectLabel label={r.displayKey ?? r.key} />
                     {r.source && <span className={`source-chip source-chip--${r.source}`}>{r.source === 'claude' ? 'Claude' : 'Codex'}</span>}
                   </td>
                   <td>{r.sessionsCount}</td>

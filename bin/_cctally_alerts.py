@@ -45,6 +45,7 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 from __future__ import annotations
 
 import argparse
+import contextvars
 import datetime as dt
 import os
 import pathlib
@@ -286,16 +287,15 @@ def _alert_label_prefix(axis: str, account_key: "str | None",
         db_path = _cctally_core.DB_PATH
         if not db_path.exists():
             return ""
-        # #386: `mode=ro` is not exempt from the opener protocol — such a
-        # connection CREATES `-shm`/`-wal` when they are absent (measured). The
-        # enclosing `except Exception` degrades the label, never the alert.
-        import _cctally_store
-        conn = _cctally_store.stats_open_guarded(
-            db_path,
-            # #778: forward the opener's `cached_statements=0`.
-            connect=lambda p, **kw: _sq.connect(
-                f"file:{p}?mode=ro", uri=True, **kw),
-        )
+        # #787 / #861: each statement is one stats query session, read with
+        # the policy `alerts test`'s startup phase chose (item 6, AD2); on
+        # the dispatch path the writer's own open established the store.
+        # The enclosing `except Exception` degrades the label, never the
+        # alert.
+        import _cctally_store_access as _store_access
+        conn = _store_access.statement_reader(
+            "stats", startup=False,
+            policy=_STATS_READ_POLICY.get())
         try:
             if not _cctally_account.provider_is_decorated(conn, vendor):
                 return ""
@@ -543,12 +543,12 @@ def _test_alert_account_key(vendor: str) -> str:
         db_path = _cctally_core.DB_PATH
         if not db_path.exists():
             return _lib_accounts.VENDOR_WIDE
-        conn = _cctally_store.stats_open_guarded(
-            db_path,
-            # #778: forward the opener's `cached_statements=0`.
-            connect=lambda p, **kw: _sq.connect(
-                f"file:{p}?mode=ro", uri=True, **kw),
-        )
+        # #787 / #861: per-statement stats query sessions, read with the
+        # policy `alerts test`'s startup phase chose (item 6, AD2).
+        import _cctally_store_access as _store_access
+        conn = _store_access.statement_reader(
+            "stats", startup=False,
+            policy=_STATS_READ_POLICY.get())
         try:
             for row in _cctally_account.load_accounts(conn, vendor):
                 key = str(row.get("account_key") or "")
@@ -562,7 +562,33 @@ def _test_alert_account_key(vendor: str) -> str:
     return _lib_accounts.VENDOR_WIDE
 
 
+#: The stats read policy of `alerts test`'s startup phase (#787 / #861
+#: item 6): `_cctally_store_access.reader_startup` converts or recovers a
+#: store the base's guarded open read through, and names the diagnostic
+#: policy for a schema-behind store. Unset (None) on the alert-dispatch
+#: path, whose recording writer has already opened stats as owner, so a
+#: detector never reaches an owner open through an alert label.
+_STATS_READ_POLICY: "contextvars.ContextVar[str | None]" = (
+    contextvars.ContextVar("alerts_stats_read_policy", default=None))
+
+
 def cmd_alerts_test(args: argparse.Namespace) -> int:
+    """`cctally alerts test`: its stats startup phase, then the rehearsal."""
+    policy = None
+    if _cctally_core.DB_PATH.exists():
+        import _cctally_store_access as _store_access
+        try:
+            policy = _store_access.reader_startup("stats")
+        except Exception:  # noqa: BLE001 — the readers degrade on their own
+            policy = None
+    token = _STATS_READ_POLICY.set(policy)
+    try:
+        return _cmd_alerts_test(args)
+    finally:
+        _STATS_READ_POLICY.reset(token)
+
+
+def _cmd_alerts_test(args: argparse.Namespace) -> int:
     """Send a synthetic test alert through the dispatch pipeline.
 
     Builds a synthetic payload via the same ``_build_alert_payload_*``

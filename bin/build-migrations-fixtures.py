@@ -66,6 +66,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fixture_builders import register_fixture_db, create_stats_db  # noqa: E402
 
 
+def _own_script_thread() -> None:
+    """#787 / #861 spec 5.1: once a builder has loaded the cctally namespace,
+    this script's thread is a process owner, like the CLI main thread."""
+    core = sys.modules.get("_cctally_core")
+    if core is not None:
+        core.establish_script_owner()
+
+
 FIXTURES_ROOT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "migrations"
 
 # Pinned instant for the stats-five per-migration goldens (W3 backfill, #279 S7).
@@ -95,6 +103,7 @@ def _load_db_module():
     mod = ilu.module_from_spec(spec)
     sys.modules["cctally"] = mod
     loader.exec_module(mod)
+    _own_script_thread()
     return sys.modules["_cctally_db"]
 
 
@@ -652,6 +661,7 @@ def build_per_migration_001_dedup_highest_wins(scenario_dir: Path) -> None:
         # sys.modules during _process_class).
         sys.modules["_cctally_db"] = mod
         spec.loader.exec_module(mod)
+        _own_script_thread()
         handler = None
         for m in mod._CACHE_MIGRATIONS:
             if m.name == "001_dedup_highest_wins":
@@ -969,6 +979,7 @@ def _load_cctally_db_module():
     # resolve the module via cls.__module__ during _process_class.
     sys.modules["_cctally_db"] = mod
     spec.loader.exec_module(mod)
+    _own_script_thread()
     return mod
 
 
@@ -1268,6 +1279,7 @@ def build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         mod = ilu.module_from_spec(spec)
         sys.modules["_cctally_db"] = mod
         spec.loader.exec_module(mod)
+        _own_script_thread()
 
         # Override the path constants on the SAME _cctally_core module
         # instance that _cctally_db is using (mod._cctally_core), so the
@@ -1434,6 +1446,7 @@ def build_per_migration_002_conversation_messages_backfill(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -1598,6 +1611,7 @@ def build_per_migration_003_conversation_reingest_tool_ids(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -1711,6 +1725,7 @@ def build_per_migration_004_conversation_reingest_subagent_kind(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -1845,6 +1860,7 @@ def build_per_migration_007_conversation_reingest_enrichment(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -1972,6 +1988,7 @@ def build_per_migration_008_session_entries_speed_backfill(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -2097,6 +2114,7 @@ def build_per_migration_009_conversation_media_reingest(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -2209,6 +2227,7 @@ def build_per_migration_010_conversation_search_split(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _to_legacy_shape(conn, db) -> None:
@@ -2349,6 +2368,7 @@ def build_per_migration_011_conversation_promote_command_args(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -2474,6 +2494,7 @@ def build_per_migration_012_create_conversation_ai_titles(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -2588,6 +2609,7 @@ def build_per_migration_013_create_conversation_sessions(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -2702,6 +2724,7 @@ def build_per_migration_014_conversation_queued_prompt_reingest(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -2821,6 +2844,7 @@ def build_per_migration_015_conversation_sessions_filter_columns(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _to_legacy_conversation_sessions_shape(conn) -> None:
@@ -2956,6 +2980,7 @@ def build_per_migration_016_drop_search_aux(scenario_dir: Path) -> None:
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -3070,6 +3095,7 @@ def build_per_migration_017_arm_nested_agent_reingest(scenario_dir: Path) -> Non
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -3185,6 +3211,7 @@ def build_per_migration_018_create_conversation_title_fts(scenario_dir: Path) ->
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -3302,6 +3329,7 @@ def build_per_migration_019_create_conversation_file_touches(scenario_dir: Path)
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -3447,6 +3475,7 @@ def build_per_migration_020_session_entries_physical_unique(scenario_dir: Path) 
         mod = ilu.module_from_spec(spec)
         sys.modules["_cctally_db"] = mod
         spec.loader.exec_module(mod)
+        _own_script_thread()
         return mod
 
     def _build_pre(path: Path) -> None:
@@ -3585,6 +3614,7 @@ def build_per_migration_021_index_conversation_messages_cwd(scenario_dir: Path) 
         mod = ilu.module_from_spec(spec)
         sys.modules["_cctally_db"] = mod
         spec.loader.exec_module(mod)
+        _own_script_thread()
         return mod
 
     def _build_pre(path: Path) -> None:
@@ -3729,6 +3759,7 @@ def build_per_migration_022_index_conversation_messages_model(scenario_dir: Path
         mod = ilu.module_from_spec(spec)
         sys.modules["_cctally_db"] = mod
         spec.loader.exec_module(mod)
+        _own_script_thread()
         return mod
 
     def _build_pre(path: Path) -> None:
@@ -4381,6 +4412,7 @@ def build_per_migration_023_conversation_sessions_enrichment_columns(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -4666,6 +4698,7 @@ def build_per_migration_029_backfill_claude_account(scenario_dir: Path) -> None:
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -4843,6 +4876,7 @@ def build_per_migration_030_session_entries_cache_creation_split(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -5044,6 +5078,7 @@ def build_per_migration_031_codex_file_account_map(scenario_dir: Path) -> None:
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -5154,6 +5189,7 @@ def build_per_migration_032_codex_canonical_reset_anchor(scenario_dir: Path) -> 
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -5317,6 +5353,7 @@ def build_per_migration_033_codex_reset_anchor_component_closure(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -5448,6 +5485,7 @@ def build_per_migration_034_codex_window_spend_adoption(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _snapshot(conn, *, root, key, source_path, offset, captured,
@@ -5590,6 +5628,7 @@ def build_per_migration_035_codex_thread_source_inference_replay(
         mod = ilu.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        _own_script_thread()
         return mod, sys.modules["_cctally_db"]
 
     def _build_pre(path: Path) -> None:
@@ -5699,6 +5738,7 @@ def _load_cctally_for_fixture():
     mod = ilu.module_from_spec(spec)
     sys.modules["cctally"] = mod
     loader.exec_module(mod)
+    _own_script_thread()
     return sys.modules["_cctally_db"]
 
 
@@ -8947,6 +8987,79 @@ def build_per_migration_conversations_012_codex_conversation_containers(
         conn.close()
 
 
+def build_per_migration_conversations_013_conversation_sessions_input_fingerprint(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #1068's rollup input-fingerprint column.
+
+    ``pre.sqlite`` is a genuine 012-head conversations store whose two rollup
+    tables lack ``input_fingerprint`` (the current schema apply creates it, so
+    it is dropped again), holding one live and one staged rollup row.
+    ``post.sqlite`` is that store after the handler: both columns present and
+    both existing rows NULL (uncertified).
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "013_conversation_sessions_input_fingerprint"
+
+    if pre.exists():
+        pre.unlink()
+    register_fixture_db(pre)
+    mod = _load_db_module()
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        mod._apply_conversations_schema(conn)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        for m in mod._CONVERSATIONS_MIGRATIONS:
+            if m.name == migration:
+                break
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                (m.name, TS_STATS_FIVE_APPLIED),
+            )
+        for table in ("conversation_sessions", "conversation_sessions_staging"):
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN input_fingerprint")
+            conn.execute(
+                f"INSERT INTO {table} (session_id, msg_count, started_utc, "
+                "last_activity_utc, project_label, cost_usd, "
+                "cache_rebuild_count, git_branch, models_json, title, "
+                "render_revision) VALUES (?, 3, '2026-11-01T00:00:00.000Z', "
+                "'2026-11-01T00:05:00.000Z', 'golden', 1.25, 0, 'main', "
+                "'[\"claude-opus-5-5\"]', 'Golden session', 2)",
+                (f"golden-{table}",),
+            )
+        conn.execute("PRAGMA user_version=12")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    import shutil
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    handler = next(
+        m.handler for m in mod._CONVERSATIONS_MIGRATIONS if m.name == migration
+    )
+    conn = sqlite3.connect(post)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        handler(conn)
+        conn.execute(
+            "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+            (migration, TS_STATS_FIVE_APPLIED),
+        )
+        conn.execute("PRAGMA user_version=13")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
     scenario_dir: Path,
 ) -> None:
@@ -9737,6 +9850,10 @@ def main() -> int:
     build_per_migration_conversations_012_codex_conversation_containers(
         FIXTURES_ROOT / "per-migration"
         / "conversations_012_codex_conversation_containers"
+    )
+    build_per_migration_conversations_013_conversation_sessions_input_fingerprint(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_013_conversation_sessions_input_fingerprint"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

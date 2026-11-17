@@ -106,6 +106,7 @@ class TestCacheSourcePathPropagation:
             "mod = importlib.util.module_from_spec(spec)\n"
             "sys.modules['cctally'] = mod\n"
             "loader.exec_module(mod)\n"
+            "sys.modules['_cctally_core'].establish_script_owner()\n"
             "conn = mod.open_cache_db()\n"
             "try:\n"
             "    es = mod.iter_entries(conn,\n"

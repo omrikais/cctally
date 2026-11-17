@@ -31,3 +31,28 @@ describe('ProjectsRankedBars', () => {
     expect(onSel).toHaveBeenCalledWith('cctally-dev');
   });
 });
+
+// #923 S2 — source rows pass their display label explicitly; a genuine path
+// still renders its basename. Both render through ProjectLabel.
+describe('ProjectsRankedBars labels (#923 S2)', () => {
+  it('renders an explicit display label whole, not its "/" basename', () => {
+    const { container } = render(
+      <ProjectsRankedBars
+        series={[{ key: 'p1', bucket_path: 'app (a/b)', label: 'app (a/b)', weekly: [1], cost: 1 }]}
+      />,
+    );
+    const label = container.querySelector('[data-series-key="p1"] .rk-label')!;
+    expect(label.textContent).toBe('app (a/b)');
+    expect(label.querySelector('.pl-suffix')?.textContent).toBe(' (a/b)');
+    expect(container.querySelector('[data-series-key="p1"]')!.getAttribute('title')).toBe('app (a/b)');
+  });
+
+  it('keeps the basename of a genuine path whose name has parentheses', () => {
+    const { container } = render(
+      <ProjectsRankedBars series={[{ key: 'p2', bucket_path: '/x/app (old)', weekly: [1], cost: 1 }]} />,
+    );
+    const label = container.querySelector('[data-series-key="p2"] .rk-label')!;
+    expect(label.textContent).toBe('app (old)');
+    expect(label.querySelector('.pl-suffix')?.textContent).toBe(' (old)');
+  });
+});

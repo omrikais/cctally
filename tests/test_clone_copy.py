@@ -256,21 +256,24 @@ def test_the_module_is_public_and_imports_nothing_private():
         assert "!bin/_lib_clone_copy.py" not in allowlist
 
 
-def test_the_shared_corpus_copier_clones_under_its_shared_lock_and_restamps(
+def test_the_shared_corpus_copier_clones_a_data_dir_under_its_shared_lock(
         tmp_path, monkeypatch):
-    # copy_shared_corpus takes every file through the clone path, with the
-    # scale's build lock held SHARED for the whole walk, still excludes the
-    # SQLite sidecars, and still re-stamps the copy's Codex trust afterwards.
+    # copy_shared_corpus takes every file of the DATA DIRECTORY through the
+    # clone path, with the scale's build lock held SHARED for the whole walk,
+    # and still excludes the SQLite sidecars. It copies no provider root: a
+    # corpus whose stores must describe its own tree is built, not copied
+    # (#1099), so the sibling `claude/` here must not reach the copy.
     import fcntl
 
     import _shared_corpus as SC
     scale = tmp_path / "corpus" / "small"
     data = scale / "data"
-    data.mkdir(parents=True)
+    (data / "journal").mkdir(parents=True)
     (data / "stats.db").write_bytes(b"s" * 8192)
     (data / "stats.db-wal").write_bytes(b"w")
+    (data / "journal" / "a.jsonl").write_text("{}\n", encoding="utf-8")
     (scale / "claude").mkdir()
-    (scale / "claude" / "a.jsonl").write_text("{}\n", encoding="utf-8")
+    (scale / "claude" / "b.jsonl").write_text("{}\n", encoding="utf-8")
     module = SC._load_clone_copy()
     lock = SC.corpus_lock_path(scale.parent, scale.name)
     real = module._clone_fd
@@ -289,15 +292,14 @@ def test_the_shared_corpus_copier_clones_under_its_shared_lock_and_restamps(
         return real(fd, destination)
 
     monkeypatch.setattr(module, "_clone_fd", spy)
-    restamped = []
-    monkeypatch.setattr(SC, "restamp_codex_hook_trust", lambda root: restamped.append(root))
     result = SC.copy_shared_corpus(data, tmp_path / "copy")
-    assert result == tmp_path / "copy" / "data"
+    assert result == tmp_path / "copy"
     assert sorted(calls) == ["a.jsonl", "stats.db"], calls
     assert held == [True, True], "the shared build lock was not held during the copy"
     assert not (result / "stats.db-wal").exists()
     assert (result / "stats.db").read_bytes() == b"s" * 8192
-    assert restamped == [tmp_path / "copy"]
+    assert (result / "journal" / "a.jsonl").read_text(encoding="utf-8") == "{}\n"
+    assert not (result / "claude").exists()
     assert os.stat(str(result / "stats.db")).st_ino != os.stat(str(data / "stats.db")).st_ino
 
 

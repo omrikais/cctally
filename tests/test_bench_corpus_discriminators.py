@@ -5,6 +5,7 @@ corpus pins SCALE, and it is worthless for that purpose unless it also reaches
 the multi-account Codex, colliding-basename and model-pool paths. Every
 assertion here is a discriminator check, not a count check.
 """
+import errno
 import importlib.machinery
 import importlib.util
 import json
@@ -17,7 +18,7 @@ import textwrap
 
 import pytest
 from conftest import (  # type: ignore
-    copy_shared_corpus, corpus_lock_path, describe_fingerprint_change,
+    CORPUS_SEED, copy_shared_corpus, corpus_lock_path, describe_fingerprint_change,
     logical_corpus_fingerprint, suspend_corpus_protection)
 
 BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
@@ -39,7 +40,7 @@ def _readonly_fixture_db(data_dir):
     """`open_fixture_db`'s read-only twin, for the SHARED corpus (#741).
 
     `bbf.open_fixture_db` opens `conversations.db` WRITE-CAPABLE and attaches
-    the cache `mode=ro`. That is right for a private copy and wrong for the
+    the cache `mode=ro`. That is right for a private corpus or copy and wrong for the
     session-scoped corpus, whose roots are now registered with the write
     detector: a write-capable connect there fails the item that opened it.
     The attachment NAME must stay `cache_db`, because that is what
@@ -203,7 +204,7 @@ def test_the_shared_corpus_is_built_once_per_run(small_corpus, corpus_root):
         try:
             with suspend_corpus_protection(small_corpus):
                 bbf.build_fixture_isolated(
-                    scale="small", seed=42, root=small_corpus.parent)
+                    scale="small", seed=CORPUS_SEED, root=small_corpus.parent)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -288,8 +289,7 @@ def test_semantic_hash_separates_codex_content(axis, mutation, tmp_path,
     test a different corpus than the one it was promised.
     """
     bbf = _load_build_bench()
-    data_dir = copy_shared_corpus(small_corpus, tmp_path / "corpus",
-                                  scope="data")
+    data_dir = copy_shared_corpus(small_corpus, tmp_path / "corpus")
 
     conn = _writable_fixture_db(data_dir)
     try:
@@ -388,7 +388,7 @@ def test_the_corpus_resolves_a_live_codex_weekly_cycle(scale, private_corpus):
     failure class as the future-dated resets: caught, logged, invisible.
     """
     bbf = _load_build_bench()
-    # A PRIVATE copy (#741): this drives a real `_tui_build_snapshot`, which
+    # A PRIVATE corpus (#741): this drives a real `_tui_build_snapshot`, which
     # opens the cache and the transcript store write-capable and may fold
     # journal records, so it must not run against the shared corpus.
     snapshot = _codex_source_state(private_corpus(scale), bbf)
@@ -425,7 +425,7 @@ def test_the_cycle_accounting_fold_is_actually_executed(scale, private_corpus,
     sliced rows for the hero; account-card totals cannot reach that seam.
     """
     bbf = _load_build_bench()
-    # A PRIVATE copy, for the same reason as the test above.
+    # A PRIVATE corpus, for the same reason as the test above.
     corpus = private_corpus(scale)  # loads the module and the corpus first
     import _cctally_dashboard_sources as sources_mod
 
@@ -469,8 +469,7 @@ def test_the_benchmark_set_is_semantic_hash_neutral(small_corpus, tmp_path):
     # last_ingested_at = '2099-01-01T00:00:00Z'` below. Run in place that hands
     # every later consumer of the session-scoped corpus a store whose ingest
     # metadata has moved to the year 2099, so it works on its own copy.
-    corpus = copy_shared_corpus(small_corpus, tmp_path / "corpus",
-                                scope="data")
+    corpus = copy_shared_corpus(small_corpus, tmp_path / "corpus")
     conn = bbf.open_fixture_db(corpus)
     try:
         before = bbf.semantic_hash(conn)
@@ -542,9 +541,84 @@ def test_the_builder_accepts_an_empty_root_and_then_its_own(tmp_path):
     bbf = _load_build_bench()
     root = tmp_path / "fresh"
     bbf.build_fixture_isolated(scale="tiny", seed=42, root=root)
-    assert (root / bbf._ROOT_SENTINEL).exists(), "no sentinel after a build"
-    # Second call on a root that is now ours: reuse, no refusal.
+    sentinel = root / bbf._ROOT_SENTINEL
+    assert sentinel.exists(), "no sentinel after a build"
+    before = sentinel.stat()
+    # Second call on a root that is now ours: reuse, no refusal. A reuse runs
+    # while other workers fingerprint the root, so it must leave the sentinel
+    # untouched: an in-place rewrite truncates first, and a fingerprint taken
+    # mid-write reads it empty (#1088).
     bbf.build_fixture_isolated(scale="tiny", seed=42, root=root)
+    after = sentinel.stat()
+    assert (after.st_ino, after.st_mtime_ns, after.st_size) == (
+        before.st_ino, before.st_mtime_ns, before.st_size), "a reuse rewrote the sentinel"
+
+
+
+@pytest.mark.parametrize("shape", ["symlinked-root", "dot-root"])
+def test_the_sentinel_is_staged_beside_the_physical_root(shape, tmp_path, monkeypatch):
+    """The sentinel's rename must stay on the root's filesystem and outside the
+    tree every fingerprint reads. The lexical parent of a symlinked root can sit
+    on another filesystem, where the rename fails (EXDEV), and the lexical
+    parent of `.` is the root itself (#1088)."""
+    bbf = _load_build_bench()
+    real = tmp_path / "physical" / "root"
+    real.mkdir(parents=True)
+    if shape == "symlinked-root":
+        (tmp_path / "links").mkdir()
+        root = tmp_path / "links" / "root"
+        root.symlink_to(real, target_is_directory=True)
+    else:
+        monkeypatch.chdir(real)
+        root = pathlib.Path(".")
+    staged = []
+    mkstemp = bbf.tempfile.mkstemp
+
+    def recording_mkstemp(*args, **kwargs):
+        staged.append(pathlib.Path(kwargs["dir"]).resolve())
+        return mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(bbf.tempfile, "mkstemp", recording_mkstemp)
+    bbf._write_root_sentinel(root)
+    assert (real / bbf._ROOT_SENTINEL).read_bytes() == bbf._ROOT_SENTINEL_BYTES
+    assert staged == [real.resolve().parent], staged
+    assert [p.name for p in real.iterdir()] == [bbf._ROOT_SENTINEL]
+
+
+
+@pytest.mark.parametrize("boundary", ["mount-point", "bind-mount"])
+def test_a_root_across_a_mount_boundary_is_refused_without_writing_into_it(
+        boundary, tmp_path, monkeypatch):
+    """A root with no parent on its own mount cannot have its sentinel renamed
+    in from outside, so it is refused, and nothing is left inside it or beside
+    it (#1088). A mount point is caught before anything is allocated; a Linux
+    bind mount from the same filesystem passes `ismount` and is caught when the
+    rename reports EXDEV."""
+    bbf = _load_build_bench()
+    # The real top of the filesystem, through the helper that writes nothing.
+    with pytest.raises(ValueError):
+        bbf._sentinel_staging_dir(pathlib.Path("/"))
+    parent = tmp_path / "parent"
+    root = parent / "root"
+    root.mkdir(parents=True)
+    if boundary == "mount-point":
+        ismount = os.path.ismount
+        monkeypatch.setattr(bbf.os.path, "ismount",
+                            lambda p: pathlib.Path(p) == root.resolve() or ismount(p))
+
+        def unreachable(*args, **kwargs):
+            raise AssertionError("a temporary file was allocated for a refused root")
+
+        monkeypatch.setattr(bbf.tempfile, "mkstemp", unreachable)
+    else:
+        def cross_device(src, dst):
+            raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
+
+        monkeypatch.setattr(bbf.os, "replace", cross_device)
+    with pytest.raises(ValueError):
+        bbf._write_root_sentinel(root)
+    assert list(root.iterdir()) == [], "the refused root was written into"
+    assert [p.name for p in parent.iterdir()] == ["root"], "a temporary file was left beside it"
 
 
 def test_the_build_lock_sits_outside_every_path_the_clear_removes(tmp_path):
@@ -631,8 +705,7 @@ def test_a_mutating_consumer_writes_only_to_its_own_copy(small_corpus, tmp_path)
     import sqlite3 as _sq
 
     shared_db = pathlib.Path(small_corpus) / "cache.db"
-    private = copy_shared_corpus(small_corpus, tmp_path / "corpus",
-                                 scope="data")
+    private = copy_shared_corpus(small_corpus, tmp_path / "corpus")
     conn = _sq.connect(private / "cache.db")
     try:
         changed = conn.execute(
@@ -795,8 +868,7 @@ def test_the_corpus_fingerprint_hashes_content_semantic_hash_ignores(
         if relative.endswith(("-wal", "-shm", "-journal"))
     ], "a transient SQLite sidecar is part of the fingerprint"
 
-    private = copy_shared_corpus(small_corpus, tmp_path / "corpus",
-                                 scope="data")
+    private = copy_shared_corpus(small_corpus, tmp_path / "corpus")
     before = logical_corpus_fingerprint(private)
     conn = bbf.open_fixture_db(private)
     try:

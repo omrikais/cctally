@@ -15,6 +15,7 @@ deterministic tie-breaker.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import sqlite3
 import sys
@@ -157,6 +158,52 @@ def opened_conns():
         conn.close()
 
 
+def _serve_stats_reads(monkeypatch: pytest.MonkeyPatch, open_fixture) -> None:
+    """Serve the fixture store at the stats read seam.
+
+    #787 / #861 AD21: these reads left `open_db` for query sessions, which
+    open the data directory's own stats.db (a seeded fixture there would be
+    rebuilt from the empty journal by the startup phase). So the fixture is
+    injected where the commands now read: the stats statement reader and the
+    `--account` resolution's and JSON decoration's command sessions. Every
+    other store still reads through the real seam."""
+    import types
+
+    import _cctally_store_access as access
+
+    real_reader = access.statement_reader
+    real_session = access.open_command_session
+    real_command = access.command_session
+
+    def statement_reader(primary, *args, **kwargs):
+        if primary == "stats":
+            return open_fixture()
+        return real_reader(primary, *args, **kwargs)
+
+    def open_command_session(primary, **kwargs):
+        if primary == "stats":
+            conn = open_fixture()
+            # (session, phase): the caller closes the phase.
+            return types.SimpleNamespace(conn=conn), conn
+        return real_session(primary, **kwargs)
+
+    @contextlib.contextmanager
+    def command_session(primary, **kwargs):
+        if primary != "stats":
+            with real_command(primary, **kwargs) as session:
+                yield session
+            return
+        conn = open_fixture()
+        try:
+            yield types.SimpleNamespace(conn=conn)
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(access, "statement_reader", statement_reader)
+    monkeypatch.setattr(access, "open_command_session", open_command_session)
+    monkeypatch.setattr(access, "command_session", command_session)
+
+
 def test_percent_breakdown_resolves_the_latest_segment_for_the_account(
     stats_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, opened_conns,
 ) -> None:
@@ -185,6 +232,7 @@ def test_percent_breakdown_resolves_the_latest_segment_for_the_account(
 
     monkeypatch.setattr(pb, "open_db", opened_conns(stats_path))
     monkeypatch.setattr(_cctally_core, "open_db", opened_conns(stats_path))
+    _serve_stats_reads(monkeypatch, opened_conns(stats_path))
     monkeypatch.setitem(ns, "load_config", lambda *a, **k: {})
 
     def _breakdown(account):
@@ -259,6 +307,7 @@ def test_diff_anchor_override_takes_the_latest_cut_not_an_arbitrary_row(
     import _lib_diff_kernel as dk
 
     monkeypatch.setattr(dk, "open_db", opened_conns(stats_path))
+    _serve_stats_reads(monkeypatch, opened_conns(stats_path))
     now_utc = dt.datetime(2026, 6, 11, 0, 0, 0, tzinfo=dt.timezone.utc)
 
     # Merged: the anchor snapshot is acct-a's, so the override is acct-a's
@@ -358,9 +407,12 @@ def test_cmd_report_threads_the_resolved_account_into_the_applier(
 
     def _spy(conn, refs, **kwargs):
         seen["account_key"] = kwargs.get("account_key", "MISSING")
+        seen["db"] = conn.execute("PRAGMA database_list").fetchall()[0][2]
         raise _AnchorReached
 
-    monkeypatch.setattr(fc, "open_db", lambda *a, **k: _row_conn(stats_path))
+    # #787 / #861 AD21: `cmd_report` reads stats through query sessions, so
+    # the fixture is served at that seam (`fc.open_db` is no longer reached).
+    _serve_stats_reads(monkeypatch, lambda: _row_conn(stats_path))
     monkeypatch.setitem(ns, "load_config", lambda *a, **k: {})
     monkeypatch.setitem(
         ns, "resolve_account_filter", lambda *a, **k: ("acct-b", None))
@@ -371,6 +423,8 @@ def test_cmd_report_threads_the_resolved_account_into_the_applier(
         ns["cmd_report"](args)
 
     assert seen["account_key"] == "acct-b"
+    assert Path(seen["db"]).resolve() == stats_path.resolve(), (
+        "the applier read another store", seen["db"])
 
 
 # --- the WRITER half of the same resolution (#750 S3, Unit B review) --------

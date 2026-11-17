@@ -86,6 +86,14 @@ Q16, `dc13` L1/L3), by WRITE_ATTRIBUTION_INPUTS:
   frontier or a first discovery after it (`frontier_problems`, with its
   consumption check off: D6's judgement decides consumption). A cursor reset,
   replay, prune or live discontinuity is INVALID.
+- image:MANIFEST (#937, write-budget preparation v2, P2) - the fixture is a
+  disk image attached at its canonical root with its sealed identity, so
+  instead of a freeze qualification the sibling identity-equality receipt
+  (IDENTITY_RECEIPT) must pass and name the manifest's digest. Membership
+  is exact (`image_membership_problems`): every cursor row, before and after
+  the drain, names a manifest file, and every manifest file has its row in
+  each family that tracks it. Then `relocation_problems` and
+  `frozen_verification_problems` apply unchanged, with no device exemption.
 The frozen checks compare every round's work against the copy's pre-drain
 state (relocation) and the stable pair's second round against its first
 (verification).
@@ -146,6 +154,11 @@ def load_tree(tree: pathlib.Path):
     module = importlib.util.module_from_spec(spec)
     sys.modules["cctally"] = module
     loader.exec_module(module)
+    # #787 / #861 spec 5.1: this tool's thread is a process owner
+    # (a tree that predates final enforcement has no helper).
+    _core = sys.modules.get("_cctally_core")
+    if _core is not None and hasattr(_core, "establish_script_owner"):
+        _core.establish_script_owner()
     return module
 
 
@@ -711,6 +724,172 @@ def frozen_verification_problems(after_catchup: dict,
     return problems
 
 
+# ── #937: image admission (write-budget preparation v2, P2) ───────────────
+
+#: The manifest schema the image mode synthesizes (frozen_roots' entry shape).
+IMAGE_MANIFEST_SCHEMA = "cctally-image-manifest/1"
+#: Sibling of the manifest: P2's identity-equality receipt.
+IDENTITY_RECEIPT = "identity-receipt.json"
+#: The cursor families that track a manifest file, by provider.
+IMAGE_TRACKING = {
+    "claude": ("session_files", "conversation_source_files"),
+    "codex": ("codex_session_files", "codex_conversation_source_files"),
+}
+_FIRST_PROBLEMS = 20
+
+
+def image_manifest(inventory: dict, roots: dict) -> dict:
+    """A manifest in `frozen_roots`' schema for an image: `roots` is
+    {"canonical": C, "claude": [walked roots], "codex": [walked roots]} and
+    `inventory` {relpath under C: [st_ino, size, mtime_ns]}. Every JSONL file
+    under a walked root becomes a file entry with its inode and admitted
+    length = its size. Pure."""
+    canonical = str(roots["canonical"]).rstrip("/")
+    root_list = []
+    for provider in ("claude", "codex"):
+        for logical in sorted(str(r).rstrip("/") for r in roots.get(provider) or []):
+            root_list.append({"index": len(root_list), "kind": "dir",
+                              "logical": logical, "provider": provider,
+                              "walk": "**/*.jsonl"})
+    entries = []
+    for rel in sorted(inventory):
+        path = f"{canonical}/{rel}"
+        if not path.endswith(".jsonl"):
+            continue
+        root = next((r for r in root_list if _under_any(path, [r["logical"]])),
+                    None)
+        if root is None:
+            continue
+        ino, size, mtime = (int(v) for v in list(inventory[rel])[:3])
+        entries.append({"logical": path, "kind": "file",
+                        "class": root["provider"], "root": root["index"],
+                        "ino": ino, "admittedLength": size, "sourceSize": size,
+                        "mtimeNs": mtime})
+    return {"schema": IMAGE_MANIFEST_SCHEMA, "canonicalRoot": canonical,
+            "roots": root_list, "entries": entries, "absences": []}
+
+
+def image_admission_inputs(manifest_path) -> dict:
+    """The image mode's inputs: the manifest (its raw bytes' SHA-256) and the
+    sibling identity-equality receipt, which must be present, passing and
+    bound to exactly this manifest's digest. Missing evidence is a problem
+    (INVALID), never a skipped check."""
+    path = pathlib.Path(manifest_path)
+    out = {"manifestPath": str(path), "manifest": None, "manifestSha256": None,
+           "receipt": None, "problems": []}
+    try:
+        raw = path.read_bytes()
+        out["manifestSha256"] = hashlib.sha256(raw).hexdigest()
+        manifest = json.loads(raw)
+        if not isinstance(manifest, dict) or \
+                manifest.get("schema") != IMAGE_MANIFEST_SCHEMA:
+            raise ValueError(f"not a {IMAGE_MANIFEST_SCHEMA} manifest")
+        out["manifest"] = manifest
+    except (OSError, ValueError) as exc:
+        out["problems"].append(f"image manifest {path} unusable: "
+                               f"{type(exc).__name__}: {exc}")
+    receipt_path = path.parent / IDENTITY_RECEIPT
+    try:
+        receipt = json.loads(receipt_path.read_text())
+        if not isinstance(receipt, dict):
+            raise ValueError("not a JSON object")
+        out["receipt"] = receipt
+    except FileNotFoundError:
+        out["problems"].append(f"the identity-equality receipt {receipt_path} "
+                               "is missing")
+        return out
+    except (OSError, ValueError) as exc:
+        out["problems"].append(f"the identity-equality receipt {receipt_path} "
+                               f"is unreadable: {type(exc).__name__}: {exc}")
+        return out
+    if receipt.get("passed") is not True or receipt.get("problems"):
+        out["problems"].append(
+            "the identity-equality receipt does not pass: "
+            + "; ".join(str(p) for p in (receipt.get("problems") or [])[:3]))
+    if out["manifestSha256"] is not None and \
+            receipt.get("manifestSha256") != out["manifestSha256"]:
+        out["problems"].append(
+            f"the manifest's digest {out['manifestSha256']} differs from the "
+            f"identity-equality receipt's {receipt.get('manifestSha256')}")
+    return out
+
+
+def image_membership_problems(manifest: dict, before: dict,
+                              after: dict) -> "list[str]":
+    """Exact two-way membership (spec §5.5 step 4): every cursor row, before
+    and after the drain, names a manifest file, and every manifest file has
+    its row in each family that tracks it. `relocation_problems` ignores
+    unlisted rows, so this is what keeps them from escaping. Pure."""
+    files = {e["logical"]: e.get("class")
+             for e in (manifest or {}).get("entries") or []
+             if e.get("kind") == "file"}
+    problems = []
+    for label, state in (("before", before), ("after", after)):
+        rows = (state or {}).get("rows", {})
+        outside = sorted(row["path"] for row in rows.values()
+                         if row["path"] not in files)
+        lacking = sorted(f"{table}: {path}" for path, provider in files.items()
+                         for table in IMAGE_TRACKING.get(provider, ())
+                         if f"{table}\t{path}" not in rows)
+        for path in outside[:_FIRST_PROBLEMS]:
+            problems.append(f"{path} has a cursor row {label} the drain but is "
+                            "not a manifest file")
+        for item in lacking[:_FIRST_PROBLEMS]:
+            problems.append(f"{item} is a manifest file without its cursor row "
+                            f"{label} the drain")
+        for count, what in ((len(outside), "unlisted cursor rows"),
+                            (len(lacking), "missing cursor rows")):
+            if count > _FIRST_PROBLEMS:
+                problems.append(f"... {count - _FIRST_PROBLEMS} more {what} "
+                                f"{label} the drain")
+    return problems
+
+
+def image_mode_judgement(inputs: dict, before: dict, final: dict,
+                         after_catchup: dict, after_verify: dict, *,
+                         rounds: "list | None" = None
+                         ) -> "tuple[dict, list[str]]":
+    """The image mode's verdict after the drain: the inputs' problems, exact
+    membership, then the frozen mode's own checks unchanged -
+    `relocation_problems` (EVERY round's state against the pre-drain state,
+    per row suffixes; spec §5.5 step 4, #937 F9) and
+    `frozen_verification_problems` (the stable pair). `rounds` is every
+    round's retained state in order, `final` the last (the default when
+    `rounds` is None). A relocation seen in an intermediate round and gone
+    by the last is reported with its round. No device exemption: P2
+    presents the sealed device. Pure."""
+    manifest = inputs.get("manifest") or {"entries": [], "roots": []}
+    expected = expected_consumption(manifest, before)
+    suffixes = row_suffixes(manifest, before)
+    membership = (image_membership_problems(manifest, before, final)
+                  if inputs.get("manifest") is not None else [])
+    relocation = relocation_problems(before, final, suffixes)
+    seen = set(relocation)
+    states = list(rounds) if rounds else [final]
+    for index, state in enumerate(states[:-1]):
+        for problem in relocation_problems(before, state, suffixes):
+            if problem not in seen:
+                seen.add(problem)
+                relocation.append(f"round {index}: {problem}")
+    verification = frozen_verification_problems(after_catchup, after_verify)
+    identity = list(inputs.get("problems") or [])
+    receipt = {
+        "mode": "image",
+        "freeze": {"manifest": inputs.get("manifestPath"),
+                   "manifestSha256": inputs.get("manifestSha256")},
+        "qualified": (inputs.get("receipt") or {}).get("passed") is True
+        and not identity,
+        "expectedFiles": sum(1 for v in expected.values() if v),
+        "expectedSuffixBytes": sum(expected.values()),
+        "expectedRows": sum(1 for v in suffixes.values() if v),
+        "expectedRowSuffixBytes": sum(suffixes.values()),
+        "identityProblems": identity,
+        "relocationProblems": relocation,
+        "membershipProblems": membership,
+        "verification": {"checked": True, "problems": verification}}
+    return receipt, identity + membership + relocation + verification
+
+
 def _tail_is_torn(path: str, size: int) -> bool:
     if size <= 0:
         return False
@@ -1213,12 +1392,15 @@ def _read_prep(path) -> "tuple[dict | None, str | None]":
 # ── admission ─────────────────────────────────────────────────────────────
 
 def _input_mode() -> "tuple[str | None, str | None]":
-    """(mode, freeze): ("frozen", FREEZE), ("live", None), or (None, None)
-    when no input mode is set (the pre-revision-15 behaviour, kept for the
+    """(mode, input): ("frozen", FREEZE), ("image", MANIFEST) (#937, the
+    relocated fixture's P2 admission), ("live", None), or (None, None) when
+    no input mode is set (the pre-revision-15 behaviour, kept for the
     hermetic tests; every runner sets one)."""
     raw = os.environ.get("WRITE_ATTRIBUTION_INPUTS", "")
     if raw.startswith("frozen:"):
         return "frozen", raw[len("frozen:"):]
+    if raw.startswith("image:"):
+        return "image", raw[len("image:"):]
     return ("live", None) if raw == "live" else (None, None)
 
 
@@ -1296,6 +1478,11 @@ def run(tree: pathlib.Path, deadline_s: float, *, source=None,
                   "expected": expected_consumption(manifest, before_state),
                   "suffixes": row_suffixes(manifest, before_state),
                   "qualification": qualification}
+    # #937: the image mode's inputs and pre-drain state, before the drain.
+    image = None
+    if mode == "image":
+        image = {"inputs": image_admission_inputs(freeze),
+                 "before": retained_state(data_dir)}
     capture = Capture(cache, data_dir)
     workers = WorkerRequests(update)
     receipt = {"tree": str(tree), "gitRev": rev,
@@ -1304,6 +1491,9 @@ def run(tree: pathlib.Path, deadline_s: float, *, source=None,
                "watermarks": {p: {"files": len(f), "bytes": sum(f.values())}
                               for p, f in marks.items()},
                "deadlineS": deadline_s, "identity": identity,
+               # Which D6 leaves are the tree's own and which the harness's
+               # stand-ins for a tree that predates them (frontier.tree_leaf).
+               "leafProvenance": libs.provenance,
                "preparation": {"source": source_root,
                                "path": None if prep_path is None
                                else str(prep_path),
@@ -1379,6 +1569,10 @@ def run(tree: pathlib.Path, deadline_s: float, *, source=None,
             "relocationProblems": relocation,
             # HR-12: the stable pair's second round against its first
             "verification": {"checked": True, "problems": verification}}
+    elif mode == "image":
+        frontier_receipt, mode_problems = image_mode_judgement(
+            image["inputs"], image["before"], states[-1], after_catchup,
+            after_verify, rounds=states)
     elif mode == "live":
         now = current_files(sorted(set(live_frontier["files"]) | {
             row["path"] for row in after_verify["rows"].values()}))

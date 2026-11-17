@@ -10,6 +10,7 @@ handler-boot pattern in ``tests/test_dashboard_api_block.py`` — ``load_script`
 The gate (anti-DNS-rebinding) is exercised by sending an explicit ``Host``
 header via ``HTTPConnection`` with ``skip_host=True``.
 """
+import contextlib
 import datetime as dt
 import base64
 import json
@@ -201,6 +202,9 @@ def _boot(
     _seed_cache(ns)
 
     HandlerCls = ns["DashboardHTTPHandler"]
+    # #787 / #861 spec 5.8: a reader never creates or bridges the transcript
+    # store; dashboard startup does, before bind, as `cmd_dashboard` does.
+    sys.modules["_cctally_dashboard"]._dashboard_startup_schema_migration()
     SnapshotRef = ns["_SnapshotRef"]
     SSEHub = ns["SSEHub"]
 
@@ -1034,19 +1038,18 @@ def test_conversation_store_open_failure_is_private_and_truthful(
     srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
     try:
         port = srv.server_address[1]
-        import _cctally_dashboard as _dash
+        conv = sys.modules["_cctally_dashboard_conversation"]
 
-        def _boom():
+        def _boom(account=None):
             raise OSError(
                 "unable to open /private/secret/conversations.db; "
                 "SQL: SELECT content FROM conversation_messages"
             )
 
-        # Patch the binding the handler resolves at request time
-        # (LOAD_GLOBAL in _cctally_dashboard's namespace). Seeding already
-        # happened in _boot, so this only affects
-        # the live request path.
-        monkeypatch.setattr(_dash, "open_conversations_db", _boom)
+        # #787 / #861: every conversation read opens its query session
+        # through this one seam, resolved at request time. Seeding already
+        # happened in _boot, so this only affects the live request path.
+        monkeypatch.setattr(conv, "_open_conversation_session", _boom)
         routes = (
             "/api/conversations",
             "/api/conversations?source=claude",
@@ -2501,12 +2504,23 @@ def test_the_live_tail_accounting_helper_targets_only_the_changed_paths(
             closed.append(True)
 
     conn = _Conn()
-    monkeypatch.setattr(mod, "open_cache_db", lambda: conn)
+
+    @contextlib.contextmanager
+    def _writer(store):
+        seen["store"] = store
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(mod, "_request_writer", _writer)
     seen = {}
 
-    def _sync(active, *, only_paths):
+    def _sync(active, only_paths):
         seen["conn"] = active
         seen["paths"] = only_paths
+        return sys.modules["_cctally_cache"].RequestIngestResult(
+            ingested=True, pending=frozenset())
 
     class _Handler:
         def log_error(self, *_args):
@@ -2515,6 +2529,7 @@ def test_the_live_tail_accounting_helper_targets_only_the_changed_paths(
     mod._advance_live_tail_accounting(
         _Handler(), ["/a.jsonl", "/b.jsonl"], _sync, "codex")
 
+    assert seen["store"] == "cache"
     assert seen["conn"] is conn
     assert seen["paths"] == {"/a.jsonl", "/b.jsonl"}
     assert closed == [True], "the accounting connection was left open"
@@ -2539,15 +2554,20 @@ def test_a_failed_live_tail_accounting_sync_never_breaks_the_stream(
         def close(self):
             closed.append(True)
 
-    def _open():
+    @contextlib.contextmanager
+    def _writer(_store):
         if failing == "open":
             raise RuntimeError("accounting store unavailable")
-        return _Conn()
+        conn = _Conn()
+        try:
+            yield conn
+        finally:
+            conn.close()
 
-    def _sync(_active, *, only_paths):
+    def _sync(_active, _only_paths):
         raise RuntimeError("forced ingest failure")
 
-    monkeypatch.setattr(mod, "open_cache_db", _open)
+    monkeypatch.setattr(mod, "_request_writer", _writer)
     logged = []
 
     class _Handler:
@@ -2799,14 +2819,13 @@ _DEGRADING_ROUTES = (
     "/api/conversation/s1/find?q=hello",
     "/api/conversation/s1/export",
 )
-# Live-tail keeps the FULL opener for the stream it holds for minutes, and that
-# decision stands. What did NOT stand is the preflight in front of it: the full
-# opener waits on the maintenance flock with no timeout, so a stream opened
-# during a rebuild held a server thread for the rebuild's whole duration —
-# measured at 716.9 s. §4a names the live-tail preflight among the routes that
-# must fail soft, so it now probes the flock non-blocking first and answers with
-# the same typed degraded envelope every other route already serves. The cases
-# below drive that with a REAL held flock.
+# The live-tail preflight once took the full opener, which waits on the
+# maintenance flock with no timeout, so a stream opened during a rebuild held a
+# server thread for the rebuild's whole duration — measured at 716.9 s. §4a
+# names the live-tail preflight among the routes that must fail soft; it reads
+# through a query session (#787 / #861 spec 5.9) and answers with the same
+# typed degraded envelope every other route serves. The cases below drive that
+# with a REAL held flock.
 
 
 @pytest.mark.parametrize("reason,factory", [
@@ -2824,10 +2843,12 @@ def test_no_read_route_returns_a_5xx_when_the_reader_cannot_be_admitted(
     dash = sys.modules["_cctally_dashboard"]
     cls = getattr(dash, factory)
 
+    conv = sys.modules["_cctally_dashboard_conversation"]
+
     def refusing(*a, **k):
         raise cls("simulated")
 
-    monkeypatch.setattr(dash, "open_conversations_db_readonly", refusing)
+    monkeypatch.setattr(conv, "_open_conversation_session", refusing)
     try:
         for route in _DEGRADING_ROUTES:
             st, body = _get_json(srv, route)
@@ -2885,7 +2906,8 @@ def _spy_on_the_reader(monkeypatch, dash):
     Wraps the REAL opener rather than replacing it, so the condition under
     test is the one the store is in and not a class the test chose.
     """
-    real = dash.open_conversations_db_readonly
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    real = conv._open_conversation_session
     raised = []
 
     def spying(*a, **k):
@@ -2895,7 +2917,7 @@ def _spy_on_the_reader(monkeypatch, dash):
             raised.append(type(exc).__name__)
             raise
 
-    monkeypatch.setattr(dash, "open_conversations_db_readonly", spying)
+    monkeypatch.setattr(conv, "_open_conversation_session", spying)
     return raised
 
 
@@ -3039,10 +3061,11 @@ def test_a_real_held_maintenance_lock_degrades_the_live_tail_preflight(
     """The live-tail preflight is the route §4a names and the route that was
     left blocking.
 
-    `_live_tail_read_connection` takes the FULL opener, whose maintenance
-    admission is a plain `LOCK_SH` with no timeout, so a stream opened during a
-    rebuild waited for the rebuild — 716.9 s in the measured run — holding a
-    server thread the whole time. The lock here is a real `LOCK_EX` on the real
+    The live-tail read connection once took the FULL opener, whose
+    maintenance admission is a plain `LOCK_SH` with no timeout, so a stream
+    opened during a rebuild waited for the rebuild — 716.9 s in the measured
+    run — holding a server thread the whole time. It is now a query session
+    under interactive admission (#787 / #861 spec 5.9). The lock here is a real `LOCK_EX` on the real
     maintenance file, which is the state `_prepare_claude_conversation_maintenance`
     leaves a reader in.
     """
@@ -3070,241 +3093,6 @@ def test_a_real_held_maintenance_lock_degrades_the_live_tail_preflight(
     finally:
         _fcntl.flock(holder, _fcntl.LOCK_UN)
         holder.close()
-        stop(srv, srv._test_thread)
-
-
-def _open_reader_off_thread(conv, *, seconds=PRESENCE_BACKSTOP_SECONDS):
-    """Call `_open_conversation_reader` on a daemon thread and wait `seconds`.
-
-    The failure under test is an UNBOUNDED wait, so the call cannot be made on
-    the test's own thread: the full opener's maintenance admission never times
-    out, so a blocked call would never return and the lock would never be
-    released. Returns ``(finished, outcome, worker)`` — `finished` False means
-    the call was still queued behind the flock when the wait expired, which IS
-    the defect. The caller MUST release the lock and then join `worker`: a
-    blocked opener that unwinds after the test's `monkeypatch` teardown has
-    restored the real path constants writes to the maintainer's production data
-    directory, which the isolation contract refuses.
-    """
-    import threading
-
-    outcome = {}
-    done = threading.Event()
-
-    def attempt():
-        try:
-            conn = conv._open_conversation_reader("/api/conversations")
-        except BaseException as exc:  # noqa: BLE001 — the outcome under test
-            outcome["error"] = exc
-        else:
-            outcome["conn"] = conn
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-        finally:
-            done.set()
-
-    worker = threading.Thread(target=attempt, daemon=True)
-    worker.start()
-    return done.wait(seconds), outcome, worker
-
-
-def test_the_reader_first_run_fallback_refuses_a_held_maintenance_lock(
-        tmp_path, monkeypatch):
-    """`_open_conversation_reader`'s absent-store fallback hands the open to
-    the FULL opener, which then waits on the maintenance flock with no timeout.
-
-    Both halves of the condition are real here: the transcript store is gone
-    while its maintenance lock is held exclusively, which is what a rebuild
-    that has replaced the file looks like to a reader arriving mid-pass.
-    """
-    import fcntl as _fcntl
-
-    ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
-    conv = sys.modules["_cctally_dashboard_conversation"]
-    dash = sys.modules["_cctally_dashboard"]
-    core = ns["_cctally_core"]
-    conn = ns["open_conversations_db"]()
-    conn.close()
-    pathlib.Path(core.CONVERSATIONS_DB_PATH).unlink()
-    assert pathlib.Path(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH).is_file()
-    holder = open(str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH), "a+")
-    worker = None
-    try:
-        _fcntl.flock(holder, _fcntl.LOCK_EX)
-        finished, outcome, worker = _open_reader_off_thread(conv)
-        assert finished, (
-            "the first-run fallback queued behind the maintenance flock "
-            "instead of refusing")
-        assert isinstance(outcome.get("error"), dash.MaintenanceInProgress), (
-            outcome)
-        assert outcome["error"].reason == "maintenance"
-    finally:
-        _fcntl.flock(holder, _fcntl.LOCK_UN)
-        holder.close()
-        if worker is not None:
-            worker.join(30)
-
-
-def test_the_reader_legacy_bridge_fallback_refuses_a_held_maintenance_lock(
-        tmp_path, monkeypatch):
-    """The second fallback, and the one that is not a first-run case.
-
-    `conversation_legacy_bridge_pending` is True after an INTERRUPTED migration
-    028, which is durable state rather than a transient. The bridge is a
-    writer, so the reader correctly hands the open back — but handing it to the
-    blocking full opener means every request in that state waits out any
-    concurrent maintenance pass. The lock is taken here at the moment the real
-    ordering makes it reachable: after the read-only open released its own
-    shared hold and before the fallback runs.
-    """
-    import fcntl as _fcntl
-
-    ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
-    conv = sys.modules["_cctally_dashboard_conversation"]
-    dash = sys.modules["_cctally_dashboard"]
-    cache = ns["_cctally_cache"]
-    core = ns["_cctally_core"]
-    conn = ns["open_conversations_db"]()
-    conn.close()
-    holder = open(str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH), "a+")
-
-    def bridge_pending_and_maintenance_starts(_conn):
-        _fcntl.flock(holder, _fcntl.LOCK_EX)
-        return True
-
-    monkeypatch.setattr(cache, "conversation_legacy_bridge_pending",
-                        bridge_pending_and_maintenance_starts)
-    worker = None
-    try:
-        finished, outcome, worker = _open_reader_off_thread(conv)
-        assert finished, (
-            "the legacy-bridge fallback queued behind the maintenance flock "
-            "instead of refusing")
-        assert isinstance(outcome.get("error"), dash.MaintenanceInProgress), (
-            outcome)
-        assert outcome["error"].reason == "maintenance"
-    finally:
-        try:
-            _fcntl.flock(holder, _fcntl.LOCK_UN)
-        except OSError:
-            pass
-        holder.close()
-        if worker is not None:
-            worker.join(30)
-
-
-def test_live_tail_holds_the_full_opener_and_writes_on_its_own_connection():
-    """The one route that is NOT on the read-only opener, and the reason.
-
-    Moving the live-tail READ connection to `open_conversations_db_readonly`
-    made `test_codex_child_discovery_emits_tail` stop emitting a tail: the
-    stream reached `ready` and `baselined`, the child rollout was ingested
-    through the separate writer, and the long-lived read connection never
-    observed the committed growth. A live-tail stream opens ONCE and holds the
-    connection for minutes, so it contributes one open rather than one per
-    request, which is not the pressure #780 removes. What #780 does require of
-    it — that every ingest branch take its OWN write connection — is what
-    `_live_tail_write` provides, and this asserts both halves.
-    """
-    import ast
-
-    conv = sys.modules["_cctally_dashboard_conversation"]
-    tree = ast.parse(pathlib.Path(conv.__file__).read_text())
-    functions = {
-        node.name: node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-    }
-    # Follow module-level helpers rather than reading one function body. The
-    # claim is which OPENER the live-tail read connection ends up on, and #802
-    # moved that open one hop away into `_full_open_or_refuse`, which refuses
-    # when the legacy bridge is still owed. A body-only read would have called
-    # that regression a rule violation, so the walk follows the indirection and
-    # the rule keeps meaning what it meant.
-    reached, pending = set(), ["_live_tail_read_connection"]
-    called = set()
-    while pending:
-        name = pending.pop()
-        if name in reached or name not in functions:
-            continue
-        reached.add(name)
-        for node in ast.walk(functions[name]):
-            if not isinstance(node, ast.Call):
-                continue
-            if isinstance(node.func, ast.Attribute):
-                called.add(node.func.attr)
-            elif isinstance(node.func, ast.Name):
-                pending.append(node.func.id)
-    assert "open_conversations_db" in called
-    assert "open_conversations_db_readonly" not in called
-
-    ingests = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_ingest"
-    ]
-    assert len(ingests) == 3, (
-        "the live-tail route set changed; give the new route its own write "
-        f"connection and update this count: {[n.lineno for n in ingests]}"
-    )
-    for fn in ingests:
-        names = {
-            node.func.id for node in ast.walk(fn)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        }
-        assert "_live_tail_write" in names, (
-            f"the _ingest at line {fn.lineno} writes on the stream's own "
-            "read connection instead of taking its own writer"
-        )
-
-
-def test_admission_is_retried_before_the_route_degrades(tmp_path, monkeypatch):
-    """Bounded by COUNT, never by wall clock: the opener's own busy timeout is
-    already route-bounded, and an unbounded retry against a rebuild that holds
-    the store for minutes would pin a request thread for the whole rebuild."""
-    ns = load_script()
-    srv = _boot(ns, tmp_path, monkeypatch)
-    dash = sys.modules["_cctally_dashboard"]
-    conv = sys.modules["_cctally_dashboard_conversation"]
-    attempts = {"n": 0}
-    real = dash.open_conversations_db_readonly
-
-    def flaky(*a, **k):
-        attempts["n"] += 1
-        if attempts["n"] < conv._CONVERSATION_READ_ATTEMPTS:
-            raise dash.MaintenanceInProgress("busy")
-        return real(*a, **k)
-
-    monkeypatch.setattr(dash, "open_conversations_db_readonly", flaky)
-    try:
-        st, body = _get_json(srv, "/api/conversations")
-        assert st == 200
-        assert body.get("status") != "degraded", body
-        assert attempts["n"] == conv._CONVERSATION_READ_ATTEMPTS
-    finally:
-        stop(srv, srv._test_thread)
-
-
-def test_the_retry_is_bounded_and_then_degrades(tmp_path, monkeypatch):
-    ns = load_script()
-    srv = _boot(ns, tmp_path, monkeypatch)
-    dash = sys.modules["_cctally_dashboard"]
-    conv = sys.modules["_cctally_dashboard_conversation"]
-    attempts = {"n": 0}
-
-    def always_busy(*a, **k):
-        attempts["n"] += 1
-        raise dash.MaintenanceInProgress("busy")
-
-    monkeypatch.setattr(dash, "open_conversations_db_readonly", always_busy)
-    try:
-        st, body = _get_json(srv, "/api/conversations")
-        assert st == 200
-        assert body["degraded_reason"] == "maintenance"
-        assert attempts["n"] == conv._CONVERSATION_READ_ATTEMPTS
-    finally:
         stop(srv, srv._test_thread)
 
 
@@ -3344,7 +3132,7 @@ def test_the_wake_up_does_not_run_the_migration_on_the_calling_thread(
     release = threading.Event()
     ran_on = {}
 
-    def blocking_migration():
+    def blocking_migration(**_kwargs):  # run_derivations (#787)
         ran_on["thread"] = threading.current_thread().ident
         started.set()
         release.wait(20)
@@ -3376,7 +3164,7 @@ def test_concurrent_wake_ups_start_exactly_one_migration(tmp_path, monkeypatch):
     runs = []
     lock = threading.Lock()
 
-    def blocking_migration():
+    def blocking_migration(**_kwargs):  # run_derivations (#787)
         with lock:
             runs.append(1)
         started.set()
@@ -3408,7 +3196,7 @@ def test_a_later_wake_up_still_dispatches_after_the_first_finishes(
     dash = sys.modules["_cctally_dashboard"]
     runs = []
 
-    def quick_migration():
+    def quick_migration(**_kwargs):  # run_derivations (#787)
         runs.append(threading.current_thread().ident)
 
     monkeypatch.setattr(
@@ -3445,7 +3233,7 @@ def test_a_second_wake_up_cannot_slip_between_the_assignment_and_the_start(
     runs_lock = threading.Lock()
     finish_migration = threading.Event()
 
-    def blocking_migration():
+    def blocking_migration(**_kwargs):  # run_derivations (#787)
         with runs_lock:
             runs.append(threading.current_thread().name)
         # The migration is still IN FLIGHT while the second caller reaches the
@@ -3581,3 +3369,511 @@ def test_the_startup_schema_owner_actually_advances_a_behind_store(
             "SELECT COUNT(*) FROM conversation_messages").fetchone() is not None
     finally:
         reader.close()
+
+
+# --- #787 / #861 spec 5.8: one transport mapping for every reader family -----
+#
+# Detects a conversation reader that answers a store state with the wrong HTTP
+# status or degraded reason, or that creates or migrates a store from a request
+# thread (an absent store used to be created by the request's fallback, D3).
+# Each row drives a real store state where one is reachable from a test; the
+# legacy bridge is reached through its predicate, which the session itself
+# reads. The routes are the six reader families of the 5.8 table.
+
+_TRANSPORT_ROWS = (
+    # state, degraded_reason (sync), degraded_reason (--no-sync), HTTP status
+    ("maintenance", "maintenance", "maintenance", 200),
+    ("busy", "maintenance", "maintenance", 200),
+    ("legacy_bridge_pending", "maintenance", "legacy_bridge_pending", 200),
+    ("schema_behind", "schema_behind", "schema_behind", 200),
+    ("schema_ahead", "schema_ahead", "schema_ahead", 200),
+    ("absent", "unavailable", "unavailable", 200),
+    ("recovery_pending", "unavailable", "unavailable", 200),
+    ("unavailable", "unavailable", "unavailable", 200),
+    ("corrupt", None, None, 500),
+)
+
+#: (route family, log label of its degraded shape, path builder)
+_TRANSPORT_ROUTES = (
+    ("browse", "/api/conversations", lambda tok: "/api/conversations"),
+    ("detail", "/api/conversation", lambda tok: "/api/conversation/s1"),
+    ("search", "/api/conversation/search",
+     lambda tok: "/api/conversation/search?q=hello"),
+    ("outline producer", "/api/conversation/outline-transfer",
+     lambda tok: f"/api/conversation/outline-transfer/{tok}?offset=0"),
+    ("bare live-tail", "/api/conversation/events",
+     lambda tok: "/api/conversation/s1/events"),
+    ("qualified live-tail", "/api/conversation/events",
+     lambda tok: "/api/conversation/v1.claude.s1/events"),
+)
+
+
+def _client_retryable(reason):
+    """The retry remedy the client offers for ``reason`` (its own table), so
+    the matrix checks the 5.8 retryable column against what a reader sees."""
+    import re
+    src = (pathlib.Path(__file__).resolve().parents[1] / "dashboard" / "web"
+           / "src" / "lib" / "conversationTransport.ts").read_text()
+    match = re.search(
+        r"\b%s: \{\s*reason: '%s',.*?retryable: (true|false)" % (reason, reason),
+        src, re.S)
+    if match is None:
+        match = re.search(
+            r"CONVERSATION_DEGRADED_FALLBACK\b[^=]*= \{.*?retryable: (true|false)",
+            src, re.S)
+    return match.group(1) == "true"
+
+
+def _induce_store_state(state, ns, monkeypatch):
+    """Put the stores into ``state``; returns a cleanup callable."""
+    import fcntl as _fcntl
+    import os as _os
+
+    core = ns["_cctally_core"]
+    cache = ns["_cctally_cache"]
+    db = sys.modules["_cctally_db"]
+    conv_path = pathlib.Path(core.CONVERSATIONS_DB_PATH)
+    monkeypatch.setattr(cache, "SCHEMA_WAKE_HOOK", None)
+    if state == "maintenance":
+        holder = open(str(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH), "a+")
+        _fcntl.flock(holder, _fcntl.LOCK_EX)
+
+        def release():
+            _fcntl.flock(holder, _fcntl.LOCK_UN)
+            holder.close()
+        return release
+    if state == "busy":
+        # A writer holding the file EXCLUSIVE: SQLite reports the store busy
+        # to every reader for as long as it holds it.
+        writer = sqlite3.connect(str(conv_path), timeout=0)
+        writer.execute("PRAGMA locking_mode=EXCLUSIVE")
+        writer.execute("BEGIN EXCLUSIVE")
+        writer.execute("CREATE TABLE IF NOT EXISTS _t787_busy(x)")
+
+        def release():
+            writer.rollback()
+            writer.close()
+        return release
+    if state == "legacy_bridge_pending":
+        monkeypatch.setattr(cache, "conversation_legacy_bridge_pending",
+                            lambda conn: True)
+        return lambda: None
+    if state in ("schema_behind", "schema_ahead"):
+        writer = sqlite3.connect(str(conv_path))
+        head = writer.execute("PRAGMA user_version").fetchone()[0]
+        writer.execute(
+            f"PRAGMA user_version={head - 1 if state == 'schema_behind' else head + 1}")
+        writer.commit()
+        writer.close()
+        return lambda: None
+    if state == "absent":
+        for suffix in ("", "-wal", "-shm"):
+            pathlib.Path(f"{conv_path}{suffix}").unlink(missing_ok=True)
+        return lambda: None
+    if state == "recovery_pending":
+        marker = db._repair_marker_path(pathlib.Path(core.CACHE_DB_PATH))
+        marker.write_text("{}")
+        return lambda: marker.unlink(missing_ok=True)
+    if state == "unavailable":
+        app_dir = pathlib.Path(core.APP_DIR)
+        mode = app_dir.stat().st_mode & 0o777
+        _os.chmod(app_dir, 0o755)
+        return lambda: _os.chmod(app_dir, mode)
+    if state == "corrupt":
+        for suffix in ("-wal", "-shm"):
+            pathlib.Path(f"{conv_path}{suffix}").unlink(missing_ok=True)
+        conv_path.write_bytes(b"this is not a sqlite database " * 256)
+        return lambda: None
+    raise AssertionError(state)
+
+
+@pytest.mark.parametrize("no_sync", [False, True], ids=["sync", "no-sync"])
+@pytest.mark.parametrize("state,sync_reason,no_sync_reason,status",
+                         _TRANSPORT_ROWS, ids=[r[0] for r in _TRANSPORT_ROWS])
+def test_degraded_transport_matrix(tmp_path, monkeypatch, state, sync_reason,
+                                   no_sync_reason, status, no_sync):
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    dash = sys.modules["_cctally_dashboard"]
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    core = ns["_cctally_core"]
+    monkeypatch.setattr(ns["DashboardHTTPHandler"], "no_sync", no_sync)
+    # Dashboard startup creates and migrates the stores before bind.
+    dash._dashboard_startup_schema_migration()
+    port = srv.server_address[1]
+    st, raw = _get(port, "/api/conversation/s1/outline?progressive=1")
+    assert st == 200, raw
+    token = json.loads(raw)["transfer"]["token"]
+    expected_reason = no_sync_reason if no_sync else sync_reason
+    cleanup = _induce_store_state(state, ns, monkeypatch)
+    try:
+        for family, label, build in _TRANSPORT_ROUTES:
+            if status == 500 and family.endswith("live-tail"):
+                # B6: an unscoped live-tail keeps main's passive keep-alive
+                # stream for an unreadable store (the test below).
+                continue
+            st, raw = _get(port, build(token))
+            assert st == status, (family, st, raw[:300])
+            body = json.loads(raw)
+            rendered = raw.decode("utf-8", "replace")
+            assert "sqlite" not in rendered.lower(), (family, rendered)
+            assert str(tmp_path) not in rendered, (family, rendered)
+            if status == 500:
+                assert set(body) == {"error"}, (family, body)
+                continue
+            assert body.get("status") == "degraded", (family, body)
+            assert body.get("degraded_reason") == expected_reason, (family, body)
+            shape = conv._CONVERSATION_DEGRADED_SHAPES.get(label, {})
+            assert set(body) == set(shape) | {"status", "degraded_reason"}, (
+                family, body)
+            assert _client_retryable(expected_reason) is (
+                expected_reason in ("maintenance", "unavailable")), (
+                family, expected_reason)
+        if state == "absent":
+            # D3: a reader never creates the store; the owner does.
+            assert not pathlib.Path(core.CONVERSATIONS_DB_PATH).exists()
+    finally:
+        cleanup()
+        stop(srv, srv._test_thread)
+
+
+def _sse_head(port, path, *, seconds=1.5):
+    """``(status line, headers, body bytes read within ``seconds``)`` of one
+    GET, over a raw socket so an open event stream does not block the read."""
+    import socket as _socket
+    s = _socket.create_connection(("127.0.0.1", port), timeout=seconds)
+    try:
+        s.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                   "Connection: close\r\n\r\n").encode())
+        buf = b""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                chunk = s.recv(4096)
+            except _socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    head, _, body = buf.partition(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    return lines[0], "\n".join(lines[1:]).lower(), body
+
+
+@pytest.mark.parametrize("no_sync", [False, True], ids=["sync", "no-sync"])
+@pytest.mark.parametrize("store", ["conversations", "cache"])
+def test_an_unreadable_store_keeps_the_live_tail_a_passive_stream(
+        tmp_path, monkeypatch, store, no_sync):
+    """B6 (#787 / #861 revision 32): with a corrupt transcript or accounting
+    store, `main` answers an unscoped conversation live-tail (bare or `v1.`)
+    with a passive keep-alive event stream, the client's backstop tick
+    still surfacing turns; a stream scoped to an account, bare or `v1.`,
+    fails closed before any byte. Detects the live-tail answering the read
+    routes' 500 envelope instead, the extra 500 the browser comparison saw,
+    a passive stream that claims to be live (`event: ready`), and a scoped
+    `v1.` stream served the unscoped passive stream."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    core = ns["_cctally_core"]
+    monkeypatch.setattr(conv, "_LIVE_TAIL_KEEPALIVE", 0.2)
+    monkeypatch.setattr(ns["DashboardHTTPHandler"], "no_sync", no_sync)
+    monkeypatch.setattr(ns["_cctally_cache"], "SCHEMA_WAKE_HOOK", None)
+    target = pathlib.Path(core.CONVERSATIONS_DB_PATH if store == "conversations"
+                          else core.CACHE_DB_PATH)
+    for suffix in ("-wal", "-shm"):
+        pathlib.Path(f"{target}{suffix}").unlink(missing_ok=True)
+    target.write_bytes(b"this is not a sqlite database " * 256)
+    port = srv.server_address[1]
+    try:
+        for path in ("/api/conversation/s1/events",
+                     "/api/conversation/v1.claude.s1/events"):
+            status, headers, body = _sse_head(port, path)
+            assert status.split()[1] == "200", (path, status, body[:200])
+            assert "content-type: text/event-stream" in headers, (path, headers)
+            assert b": keep-alive" in body, (path, body[:200])
+            assert b"event: ready" not in body, (path, body[:200])
+        # F2: a stream scoped to an account, bare or `v1.`, fails closed.
+        # Read through `_sse_head` so a wrongly served stream is a bounded
+        # failure rather than a hung read.
+        for path in ("/api/conversation/s1/events?account=acc-1",
+                     "/api/conversation/v1.claude.s1/events?account=acc-1"):
+            status, headers, body = _sse_head(port, path)
+            assert status.split()[1] == "500", (path, status, body[:200])
+            assert set(json.loads(body)) == {"error"}, (path, body[:200])
+    finally:
+        stop(srv, srv._test_thread)
+
+
+@pytest.mark.parametrize("no_sync", [False, True], ids=["sync", "no-sync"])
+def test_a_live_cache_repair_serves_what_main_served_without_cache_db(
+        tmp_path, monkeypatch, no_sync):
+    """Round 7 (#787 / #861, spec 5.11 and 5.12 N2): while another process
+    holds a live cache.db repair marker, `main` attached cache.db raw to every
+    conversation read and answered the live-tail with a passive stream after
+    its full opener refused cache.db. conversations.db is not under repair, so
+    the routes whose answer `main` read from conversations.db alone (the
+    browse list and its facets, over an authoritative rollup, unscoped) are
+    answered byte-identically to the pre-repair answer, and the live-tail is
+    a passive keep-alive stream; the reader and the outline, which price
+    turns and flag cache rebuilds from cache.db's session_entries, a list
+    over a pending rollup backfill (its costs come from session_entries) and
+    every account-scoped read keep the typed maintenance answer. Detects the
+    conversation list and live-tail diverging from `main` during a repair,
+    and any new connection to cache.db while the repair holds its marker."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    core = ns["_cctally_core"]
+    import _cctally_store_access as access
+    db = sys.modules["_cctally_db"]
+    monkeypatch.setattr(conv, "_LIVE_TAIL_KEEPALIVE", 0.2)
+    monkeypatch.setattr(ns["DashboardHTTPHandler"], "no_sync", no_sync)
+    monkeypatch.setattr(ns["_cctally_cache"], "SCHEMA_WAKE_HOOK", None)
+    conv_path = pathlib.Path(core.CONVERSATIONS_DB_PATH)
+    cache_path = pathlib.Path(core.CACHE_DB_PATH)
+    # A synced store: the browse rollup is authoritative.
+    c = sqlite3.connect(conv_path)
+    c.execute("DELETE FROM cache_meta "
+              "WHERE key='conversation_sessions_backfill_pending'")
+    c.commit()
+    c.close()
+    port = srv.server_address[1]
+    served = ("/api/conversations", "/api/conversations/facets",
+              "/api/conversations?source=claude",
+              "/api/conversations/facets?source=claude")
+    before = {path: _get(port, path) for path in served}
+    for path, (st, raw) in before.items():
+        assert st == 200 and "degraded_reason" not in json.loads(raw), (
+            path, raw[:200])
+    opened = []
+    real_uri, real_connect = access._ro_uri, access._connect_ro
+
+    def _uri(path):
+        opened.append(pathlib.Path(path).name)
+        return real_uri(path)
+
+    def _connect(store, path, *a, **k):
+        opened.append(pathlib.Path(path).name)
+        return real_connect(store, path, *a, **k)
+
+    monkeypatch.setattr(access, "_ro_uri", _uri)
+    monkeypatch.setattr(access, "_connect_ro", _connect)
+    claim, why = db._claim_repair_marker(cache_path)
+    assert claim is not None, why
+    try:
+        for path in served:
+            assert _get(port, path) == before[path], path
+        for path in ("/api/conversation/s1", "/api/conversation/s1/outline",
+                     "/api/conversation/sess-rebuild/outline",
+                     "/api/conversations?account=acc-1",
+                     "/api/conversations?source=codex"):
+            st, raw = _get(port, path)
+            assert st == 200, (path, raw[:200])
+            assert json.loads(raw)["degraded_reason"] == "maintenance", (
+                path, raw[:200])
+        for path in ("/api/conversation/s1/events",
+                     "/api/conversation/v1.claude.s1/events"):
+            status, headers, body = _sse_head(port, path)
+            assert status.split()[1] == "200", (path, status, body[:200])
+            assert "content-type: text/event-stream" in headers, (path, headers)
+            assert b": keep-alive" in body, (path, body[:200])
+            assert b"event: ready" not in body, (path, body[:200])
+        # F2: an account-scoped stream, bare or `v1.`, keeps its typed
+        # maintenance answer before any SSE byte.
+        for path in ("/api/conversation/s1/events?account=acc-1",
+                     "/api/conversation/v1.claude.s1/events?account=acc-1"):
+            status, headers, body = _sse_head(port, path)
+            assert "text/event-stream" not in headers, (path, body[:200])
+            assert status.split()[1] == "200", (path, status, body[:200])
+            assert json.loads(body)["degraded_reason"] == "maintenance", (
+                path, body[:200])
+        c = sqlite3.connect(conv_path)
+        c.execute("INSERT OR REPLACE INTO cache_meta(key, value) "
+                  "VALUES('conversation_sessions_backfill_pending', '1')")
+        c.commit()
+        c.close()
+        st, raw = _get(port, "/api/conversations")
+        assert st == 200 and json.loads(raw)["degraded_reason"] == "maintenance", (
+            raw[:200])
+        assert cache_path.name not in opened, opened
+        assert conv_path.name in opened, opened
+    finally:
+        db._release_repair_marker(cache_path, claim)
+        stop(srv, srv._test_thread)
+
+
+@pytest.mark.parametrize("path", ["/api/conversations",
+                                  "/api/conversations/facets"])
+def test_a_backfill_flag_flipping_mid_request_never_reaches_session_entries(
+        tmp_path, monkeypatch, path):
+    """F7 (#787 / #861 round 9): during a live cache repair the cache-free
+    browse unit decides "the rollup is authoritative" and then runs the
+    kernel, which reads the flag again. Both reads must see one snapshot:
+    if a writer sets `conversation_sessions_backfill_pending` between them
+    (a repair ending, its owner pass re-arming the backfill), the kernel
+    must not take the live branch on a connection without cache.db. Detects
+    the 500 `OperationalError: no such table: session_entries` that a
+    second, fresh read of the flag produced."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    lcq = sys.modules["_lib_conversation_query"]
+    core = ns["_cctally_core"]
+    db = sys.modules["_cctally_db"]
+    monkeypatch.setattr(ns["_cctally_cache"], "SCHEMA_WAKE_HOOK", None)
+    conv_path = pathlib.Path(core.CONVERSATIONS_DB_PATH)
+    cache_path = pathlib.Path(core.CACHE_DB_PATH)
+    c = sqlite3.connect(conv_path)
+    c.execute("DELETE FROM cache_meta "
+              "WHERE key='conversation_sessions_backfill_pending'")
+    c.commit()
+    c.close()
+    port = srv.server_address[1]
+    st, before = _get(port, path)
+    assert st == 200, before[:200]
+    real = lcq._rollup_authoritative
+    flipped, answers = [], []
+
+    def flip_after_first(conn):
+        answer = real(conn)
+        answers.append(answer)
+        if not flipped:
+            flipped.append(answer)
+            w = sqlite3.connect(conv_path, timeout=5)
+            w.execute("INSERT OR REPLACE INTO cache_meta(key, value) "
+                      "VALUES('conversation_sessions_backfill_pending', '1')")
+            w.commit()
+            w.close()
+        return answer
+
+    monkeypatch.setattr(lcq, "_rollup_authoritative", flip_after_first)
+    claim, why = db._claim_repair_marker(cache_path)
+    assert claim is not None, why
+    try:
+        st, raw = _get(port, path)
+    finally:
+        db._release_repair_marker(cache_path, claim)
+        stop(srv, srv._test_thread)
+    assert flipped == [True], "premise: the predicate read an authoritative rollup"
+    assert len(answers) >= 2, ("non-vacuity: the kernel read the flag after "
+                               "the predicate", answers)
+    assert st == 200, (st, raw[:300])
+    assert raw == before, raw[:300]
+
+
+# ── #787 / #861 I3b: violations never reach a publication (spec 5.2) ───────
+
+
+def _swallow_a_write(core):
+    """A reader that swallows its own refusal: the pattern the latch exists
+    for, since a broad ``except BaseException`` would otherwise hide it."""
+    try:
+        core.require_capability("WRITE", entry="swallowing_reader")
+    except BaseException:  # noqa: BLE001
+        pass
+
+
+@pytest.mark.parametrize("loop", ["sync", "obligation"])
+def test_owner_thread_survives_violation(tmp_path, monkeypatch, loop):
+    """Review Focus 3. Detects an owner loop that dies on a violation (a
+    BaseException no ``except Exception`` catches, so the dashboard's only
+    drainer would end) or that publishes the violating pass: the first pass
+    narrows, swallows a refusal and tries to publish, which refuses; the loop
+    logs it, keeps running, and the next pass publishes."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    core = ns["_cctally_core"]
+    dash = sys.modules["_cctally_dashboard"]
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    published, passes = [], []
+    stop_event = threading.Event()
+    attention = threading.Event()
+
+    def one_pass():
+        passes.append(core.current_authority().kind)
+        marker = f"pass-{len(passes)}"
+        if len(passes) == 1:
+            with core.authority_scope("query", policy="interactive"):
+                _swallow_a_write(core)
+        import dataclasses
+        ref.set(dataclasses.replace(ref.get(), last_sync_error=marker))
+        published.append(marker)
+        if len(passes) >= 2:
+            stop_event.set()
+            attention.set()
+        else:
+            attention.set()
+
+    if loop == "sync":
+        body = lambda: dash._dashboard_sync_loop(  # noqa: E731
+            stop=stop_event, interval=0.05, run_iteration=one_pass)
+    else:
+        body = lambda: dash._dashboard_obligation_loop(  # noqa: E731
+            stop=stop_event, attention=attention, interval=0.05,
+            drain=one_pass, outstanding=lambda: True)
+    thread = threading.Thread(target=dash._owner_thread_target(body),
+                              daemon=True)
+    thread.start()
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the owner loop never finished its passes"
+    assert passes[:2] == ["process", "process"], passes
+    assert published == ["pass-2"], published
+    assert ref.get().last_sync_error == "pass-2"
+
+
+def test_share_swallowed_violation_not_published(tmp_path, monkeypatch):
+    """Detects a share render that publishes output built after a refused
+    capability its reader swallowed: the route's query ceiling refuses the
+    write, the latch records it, and the response writer answers the
+    privacy-safe 500 instead of the rendered artifact."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    core = ns["_cctally_core"]
+    share = sys.modules["_cctally_dashboard_share"]
+    real_tz = share._share_resolved_display_tz
+
+    def swallowing_tz(*a, **k):
+        _swallow_a_write(core)
+        return real_tz(*a, **k)
+
+    monkeypatch.setattr(share, "_share_resolved_display_tz", swallowing_tz)
+    H = ns["DashboardHTTPHandler"]
+    H.snapshot_ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    H.hub = ns["SSEHub"]()
+    H.sync_lock = threading.Lock()
+    H.run_sync_now = staticmethod(lambda: None)
+    H.run_sync_now_locked = staticmethod(lambda: None)
+    H.no_sync = False
+    H.display_tz_pref_override = None
+    srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+    srv._test_thread = start(srv)
+    port = srv.server_address[1]
+    payload = json.dumps({
+        "panel": "weekly", "template_id": "weekly-recap",
+        "options": {"format": "svg", "theme": "light",
+                    "reveal_projects": True, "no_branding": False,
+                    "top_n": 5, "period": {"kind": "current"},
+                    "project_allowlist": None,
+                    "show_chart": True, "show_table": True},
+    }).encode()
+    try:
+        c = HTTPConnection("127.0.0.1", port,
+                           timeout=PRESENCE_BACKSTOP_SECONDS)
+        c.putrequest("POST", "/api/share/render", skip_host=True)
+        c.putheader("Host", f"127.0.0.1:{port}")
+        c.putheader("Origin", f"http://127.0.0.1:{port}")
+        c.putheader("Content-Type", "application/json")
+        c.putheader("Content-Length", str(len(payload)))
+        c.endheaders()
+        c.send(payload)
+        r = c.getresponse()
+        status, raw = r.status, r.read()
+        c.close()
+    finally:
+        stop(srv, srv._test_thread)
+    assert status == 500, raw[:200]
+    assert json.loads(raw) == {"error": "internal error"}
+    assert b"<svg" not in raw

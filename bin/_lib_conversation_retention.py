@@ -73,6 +73,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import _cctally_core
+import _lib_conversation_fts_integrity as _fts_integrity
 import _lib_reclaim_planner as _planner
 import _lib_sqlite_close
 import _lib_write_budget as _budget
@@ -537,6 +538,52 @@ def _write_reclaim_pending(conn: sqlite3.Connection, state: "dict | None") -> No
     )
 
 
+#: #1090 spec §5.1: the largest retention cutoff a committed deletion or a
+#: completed visit has applied, in `_cutoff_iso` format. Monotone: it never
+#: decreases, and an unchanged merge writes nothing.
+APPLIED_CUTOFF_KEY = "conversation_retention_applied_cutoff"
+
+
+def _merge_applied_cutoff(conn: sqlite3.Connection, cutoff_iso: str) -> bool:
+    """Max-merge ``cutoff_iso`` into `APPLIED_CUTOFF_KEY` inside the caller's
+    transaction (never commits). Writes only when the key is absent, holds no
+    usable string, or holds a value below ``cutoff_iso`` in `_sqlite_order`.
+    Returns True when it wrote."""
+    row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                       (APPLIED_CUTOFF_KEY,)).fetchone()
+    stored = None if row is None else row[0]
+    if (isinstance(stored, str) and stored
+            and _sqlite_order(cutoff_iso) <= _sqlite_order(stored)):
+        return False
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (APPLIED_CUTOFF_KEY, cutoff_iso))
+    return True
+
+
+def retention_cutoff_proof(conn: sqlite3.Connection) -> "str | None":
+    """#1090 spec §5.1, the single reader of retention's entitlement: the
+    `_sqlite_order` maximum of `APPLIED_CUTOFF_KEY` and the reclaim record's
+    ``continuation_cutoff``, ignoring absent, empty and non-string values;
+    None when neither exists. Read-only, and opens no transaction of its own
+    (the caller's read transaction, if any, is the snapshot). Never inferred
+    from the prune stamp, ``retention_days`` or today's horizon (Q1)."""
+    candidates = []
+    try:
+        row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                           (APPLIED_CUTOFF_KEY,)).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is not None:
+        candidates.append(row[0])
+    record = read_reclaim_pending(conn)
+    if record is not None:
+        candidates.append(record.get("continuation_cutoff"))
+    usable = [c for c in candidates if isinstance(c, str) and c]
+    return max(usable, key=_sqlite_order) if usable else None
+
+
 def _write_reclaim_state_in_chunk(conn: sqlite3.Connection,
                                   record: dict) -> None:
     """A reclaim chunk's state write: a same-key `UPDATE` of the existing
@@ -795,6 +842,9 @@ def open_deletion_connection(db_path) -> sqlite3.Connection:
         _apply_connection_settings(conn)
         conn.execute(f"PRAGMA cache_size = -{DELETION_CACHE_SIZE_KIB}")
         conn.execute("PRAGMA temp_store = MEMORY")
+        # #1094: the FTS write guard, after the temp_store setting (which
+        # deletes every TEMP object). Deletions fire it per row.
+        _fts_integrity.install_conversation_fts_guard(conn)
     except BaseException:
         conn.close()
         raise
@@ -829,6 +879,8 @@ def open_reclaim_connection(db_path) -> sqlite3.Connection:
             applied = (
                 int(conn.execute("PRAGMA cache_spill").fetchone()[0]),
                 int(conn.execute("PRAGMA temp_store").fetchone()[0]))
+            # #1094: the FTS write guard, after the temp_store setting.
+            _fts_integrity.install_conversation_fts_guard(conn)
         except sqlite3.Error as exc:
             # The primary's disposition 5: a pragma that fails is a typed
             # refusal (§5.4 "a failure to apply the reclaim connection's
@@ -857,6 +909,8 @@ def _open_state_connection(db_path) -> sqlite3.Connection:
                            timeout=_CONNECTION_BUSY_TIMEOUT_MS / 1000)
     _apply_connection_settings(conn)
     conn.execute("PRAGMA wal_autocheckpoint = 0")
+    # #1094: every writable retention connection carries the FTS write guard.
+    _fts_integrity.install_conversation_fts_guard(conn)
     try:
         _lib_sqlite_close.set_no_checkpoint_on_close(
             conn, True, purpose="retention state")
@@ -1196,6 +1250,10 @@ def delete_group(conn: sqlite3.Connection, group: ExpiredGroup, *,
     # temp_store may only change outside a transaction; the provider flocks
     # the visit holds keep `rows` exact until the DELETE.
     conn.execute(f"PRAGMA temp_store = {'FILE' if fallback else 'MEMORY'}")
+    # #1094 N1: the switch deleted the TEMP FTS write guard; reinstall it
+    # before the deletion so an unlisted build's delete still retracts the
+    # tokenizer verification in this operation's transaction.
+    _fts_integrity.install_conversation_fts_guard(conn)
     interval = _lib_write_io.begin_interval("maintenance")
     t0 = clock()
     op_started = _operation_start(started_at, t0, visit_clock0)
@@ -1221,6 +1279,9 @@ def delete_group(conn: sqlite3.Connection, group: ExpiredGroup, *,
             state.charge(reservation, started_at, started_utc=op_started),
             continuation_cutoff=cutoff_iso)
         _write_reclaim_pending(conn, charged.to_record())
+        # #1090 §5.1: the applied cutoff commits with this deletion or not at
+        # all, so a rolled-back deletion leaves no entitlement behind.
+        _merge_applied_cutoff(conn, cutoff_iso)
         _delete_group_rows(conn, group)
         conn.commit()
     except BaseException:
@@ -1542,12 +1603,16 @@ def _record_reclaim_failure(db_path, reason: str, now_utc: dt.datetime) -> None:
     _update_record(db_path, mutate)
 
 
-def _stamp_retention_complete(conn: sqlite3.Connection, now_utc: dt.datetime) -> None:
-    """Both providers finished: the daily stamp, and the continuation
-    cleared, in one small transaction on the deletion connection."""
+def _stamp_retention_complete(conn: sqlite3.Connection, now_utc: dt.datetime,
+                              cutoff_iso: str) -> None:
+    """Both providers finished: the daily stamp, the visit's ``cutoff_iso``
+    merged into the applied cutoff (#1090 §5.1, before the continuation is
+    cleared, so the proof never lapses), and the continuation cleared, in one
+    small transaction on the deletion connection."""
     conn.execute("BEGIN IMMEDIATE")
     try:
         _stamp_retention_prune(conn, now_utc)
+        _merge_applied_cutoff(conn, cutoff_iso)
         record = read_reclaim_pending(conn)
         if isinstance(record, dict) and record.get("continuation_cutoff") is not None:
             _write_reclaim_pending(conn, {**record, "continuation_cutoff": None})
@@ -1588,7 +1653,7 @@ def _run_deletion_visit(db_path, *, now, retention_days, state, record_phase,
                 complete = False
                 break
         if complete:
-            _stamp_retention_complete(conn, now)
+            _stamp_retention_complete(conn, now, cutoff_iso)
     finally:
         conn.close()
     return PruneStats(**counts, complete=complete)

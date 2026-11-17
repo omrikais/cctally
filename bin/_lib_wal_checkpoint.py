@@ -100,6 +100,7 @@ disabled" run). Stdlib-only leaf.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import fcntl
 import os
 import pathlib
@@ -720,12 +721,36 @@ def _start_timer_locked() -> None:
     _TIMER.start()
 
 
+def _timer_authority():
+    """The `process` authority the timer thread establishes at its start
+    (#787 / #861 spec 5.9, W9 keeper row; 5.1: a new thread establishes its
+    own). Its rounds are this process's W9 duties whichever connection armed
+    the store, including a request writer's. ``_cctally_core`` is imported
+    lazily, as this module is imported lazily from it; a process without it
+    has no authority to establish."""
+    try:
+        import _cctally_core
+    except Exception:  # noqa: BLE001 — a bare policy user (a test child)
+        return contextlib.nullcontext(), ()
+    return (_cctally_core.establish_authority("process"),
+            (_cctally_core.QueryAuthorityViolation,))
+
+
 def _timer_main(stop: threading.Event) -> None:
-    while not stop.wait(max(0.001, float(TIMER_INTERVAL_SECONDS))):
-        try:
-            _timer_round(stop)
-        except Exception:  # noqa: BLE001 — the thread must outlive any error
-            pass
+    scope, violations = _timer_authority()
+    with scope:
+        while not stop.wait(max(0.001, float(TIMER_INTERVAL_SECONDS))):
+            try:
+                _timer_round(stop)
+            except Exception:  # noqa: BLE001 — the thread must outlive any error
+                pass
+            except violations:
+                # A BaseException. A new thread has no latch and this one
+                # opens no operation boundary of its own, so nothing here
+                # records it; the capability observers saw it when it was
+                # raised. The thread survives it and the next round runs
+                # (spec 5.9).
+                pass
 
 
 def _timer_round(stop: "threading.Event | None" = None) -> None:

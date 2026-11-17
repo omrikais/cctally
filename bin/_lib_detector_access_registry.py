@@ -132,6 +132,14 @@ CODEX = (
     'decision.'
 )
 
+CODEX_WITNESS = (
+    'Codex quota publication witness (#1069): read only to compare equal '
+    'against the same read inside the ingest lock, which decides whether a '
+    'Codex projection pass re-prepares; the value is never stored, returned '
+    'or used by any Claude automatic credit, moved-end transition or '
+    'drop-consensus decision.'
+)
+
 DEBOUNCE = (
     'Debounce singleton: one row per account whose stored date key and end '
     'are compared in Python with the incoming reading; a prefix state '
@@ -202,6 +210,15 @@ LINEAGE = (
     'Correction-to-fit lineage projection (#1015): written for the '
     'calibration lineage readers (forecast, project, doctor, status line); '
     'no automatic credit, moved-end or drop-consensus decision reads it.'
+)
+
+CONVERSATION_FTS = (
+    'Conversation search-index integrity (#1094): conversations.db '
+    '`cache_meta` build and invalidation state rows, its FTS5 indexes and '
+    'shadow tables, its `sqlite_temp_master` TEMP guard triggers, `dbstat` '
+    'and content-table byte counts, or a private `:memory:` tokenizer probe; '
+    'never stats.db, and no automatic credit, moved-end transition or '
+    'drop-consensus decision reads any of it.'
 )
 
 REGISTRY: "tuple[AccessContract, ...]" = (
@@ -1307,10 +1324,20 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # table selection, predicate, ordering, selected column, execution
     # condition or effect of this site changed, so the contract and its MAINT
     # inert rule stand.
+    # Reviewed re-pin (#787 / #861 Task 2, base d77d88bfa), for open_db #1.
+    # Changed: only the producer `open_db` itself, which now checks its
+    # capability per branch (spec 5.1): `full_open_branch_capability`
+    # classifies the branch effect-free before `ensure_dirs()` or any connect,
+    # and `require_capability` (STARTUP, WRITE, MAINTENANCE, LAUNCH) raises
+    # `QueryAuthorityViolation` under a query authority and returns otherwise.
+    # Neither issues a statement against stats.db. No SQL, table selection,
+    # predicate, ordering, selected column, parameter, execution condition for
+    # an owner caller or effect of this site changed, so the contract and its
+    # MAINT inert rule stand.
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#1',
-        sql_shape='sha256:89c6c21da1b99cc6',
+        sql_shape='sha256:f4eff39cb8707c8d',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1367,10 +1394,20 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # table selection, predicate, ordering, selected column, execution
     # condition or effect of this site changed, so the contract and its MAINT
     # inert rule stand.
+    # Reviewed re-pin (#787 / #861 Task 2, base d77d88bfa), for open_db #2.
+    # Changed: only the producer `open_db` itself, which now checks its
+    # capability per branch (spec 5.1): `full_open_branch_capability`
+    # classifies the branch effect-free before `ensure_dirs()` or any connect,
+    # and `require_capability` (STARTUP, WRITE, MAINTENANCE, LAUNCH) raises
+    # `QueryAuthorityViolation` under a query authority and returns otherwise.
+    # Neither issues a statement against stats.db. No SQL, table selection,
+    # predicate, ordering, selected column, parameter, execution condition for
+    # an owner caller or effect of this site changed, so the contract and its
+    # MAINT inert rule stand.
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#2',
-        sql_shape='sha256:da7e324fa4e6c968',
+        sql_shape='sha256:a1e04208590b6816',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1427,10 +1464,20 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # table selection, predicate, ordering, selected column, execution
     # condition or effect of this site changed, so the contract and its MAINT
     # inert rule stand.
+    # Reviewed re-pin (#787 / #861 Task 2, base d77d88bfa), for open_db #3.
+    # Changed: only the producer `open_db` itself, which now checks its
+    # capability per branch (spec 5.1): `full_open_branch_capability`
+    # classifies the branch effect-free before `ensure_dirs()` or any connect,
+    # and `require_capability` (STARTUP, WRITE, MAINTENANCE, LAUNCH) raises
+    # `QueryAuthorityViolation` under a query authority and returns otherwise.
+    # Neither issues a statement against stats.db. No SQL, table selection,
+    # predicate, ordering, selected column, parameter, execution condition for
+    # an owner caller or effect of this site changed, so the contract and its
+    # MAINT inert rule stand.
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#3',
-        sql_shape='sha256:c3f6f15f3c9914f7',
+        sql_shape='sha256:21d79d16a4cb14cd',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2644,10 +2691,259 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # site's `SELECT COUNT(*) FROM {tbl}` over the unchanged
     # `_REBUILD_COUNT_TABLES`, its execution condition and its read-only
     # effect are unchanged, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1068, base 4b75e59f8; the delta on the branch merged
+    # with that main), for _rebuild_stats_index_locked #1, reached through
+    # `sync_cache`. Added: `computed-by` `_cctally_cache` helpers
+    # `_ensure_incarnation_id_committed`, `_conversation_rollup_epoch`,
+    # `_rollup_certification_allowed`, `_rollup_row_seal`,
+    # `_format_input_fingerprint`, `_session_max_message_ids` and
+    # `_account_scoped_connection`, with the bindings
+    # `_CONVERSATION_FINGERPRINT_FORMAT_VERSION`,
+    # `_CONVERSATION_ROLLUP_DERIVATION_VERSION` and `_ROLLUP_SEAL_COLUMNS`.
+    # Changed: `sync_cache` (it inserts the cache incarnation id under the
+    # cache flock), `_fill_conversation_sessions_filter_columns` (it stamps a
+    # certified row's `input_fingerprint`), `open_cache_db` (a fence row
+    # sends a current store's open through the serialized branch, which
+    # clears a dead run's fence rows) and `assigned _LAST_WARNED_ORPHAN_SET`,
+    # whose assigning body is sync_cache. All of it reads or writes
+    # cache.db `cache_meta` and conversations.db `conversation_sessions`,
+    # never stats.db. This site's `SELECT COUNT(*) FROM {tbl}` over the
+    # unchanged `_REBUILD_COUNT_TABLES`, its execution condition and its
+    # read-only effect are unchanged, so the contract and its MAINT inert
+    # rule stand.
+    # Reviewed re-pin (#1072, base c43cfa068), for
+    # _rebuild_stats_index_locked #1, reached through `sync_cache`. Added:
+    # the bindings `CLAUDE_ACCOUNTING_GENERATION_KEY`, `ROLLUP_CURSOR_KEY`,
+    # `ROLLUP_PENDING_KEY` and `_ROLLUP_PENDING_MAX_IDS`, and the
+    # `computed-by` `_cctally_cache` helpers
+    # `_delete_claude_session_entries` (every `session_entries` delete, which
+    # rotates the accounting generation), `_ensure_claude_accounting_generation`
+    # and its `_committed` twin (mint the generation in cache.db `cache_meta`),
+    # `_read_rollup_meta`, `_delete_rollup_meta`, `_read_rollup_pending`,
+    # `_write_rollup_pending`, `_merge_rollup_pending` (the rollup's pending
+    # set and traversal cursor in conversations.db `cache_meta`) and
+    # `_arm_rollup_backfill_restarting_traversal`. Changed: `sync_cache` (its
+    # deletes go through the rotating helper), `_resumable_reingest_conversation_messages`
+    # (records its deleted sessions and arms the rollup backfill in its own
+    # completion commit), `_consume_promote_command_args` (records the
+    # sessions a promote rewrote) and `assigned _LAST_WARNED_ORPHAN_SET`,
+    # whose assigning body is sync_cache. All of it reads or writes cache.db
+    # `session_entries` and `cache_meta` and conversations.db `cache_meta`,
+    # never stats.db. This site's `SELECT COUNT(*) FROM {tbl}` over the
+    # unchanged `_REBUILD_COUNT_TABLES`, its execution condition and its
+    # read-only effect are unchanged, so the contract and its MAINT inert
+    # rule stand.
+    # Reviewed re-pin (#1042, base b957702e1), for
+    # _rebuild_stats_index_locked #1, reached through `sync_cache`. Added:
+    # the batch bounds `CLAUDE_ACCOUNTING_BATCH_FILES` and
+    # `CLAUDE_ACCOUNTING_BATCH_BYTES`, the per-file savepoint statements
+    # `_CLAUDE_ACCOUNTING_SAVEPOINT`, `_CLAUDE_ACCOUNTING_RELEASE` and
+    # `_CLAUDE_ACCOUNTING_ROLLBACK_TO`, and the `computed-by` `_cctally_cache`
+    # helpers `_rollback_claude_batch` (rolls back the open accounting batch)
+    # and `_session_files_identity_missing` (whether a `session_files` row
+    # needs its identity backfill). Changed: `sync_cache` (the Claude
+    # accounting walk commits once per batch, with a savepoint per file),
+    # `_ClaudeAttributionRun` (its `file_ops`, the ops the current file
+    # appended), `_attribute_claude_rows` (passes `file_ops` to
+    # `append_decisions`),
+    # `_ensure_session_files_row` (its `commit` keyword) and `assigned
+    # _LAST_WARNED_ORPHAN_SET`, whose assigning body is sync_cache. All of it
+    # is cache.db transaction control and cache.db `session_files`,
+    # `session_entries`, `claude_cost_decisions` and `cache_meta` writes,
+    # never stats.db, and the journal records the walk appends are unchanged
+    # (the same 141 items in 3 ops on the #939 copy as main). This site's
+    # `SELECT COUNT(*) FROM {tbl}` over the unchanged
+    # `_REBUILD_COUNT_TABLES`, its execution condition and its read-only
+    # effect are unchanged, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1094, base 32c087be8), for
+    # _rebuild_stats_index_locked #1, reached through `sync_cache`. Changed:
+    # only `_cctally_cache._consume_title_fts`, whose title-index backfill
+    # now sends its `'rebuild'` through
+    # `_lib_conversation_fts_integrity.conversation_fts_command` instead of
+    # executing the FTS command inline. Added, all from that new module and
+    # reached only through that call: the `computed-by` helpers
+    # `conversation_fts_command`, `write_locked`, `_rollback`,
+    # `retract_unless_listed`, `_retraction_condition`, `_check_key`,
+    # `_has_cache_meta`, `_table_exists`, `build_key` (the build key memoized
+    # per process), `fts5_module_available`, `_probe_digest`, `_probe_rows`,
+    # `_fts5_table_sql` and `_segment` (the sentinel tokenizer probe in a
+    # private `:memory:` connection), with the bindings `BUILD_ROW_PREFIX`,
+    # `_BUILD_ROW_UPPER`, `INVALIDATED_KEY`, `SENTINEL_CODE_POINTS`,
+    # `_ANY_BUILD_ROW_SQL`, `_DELETE_BUILD_ROWS_SQL`, `_UTC_NOW_SQL`,
+    # `_SEGMENTS_PER_ROW`, `_TRUNCATION_ROW`, `_BUILD_KEY_MEMO` and
+    # `_FTS5_MEMO`. Nothing was removed. All of it reads or writes
+    # conversations.db `cache_meta` build and invalidation rows and the
+    # `conversation_title_fts` index (in one write transaction with the
+    # command), or a `:memory:` probe, never stats.db. `_cctally_journal` is
+    # unchanged on the branch, so this site's `SELECT COUNT(*) FROM {tbl}`,
+    # its table selection (the unchanged `_REBUILD_COUNT_TABLES`, absent from
+    # the delta), its predicate (none), ordering (none), selected column
+    # (`COUNT(*)`), parameters (none), execution condition and read-only
+    # effect are unchanged, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#787 / #861 Task 2, base d77d88bfa), for
+    # _rebuild_stats_index_locked #1. Added: the authority kernel of
+    # `_cctally_core` (`Authority`, `authority_scope`, `operation_boundary`,
+    # `operation_deadline`, `require_capability`, `has_capability`,
+    # `current_authority`, the capability observers and violation latch, with
+    # their bindings), the query service `_cctally_store_access` (sessions,
+    # admission, the AD19 header probe, readiness reads, the composed
+    # authorizer and `QUERY_TEMP_STORE`), reached through the cache facade
+    # `_facade_session_read` / `_read_claude_session_entries` and through
+    # `open_db`'s branch classification (`full_open_branch_capability`,
+    # `_immutable_header_probe`); the AD20 access record
+    # (`_record_data_dir_access`, `data_dir_access_ok`,
+    # `data_dir_access_record_path`, `DATA_DIR_ACCESS_RECORD_NAME`,
+    # `_DATA_DIR_ACCESS_FIELDS`); the readiness twins
+    # `quota_projection_incomplete_flag` and the content-revision reader; and
+    # the Codex metadata resolution cache bindings. Changed: the capability
+    # checks in `open_db`, `open_cache_db`, `_cache_open_guarded`,
+    # `_recover_corrupt_cache`, `sync_cache`, `get_claude_session_entries`,
+    # `_reconcile_durable_applied_migration_errors` and
+    # `_ensure_stats_content_revision`; `ensure_dirs`, which now writes or
+    # removes the data directory's access record; and the producer
+    # `_rebuild_stats_index_locked` itself, which leaves the stats maintenance
+    # lock file beside a live publication (AD22: one `O_CREAT | O_APPEND`
+    # open, no statement). All of it is capability checks, `mode=ro` query
+    # sessions or file effects on the record and lock files. This site's
+    # `SELECT COUNT(*) FROM {tbl}`, its table selection (the unchanged
+    # `_REBUILD_COUNT_TABLES`, absent from the delta), its predicate (none),
+    # ordering (none), selected column (`COUNT(*)`), parameters (none),
+    # execution condition and read-only effect are unchanged, so the contract
+    # and its MAINT inert rule stand.
+    # Second delta on the same review: `_stats_journal_cleared`, the stats
+    # query precheck's bounded wait for a live writer's transient
+    # `-journal` (`journal_mode=DELETE`) to clear before a persistent one
+    # is refused. It only tests the file's existence and sleeps; no
+    # statement, so the contract and inert rule still stand.
+    # Third delta on the same review (#787 / #861 Task 2 fix tranche I2d):
+    # `ensure_dirs` now writes the access record only after a chmod that
+    # returned success; `data_dir_access_ok` reads the record through an
+    # `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` descriptor checked with `fstat`;
+    # the stats query precheck names its journal refusal through
+    # `_STATS_JOURNAL_REFUSAL`, and `_build_session` maps SQLite's read-only
+    # rollback error (`_hot_journal_refusal`, `_SQLITE_READONLY_ROLLBACK`)
+    # to that same typed refusal; the header probe's `corrupt` refusal now
+    # carries SQLite's own text ("file is not a database"). All of it is
+    # file checks, exception mapping and a message literal on `mode=ro`
+    # query sessions; no statement against stats.db changed, so the
+    # contract and its MAINT inert rule stand.
+    # Fourth delta (Task 2 fix tranche I2e): `ensure_dirs` decides the
+    # access record through `_record_data_dir_access_after_chmod`, which
+    # also mints it after a chmod that raised EPERM/ENOTSUP/EOPNOTSUPP (AD20
+    # revision 20; `_DATA_DIR_MODE_REFUSED_ERRNOS`); `diagnostic_flock`
+    # records the last OS error (`_GUARD_OS_ERROR`) and
+    # `_maintenance_busy_error` names it (AD18); `_unavailable` marks its
+    # refusals `query_refusal` / `sqlite_text` for the Q-W1 rendering. Each
+    # is a file-mode decision, an error message or an exception attribute;
+    # no statement against stats.db changed, so the contract and its MAINT
+    # inert rule stand.
+    # Fifth delta (Task 2 fix tranche I2f): the query admission `_admit`
+    # maps an `OSError` other than contention from its shared `flock` to
+    # the typed `unavailable` refusal, chained to the OS error, instead of
+    # letting it propagate. Exception mapping and a message literal on the
+    # admission lock; no statement against stats.db changed, so the
+    # contract and its MAINT inert rule stand.
+    # Sixth delta (#787 / #861 Task 3 fix tranche I3c, base eb04ac636):
+    # `~ computed-by _cctally_store_access._QueryConnection`, which gains the
+    # class attribute `query_session_snapshot = True` so a Codex
+    # conversation envelope borrows a query session's read snapshot instead
+    # of refusing it. A constant on the query connection class; no
+    # statement against stats.db changed, so the contract and its MAINT
+    # inert rule stand.
+    # Seventh delta (#787 / #861 Task 4 I4a, base 04b5c7b33):
+    # `~ computed-by _cctally_store_access._read_store`, whose stats
+    # readiness probe now admits a malformed content-revision singleton
+    # (no reusable revision, no obligation) instead of refusing the store
+    # as corrupt, the semantics the owner opener already had. An admission
+    # decision in the query-session probe; no statement against stats.db
+    # changed, so the contract and its MAINT inert rule stand.
+    # Eighth delta (#787 / #861 Task 4 I4a final enforcement):
+    # `~ binding _cctally_core.UNSPECIFIED_AUTHORITY_RAISES`, flipped to
+    # True so an owner entry reached with no established authority raises
+    # (spec 5.1 / AD5). A guard flag, not SQL; no statement against
+    # stats.db changed, so the contract and its MAINT inert rule stand.
+    # Ninth delta (#787 / #861 Task 4 I4c, spec 5.9 W9 keeper row, base
+    # d95706580): `~ computed-by _lib_wal_checkpoint._timer_main`, which
+    # now runs its rounds inside the new
+    # `+ computed-by _lib_wal_checkpoint._timer_authority` (the `process`
+    # authority through `+ computed-by _cctally_core.establish_authority`,
+    # imported lazily) and also catches `QueryAuthorityViolation` per
+    # round. The closure reaches it through the W9 keeper's
+    # `_start_timer_locked`. Thread authority, never SQL; no statement
+    # against stats.db changed, so the contract and its MAINT inert rule
+    # stand.
+    # Tenth delta (#787 / #861 I5 review fix round, base 9defccd1b):
+    # `+ computed-by _cctally_core._reset_scope_var` with
+    # `+ binding _cctally_core.CROSS_CONTEXT_RESETS` and
+    # `_CROSS_CONTEXT_RESETS_MAX`, and `~ computed-by` `_AuthorityScope`,
+    # `_OperationBoundary` and `_OperationDeadline`, whose exit now leaves a
+    # context variable unchanged (and records its name) when the scope was
+    # entered in another context, instead of setting it to None (F5);
+    # `+ binding _cctally_store_access.SCHEMA_MISMATCH_REASONS` and
+    # `~ computed-by` `_check_admissible`, `_session` and `QueryService`,
+    # whose `tolerate` argument lets a caller admit a schema-mismatched
+    # store read-only (F4, the dashboard session-title read). Context
+    # bookkeeping and a query-session admission decision; no statement
+    # against stats.db changed, so the contract and its MAINT inert rule
+    # stand.
+    # Eleventh delta (#787 / #861 I5c' AD29, base 9556fdda8): `+ binding`
+    # `_cctally_core._ADMISSION_BUDGET` and `_ADMISSION_ACTIVE`,
+    # `+ computed-by` `AdmissionBudget`, `_ActiveAdmission`,
+    # `_AdmissionScope`, `_OperationBudget`, `_owned_budget`, `_owned_here`,
+    # `_policy_admission_s`, `admission_deadline`, `admission_scope` and
+    # `operation_budget`, `- computed-by` `_OperationDeadline` and
+    # `operation_deadline` (no longer reached from `_session`), and
+    # `~ computed-by` `remaining_deadline`, `QueryService` and `_session`:
+    # a query session's deadline is now the read unit's admission budget,
+    # debited by admission time only, and each admission's effective
+    # deadline. Admission bookkeeping; no statement against stats.db
+    # changed, so the contract and its MAINT inert rule stand.
+    # Twelfth delta (#787 / #861 I5d, base e9510b78f): `~ computed-by`
+    # `_cctally_core.admission_deadline` (a caller deadline inside a running
+    # admission now tightens it, K2), `_cctally_store_access._check_admissible`
+    # (a tolerated schema reason still notifies the owner, N8) and
+    # `_cctally_store_access._admit` and `_header_probe_deadline` (docstrings
+    # restated for AD29, N5). Admission bookkeeping and owner notification;
+    # no statement against stats.db changed, so the contract and its MAINT
+    # inert rule stand.
+    # Thirteenth delta (#787 / #861 I5g-I5h, base 322215e9e): `+ binding`
+    # `_cctally_store_access._HEADER_PROBED` (the AD19 verdicts a process
+    # probed itself, which a diagnosis worker returns, AD30 revision 29),
+    # `+ computed-by _header_stat_key` (the AD19 cache key, extracted
+    # unchanged for the AD30 handoff), `~ computed-by _stats_header_kind`
+    # (reads that key and records its own probes) and `~ computed-by
+    # _connect_ro` (an `uncached` flag for the AD31 held-session reader;
+    # stats connections keep `cached_statements=0` as before). The AD19 key,
+    # verdicts and probe are unchanged and no statement against stats.db
+    # changed, so the contract and its MAINT inert rule stand.
+    # Fourteenth delta (#787 / #861 Task C fix round, base 82b9c66d1):
+    # `~ computed-by _cctally_store_access._precheck`, which now refuses a
+    # stats header the AD19 probe could not read (`kind is None`) with its
+    # own detail, "stats.db could not be read", instead of falling through
+    # to the not-a-rollback-index detail. The same `unavailable` refusal,
+    # raised at the same point before any connection opens; no statement
+    # against stats.db changed, so the contract and its MAINT inert rule
+    # stand.
+    # Fifteenth delta (#787 / #861 fix round 5, base 82b9c66d1): `+ computed-by
+    # _cctally_store_access._cache_repair_owner_alive` (R32-1: a cache.db
+    # repair marker whose owner record decodes and names a live PID refuses a
+    # query as `maintenance`, read without creating a process) with `~
+    # computed-by _precheck` calling it for cache.db only, and a `notify`
+    # flag threaded through `~ _check_admissible`, `~ _session` and `~
+    # QueryService` (R32-V2: the AD12 outstanding-work probe reads readiness
+    # without waking the owner). Cache classification and owner notification;
+    # no statement against stats.db changed, so the contract and its MAINT
+    # inert rule stand.
+    # Sixteenth delta (#787 / #861 fix round 9, base 15adf32a0): `~
+    # computed-by _cctally_db._pid_is_alive`, which now reads an
+    # `OverflowError` from `os.kill` (a PID beyond a C int in a legacy or
+    # corrupt owner record) as "not alive" instead of raising. A liveness
+    # answer for a marker's owner; no statement against stats.db changed, so
+    # the contract and its MAINT inert rule stand.
     AccessContract(
         function='_cctally_journal:_rebuild_stats_index_locked',
         sql_fingerprint='dynamic:_cctally_journal:_rebuild_stats_index_locked#1',
-        sql_shape='sha256:2c06127369fd4dad',
+        sql_shape='sha256:4d6be00c40aaeb91',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -3798,13 +4094,29 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_quota:_apply_quota_projection_rows',
         sql_fingerprint='dynamic:_cctally_quota:_apply_quota_projection_rows#1',
-        sql_shape='sha256:0c02fccf21f059a5',
+        # #1069 reviewed re-pin: the producer's only change is the stamp set
+        # (`roots_to_stamp = set(roots_to_reconcile)`, formerly intersected
+        # with the active roots), so this `DELETE ... account_key NOT IN (...)`
+        # now also runs for a reconciled historic root. Its table, key,
+        # predicate, parameter construction and effect are unchanged, and the
+        # rows stay provider-codex projection state, so CODEX still holds.
+        # #1070 T11 reviewed re-pin (base 5b0297408): the only changed
+        # dependency is the producer body, which gains an
+        # `activation_cutoffs` parameter passed through to
+        # `_evaluate_quota_alerts` and records `holder["disarmed"]` from the
+        # evaluator's report after the call. Neither reaches this DELETE: its
+        # table, key, predicate, parameter construction, execution condition
+        # and effect are unchanged, so the contract and CODEX still hold.
+        # #1069 fix round: the effect is the DELETE it executes (it was
+        # recorded as a read); dynamic effects are not derived from the SQL,
+        # so only this metadata changes.
+        sql_shape='sha256:299ba696aea78665',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
         ordering='',
         selected=(),
-        effects='read',
+        effects='delete',
         classes=('cross-period',),
         inert_rule=CODEX,
     ),
@@ -3828,6 +4140,22 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         predicate='source=? AND source_root_key=? AND account_key=? AND logical_limit_key=? AND observed_slot=? AND window_minutes=?',
         ordering='',
         selected=('rule_fingerprint', 'activated_at_utc'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=CODEX,
+    ),
+    # #1071 T12 (revision 6, Q19-Q20): the interleave closure reads every
+    # Codex block's published interpreted span in the preparation's stats
+    # snapshot, beside the witness. It only widens which cache rows a scoped
+    # Codex projection pass loads; nothing is stored or returned from it.
+    AccessContract(
+        function='_cctally_quota:_codex_historical_block_spans',
+        sql_fingerprint="SELECT physical_group_key, first_observed_at_utc, last_observed_at_utc FROM quota_window_blocks WHERE source='codex'",
+        table='quota_window_blocks',
+        keys=(),
+        predicate="source='codex'",
+        ordering='',
+        selected=('physical_group_key', 'first_observed_at_utc', 'last_observed_at_utc'),
         effects='read',
         classes=('cross-period',),
         inert_rule=CODEX,
@@ -4141,8 +4469,11 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=CODEX,
     ),
+    # #1069: the arming probe moved unchanged from the reconcile into the
+    # preparation routine, which runs optimistically and once more inside the
+    # ingest lock; the witness reads below feed only its equality check.
     AccessContract(
-        function='_cctally_quota:reconcile_codex_quota_projection',
+        function='_cctally_quota:_prepare_codex_quota_pass',
         sql_fingerprint="SELECT 1 FROM quota_alert_arming WHERE source='codex' LIMIT 1",
         table='quota_alert_arming',
         keys=(),
@@ -4152,6 +4483,93 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         effects='read',
         classes=('cross-period',),
         inert_rule=CODEX,
+    ),
+    # #1069 Q4: the stats half of the hook pass's empty-store test, three
+    # existence probes read beside the witness; any row (or a failed read)
+    # keeps the pass on its ordinary route, so none can narrow Codex work.
+    AccessContract(
+        function='_cctally_quota:_codex_projected_rows_present',
+        sql_fingerprint="SELECT 1 FROM quota_window_blocks WHERE source='codex' LIMIT 1",
+        table='quota_window_blocks',
+        keys=(),
+        predicate="source='codex'",
+        ordering='',
+        selected=('1',),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=CODEX,
+    ),
+    AccessContract(
+        function='_cctally_quota:_codex_projected_rows_present',
+        sql_fingerprint="SELECT 1 FROM quota_percent_milestones WHERE source='codex' LIMIT 1",
+        table='quota_percent_milestones',
+        keys=(),
+        predicate="source='codex'",
+        ordering='',
+        selected=('1',),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=CODEX,
+    ),
+    AccessContract(
+        function='_cctally_quota:_codex_projected_rows_present',
+        sql_fingerprint="SELECT 1 FROM quota_threshold_events WHERE source='codex' LIMIT 1",
+        table='quota_threshold_events',
+        keys=(),
+        predicate="source='codex'",
+        ordering='',
+        selected=('1',),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=CODEX,
+    ),
+    AccessContract(
+        function='_cctally_quota:_codex_projection_witness',
+        sql_fingerprint="SELECT * FROM quota_projection_ledger_state WHERE source='codex'",
+        table='quota_projection_ledger_state',
+        keys=(),
+        predicate="source='codex'",
+        ordering='',
+        selected=('*',),
+        effects='read',
+        classes=('singleton',),
+        inert_rule=CODEX_WITNESS,
+    ),
+    AccessContract(
+        function='_cctally_quota:_codex_projection_witness',
+        sql_fingerprint='SELECT record_path, started_at_utc, stamped_at_utc FROM stats_publication_stamp ORDER BY rowid',
+        table='stats_publication_stamp',
+        keys=(),
+        predicate='',
+        ordering='rowid',
+        selected=('record_path', 'started_at_utc', 'stamped_at_utc'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=CODEX_WITNESS,
+    ),
+    AccessContract(
+        function='_cctally_quota:_codex_projection_witness',
+        sql_fingerprint='SELECT source_root_key, account_key, generation, physical_signature FROM quota_projection_state ORDER BY source_root_key, account_key',
+        table='quota_projection_state',
+        keys=(),
+        predicate='',
+        ordering='source_root_key, account_key',
+        selected=('source_root_key', 'account_key', 'generation', 'physical_signature'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=CODEX_WITNESS,
+    ),
+    AccessContract(
+        function='_cctally_quota:_codex_projection_witness',
+        sql_fingerprint="SELECT source_root_key, account_key, logical_limit_key, observed_slot, window_minutes, rule_fingerprint, activated_at_utc FROM quota_alert_arming WHERE source='codex' ORDER BY source_root_key, account_key, logical_limit_key, observed_slot, window_minutes",
+        table='quota_alert_arming',
+        keys=(),
+        predicate="source='codex'",
+        ordering='source_root_key, account_key, logical_limit_key, observed_slot, window_minutes',
+        selected=('source_root_key', 'account_key', 'logical_limit_key', 'observed_slot', 'window_minutes', 'rule_fingerprint', 'activated_at_utc'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=CODEX_WITNESS,
     ),
     # #1015 T5/T7 and R6: the calibration lineage readers. `_read_base`
     # reads the always-needed half of the correction facts (completed
@@ -5486,6 +5904,92 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         effects='read',
         classes=('cross-period',),
         inert_rule=Q7,
+    ),
+    # #1094: the conversation FTS tokenizer-integrity kernel, reached from
+    # `sync_cache` through `_cctally_cache._consume_title_fts` (its title-index
+    # rebuild goes through `conversation_fts_command`). Every site works on
+    # conversations.db or a private `:memory:` connection, never stats.db;
+    # their literal statements (the `sqlite_temp_master` guard-trigger reads,
+    # `dbstat` and content-table byte counts) name no stats table, so only
+    # these dynamic sites carry contracts.
+    AccessContract(
+        function='_lib_conversation_fts_integrity:_probe_digest',
+        sql_fingerprint='dynamic:_lib_conversation_fts_integrity:_probe_digest#1',
+        sql_shape='sha256:f8af4ee2de69c5a7',
+        table='dynamic',
+        keys=(),
+        predicate=('dynamic SQL: `CREATE VIRTUAL TABLE p USING fts5(...)` '
+                   '(with the caller\'s tokenize argument) on a private '
+                   '`:memory:` connection the probe opens and closes; never '
+                   'stats.db'),
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=CONVERSATION_FTS,
+    ),
+    AccessContract(
+        function='_lib_conversation_fts_integrity:conversation_fts_command',
+        sql_fingerprint='dynamic:_lib_conversation_fts_integrity:conversation_fts_command#1',
+        sql_shape='sha256:f48213bca1bb3b08',
+        table='dynamic',
+        keys=(),
+        predicate=('dynamic SQL: `INSERT INTO {table}({table}) VALUES(?)`, an '
+                   'FTS5 command (`rebuild` or `delete-all`) over a whole '
+                   'conversations.db search index, in the write transaction '
+                   'that first runs `retract_unless_listed`; never stats.db'),
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('cross-period',),
+        inert_rule=CONVERSATION_FTS,
+    ),
+    AccessContract(
+        function='_lib_conversation_fts_integrity:retract_unless_listed',
+        sql_fingerprint='dynamic:_lib_conversation_fts_integrity:retract_unless_listed#1',
+        sql_shape='sha256:71c41845a94ff913',
+        table='dynamic',
+        keys=('key',),
+        predicate=('dynamic SQL: `SELECT <retraction condition>`, whether '
+                   'conversations.db `cache_meta` lacks this build\'s row and '
+                   'holds any build row (the key range after '
+                   '`BUILD_ROW_PREFIX`); never stats.db'),
+        ordering='',
+        selected=('retraction condition',),
+        effects='read',
+        classes=('singleton',),
+        inert_rule=CONVERSATION_FTS,
+    ),
+    AccessContract(
+        function='_lib_conversation_fts_integrity:retract_unless_listed',
+        sql_fingerprint='dynamic:_lib_conversation_fts_integrity:retract_unless_listed#2',
+        sql_shape='sha256:9192368ef342e7a5',
+        table='dynamic',
+        keys=('key',),
+        predicate=('dynamic SQL: `_DELETE_BUILD_ROWS_SQL`, deletes every '
+                   'conversations.db `cache_meta` build row (the key range '
+                   'after `BUILD_ROW_PREFIX`); never stats.db'),
+        ordering='',
+        selected=(),
+        effects='delete',
+        classes=('singleton',),
+        inert_rule=CONVERSATION_FTS,
+    ),
+    AccessContract(
+        function='_lib_conversation_fts_integrity:retract_unless_listed',
+        sql_fingerprint='dynamic:_lib_conversation_fts_integrity:retract_unless_listed#3',
+        sql_shape='sha256:55282268e7dac9b4',
+        table='dynamic',
+        keys=('key',),
+        predicate=('dynamic SQL: `INSERT OR REPLACE INTO cache_meta(key, '
+                   'value)`, the conversations.db invalidation row '
+                   '(`INVALIDATED_KEY`, the build key and the UTC time); never '
+                   'stats.db'),
+        ordering='',
+        selected=(),
+        effects='upsert',
+        classes=('singleton',),
+        inert_rule=CONVERSATION_FTS,
     ),
     AccessContract(
         function='_lib_five_hour:latest_five_hour_reading',

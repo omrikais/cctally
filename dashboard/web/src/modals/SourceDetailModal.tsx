@@ -1,4 +1,4 @@
-import { useCallback, useState, useSyncExternalStore } from 'react';
+import { useCallback, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSourceDetail } from '../hooks/useSourceDetail';
 import { useSnapshot } from '../hooks/useSnapshot';
@@ -14,6 +14,7 @@ import { ShareIcon } from '../components/ShareIcon';
 import type { SharePanelId } from '../share/types';
 import { Modal } from './Modal';
 import { providerAccentClass } from '../lib/providerAccent';
+import { ProjectLabel } from '../components/ProjectLabel';
 import type {
   ClaudeBlockDetailBody,
   ClaudeProjectDetailBody,
@@ -245,9 +246,46 @@ function BoundedCollection<T>({
   renderItem: (item: T, index: number) => React.ReactNode;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  // #1075 — an expanded list grows in `.modal-body`'s flow, so collapsing it
+  // removes rows above the toggle. Without help the body keeps its scrollTop
+  // and the toggle jumps out of view (measured: y 760 -> 91 at 390 px with a
+  // later list expanded). Keep the toggle's offset in the body when the
+  // scroll range allows it, then make sure it is fully visible in the body's
+  // scrollport. Only this one scroller moves: native scrollIntoView would also
+  // scroll the overflow:hidden `.modal-card` (see SettingsOverlay's
+  // jumpToSection).
+  const collapseAnchor = useRef<{ scroller: HTMLElement; offset: number } | null>(null);
+  useLayoutEffect(() => {
+    const anchor = collapseAnchor.current;
+    collapseAnchor.current = null;
+    const toggle = toggleRef.current;
+    if (expanded || !anchor || !toggle) return;
+    const { scroller } = anchor;
+    const offset = toggle.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+    scroller.scrollTop += offset - anchor.offset;
+    // The scrollport, not the border box: a border or a horizontal
+    // scrollbar would otherwise count as visible space.
+    const top = scroller.getBoundingClientRect().top + scroller.clientTop;
+    const bottom = top + scroller.clientHeight;
+    const rect = toggle.getBoundingClientRect();
+    if (rect.top < top) scroller.scrollTop -= top - rect.top;
+    else if (rect.bottom > bottom) scroller.scrollTop += rect.bottom - bottom;
+  }, [expanded]);
   if (items.length === 0) return <p className="sd-empty-note">{empty}</p>;
   const visible = expanded ? items : items.slice(0, initial);
   const hidden = items.length - Math.min(items.length, initial);
+  const onToggle = () => {
+    const button = toggleRef.current;
+    const scroller = button?.closest<HTMLElement>('.modal-body');
+    if (expanded && button && scroller) {
+      collapseAnchor.current = {
+        scroller,
+        offset: button.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
+      };
+    }
+    setExpanded((value) => !value);
+  };
   return (
     <div className={`sd-bounded-collection${expanded ? ' is-expanded' : ''}`}>
       <ul className="sd-collection-list">
@@ -259,11 +297,12 @@ function BoundedCollection<T>({
       </ul>
       {hidden > 0 ? (
         <button
+          ref={toggleRef}
           type="button"
           className="sd-collection-toggle"
           aria-expanded={expanded}
           aria-label={expanded ? `Show first ${initial} ${noun}` : `Show all ${items.length} ${noun}`}
-          onClick={() => setExpanded((value) => !value)}
+          onClick={onToggle}
         >
           {expanded ? 'Show less' : `+${hidden} more`}
         </button>
@@ -443,7 +482,7 @@ function CodexProjectDetailView({ d }: { d: CodexProjectDetailBody }) {
     <div className="sd-codex-project modal-content" data-testid="codex-project-detail">
       {d.metadata_availability === 'partial' ? <p className="sd-note">{d.metadata_reason}</p> : null}
       <div className="m-chipstrip">
-        <span className="msess-badge sd-project-label" title={d.label || 'Codex project'}>{d.label || 'Codex project'}</span>
+        <span className="msess-badge sd-project-label" title={d.label || 'Codex project'}><ProjectLabel label={d.label || 'Codex project'} /></span>
         <span className={`m-pill ${providerAccentClass('codex')}`}>Codex</span>
       </div>
       {reportedWindow && (

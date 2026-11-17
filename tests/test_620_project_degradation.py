@@ -15,6 +15,7 @@ a figure describing neither account.
 """
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import sys
 
@@ -51,13 +52,10 @@ class _NoAccountColumnConn:
         return self._real.execute(sql, params)
 
     def close(self):
-        """A no-op, because the TEST owns the wrapped connection's lifetime.
-
-        `_load_week_snapshots` opens and closes its own connection, and the
-        monkeypatched `open_db` hands back this one wrapper every time. Left
-        delegating, the first call would close the real connection and the
-        second would raise `ProgrammingError` before reaching the predicate
-        this test is about.
+        """A no-op, because the TEST's reader seam owns the wrapped reader's
+        lifetime: it closes each real statement reader when the `with` block
+        `_load_week_snapshots` opens it in ends, and hands back this one
+        wrapper every time so the flag below spans both calls.
         """
 
     def __getattr__(self, name):
@@ -73,9 +71,29 @@ def test_account_scoped_snapshot_read_degrades_on_a_missing_column(
     import _cctally_core
     import _cctally_project
 
-    real = _cctally_core.open_db()
-    wrapper = _NoAccountColumnConn(real)
-    monkeypatch.setattr(_cctally_project, "open_db", lambda *a, **k: wrapper)
+    # #787 / #861 AD21: the read left `open_db` for a query-session statement
+    # reader, so the wrapper sits on the real reader, at the command module's
+    # own `_store_access` binding. The owner open first creates the store the
+    # reader admits, as every installation has one.
+    _cctally_core.open_db().close()
+    wrapper = _NoAccountColumnConn(None)
+    real_access = _cctally_project._store_access
+
+    class _Access:
+        def __getattr__(self, name):
+            return getattr(real_access, name)
+
+        @staticmethod
+        @contextlib.contextmanager
+        def statement_reader(store, *args, **kwargs):
+            with real_access.statement_reader(store, *args, **kwargs) as reader:
+                if store != "stats":
+                    yield reader
+                    return
+                wrapper._real = reader
+                yield wrapper
+
+    monkeypatch.setattr(_cctally_project, "_store_access", _Access())
 
     # #750 S4 §2.1: the reducer takes the emitted SEGMENTS rather than a date
     # range, because the segment is the identity a percentage belongs to.
@@ -107,7 +125,6 @@ def test_account_scoped_snapshot_read_degrades_on_a_missing_column(
         "the scoped read must not fall back to an unscoped query — that "
         "sums another account's percentage into an account-filtered total"
     )
-    real.close()
 
 
 # --- Error precedence: a usage error still outranks an environment error ---

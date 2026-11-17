@@ -1,6 +1,8 @@
 """#968 T5 (cache side): the publication barrier's certificates and the heal."""
 from __future__ import annotations
 
+import datetime
+import importlib
 import itertools
 import json
 import os
@@ -16,6 +18,7 @@ for extra in (REPO_ROOT / "bin", REPO_ROOT / "tests"):
         sys.path.insert(0, str(extra))
 
 import _lib_codex_publication_barrier as barrier  # noqa: E402
+from conftest import as_process_owner  # noqa: E402
 
 
 def _t(identity, *, gen="g1", end=100, hold=None, wm_gen="g1", wm_off=100,
@@ -913,8 +916,8 @@ def test_an_admitted_barrier_write_opens_the_store_before_admission(env):
         raw.close()
     outcome: list[object] = []
     started = time.monotonic()
-    worker = threading.Thread(target=lambda: outcome.append(
-        _cache().run_codex_barrier_seal_drain(wait_for_requests=False)),
+    worker = threading.Thread(target=as_process_owner(lambda: outcome.append(
+        _cache().run_codex_barrier_seal_drain(wait_for_requests=False))),
         daemon=True)
     worker.start()
     worker.join(60)
@@ -3213,8 +3216,9 @@ def test_contended_claude_hook_ingests_between_admitted_units(
         except BaseException as exc:  # reported as its own failure below
             hook["exc"] = exc
 
-    thread = threading.Thread(target=run_hook, name="claude-hook-1055",
-                              daemon=True)
+    # The hook is its own `cctally hook-tick` process owner (#787 / #861).
+    thread = threading.Thread(target=as_process_owner(run_hook),
+                              name="claude-hook-1055", daemon=True)
 
     def on_commit(path):
         events.append(("commit", path))
@@ -4460,3 +4464,300 @@ def test_heal_history_start_unit_bounds_lock_contention(env, monkeypatch):
                                         population=population)
     assert result.outcome == "contended", result
     assert _heal_record(ns) is None, "the contended start unit wrote a record"
+
+
+# ── #1090 T7: publication settlement of retention-aware legacy adoption ────
+
+#: An equal-length accounting mutation the cache side's legacy check rejects;
+#: the conversations side never sees it (its only key retention removed).
+_T7_CACHE_MUTATION = (b'"output_tokens":40', b'"output_tokens":41')
+_T7_TORN = b'{"timestamp":"2026-07-20T10:00:30.000Z","type":"event_msg"'
+_T7_CUTOFF = "2026-08-01T00:00:00Z"
+
+
+def _t7_conv(ns, sql, params=()):
+    conv = ns["open_conversations_db"]()
+    try:
+        return conv.execute(sql, params).fetchall()
+    finally:
+        conv.close()
+
+
+def _t7_conv_write(ns, action):
+    conv = ns["open_conversations_db"]()
+    try:
+        action(conv)
+        conv.commit()
+    finally:
+        conv.close()
+
+
+def _t7_published(ns, key):
+    rows = _t7_conv(ns, "SELECT published_revision FROM "
+                        "codex_conversation_publications WHERE conversation_key=?",
+                    (key,))
+    return None if not rows else int(rows[0][0])
+
+
+def _t7_rows(ns):
+    """Every conversations-store row a publication or an ingest can create."""
+    return (_t7_conv(ns, "SELECT conversation_key, source_path, line_offset "
+                         "FROM codex_conversation_events ORDER BY id"),
+            _t7_conv(ns, "SELECT conversation_key, source_path, line_offset "
+                         "FROM codex_conversation_messages ORDER BY id"),
+            _t7_conv(ns, "SELECT conversation_key FROM codex_conversation_rollups"))
+
+
+def _t7_identity(ns, path):
+    return _one(ns, "SELECT file_identity FROM codex_barrier_targets "
+                    "WHERE source_path=?", (str(path),))[0]
+
+
+def _t7_pass(ns):
+    import _lib_ingest_frontier as frontier
+    stats = _sync_conversations(ns)
+    return stats, frontier.conversation_sync_certifiable("full", stats)
+
+
+def _t7_fixture(env, *, cache, extra=b""):
+    """#1090 T7's pre-fix state on a real two-store fixture: the legacy
+    conversations cursor of ``a`` (its only conversation retention removed,
+    no proof yet) is rejected exactly as `main` rejects it — recordless
+    `unverified/legacy-inequivalent` — while the cache side either accepted
+    the compressed container (``cache="accepted"``: ``a`` is a certified
+    contributor and the unit a #1052 terminal deferral) or suspended it
+    (``cache="suspended"``: `verification-unverified`, ``a`` an exclusion of
+    the certificate). Nothing else holds certification. The container is the
+    retained prefix plus ``extra``. Returns ``(a, zpath, good, key)``."""
+    ns, _provider, day, _ = env
+    a = day / _name(11, 1)
+    write_rollout(a, conversation_records(2, session_id=SESSION, label="a"))
+    _sync(ns)
+    _sync_conversations(ns)
+    key = _key(ns, a)
+    for opener, table in (("open_cache_db", "codex_session_files"),
+                          ("open_conversations_db",
+                           "codex_conversation_source_files")):
+        conn = ns[opener]()
+        try:
+            conn.execute(f"UPDATE {table} SET content_anchor=NULL, "
+                         "content_anchor_version=NULL, content_anchor_offset=NULL")
+            conn.commit()
+        finally:
+            conn.close()
+    retention = importlib.import_module("_lib_conversation_retention")
+    _t7_conv_write(ns, lambda c: retention._delete_codex_conversation(c, key))
+    # Retention's visit stamps its history when it prunes; without the stamp
+    # the store reads as never pruned and §5.4 (a) re-arms before proof.
+    _t7_conv_write(ns, lambda c: retention._stamp_retention_prune(
+        c, datetime.datetime(2026, 11, 13, 12, 0, tzinfo=datetime.timezone.utc)))
+    good = a.read_bytes()
+    prefix = (good.replace(*_T7_CACHE_MUTATION, 1) if cache == "suspended"
+              else good)
+    zpath = a.with_name(a.name + ".zst")
+    zpath.write_bytes(zstd_bytes(prefix + extra))
+    a.unlink()
+    _sync(ns)
+    _sync_conversations(ns)
+    _cache().run_codex_container_verification_drain(wait_for_requests=False)
+    # `main` writes no retry record; this is its rejection exactly.
+    _t7_conv_write(ns, lambda c: c.execute(
+        "DELETE FROM cache_meta WHERE key LIKE 'codex_legacy_retry:%'"))
+    _sync(ns)
+    _cache().run_codex_barrier_seal_drain(wait_for_requests=False)
+    _sync(ns)
+    assert _cursor_row(ns, a)["container_state"] == (
+        "accepted" if cache == "accepted" else "unverified")
+    assert _t7_conv(ns, "SELECT container_state, container_state_reason "
+                        "FROM codex_conversation_source_files") == [
+        ("unverified", "legacy-inequivalent")]
+    assert _t7_rows(ns) == ([], [], []), "retention removed the conversation"
+    cert = _certificate(ns, key)
+    if cache == "accepted":
+        assert _paths(cert) == [str(a)] and cert["exclusions"] == []
+    else:
+        assert _paths(cert) == []
+        assert [(e["path"], e["reason"]) for e in cert["exclusions"]] == [
+            (str(a), "verification-unverified")]
+    return a, zpath, good, key
+
+
+def _t7_baseline(ns, a, key, cache):
+    """The pre-fix pass: certifiable, nothing retried. With a certified
+    contributor the key is the #1052 terminal deferral; with the contributor
+    suspended the certificate names no contributor at all, so its unit
+    reads no file and publishes (the spec's "terminal" premise is
+    unrealizable for a suspended contributor; see the #1090 closeout)."""
+    stats, certifiable = _t7_pass(ns)
+    assert certifiable and not stats.barrier_retry
+    assert stats.barrier_deferred_targets == {}
+    cert = _certificate(ns, key)
+    if cache == "accepted":
+        assert stats.barrier_terminal_keys == {str(a): frozenset({key})}
+        assert _t7_published(ns, key) is None
+    else:
+        assert stats.barrier_terminal_keys == {}
+        assert _t7_published(ns, key) == cert["revision"]
+    return stats
+
+
+def _t7_set_proof(ns):
+    retention = importlib.import_module("_lib_conversation_retention")
+    _t7_conv_write(ns, lambda c: retention._merge_applied_cutoff(c, _T7_CUTOFF))
+
+
+def _t7_assert_settled(ns, key, *, deferred=None, settle_pass=1):
+    """The key's certificate is published by the first pass, and pass
+    ``settle_pass`` and every later one (two passes in all) certify with
+    nothing terminal and nothing retried; ``deferred`` names the only
+    deferral allowed. T7(b) and (c) settle on the first pass; T7(a) allows
+    its first pass to publish and only the one after to certify
+    (``settle_pass=2``), as the spec words it."""
+    for number in (1, 2):
+        stats, certifiable = _t7_pass(ns)
+        assert _t7_published(ns, key) == _certificate(ns, key)["revision"]
+        if number < settle_pass:
+            continue
+        assert certifiable, (number, stats.barrier_retry_causes,
+                             stats.deferred_reason)
+        assert not stats.barrier_retry, (number, stats.barrier_retry_causes)
+        assert stats.barrier_terminal_keys == {}, number
+        assert stats.barrier_deferred_targets == (deferred or {}), number
+
+
+@pytest.mark.parametrize("cache", ["suspended", "accepted"])
+def test_t7_complete_legacy_cursor_under_a_current_certificate_settles(
+        env, cache):
+    """#1090 T7(a): a complete legacy cursor, under an exclusion certificate
+    (cache contributor suspended) or a certificate naming its current
+    generation (the #1052 terminal unit), is `accepted` after the drain once
+    retention's proof exists; the key `v1.<SESSION>` publishes and the next
+    pass certifies with no terminal key. Detects a retention-aware adoption
+    that leaves the barrier retrying or the key unpublished."""
+    ns, *_ = env
+    a, _zpath, _good, key = _t7_fixture(env, cache=cache)
+    _t7_baseline(ns, a, key, cache)
+    _t7_set_proof(ns)
+    _cache().run_codex_container_verification_drain(wait_for_requests=False)
+    assert _t7_conv(ns, "SELECT container_state FROM "
+                        "codex_conversation_source_files") == [("accepted",)]
+    _t7_assert_settled(ns, key, settle_pass=2)
+    assert _t7_rows(ns) == ([], [], []), "adoption recreates no row"
+
+
+def test_t7_certificate_of_an_older_generation_settles_after_one_cache_sync(env):
+    """#1090 T7(b): the container is replaced (a new generation of `a`) after
+    the certificate was sealed, so the drain adopts a complete cursor under a
+    certificate naming the older generation. At most the next pass may report
+    `unit_failed`; after ONE Codex cache sync re-arms and re-seals the key,
+    the following pass publishes it and certifies. Detects a stale-generation
+    certificate that never settles."""
+    ns, *_ = env
+    a, zpath, good, key = _t7_fixture(env, cache="accepted")
+    _t7_baseline(ns, a, key, "accepted")
+    old = _certificate(ns, key)
+    _replace_container(zpath, good)              # same bytes, a new inode
+    _sync(ns)
+    _t7_set_proof(ns)
+    _cache().run_codex_container_verification_drain(wait_for_requests=False)
+    assert _t7_conv(ns, "SELECT container_state FROM "
+                        "codex_conversation_source_files") == [("accepted",)]
+    stats, _certifiable = _t7_pass(ns)
+    assert not stats.barrier_retry or stats.barrier_retry_causes == {"unit_failed"}
+    assert stats.barrier_terminal_keys == {}
+    assert _t7_published(ns, key) is None
+    _sync(ns)                                       # the one cache sync
+    cert = _certificate(ns, key)
+    assert cert["revision"] > old["revision"]
+    assert [c["generation"] for c in cert["contributors"]] != [
+        c["generation"] for c in old["contributors"]]
+    _t7_assert_settled(ns, key)
+    assert _t7_rows(ns) == ([], [], [])
+
+
+def _t7_suffix(name):
+    if name == "torn":
+        return _T7_TORN
+    return b"".join(
+        json.dumps(r, separators=(",", ":")).encode() + b"\n"
+        for r in conversation_records(3, session_id=SESSION, label="a")[-4:])
+
+
+@pytest.mark.parametrize("suffix", ["lines", "torn"])
+def test_t7_held_suffix_stays_quiet_then_settles_once_the_cache_accepts(
+        env, monkeypatch, suffix):
+    """#1090 T7(c) (R1-P1-1, R2-P1-1): with the cache contributor suspended
+    and an unread complete suffix (or a growing torn-only suffix), the drain
+    holds the row as `legacy-cache-held` and two passes stay exactly as the
+    baseline (certifiable, nothing retried or deferred, the key's
+    publication unchanged). Once the cache cursor is `accepted` and the cache
+    has sealed the suffix, the evaluator re-arms the row, it adopts and
+    ingests, and the next pass publishes and certifies; only the suffix's own
+    rows appear. Detects the uncovered deferral the gate exists to prevent
+    (see the ungated RED below)."""
+    ns, *_ = env
+    extra = _t7_suffix(suffix)
+    a, zpath, good, key = _t7_fixture(env, cache="suspended", extra=extra)
+    _t7_baseline(ns, a, key, "suspended")
+    published = _t7_published(ns, key)
+    _t7_set_proof(ns)
+    _cache().run_codex_container_verification_drain(wait_for_requests=False)
+    assert _t7_conv(ns, "SELECT container_state, container_state_reason "
+                        "FROM codex_conversation_source_files") == [
+        ("unverified", "legacy-cache-held")]
+    for _ in range(2):
+        stats, certifiable = _t7_pass(ns)
+        assert certifiable and not stats.barrier_retry
+        assert stats.barrier_terminal_keys == {}
+        assert stats.barrier_deferred_targets == {}
+        assert _t7_published(ns, key) == published
+    assert _t7_rows(ns) == ([], [], [])
+    _replace_container(zpath, good + extra)          # the cache side recovers
+    _sync(ns)
+    cc = _cache()
+    real = cc._reevaluate_codex_legacy_rejections
+    rearmed = []
+    monkeypatch.setattr(cc, "_reevaluate_codex_legacy_rejections",
+                        lambda conn: rearmed.append(real(conn)) or rearmed[-1])
+    cc.run_codex_container_verification_drain(wait_for_requests=False)
+    assert rearmed == [1], "the held row is re-armed by its cache trigger"
+    assert _cursor_row(ns, a)["container_state"] == "accepted"
+    assert _t7_conv(ns, "SELECT container_state FROM "
+                        "codex_conversation_source_files") == [("accepted",)]
+    identity = _t7_identity(ns, a)
+    _t7_assert_settled(ns, key, deferred=(
+        {str(a): (identity, True)} if suffix == "torn" else None))
+    assert _certificate(ns, key)["revision"] > published
+    events, messages, rollups = _t7_rows(ns)
+    if suffix == "torn":
+        assert (events, messages, rollups) == ([], [], [])
+    else:
+        assert events and messages and rollups == [(key,)]
+        assert {(k, p) for k, p, _o in events + messages} == {(key, str(a))}
+        assert min(o for _k, _p, o in events + messages) >= len(good)
+
+
+@pytest.mark.parametrize("suffix", ["lines", "torn"])
+def test_t7_ungated_suffix_adoption_retries_uncovered_on_every_pass(
+        env, monkeypatch, suffix):
+    """#1090 T7(c) RED: the same fixture with the cache-held gate disabled
+    adopts the row against its suspended cache cursor; every later pass then
+    defers `a` against a target with no scan target and reports
+    `barrier_retry` with cause `uncovered`, so the provider never certifies.
+    This is the defect the gate prevents."""
+    ns, *_ = env
+    extra = _t7_suffix(suffix)
+    a, _zpath, _good, key = _t7_fixture(env, cache="suspended", extra=extra)
+    _t7_baseline(ns, a, key, "suspended")
+    _t7_set_proof(ns)
+    monkeypatch.setattr(_cache(), "_codex_legacy_cache_held",
+                        lambda *args: False)
+    _cache().run_codex_container_verification_drain(wait_for_requests=False)
+    assert _t7_conv(ns, "SELECT container_state FROM "
+                        "codex_conversation_source_files") == [("accepted",)]
+    identity = _t7_identity(ns, a)
+    for _ in range(3):
+        stats, certifiable = _t7_pass(ns)
+        assert not certifiable and stats.barrier_retry
+        assert "uncovered" in stats.barrier_retry_causes
+        assert stats.barrier_deferred_targets == {str(a): (identity, False)}

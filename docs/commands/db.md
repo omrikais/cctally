@@ -1,8 +1,8 @@
 # `cctally db`
 
-Migration / DB-management subcommand. Twelve actions: `status`, `skip`,
+Migration / DB-management subcommand. Thirteen actions: `status`, `skip`,
 `unskip`, `rebuild`, `rederive`, `journal-repair`, `recover`, `repair`,
-`backup`, `checkpoint`, `prune`, and `vacuum`.
+`backup`, `checkpoint`, `prune`, `vacuum`, and `reindex-search`.
 
 ## Synopsis
 
@@ -19,6 +19,7 @@ cctally db backup --db {cache,stats} [--output <path>]
 cctally db checkpoint [--db {cache,conversations,stats}] [--json]
 cctally db prune [--yes] [--include-backups] [--json]
 cctally db vacuum [--db {cache,conversations,stats,all}]
+cctally db reindex-search [--check] [--json]
 ```
 
 ## Description
@@ -45,6 +46,12 @@ Spec: `docs/superpowers/specs/2026-05-06-migration-framework-design.md`,
 
 Renders applied / pending / failed / skipped state for every migration
 in both DBs.
+
+`db status` only reads. It opens each database read-only and changes
+nothing: it does not resume an interrupted stats.db rebuild or a pending
+recovery, does not create a missing database, and does not run a pending
+migration. An interrupted rebuild is reported, and the next command that
+opens stats.db for writing resumes it.
 
 | Flag | Description |
 | --- | --- |
@@ -785,6 +792,37 @@ This is **never automatic** and always explicit. VACUUM needs exclusive access: 
 `0` reclaimed (or the DB is absent — nothing to do); `3` (staged) the target is
 in use (stop the dashboard / other cctally processes and retry), a maintenance
 operation is already running, or free disk is below the required margin.
+
+## `cctally db reindex-search [--check] [--json]`
+
+Check the conversation search indexes (`conversation_fts`, `codex_conversation_fts` and `conversation_title_fts` in `conversations.db`) against the messages they index, and rebuild any that disagree. An index disagrees with its messages when another SQLite build wrote some of its entries and that build split some text into words differently: SQLite 3.54.0, for example, treated U+FFFE and U+FFFF as letters. Transcript search then misses messages containing such text, and deleting those messages leaves orphaned index entries behind.
+
+The check is FTS5's content-aware `integrity-check` (rank 1), which re-derives every index entry from the stored messages. It holds the conversation store's write lock while it runs, so conversation syncs skip meanwhile; on a store of a few million messages it takes several minutes. A rebuild re-indexes every message from the stored content with the running SQLite and changes no message: it rewrites only the index. Before a rebuild the command requires free space on the store's volume of twice the larger of the index's current size and its indexed text, plus 256 MiB, because the rebuild is one transaction and the WAL holds the whole new index until it commits; short of that, it rebuilds nothing.
+
+When every index passes, the store records this SQLite build as verified. A later write by a build whose tokenizer differs withdraws that record in the same transaction, and the dashboard and `cache-sync` then repeat the check automatically (after an upgrade, after such a write, and every 30 days; at most one automatic attempt a day). This command runs the same check on demand, whatever that schedule says.
+
+`--check` runs only the check: an index that disagrees is reported (exit 1) and the store is recorded as unverified, but nothing is rebuilt; when every index is consistent it records the store as verified, like the full command. A check that is interrupted or cannot finish leaves the store unverified, so the automatic check runs again a day later. The command does nothing and exits 3 while a conversation rebuild is pending (`conversation_rebuild_claude_pending`, `conversation_rebuild_codex_pending`, `conversation_search_split_pending`, `conversation_title_fts_backfill_pending`, or a required index missing), because that work clears or refills the indexes; run it again afterwards. It also exits 3 without checking when another cctally process holds the conversation store's maintenance or sync locks.
+
+### Text output
+
+One line per index, then a summary line:
+
+```
+conversation_fts        out of date → rebuilt in 6m 12s → consistent
+codex_conversation_fts  consistent (checked in 58.3s)
+conversation_title_fts  consistent (checked in 0.1s)
+Search indexes match this SQLite's tokenizer (3.54.1).
+```
+
+An index the check could not read prints `not checked:` with SQLite's error, and a rebuilt index whose re-check failed prints `not re-checked:` with the error; a rebuilt index is always re-checked, even when another index was refused or failed. The summary goes to stdout when every index is consistent and for a `--check` finding; otherwise it goes to stderr: the pending-rebuild, busy and no-FTS5 lines, and, after a disk refusal or a rebuild that did not converge, a line saying the indexes are still out of date and to run the command again (after freeing space, for a refusal). A busy summary also covers a lock or I/O error on any write after the store opened; the per-index line names the actual error.
+
+### `--json` fields
+
+`schemaVersion` (always first, `1`), `outcome` (`verified`, `mismatch`, `repair-failed`, `disk`, `busy`, `deferred` or `unavailable`; `store-unavailable` when `conversations.db` could not be opened, `error` on a database error after it opened), `indexes[]` (`name`, `before` and `after` each `consistent`/`mismatch`/`error`, `action` `none`/`rebuilt`/`refused`, `seconds`), `deferredBy` (the pending marker or the missing index, when deferred), `sqliteVersion`, `fingerprint` (the tokenizer fingerprint this run recorded: null unless the outcome is `verified` and the certifying check took at least 2 seconds, since below that a re-check under a new SQLite costs less than computing the fingerprint), `state` (`verified` or `unverified`, with `reason`, `verifiedAt`, `lastAttemptAt`; `reason` is `verified`, or for an unverified store `legacy` or `new` (never verified; with or without messages), `checking` (a check started and did not certify: every check withdraws the verification when it starts and only a check that finds every index consistent restores it), `mismatch` (a check proved an index inconsistent) or `unlisted-build` (a write by a SQLite build whose tokenizer was not verified)), and `needBytes`/`availBytes` (whenever the disk guard ran: the largest free-space requirement it evaluated in this run and the free space measured at that evaluation, whether or not it refused; null when no rebuild was considered). When the store cannot be opened, `--json` still prints the envelope, with `outcome` `store-unavailable`, an `error` key holding the opener's error, an empty `indexes`, a null `state` and null `fingerprint`, `needBytes` and `availBytes`, and exits 3. A database error from the check's own reads after the store opened (a malformed store, an I/O error) prints the same envelope with `outcome` `error` and the error, and exits 3.
+
+### Exit codes
+
+`0` every index is consistent, after any rebuild; `1` `--check` found an index that disagrees with its messages; `2` usage; `3` (staged) busy, FTS5 unavailable, deferred to a pending conversation rebuild, a rebuild that did not converge, the disk guard's refusal, or the store could not be opened.
 
 ## Notes
 

@@ -8,6 +8,7 @@ cache projections, and the separate S3 coverage helper.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import importlib
 import sqlite3
@@ -234,9 +235,23 @@ def test_conversations_opens_read_only_and_never_attaches_cache(
         conn = bundle.connection("conversations")
         dbs = [row[1] for row in conn.execute("PRAGMA database_list")]
         assert dbs == ["main"]
-        with pytest.raises(sqlite3.OperationalError):
+        # #787 / #861 AD31 (revision 29): the held reader carries the query
+        # session's authorizer, which denies the write and latches it ...
+        with pytest.raises(sqlite3.DatabaseError):
             conn.execute("CREATE TABLE t (x)")
-    finally:
+        # ... and, beneath it, the connection itself is `mode=ro`.
+        # (Past the query connection's own keyword refusal and with its
+        # authorizer removed, so only the open mode is left to refuse.)
+        conn.set_authorizer(None)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            sqlite3.Connection.execute(conn, "CREATE TABLE t (x)")
+    except BaseException:
+        with contextlib.suppress(_cctally_core.QueryAuthorityViolation):
+            bundle.close()
+        raise
+    # The latched denial refuses the read unit at close, even though the
+    # caller swallowed the raising statement (5.2).
+    with pytest.raises(_cctally_core.QueryAuthorityViolation):
         bundle.close()
 
 
@@ -251,10 +266,12 @@ def test_a_denied_plan_never_opens_the_conversations_store(tmp_path,
     scope = _scope()
     denied = kernel.resolve_policy_plan("claude", transcripts_visible=False)
     opened = []
-    real_open = sources.open_read_only
+    # #787 / #861 AD21: the bundle opens stats and cache as query sessions
+    # (`open_read_only` is no longer reached), so the spy sits there.
+    real_session = sources.query_session
     monkeypatch.setattr(
-        sources, "open_read_only",
-        lambda kind: (opened.append(kind), real_open(kind))[1])
+        sources, "query_session",
+        lambda kind: (opened.append(kind), real_session(kind))[1])
     real_conversations = sources.StoreBundle._open_conversations
     monkeypatch.setattr(
         sources.StoreBundle, "_open_conversations",
@@ -266,6 +283,9 @@ def test_a_denied_plan_never_opens_the_conversations_store(tmp_path,
     finally:
         bundle.close()
     assert "conversations" not in opened
+    # Non-vacuity: the accounting stores WERE opened through the spied seams,
+    # so the absence above is the plan's decision.
+    assert {"stats", "cache"} <= set(opened), opened
     assert bundle.vector is not None
     assert bundle.vector.conversations is None
     assert "conversations" not in bundle.vector.as_dict()

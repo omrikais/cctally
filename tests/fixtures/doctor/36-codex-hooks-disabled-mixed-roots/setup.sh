@@ -4,7 +4,13 @@ set -euo pipefail
 : "${HARNESS_FAKE_HOME:?HARNESS_FAKE_HOME must be set}"
 : "${REPO_ROOT:?REPO_ROOT must be set}"
 mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally"
+# Every install's data dir is 0700 (ensure_dirs), and query sessions
+# read only a private data dir (#787 / #861 spec 5.4).
+chmod 700 "$HARNESS_FAKE_HOME/.local/share/cctally"
 touch "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db.maintenance.lock"
+# Every owner open creates the stats maintenance lock; a diagnostic
+# reader treats a missing one as an absent store (#787 AD22).
+touch "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db.maintenance.lock"
 mkdir -p "$HARNESS_FAKE_HOME/.claude"
 mkdir -p "$HARNESS_FAKE_HOME/.local/bin"
 # The harness sets CCTALLY_AS_OF before invoking doctor, so all

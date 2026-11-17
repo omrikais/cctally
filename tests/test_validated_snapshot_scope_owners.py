@@ -201,18 +201,33 @@ def test_statusline_projection_withholds_an_unvalidated_index(ns, monkeypatch):
     jr, J, snap = _mods()
     jr.run_stats_ingest(mode="authoritative")
     import _cctally_statusline as sl
-    real_open = sl.open_db
+    import _cctally_store_access as access
+    real_connect = access._connect_ro
+    republished = []
 
-    def open_then_republish():
-        # The old release republishes AFTER this reader opened (and its
-        # open-time handshake passed), before the projection reads.
-        conn = real_open()
-        _republish_as_old_release()
+    def connect_then_republish(store, *args, **kwargs):
+        # #787 / #861 AD21, 5.13: the projection reads through a query
+        # session, whose identity and readiness are read inside the snapshot
+        # the projection then queries. The index changes AFTER the session's
+        # admission and connect (its open-time handshake), before that
+        # snapshot. An epoch the session reads there is its own refusal, so
+        # what reaches the projection's in-snapshot validation is an index the
+        # session admits: the current epoch without the protocol marker.
+        conn = real_connect(store, *args, **kwargs)
+        if store == "stats" and not republished:
+            republished.append(store)
+            raw = sqlite3.connect(str(_cctally_core.DB_PATH))
+            try:
+                raw.execute("DROP TABLE IF EXISTS journal_admission_summary")
+                raw.commit()
+            finally:
+                raw.close()
         return conn
 
-    monkeypatch.setattr(sl, "open_db", open_then_republish)
+    monkeypatch.setattr(access, "_connect_ro", connect_then_republish)
     with pytest.raises(snap.StatsIndexNotCurrent):
         sl._read_db_projection_once(account_key="unattributed")
+    assert republished == ["stats"]
 
 
 def test_completion_checks_fail_closed_on_an_unvalidated_index(ns):

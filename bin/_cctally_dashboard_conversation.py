@@ -44,6 +44,7 @@ import sqlite3
 import sys
 import base64
 import collections
+import contextlib
 import dataclasses
 import hashlib
 import os
@@ -54,19 +55,19 @@ import threading
 import time
 
 from _cctally_cache import (
-    open_cache_db,
-    scope_conversations_db_to_account,
-    sync_cache,
-    sync_codex_cache,
-    sync_claude_conversations,
-    sync_codex_conversations,
+    sync_cache_request,
+    sync_codex_cache_request,
+    sync_claude_conversations_request,
+    sync_codex_conversations_request,
     _codex_provider_roots,
 )
+import _cctally_core
 from _lib_dashboard_json import (
     encode_dashboard_json,
     encode_dashboard_json_bytes_capped,
 )
 from _lib_retained_size import retained_size_bytes
+import _lib_codex_metadata
 import _lib_codex_rollout_container as _rc
 
 
@@ -81,25 +82,33 @@ def _advance_live_tail_accounting(handler, changed, sync, label):
     that tick was certified caught up.  The ingest is targeted at exactly the
     paths the tail resolved as changed, so this costs one file, never a walk.
 
+    #787 / #861 spec 5.9: ``sync`` is the provider's request entry
+    (``sync_cache_request`` / ``sync_codex_cache_request``), run on a request
+    writer through `_live_tail_request`. The Codex request defers the quota
+    projection reconcile (``quota_reconcile="defer"``), which is the owner's:
+    a Codex ingest that processed growth sets owner attention for stats.
+
     Cost is an enhancement to the stream and never a precondition for it: a
     contended or failed accounting write is logged and the transcript still
     advances, because stalling the turns a reader is watching is strictly worse
-    than showing them beside a stale figure.  Callers that genuinely depend on
+    than showing them beside a stale figure.  Returns the accounting ingest's
+    stats (``None`` when it failed), for the callers that genuinely depend on
     the accounting result -- the account-scoped Codex tail, which needs the
-    physical account-range decision committed before transcript ingest -- must
-    do their own ordered sync instead of calling this.
+    physical account-range decision committed before transcript ingest, and
+    child discovery -- and must not ingest the transcript past it.
     """
     try:
-        accounting = open_cache_db()
-        try:
-            sync(accounting, only_paths=set(changed))
-        finally:
-            accounting.close()
+        stats = _live_tail_request("cache", sync, changed)
     except Exception as exc:  # noqa: BLE001
         handler.log_error(
             "api/conversation/events %s accounting sync failed: %r",
             label, exc,
         )
+        return None
+    if label == "codex" and getattr(stats, "files_processed", 0):
+        _cctally_core.notify_owner("stats", _cctally_core.Readiness(
+            "stats", True, None, frozenset({"quota_projection_incomplete"})))
+    return stats
 
 # Live-tail watch-loop tuning — used ONLY by _handle_get_conversation_events_impl
 # below, so moved here with the events handler (spec §4.1 / §6).
@@ -1024,7 +1033,8 @@ def _handle_qualified_browse(handler, qs_raw, source):
             conn, source=source, effective_speed=speed,
             project_key=project_key, model=model, limit=limit, cursor=cursor,
             selected=selected),
-        "/api/conversations")
+        "/api/conversations",
+        cache_free=_browse_reads_no_cache if source == "claude" else None)
     if not ok:
         return
     handler._respond_json(200, body)
@@ -1041,7 +1051,8 @@ def _handle_qualified_facets(handler, qs_raw, source):
     ok, body = handler._run_conversation_query(
         lambda conn: disp.neutral_facets(
             conn, source=source, effective_speed=speed),
-        "/api/conversations/facets")
+        "/api/conversations/facets",
+        cache_free=_browse_reads_no_cache if source == "claude" else None)
     if not ok:
         return
     facets = (body or {}).get("facets") or {"projects": [], "models": []}
@@ -1107,13 +1118,6 @@ def _parse_search_kind_impl(handler, q, valid=_CONV_SEARCH_KINDS):
         return None
     return kind
 
-#: #780 — how many times a read route re-attempts admission before it degrades.
-#: Bounded by count, never by wall clock: the opener's own busy timeout is
-#: already route-bounded, and an unbounded retry against a rebuild that holds
-#: the store for minutes would pin a request thread for the whole rebuild.
-_CONVERSATION_READ_ATTEMPTS = 3
-_CONVERSATION_READ_RETRY_SLEEP_S = 0.02
-
 #: The empty-but-valid body each named read route serves alongside the typed
 #: degraded marker. Keyed on the caller's own log label, so no call site
 #: changes and a route with no entry still gets the marker.
@@ -1136,16 +1140,6 @@ _CONVERSATION_DEGRADED_SHAPES = {
 }
 
 
-def _reader_unavailable():
-    """The typed reader-admission condition, resolved lazily.
-
-    `_cctally_dashboard` re-exports the cache module's opener, and the tests
-    monkeypatch that re-export, so the class is read through the same module
-    object the opener came from rather than imported at module scope.
-    """
-    return sys.modules["_cctally_dashboard"].ConversationReaderUnavailable
-
-
 def _conversation_degraded_body(log_label, reason):
     """One typed degraded envelope for a read route that could not be admitted.
 
@@ -1162,150 +1156,208 @@ def _conversation_degraded_body(log_label, reason):
     return body
 
 
-def _full_open_or_refuse():
-    """Open write-capable, and refuse if the legacy bridge is STILL owed (#802).
+def _store_access():
+    """The store-authority services module (#787 / #861), resolved at call
+    time like every other sibling this module reaches."""
+    import _cctally_store_access
+    return _cctally_store_access
 
-    The full opener is what fixes an interrupted migration 028: it runs
-    `_import_legacy_conversation_rows`, which moves the transcript rows out of
-    `cache.db` and derives the browse rollup from them. Under `dashboard
-    --no-sync` the process policy suppresses that derivation, so this opener
-    returns a store where the rows are still in `cache.db` and the rollup is
-    still empty — and `list_conversation_facets` reads the rollup's
-    `project_label` with no authoritative gate, so the conversation list and
-    the browse project filter would both render empty for the life of the
-    process, with no pending state and nothing said.
 
-    Spec §9 permits exactly this alternative for a route that cannot inherit
-    the derivation policy: return a typed degraded response instead. The
-    outcome is checked rather than the policy, so a bridge that COMPLETED is
-    byte-unchanged, and a future third reason the bridge could not run is
-    covered without a second predicate.
+#: Refusals an owner can resolve (create, migrate, bridge, recover, harden), so
+#: a reader that meets one tells the owner (spec 5.5, 5.8). Contention is not
+#: owner work: maintenance ends by itself and a busy store by its writer.
+_OWNER_RESOLVES_EXCEPT = frozenset({"maintenance", "busy"})
 
-    The claim is about the outcome, not about the mode. It was first written as
-    "every mode allowed to do work is byte-unchanged", and that is too strong:
-    `_import_legacy_conversation_rows` is fail-soft per table (`except
-    sqlite3.Error: continue`), so a mode that IS allowed to do work but whose
-    import raised on one table leaves the predicate true and is refused here,
-    where the old code returned the connection. That refusal is the better
-    answer — the old code served an empty conversation surface over rows it had
-    just failed to move, and said nothing about it — but it is a change, so it
-    is stated rather than covered by an absolute.
+
+def _browse_reads_no_cache(conn):
+    """Whether this conversations-only connection can answer the Claude browse
+    list and its facets exactly as `main` did with cache.db attached (round 7,
+    spec 5.11 / 5.12 N2).
+
+    It can when the browse rollup is authoritative: the rows, costs, titles
+    and facets then come from conversations.db alone. A pending backfill puts
+    the list on the live branch, which prices each session from cache.db's
+    `session_entries`, and an empty transcript table may be a legacy bridge
+    still owed from cache.db, which only the attached store can tell; both
+    keep the cache refusal."""
+    import _lib_conversation_query as lcq
+    if conn.execute(
+            "SELECT 1 FROM main.conversation_messages LIMIT 1").fetchone() is None:
+        return False
+    return lcq._rollup_authoritative(conn)
+
+
+def _open_conversation_session(account=None):
+    """One conversations read unit: a ``query(interactive)`` session with the
+    accounting store attached read-only and, for a qualified request, the
+    account TEMP scope built inside the session (spec 5.8, 5.13).
+
+    Returns ``(session, stack)``; closing ``stack`` ends the session (rollback,
+    TEMP scope dropped, resolver caches evicted, detach, close). It never
+    creates, migrates or bridges a store, and it never waits behind
+    maintenance: admission is the interactive policy's (spec 5.3). A refusal
+    the owner resolves is handed to it (``notify_owner``) and raised as the
+    typed ``StoreUnavailable``, which `_conversation_transport_for` maps.
     """
-    dash = sys.modules["_cctally_dashboard"]
-    cache_mod = sys.modules["_cctally_cache"]
-    conn = dash.open_conversations_db()
-    if not cache_mod.conversation_legacy_bridge_pending(conn):
-        return conn
-    conn.close()
-    raise dash.LegacyBridgePending(
-        "the legacy transcript bridge is owed and derivations are suppressed")
+    return _enter_conversation_session(_store_access(), ("cache",), account)
 
 
-def _open_conversation_reader(log_label):
-    """Admit one read route, with a bounded retry (#780).
+def _open_cache_free_session(refusal, account, cache_free):
+    """Round 7 (spec 5.11, 5.12 N2): the read unit for a route `main` answered
+    from conversations.db alone, once `_open_conversation_session` refused
+    the attached cache for maintenance (a live repair, or its maintenance
+    lock held).
 
-    Reads through the read-only opener, which performs no schema apply, no
-    migration dispatch, no PRAGMA write and no chmod, so a browse is no longer
-    a writer that can lose the SQLite write lock to a reclaim pass.
+    ``cache_free`` is the route's predicate. Without it, for a request that
+    names an account (whose scope is built from cache.db, so it fails
+    closed), or for any other refusal, ``refusal`` stands. Otherwise the unit
+    is opened again on conversations.db with nothing attached, so no
+    connection reaches cache.db while its repair holds the marker, and the
+    route is served only when the predicate holds on that connection.
 
-    A store that is simply not present yet falls back to the full opener, which
-    creates and migrates it. That is the first-run path, not the steady state,
-    and removing it would make an empty installation serve a degraded envelope
-    forever with no process willing to create the store.
-
-    BOTH fallbacks probe the maintenance flock first. The full opener's
-    admission is a plain `LOCK_SH` with no timeout, so falling back to it
-    during a rebuild queued the request behind the whole rebuild — 716.9 s in
-    the measured run — which is the failure this opener exists to remove,
-    reintroduced on the two paths that leave it. The probe refuses instead, and
-    the route serves the same typed degraded envelope every other refusal
-    already produces. The legacy-bridge fallback matters more than the
-    first-run one here: `conversation_legacy_bridge_pending` is durable state
-    after an interrupted migration 028, so it is not a one-off startup case.
-
-    Both fallbacks go through `_full_open_or_refuse`, which serves the opened
-    connection only when the bridge is no longer owed. Under `--no-sync` the
-    bridge is suppressed and cannot clear, so the route answers the typed
-    degraded envelope rather than an empty conversation surface (#802).
+    The predicate and the route's kernel run inside the session's one
+    deferred read transaction, so they read one snapshot: a backfill flag a
+    writer sets between them is invisible to the kernel, which therefore
+    never takes the live branch (`session_entries`) on this cache-free
+    connection. Do not end the unit between them.
     """
-    dash = sys.modules["_cctally_dashboard"]
-    cache_mod = sys.modules["_cctally_cache"]
-    last = None
-    for attempt in range(_CONVERSATION_READ_ATTEMPTS):
-        try:
-            conn = dash.open_conversations_db_readonly()
-        except dash.MaintenanceInProgress as exc:
-            last = exc
-            if attempt + 1 < _CONVERSATION_READ_ATTEMPTS:
-                time.sleep(_CONVERSATION_READ_RETRY_SLEEP_S)
-                continue
-            raise
-        except dash.ConversationReaderUnavailable as exc:
-            if type(exc) is dash.ConversationReaderUnavailable:
-                # The store (or the accounting store it attaches) is absent.
-                dash.probe_conversations_maintenance_free()
-                return _full_open_or_refuse()
-            raise
-        if cache_mod.conversation_legacy_bridge_pending(conn):
-            # An interrupted migration 028 left transcript rows in cache.db.
-            # The bridge that moves them is a writer, so hand the open back to
-            # the full opener rather than serving an empty surface over rows
-            # that are present but not yet in this store.
-            conn.close()
-            dash.probe_conversations_maintenance_free()
-            return _full_open_or_refuse()
-        return conn
-    raise last  # unreachable: the loop either returns or raises
+    if not (cache_free is not None and account is None
+            and isinstance(refusal, _cctally_core.StoreUnavailable)
+            and refusal.store == "cache" and refusal.reason == "maintenance"):
+        raise refusal
+    session, stack = _enter_conversation_session(_store_access(), (), None)
+    try:
+        served = cache_free(session.conn)
+    except BaseException:
+        stack.close()
+        raise
+    if not served:
+        stack.close()
+        raise refusal
+    return session, stack
+
+
+def _enter_conversation_session(access, attach, account):
+    """`_open_conversation_session`'s one session entry, with its owner
+    notification on a refusal the owner resolves."""
+    stack = contextlib.ExitStack()
+    try:
+        session = stack.enter_context(access.QueryService.session(
+            "conversations", attach=attach, account=account,
+            policy="interactive"))
+    except BaseException as exc:
+        stack.close()
+        if (isinstance(exc, _cctally_core.StoreUnavailable)
+                and exc.reason not in _OWNER_RESOLVES_EXCEPT):
+            # The session already told the owner about a readiness state it
+            # read; a refusal raised before any read (an absent store or
+            # lock, a pending recovery, a data directory that is not private)
+            # is told here. Notifications coalesce.
+            _cctally_core.notify_owner(exc.store, _cctally_core.Readiness(
+                exc.store, False, exc.reason, frozenset()))
+        raise
+    return session, stack
+
+
+#: The one 500 envelope a conversation reader serves for a store it cannot
+#: read for a reason other than a typed state (corruption, an I/O error).
+_CONVERSATION_STORE_500 = {
+    "error": "transcript store unavailable; run cctally doctor for details",
+}
+
+
+def _conversation_transport_for(exc, *, no_sync):
+    """``(HTTP status, body)`` for a conversation reader's store refusal
+    (spec 5.5 translation boundary, 5.8 table).
+
+    The one mapping every conversation reader family uses: browse, detail,
+    search, the outline producer and both live-tail preflights. Typed states
+    are a 200 degraded marker with an existing client reason (Q-W1: no SQLite
+    text, path or internal reason reaches the body); a pending legacy bridge
+    is maintenance while an owner that may run it is present, and its own
+    reason under ``--no-sync``, where only ``cache-sync`` can finish it.
+    Corruption and every untyped error keep the existing 500 envelope.
+    """
+    reason = (exc.reason if isinstance(exc, _cctally_core.StoreUnavailable)
+              else None)
+    if reason is None or reason == "corrupt":
+        return 500, dict(_CONVERSATION_STORE_500)
+    if reason in ("maintenance", "busy"):
+        wire = "maintenance"
+    elif reason == "legacy_bridge_pending":
+        wire = "legacy_bridge_pending" if no_sync else "maintenance"
+    elif reason in ("schema_behind", "schema_ahead"):
+        wire = reason
+    else:   # absent, recovery_pending, unavailable
+        wire = "unavailable"
+    return 200, {"status": "degraded", "degraded_reason": wire}
+
+
+def _respond_conversation_refusal(handler, exc, log_label):
+    """Answer a store refusal through `_conversation_transport_for`, with the
+    route's own degraded shape. The specific reason goes only to the log."""
+    status, body = _conversation_transport_for(
+        exc, no_sync=bool(getattr(handler, "no_sync", False)))
+    if status == 200:
+        handler.log_error("%s transcript store degraded: %s", log_label,
+                          getattr(exc, "reason", "unavailable"))
+        body = _conversation_degraded_body(log_label, body["degraded_reason"])
+    else:
+        handler.log_error("%s transcript store open failed: %r", log_label, exc)
+    handler._respond_json(status, body)
+
+
+#: `_run_conversation_query_impl`'s default: the account comes from the
+#: request's own query string.
+_ACCOUNT_FROM_PATH = object()
+
 
 def _run_conversation_query_impl(
     handler, kernel_call, log_label, *, cancelled=None,
+    account=_ACCOUNT_FROM_PATH, cache_free=None,
 ):
-    """Open conversations.db, run ``kernel_call(conn)``, close.
+    """Run ``kernel_call(conn)`` inside one conversations query session.
 
-    Collapses the triplicated open-store → try/except/finally → 500
-    scaffold to one site. Returns ``(ok, body)``: ``ok=False`` means a 500
-    has ALREADY been sent and the caller must just ``return``; ``ok=True``
-    carries the kernel result (which may itself be ``None`` — the reader's
-    404 sentinel — so the explicit flag, not ``body is None``, signals
-    failure). An ``open_conversations_db`` failure is logged in full but
-    returned through one privacy-safe transcript-store envelope. A kernel
-    exception is logged as ``<log_label> failed: %r`` and returned as a
-    ``{type}: {msg}`` 500.
+    Collapses the open-store → try/except/finally → 500 scaffold to one site.
+    Returns ``(ok, body)``: ``ok=False`` means a response has ALREADY been
+    sent and the caller must just ``return``; ``ok=True`` carries the kernel
+    result (which may itself be ``None`` — the reader's 404 sentinel — so the
+    explicit flag, not ``body is None``, signals failure).
+
+    The account (``?account=``, or ``account`` for a caller whose request is
+    not the one that named it) is validated before any lock, attach or
+    sidecar (spec 5.8), and scoped inside the session. A store refusal is
+    answered through `_conversation_transport_for`; a kernel exception is
+    logged as ``<log_label> failed: %r`` and returned as a ``{type}: {msg}``
+    500. ``cache_free`` is `_open_cache_free_session`'s predicate for a route
+    `main` answered from conversations.db alone (round 7).
     """
-    try:
-        conn = _open_conversation_reader(log_label)
-    except _reader_unavailable() as exc:
-        # #780: maintenance and schema admission are NOT server errors. A
-        # rebuild, a reclaim pass or a store one migration behind used to reach
-        # the reader as a 500, which is exactly the 5xx this session exists to
-        # remove. Answer with the route's own typed degraded envelope instead.
-        handler.log_error(
-            "%s transcript store degraded: %s", log_label, exc.reason)
-        handler._respond_json(200, _conversation_degraded_body(
-            log_label, exc.reason))
-        return False, None
-    except (sqlite3.DatabaseError, OSError) as exc:
-        handler.log_error("%s transcript store open failed: %r", log_label, exc)
-        handler._respond_json(
-            500,
-            {
-                "error": (
-                    "transcript store unavailable; "
-                    "run cctally doctor for details"
-                )
-            },
-        )
-        return False, None
-    try:
+    if account is _ACCOUNT_FROM_PATH:
         import urllib.parse as _u
         account_vals = _u.parse_qs(
             handler.path.partition("?")[2], keep_blank_values=True
         ).get("account")
-        if account_vals is not None:
-            if len(account_vals) != 1 or not account_vals[0]:
-                handler._respond_json(400, {"error": "invalid account"})
-                return False, None
-            scope_conversations_db_to_account(conn, account_vals[0])
+        if account_vals is not None and (
+                len(account_vals) != 1 or not account_vals[0]):
+            handler._respond_json(400, {"error": "invalid account"})
+            return False, None
+        account = account_vals[0] if account_vals else None
+    try:
+        try:
+            session, stack = _open_conversation_session(account)
+        except _cctally_core.StoreUnavailable as exc:
+            if cache_free is None:
+                raise
+            session, stack = _open_cache_free_session(exc, account, cache_free)
+    except (sqlite3.DatabaseError, OSError) as exc:
+        _respond_conversation_refusal(handler, exc, log_label)
+        return False, None
+    except ValueError as exc:
+        handler.log_error("%s failed: %r", log_label, exc)
+        handler._respond_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+        return False, None
+    conn = session.conn
+    try:
         if cancelled is not None:
             conn.set_progress_handler(lambda: 1 if cancelled() else 0, 1000)
             if cancelled():
@@ -1325,7 +1377,9 @@ def _run_conversation_query_impl(
                 conn.set_progress_handler(None, 0)
             except sqlite3.Error:
                 pass
-        conn.close()
+        # The session's teardown evicts the resolver caches (#854 R2), drops
+        # the account scope and closes the connection.
+        stack.close()
     return True, body
 
 def _parse_conversation_filters_impl(handler, q):
@@ -1446,7 +1500,7 @@ def _handle_get_conversations_impl(handler) -> None:
         lambda conn: handler._conversation_query().list_conversations(
             conn, sort=sort, limit=limit, offset=offset, selected=selected,
             **filters),
-        "/api/conversations")
+        "/api/conversations", cache_free=_browse_reads_no_cache)
     if not ok:
         return
     handler._respond_json(200, body)
@@ -1474,7 +1528,7 @@ def _handle_get_conversations_facets_impl(handler) -> None:
         return _handle_qualified_facets(handler, qs_raw, source)
     ok, body = handler._run_conversation_query(
         lambda conn: handler._conversation_query().list_conversation_facets(conn),
-        "/api/conversations/facets")
+        "/api/conversations/facets", cache_free=_browse_reads_no_cache)
     if not ok:
         return
     handler._respond_json(200, body)
@@ -1549,7 +1603,7 @@ def _send_sse_headers(handler) -> None:
 
 
 def _run_conversation_events_stream(
-    handler, conn, *, passive, tail_data, resolve, ingest, cached_sigs,
+    handler, reader, *, passive, tail_data, resolve, ingest, cached_sigs,
     discovery_step=None, stat_fn=None, committed_sig=None,
 ) -> None:
     """Shared per-conversation live-tail SSE loop (spec §5.2), driving both the
@@ -1559,14 +1613,20 @@ def _run_conversation_events_stream(
     stream bytes are byte-identical to today (only ``tail_data`` differs).
 
     ``resolve()`` → the watched file list; ``ingest(changed)`` → the targeted
-    ingest (Claude ``sync_cache`` / Codex ``sync_codex_cache``) whose stats carry
-    ``targeted_clean``; ``cached_sigs(paths)`` → ``{path: committed cursor}`` (the
-    per-path committed-cursor baseline, so growth during an ingest is re-detected
-    next cycle); ``discovery_step(files, seen) → (files, emitted)`` is the
+    request-writer ingest whose stats carry ``targeted_clean``;
+    ``cached_sigs(paths)`` → ``{path: committed cursor}`` (the per-path
+    committed-cursor baseline, so growth during an ingest is re-detected next
+    cycle); ``discovery_step(files, seen) → (files, emitted)`` is the
     ~10-cycle Codex child-discovery frontier (``None`` for Claude — a bare or
-    qualified-Claude stream never runs it). The cache lock is held ONLY inside
-    ``ingest`` / ``discovery_step``, never across a sleep (the #297 WAL
-    discipline).
+    qualified-Claude stream never runs it).
+
+    #787 / #861 spec 5.9: the stream's reads go through ``reader``, a
+    `_LiveTailReader` whose read unit is one ``query(interactive)`` session.
+    The unit is closed before every sleep and around every ingest, so no
+    session spans an ingest or a sleep (AD21), and the ingest phase (the
+    request-writer entries, at the stream's ceiling) runs only on growth and
+    never under ``--no-sync``. A read unit the store refuses mid-stream skips
+    that cycle: the growth stays unacknowledged in ``seen`` and is retried.
 
     ``stat_fn`` / ``committed_sig`` are the provider's observation seam
     (#968 spec 5.9): Codex passes ``_codex_watch_probes`` so both poll sites
@@ -1578,12 +1638,14 @@ def _run_conversation_events_stream(
     watch = sys.modules["cctally"]._load_sibling("_lib_conversation_watch")
     probe = stat_fn or watch.file_sig
     committed = committed_sig or (lambda p: cached_sigs([p]).get(p))
+    release = lambda: _end_unit(reader)  # noqa: E731
     tail_frame = (
         "event: tail\ndata: " + encode_dashboard_json(tail_data) + "\n\n"
     ).encode("utf-8")
 
     if passive:
-        # Frozen-data contract: no ingest, no emit. Keep-alive only.
+        # Frozen-data contract: no ingest, no emit, no read. Keep-alive only.
+        release()
         while True:
             if _request_peer_gone(
                     handler, timeout=_LIVE_TAIL_KEEPALIVE):
@@ -1597,15 +1659,19 @@ def _run_conversation_events_stream(
     handler.wfile.flush()
 
     files = resolve()
-    # Best-effort connect ingest for immediacy, then baseline `seen` from the
-    # cache's own committed cursor so any pre-connect growth the connect-ingest
-    # declined is still caught on cycle 1.
+    # Best-effort connect ingest for immediacy, of the growth the cache has
+    # not committed yet (the request-writer phase runs only on growth), then
+    # baseline `seen` from the cache's own committed cursor so any pre-connect
+    # growth the connect-ingest declined is still caught on cycle 1.
     try:
         if files:
-            ingest(files)
+            pending = watch.changed_paths(files, cached_sigs(files), probe)
+            if pending:
+                ingest(pending)
     except sqlite3.DatabaseError:
         pass
     seen = cached_sigs(files)
+    release()
 
     # #630 S2: `ready` above means "this connection is live-tailing"; it fires
     # BEFORE resolve() and ingest(), so it does not mean a baseline exists,
@@ -1622,188 +1688,262 @@ def _run_conversation_events_stream(
     idle = 0.0
     cycles = 0
     while True:
+        release()   # no read unit spans the sleep (spec 5.9, AD21)
         if _request_peer_gone(handler, timeout=_LIVE_TAIL_POLL_INTERVAL):
             return
         cycles += 1
-        changed = watch.changed_paths(files, seen, probe)
-        if changed:
-            _time.sleep(_LIVE_TAIL_DEBOUNCE)
-            observation = None
+        try:
+            changed = watch.changed_paths(files, seen, probe)
+            if changed:
+                _time.sleep(_LIVE_TAIL_DEBOUNCE)
+                observation = None
 
-            def poll_ingest(changed):
-                nonlocal observation
-                observation = ingest(changed)
-                return observation
+                def poll_ingest(changed):
+                    nonlocal observation
+                    observation = ingest(changed)
+                    return observation
 
-            new_seen, emitted = watch.watch_step(
-                files, seen, stat_fn=probe, ingest_fn=poll_ingest,
-                committed_sig_fn=committed)
-            if isinstance(observation, _CodexWatchIngest):
-                # A held container was observed, not successfully ingested.
-                # Keep that distinction out of the generic watch kernel and
-                # out of every durable cursor/certification decision.
-                new_seen = dict(new_seen)
-                new_seen.update(observation.acknowledged)
-                emitted = emitted or observation.observation_visible
-            seen = new_seen
-            if emitted:
-                handler.wfile.write(tail_frame)
-                handler.wfile.flush()
-                idle = 0.0
-                # A brand-new child file's FIRST content was just ingested, so
-                # the conversation's source-path set may have grown. Re-resolve
-                # now (vs waiting up to _LIVE_TAIL_FILE_RESET_EVERY cycles) so the
-                # new thread live-tails promptly. A new path seeds seen=None (cur
-                # lacks a row) → changed_paths flags it next cycle → it emits.
-                new_files = resolve()
-                if set(new_files) != set(files):
-                    files = new_files
-                    cur = cached_sigs(files)
-                    for p in files:
-                        seen.setdefault(p, cur.get(p))
-                continue
-        idle += _LIVE_TAIL_POLL_INTERVAL
-        if idle >= _LIVE_TAIL_KEEPALIVE:
-            handler.wfile.write(b": keep-alive\n\n")
-            handler.wfile.flush()
-            idle = 0.0
-        if cycles % _LIVE_TAIL_FILE_RESET_EVERY == 0:
-            # Layer 1 (both providers): DB re-resolve so a child ingested by ANY
-            # other writer joins the watch immediately.
-            files = resolve()
-            seen = {p: s for p, s in seen.items() if p in set(files)}
-            # Layer 2 (Codex only): bounded filesystem child discovery for
-            # brand-new files no table yet knows (§5.4). A widened file set emits
-            # a `tail` — the client refetches detail, whose children list
-            # surfaces the new child (no new frame type).
-            if discovery_step is not None:
-                files, disc_emitted = discovery_step(files, seen)
-                if disc_emitted:
+                new_seen, emitted = watch.watch_step(
+                    files, seen, stat_fn=probe, ingest_fn=poll_ingest,
+                    committed_sig_fn=committed)
+                if isinstance(observation, _CodexWatchIngest):
+                    # A held container was observed, not successfully
+                    # ingested. Keep that distinction out of the generic watch
+                    # kernel and out of every durable cursor/certification
+                    # decision.
+                    new_seen = dict(new_seen)
+                    new_seen.update(observation.acknowledged)
+                    emitted = emitted or observation.observation_visible
+                seen = new_seen
+                if emitted:
                     handler.wfile.write(tail_frame)
                     handler.wfile.flush()
                     idle = 0.0
+                    # A brand-new child file's FIRST content was just ingested,
+                    # so the conversation's source-path set may have grown.
+                    # Re-resolve now (vs waiting up to
+                    # _LIVE_TAIL_FILE_RESET_EVERY cycles) so the new thread
+                    # live-tails promptly. A new path seeds seen=None (cur
+                    # lacks a row) → changed_paths flags it next cycle → it
+                    # emits.
+                    new_files = resolve()
+                    if set(new_files) != set(files):
+                        files = new_files
+                        cur = cached_sigs(files)
+                        for p in files:
+                            seen.setdefault(p, cur.get(p))
+                    continue
+            idle += _LIVE_TAIL_POLL_INTERVAL
+            if idle >= _LIVE_TAIL_KEEPALIVE:
+                handler.wfile.write(b": keep-alive\n\n")
+                handler.wfile.flush()
+                idle = 0.0
+            if cycles % _LIVE_TAIL_FILE_RESET_EVERY == 0:
+                # Layer 1 (both providers): DB re-resolve so a child ingested
+                # by ANY other writer joins the watch immediately.
+                files = resolve()
+                seen = {p: s for p, s in seen.items() if p in set(files)}
+                # Layer 2 (Codex only): bounded filesystem child discovery for
+                # brand-new files no table yet knows (§5.4). A widened file
+                # set emits a `tail` — the client refetches detail, whose
+                # children list surfaces the new child (no new frame type).
+                if discovery_step is not None:
+                    files, disc_emitted = discovery_step(files, seen)
+                    if disc_emitted:
+                        handler.wfile.write(tail_frame)
+                        handler.wfile.flush()
+                        idle = 0.0
+        except _cctally_core.StoreUnavailable:
+            # A read unit was refused (maintenance began, a writer holds the
+            # store): skip this cycle. The session told the owner.
+            continue
 
 
-def _live_tail_read_connection():
-    """The READ connection a live-tail stream holds for its whole lifetime.
+class _LiveTailReader:
+    """The live-tail stream's reads, one ``query(interactive)`` session per
+    read unit (#787 / #861 spec 5.9, AD21).
 
-    Deliberately the full opener, not `open_conversations_db_readonly`, and the
-    reason is measured rather than assumed. Moving it to the read-only opener
-    made `test_codex_child_discovery_emits_tail` stop emitting a tail: the
-    stream reached `ready` and `baselined`, the child rollout was ingested
-    through the separate writer below, and the long-lived read connection never
-    observed the committed growth, so `seen` never changed and no `event: tail`
-    was ever pushed.
+    ``conn`` opens the unit's session on first use (conversations with the
+    accounting store attached read-only, the account TEMP scope and resolver
+    state rebuilt) and ``end_unit()`` closes it; the stream ends the unit
+    before every sleep and around every ingest, so each cycle reads a fresh
+    snapshot of what the writer phase committed. ``execute`` reads through
+    the open unit, for the stream's own cursor helpers. The connection is
+    the session's, so it can never write a store (the query authorizer)."""
 
-    That is a different problem from the one #780 is about. A read ROUTE opens
-    per request, so its opener's write-capable pragmas are what compete with
-    maintenance for the SQLite write lock on every browse; a live-tail stream
-    opens ONCE and then holds the connection for minutes, so it contributes one
-    open, not one per request. Task 3.3's requirement — that every live-tail
-    INGEST branch takes its own write connection — is met by `_live_tail_write`
-    below, and that is the part that would otherwise make each stream a writer.
+    def __init__(self, account_key=None):
+        self._account = account_key
+        self._session = None
+        self._stack = None
 
-    What did NOT survive is entering that opener unconditionally. Its
-    maintenance admission is a blocking `LOCK_SH`, so a stream opened during a
-    rebuild waited out the rebuild — 716.9 s measured — holding a server thread
-    the whole time and answering nothing. §4a names the live-tail preflight
-    among the routes that must fail soft, so the flock is probed non-blocking
-    first and the two callers turn `MaintenanceInProgress` into the same typed
-    degraded envelope every other read route serves.
+    @property
+    def conn(self):
+        if self._session is None:
+            self._session, self._stack = _open_conversation_session(
+                self._account)
+        return self._session.conn
 
-    It goes through `_full_open_or_refuse` for the same reason the read routes
-    do: under `--no-sync` the legacy bridge is suppressed, so a stream opened
-    over an owed bridge would tail a store whose transcript rows are still in
-    `cache.db` and report nothing for as long as it ran (#802).
-    """
-    dash = sys.modules["_cctally_dashboard"]
-    dash.probe_conversations_maintenance_free()
-    return _full_open_or_refuse()
+    def execute(self, sql, parameters=()):
+        return self.conn.execute(sql, parameters)
+
+    def end_unit(self) -> None:
+        stack, self._session, self._stack = self._stack, None, None
+        if stack is not None:
+            stack.close()
+
+    close = end_unit
 
 
-def _live_tail_write(work):
-    """Run one live-tail ingest on its OWN write connection (#780).
+def _read_conn(source):
+    """The connection to read through: the open unit of a `_LiveTailReader`,
+    or ``source`` itself when a caller hands a plain connection."""
+    return source.conn if isinstance(source, _LiveTailReader) else source
 
-    Live-tail is the single write exception among the conversation routes.
-    Its own read connection is NOT read-only — `_live_tail_read_connection`
-    above keeps the full opener, and says why — but that connection must still
-    not be the one that ingests: a stream holds it for minutes, and driving a
-    sync on it mixes the stream's long-lived read transaction with writes. The
-    ingest branches therefore open a writer, use it, and close it. The stream's
-    read connection is refreshed by the caller's next query, which starts a
-    fresh read transaction and so observes what this writer committed.
-    """
-    writer = sys.modules["_cctally_dashboard"].open_conversations_db()
+
+def _end_unit(source) -> None:
+    if isinstance(source, _LiveTailReader):
+        source.end_unit()
+
+
+def _live_tail_phase(reader, ingest):
+    """Run ``ingest`` as the cycle's writer phase: no read unit is open
+    around it, so the phases never overlap (spec 5.9)."""
+    def phased(changed):
+        _end_unit(reader)
+        try:
+            return ingest(changed)
+        finally:
+            _end_unit(reader)
+    return phased
+
+
+class _PendingIngest:
+    """The stats of a request the writer phase did not run (spec 5.9
+    "pending"): nothing was ingested, so the watch keeps the growth
+    unacknowledged and retries it next cycle."""
+
+    targeted_clean = False
+    targeted_visible = False
+
+    def __init__(self, pending):
+        self.pending = frozenset(pending)
+
+
+def _request_writer(store):
+    """A `WriterService.request_writer` connection (the stream's seam)."""
+    return _store_access().WriterService.request_writer(store)
+
+
+def _live_tail_request(store, entry, paths):
+    """One request-writer ingest (spec 5.9): ``entry(writer, paths)`` — one
+    of the restricted ``sync_*_request`` entries — on a request-writer
+    connection, at the stream's ``request_writer`` ceiling.
+
+    Returns the entry's ingest stats, or a `_PendingIngest` when it ran
+    nothing. A refusal is pending, never a recovery: there is no recovery
+    wrapper, a typed store refusal the owner resolves is handed to it, and the
+    stream retries the growth next cycle. Owner work the entry meets (an
+    invalid quota index, a pending replay or contract, a drain) is returned by
+    the entry as pending and handed to the owner there."""
     try:
-        return work(writer)
-    finally:
-        writer.close()
+        with _cctally_core.operation_boundary("live-tail-ingest"):
+            with _request_writer(store) as writer:
+                result = entry(writer, set(paths))
+    except sqlite3.DatabaseError as exc:
+        reason = getattr(exc, "reason", None)
+        if (isinstance(exc, _cctally_core.StoreUnavailable)
+                and reason not in _OWNER_RESOLVES_EXCEPT):
+            _cctally_core.notify_owner(exc.store, _cctally_core.Readiness(
+                exc.store, False, reason, frozenset()))
+        return _PendingIngest({reason or "database_error"})
+    stats = getattr(result, "stats", None)
+    return stats if stats is not None else _PendingIngest(result.pending)
+
+
+def _passive_live_tail_for(handler, exc, tail_data) -> bool:
+    """B6 (#787 / #861 revision 32): a live-tail whose store refusal maps to
+    the conversation 500 envelope (corruption, an untyped open failure)
+    answers as `main` did, with a passive keep-alive stream instead: no
+    `ready`, no read and no ingest, the client's backstop tick still
+    surfacing turns. Returns whether it answered; other typed refusals keep
+    their degraded envelope."""
+    status, _body = _conversation_transport_for(
+        exc, no_sync=bool(getattr(handler, "no_sync", False)))
+    # Round 7: so does an attached cache.db under maintenance (a live
+    # repair, or its maintenance lock held). `main`'s live-tail opened the
+    # full writer, whose cache open refused before connecting, and streamed
+    # passively; no connection reaches cache.db here either (5.12, N2).
+    cache_maintenance = (isinstance(exc, _cctally_core.StoreUnavailable)
+                         and exc.store == "cache"
+                         and exc.reason == "maintenance")
+    if status != 500 and not cache_maintenance:
+        return False
+    handler.log_error("/api/conversation/events transcript store open "
+                      "failed: %r; passive stream", exc)
+    _send_sse_headers(handler)
+    try:
+        _run_conversation_events_stream(
+            handler, None, passive=True, tail_data=tail_data,
+            resolve=lambda: [], ingest=lambda changed: None,
+            cached_sigs=lambda paths: {})
+    except (BrokenPipeError, ConnectionResetError,
+            ConnectionAbortedError, socket.timeout):
+        pass
+    except Exception as exc2:  # noqa: BLE001
+        handler.log_error("api/conversation/events stream failed: %r", exc2)
+    return True
 
 
 def _bare_conversation_events(
     handler, session_id: str, account_key: str | None = None,
 ) -> None:
-    """Bare legacy Claude live-tail — today's no-preflight, ``sessionId``-framed
-    behavior, byte-identical (spec §5.2 reserves this for bare streams)."""
+    """Bare legacy Claude live-tail — today's ``sessionId``-framed behavior
+    (spec §5.2 reserves this for bare streams)."""
     cq = handler._conversation_query()
     passive = bool(type(handler).no_sync)
+    reader = _LiveTailReader(account_key)
     try:
-        conn = _live_tail_read_connection()
-    except _reader_unavailable() as exc:
-        # #780: maintenance is not a server error and not a passive stream
-        # either. Answer the typed degraded envelope BEFORE any SSE byte, the
-        # same way every other read route does.
-        handler._respond_json(
-            200, _conversation_degraded_body(
-                "/api/conversation/events", getattr(exc, "reason",
-                                                    "unavailable")))
-        return
-    except (sqlite3.DatabaseError, OSError):
-        if account_key is not None:
-            # A qualified account boundary must be established before any SSE
-            # bytes.  If it cannot be proven, fail closed as JSON.
-            handler._respond_json(500, {"error": "internal error"})
-            return
-        # Unqualified legacy behavior: degrade to keep-alive only; the client
-        # backstop tick still surfaces turns.
-        passive = True
-        conn = None
-    if conn is not None and account_key is not None:
-        scope_conversations_db_to_account(conn, account_key)
-        if conn.execute(
+        reader.conn
+        if account_key is not None and reader.execute(
             "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
             (session_id,),
         ).fetchone() is None:
-            conn.close()
+            reader.close()
             handler._respond_json(404, {"error": "conversation not found"})
             return
+    except (sqlite3.DatabaseError, OSError, ValueError) as exc:
+        # Answered BEFORE any SSE byte, through the one conversation transport
+        # mapping every reader route uses (spec 5.8), except that an
+        # unscoped stream over an unreadable store keeps `main`'s passive
+        # keep-alive stream (B6); a stream scoped to an account fails closed.
+        reader.close()
+        if account_key is None and _passive_live_tail_for(
+                handler, exc, {"sessionId": session_id}):
+            return
+        _respond_conversation_refusal(
+            handler, exc, "/api/conversation/events")
+        return
+    reader.end_unit()
     _send_sse_headers(handler)
 
     def _resolve():
-        return cq.session_source_paths(conn, session_id) if conn else []
+        return cq.session_source_paths(reader.conn, session_id)
 
     def _ingest(changed):
-        _advance_live_tail_accounting(handler, changed, sync_cache, "claude")
+        _advance_live_tail_accounting(
+            handler, changed, sync_cache_request, "claude")
         if account_key is None:
-            # #780: ingest takes its OWN write connection. The read connection
-            # this stream then queries is opened read-only, so writing through
-            # it would fail outright — and even on a writable connection,
-            # driving ingestion from the connection a long-lived SSE stream
-            # reads from is what made every live-tail a writer.
-            return _live_tail_write(
-                lambda writer: sync_claude_conversations(
-                    writer, only_paths=set(changed)))
-        before = conn.execute(
+            return _live_tail_request(
+                "conversations", sync_claude_conversations_request, changed)
+        before = reader.execute(
             "SELECT COUNT(*),MAX(id) FROM conversation_messages "
             "WHERE session_id=?",
             (session_id,),
         ).fetchone()
-        writer = sys.modules["_cctally_dashboard"].open_conversations_db()
-        try:
-            stats = sync_claude_conversations(writer, only_paths=set(changed))
-        finally:
-            writer.close()
-        after = conn.execute(
+        reader.end_unit()
+        stats = _live_tail_request(
+            "conversations", sync_claude_conversations_request, changed)
+        after = reader.execute(
             "SELECT COUNT(*),MAX(id) FROM conversation_messages "
             "WHERE session_id=?",
             (session_id,),
@@ -1813,10 +1953,10 @@ def _bare_conversation_events(
 
     try:
         _run_conversation_events_stream(
-            handler, conn, passive=passive,
+            handler, reader, passive=passive,
             tail_data={"sessionId": session_id},
-            resolve=_resolve, ingest=_ingest,
-            cached_sigs=lambda paths: _cached_file_sigs(conn, paths))
+            resolve=_resolve, ingest=_live_tail_phase(reader, _ingest),
+            cached_sigs=lambda paths: _cached_file_sigs(reader, paths))
     except (BrokenPipeError, ConnectionResetError,
             ConnectionAbortedError, socket.timeout):
         # #279 S1 F3: a stalled send past the handler timeout raises
@@ -1827,17 +1967,24 @@ def _bare_conversation_events(
         # operator signal through the _lib_log chokepoint + a clean close.
         handler.log_error("api/conversation/events stream failed: %r", exc)
     finally:
-        if conn is not None:
-            conn.close()
+        reader.close()
 
 
-def _make_codex_discovery_step(handler, conn, conversation_key, cq_codex):
+def _make_codex_discovery_step(handler, reader, conversation_key, cq_codex):
     """Build the ~10-cycle Codex child-discovery frontier step (spec §5.4), or
     ``None`` when the conversation's own root is not currently configured (the
     frontier is then skipped — the DB re-resolve of layer 1 still runs). The
     frontier is constructed ONCE per SSE connection so its directory index,
-    pending-candidate set, and rotation cursors accumulate across cycles."""
-    locations = _codex_walk_root_for_conversation(conn, conversation_key)
+    pending-candidate set, and rotation cursors accumulate across cycles.
+
+    #787 / #861 spec 5.9: discovery's ingest is the cycle's writer phase. It
+    used to run the transcript ingest on the stream's READ connection, which
+    is why that connection could not be read-only: on a read-only reader every
+    write failed (``files_failed``), the child was never classified and never
+    joined the watch. It now runs through the request entries on a request
+    writer, with no read unit open around it."""
+    locations = _codex_walk_root_for_conversation(
+        _read_conn(reader), conversation_key)
     if locations is None:
         return None
     fw = sys.modules["cctally"]._load_sibling("_lib_codex_conversation_watch")
@@ -1848,44 +1995,35 @@ def _make_codex_discovery_step(handler, conn, conversation_key, cq_codex):
         # Diff brand-new *.jsonl against every tracked Codex file; the same
         # {path: size} feeds both the frontier's known-set and its committed-size
         # growth baseline (a plain SELECT — no lock across the sleep).
-        known = _codex_all_committed_sizes(conn)
+        known = _codex_all_committed_sizes(reader)
         to_ingest = frontier.cycle(
             known_paths=set(known.keys()), committed_sizes=known)
         if not to_ingest:
             return files, False
+        _end_unit(reader)
         try:
             # A newly discovered child has no compact thread row yet. Advance
             # the independent core cursor first so transcript normalization can
             # link the child through the read-only attached cache, then commit
             # the transcript cursor. Neither lock is held across the other.
-            core = open_cache_db()
-            try:
-                cache_mod = sys.modules["cctally"]._load_sibling("_cctally_cache")
-                core_stats, core = cache_mod._run_cache_operation_with_recovery(
-                    core,
-                    lambda active_conn: sync_codex_cache(
-                        active_conn, only_paths=set(to_ingest)
-                    ),
-                    origin="dashboard.conversation.codex_sync",
-                )
-            finally:
-                core.close()
-            if not core_stats.targeted_clean:
+            core_stats = _advance_live_tail_accounting(
+                handler, to_ingest, sync_codex_cache_request, "codex")
+            if not getattr(core_stats, "targeted_clean", False):
                 return files, False
-            transcript_stats = sync_codex_conversations(
-                conn, only_paths=set(to_ingest)
-            )
+            transcript_stats = _live_tail_request(
+                "conversations", sync_codex_conversations_request, to_ingest)
             if not transcript_stats.targeted_clean:
                 return files, False
         except sqlite3.DatabaseError:
             return files, False
         # Reap the now-classified candidates (child → already widened; non-child
         # → done). Unclassified ones stay pending and are retried next cycle.
-        frontier.reap(_codex_classified_paths(conn, to_ingest))
-        new_files = cq_codex.codex_conversation_source_paths(conn, conversation_key)
+        frontier.reap(_codex_classified_paths(reader, to_ingest))
+        new_files = cq_codex.codex_conversation_source_paths(
+            _read_conn(reader), conversation_key)
         if set(new_files) == set(files):
             return files, False
-        cur = _codex_cached_file_sigs(conn, new_files)
+        cur = _codex_cached_file_sigs(reader, new_files)
         for p in new_files:
             seen.setdefault(p, cur.get(p))
         return new_files, True
@@ -1903,43 +2041,24 @@ def _qualified_conversation_events(
     existing Claude ingestion/watch mechanics internally; a Codex key uses
     targeted ingest + the directory-frontier child discovery."""
     disp = _conversation_dispatch_impl()
+    reader = _LiveTailReader(account_key)
     try:
-        conn = _live_tail_read_connection()
-    except _reader_unavailable() as exc:
-        # #780: maintenance holds the store. The preflight has committed no SSE
-        # bytes yet, so this is answerable as the same typed degraded envelope
-        # every other read route serves — and it must be, because a passive
-        # stream here would look to the client like a conversation with no
-        # turns rather than a store that is busy.
-        handler._respond_json(
-            200, _conversation_degraded_body(
-                "/api/conversation/events", getattr(exc, "reason",
-                                                    "unavailable")))
+        conn = reader.conn
+    except (sqlite3.DatabaseError, OSError, ValueError) as exc:
+        # The preflight has committed no SSE bytes yet, so a store refusal is
+        # answered through the one conversation transport mapping (spec 5.8):
+        # a passive stream here would look to the client like a conversation
+        # with no turns rather than a store that is busy. An unscoped stream
+        # over a store it cannot read at all keeps `main`'s passive
+        # keep-alive stream (B6); a stream scoped to an account fails closed,
+        # as the bare route does.
+        reader.close()
+        if account_key is None and _passive_live_tail_for(
+                handler, exc, {"conversationKey": key}):
+            return
+        _respond_conversation_refusal(
+            handler, exc, "/api/conversation/events")
         return
-    except (sqlite3.DatabaseError, OSError):
-        # Any other open failure takes the passive keep-alive stream: a
-        # genuinely unopenable store — an incomplete recovery, a live repair
-        # marker, an I/O error.
-        conn = None
-
-    if conn is None:
-        # Cache unavailable — existence is unknowable, so we cannot preflight.
-        # Degrade to a passive keep-alive stream (the client's backstop tick
-        # still surfaces turns), mirroring the bare path's conn-failure fallback.
-        _send_sse_headers(handler)
-        try:
-            _run_conversation_events_stream(
-                handler, None, passive=True, tail_data={"conversationKey": key},
-                resolve=lambda: [], ingest=lambda c: None,
-                cached_sigs=lambda paths: {})
-        except (BrokenPipeError, ConnectionResetError,
-                ConnectionAbortedError, socket.timeout):
-            pass
-        except Exception as exc:  # noqa: BLE001
-            handler.log_error("api/conversation/events stream failed: %r", exc)
-        return
-    if account_key is not None:
-        scope_conversations_db_to_account(conn, account_key)
 
     try:
         preflight = disp.neutral_events_preflight(conn, key)
@@ -1948,115 +2067,110 @@ def _qualified_conversation_events(
         # possible (unlike a mid-stream failure).
         handler.log_error("api/conversation/events preflight failed: %r", exc)
         handler._respond_json(500, {"error": "internal error"})
-        conn.close()
+        reader.close()
         return
     status = preflight.get("status")
     if status == "normalization_pending":
         # A legitimate empty state (migration 025 not yet stamped) — 200 JSON
         # envelope, never a 200-SSE stream with nothing to say (§2.3).
         handler._respond_json(200, preflight)
-        conn.close()
+        reader.close()
         return
     if status != "ok":
         # not_found (unresolvable ref or no rows) → 404 JSON (§2.3).
         handler._respond_json(404, preflight)
-        conn.close()
+        reader.close()
         return
     source = preflight["source"]
     native = preflight["native_key"]
+    reader.end_unit()
 
     # ok → commit SSE headers and enter the qualified watch loop.
     _send_sse_headers(handler)
     passive = bool(type(handler).no_sync)
-    if source == "codex":
-        cq_codex = _conversation_query_impl_codex()
-
-        def _resolve():
-            return cq_codex.codex_conversation_source_paths(conn, key)
-
-        def _ingest(changed):
-            if account_key is None:
-                _advance_live_tail_accounting(
-                    handler, changed, sync_codex_cache, "codex")
-                return _live_tail_write(
-                    lambda writer: sync_codex_conversations(
-                        writer, only_paths=set(changed)))
-            before = conn.execute(
-                "SELECT COUNT(*),MAX(id) FROM codex_conversation_messages "
-                "WHERE conversation_key=?",
-                (key,),
-            ).fetchone()
-            # The accounting cache owns the durable physical account-range
-            # decision. Advance it first so transcript ingest never treats the
-            # previous range as open-ended across an account switch.
-            accounting = open_cache_db()
-            try:
-                accounting_stats = sync_codex_cache(
-                    accounting, only_paths=set(changed)
-                )
-            finally:
-                accounting.close()
-            if not accounting_stats.targeted_clean:
-                return _CodexWatchIngest(
-                    accounting_stats, accounting_blocked=True)
-            writer = sys.modules["_cctally_dashboard"].open_conversations_db()
-            try:
-                stats = sync_codex_conversations(writer, only_paths=set(changed))
-            finally:
-                writer.close()
-            after = conn.execute(
-                "SELECT COUNT(*),MAX(id) FROM codex_conversation_messages "
-                "WHERE conversation_key=?",
-                (key,),
-            ).fetchone()
-            stats.targeted_visible = after != before
-            return stats
-
-        cached = lambda paths: _codex_cached_file_sigs(conn, paths)
-        stat_fn, committed_sig, settle_ingest = _codex_watch_probes(conn)
-        _ingest = settle_ingest(_ingest)
-        discovery = (
-            None if account_key is not None
-            else _make_codex_discovery_step(handler, conn, key, cq_codex)
-        )
-    else:  # claude — reuse the Claude mechanics, speak qualified frames.
-        cq = handler._conversation_query()
-
-        def _resolve():
-            return cq.session_source_paths(conn, native)
-
-        def _ingest(changed):
-            _advance_live_tail_accounting(
-                handler, changed, sync_cache, "claude")
-            if account_key is None:
-                return _live_tail_write(
-                    lambda writer: sync_claude_conversations(
-                        writer, only_paths=set(changed)))
-            before = conn.execute(
-                "SELECT COUNT(*),MAX(id) FROM conversation_messages "
-                "WHERE session_id=?",
-                (native,),
-            ).fetchone()
-            writer = sys.modules["_cctally_dashboard"].open_conversations_db()
-            try:
-                stats = sync_claude_conversations(writer, only_paths=set(changed))
-            finally:
-                writer.close()
-            after = conn.execute(
-                "SELECT COUNT(*),MAX(id) FROM conversation_messages "
-                "WHERE session_id=?",
-                (native,),
-            ).fetchone()
-            stats.targeted_visible = after != before
-            return stats
-
-        cached = lambda paths: _cached_file_sigs(conn, paths)
-        stat_fn = committed_sig = None
-        discovery = None
-
     try:
+        if source == "codex":
+            cq_codex = _conversation_query_impl_codex()
+
+            def _resolve():
+                return cq_codex.codex_conversation_source_paths(
+                    reader.conn, key)
+
+            def _ingest(changed):
+                if account_key is None:
+                    _advance_live_tail_accounting(
+                        handler, changed, sync_codex_cache_request, "codex")
+                    return _live_tail_request(
+                        "conversations", sync_codex_conversations_request,
+                        changed)
+                before = reader.execute(
+                    "SELECT COUNT(*),MAX(id) FROM codex_conversation_messages "
+                    "WHERE conversation_key=?",
+                    (key,),
+                ).fetchone()
+                reader.end_unit()
+                # The accounting cache owns the durable physical account-range
+                # decision. Advance it first so transcript ingest never treats
+                # the previous range as open-ended across an account switch.
+                accounting_stats = _advance_live_tail_accounting(
+                    handler, changed, sync_codex_cache_request, "codex")
+                if not getattr(accounting_stats, "targeted_clean", False):
+                    return _CodexWatchIngest(
+                        accounting_stats or _PendingIngest(()),
+                        accounting_blocked=True)
+                stats = _live_tail_request(
+                    "conversations", sync_codex_conversations_request, changed)
+                after = reader.execute(
+                    "SELECT COUNT(*),MAX(id) FROM codex_conversation_messages "
+                    "WHERE conversation_key=?",
+                    (key,),
+                ).fetchone()
+                stats.targeted_visible = after != before
+                return stats
+
+            cached = lambda paths: _codex_cached_file_sigs(reader, paths)
+            stat_fn, committed_sig, settle_ingest = _codex_watch_probes(reader)
+            _ingest = settle_ingest(_live_tail_phase(reader, _ingest))
+            discovery = (
+                None if account_key is not None or passive
+                else _make_codex_discovery_step(handler, reader, key, cq_codex)
+            )
+        else:  # claude — reuse the Claude mechanics, speak qualified frames.
+            cq = handler._conversation_query()
+
+            def _resolve():
+                return cq.session_source_paths(reader.conn, native)
+
+            def _ingest(changed):
+                _advance_live_tail_accounting(
+                    handler, changed, sync_cache_request, "claude")
+                if account_key is None:
+                    return _live_tail_request(
+                        "conversations", sync_claude_conversations_request,
+                        changed)
+                before = reader.execute(
+                    "SELECT COUNT(*),MAX(id) FROM conversation_messages "
+                    "WHERE session_id=?",
+                    (native,),
+                ).fetchone()
+                reader.end_unit()
+                stats = _live_tail_request(
+                    "conversations", sync_claude_conversations_request, changed)
+                after = reader.execute(
+                    "SELECT COUNT(*),MAX(id) FROM conversation_messages "
+                    "WHERE session_id=?",
+                    (native,),
+                ).fetchone()
+                stats.targeted_visible = after != before
+                return stats
+
+            cached = lambda paths: _cached_file_sigs(reader, paths)
+            _ingest = _live_tail_phase(reader, _ingest)
+            stat_fn = committed_sig = None
+            discovery = None
+
         _run_conversation_events_stream(
-            handler, conn, passive=passive,
+            handler, reader, passive=passive,
             tail_data={"conversationKey": key},
             resolve=_resolve, ingest=_ingest, cached_sigs=cached,
             discovery_step=discovery, stat_fn=stat_fn,
@@ -2067,7 +2181,7 @@ def _qualified_conversation_events(
     except Exception as exc:  # noqa: BLE001
         handler.log_error("api/conversation/events stream failed: %r", exc)
     finally:
-        conn.close()
+        reader.close()
 
 
 def _handle_get_conversation_events_impl(handler, path: str) -> None:
@@ -2092,10 +2206,16 @@ def _handle_get_conversation_events_impl(handler, path: str) -> None:
     if not key:
         handler.send_error(404, "conversation not found")
         return
-    if key.startswith("v1."):
-        _qualified_conversation_events(handler, key, account_key)
-    else:
-        _bare_conversation_events(handler, key, account_key)
+    # #787 / #861 spec 5.1, 5.9: the live-tail route runs under the
+    # request_writer ceiling; each cycle's read unit narrows to
+    # query(interactive) inside its session. On a thread whose request ceiling
+    # is already request_writer this only narrows to the same set.
+    with _cctally_core.establish_authority(
+            "request_writer", policy="interactive"):
+        if key.startswith("v1."):
+            _qualified_conversation_events(handler, key, account_key)
+        else:
+            _bare_conversation_events(handler, key, account_key)
 
 
 def _handle_get_conversation_search_impl(handler) -> None:
@@ -2255,16 +2375,16 @@ def _handle_get_conversation_outline_impl(handler, path: str) -> None:
         account_key = account_values[0] if account_values else None
 
         def _build_qualified(transfer_handler, cancelled):
-            def _query(conn):
-                if account_key is not None:
-                    scope_conversations_db_to_account(conn, account_key)
-                return disp.neutral_outline(
-                    conn, session_id, effective_speed=speed)
+            # The producer runs on its own thread for the transfer request,
+            # whose path does not carry the account: it is passed explicitly
+            # and scoped inside the producer's own session (spec 5.8).
             return _run_conversation_query_impl(
                 transfer_handler,
-                _query,
+                lambda conn: disp.neutral_outline(
+                    conn, session_id, effective_speed=speed),
                 "/api/conversation/outline-transfer",
                 cancelled=cancelled,
+                account=account_key,
             )
 
         handler._respond_json(200, {
@@ -2286,17 +2406,14 @@ def _handle_get_conversation_outline_impl(handler, path: str) -> None:
             return
 
         def _build_bare(transfer_handler, cancelled):
-            def _query(conn):
-                account_values = query.get("account")
-                if account_values:
-                    scope_conversations_db_to_account(conn, account_values[0])
-                return transfer_handler._conversation_query(
-                ).get_conversation_outline(conn, session_id)
+            account_values = query.get("account")
             return _run_conversation_query_impl(
                 transfer_handler,
-                _query,
+                lambda conn: transfer_handler._conversation_query(
+                ).get_conversation_outline(conn, session_id),
                 "/api/conversation/outline-transfer",
                 cancelled=cancelled,
+                account=account_values[0] if account_values else None,
             )
 
         handler._respond_json(200, {
@@ -2329,13 +2446,20 @@ class _OutlineTransferBuildHandler:
         self.response = (status, body)
 
 
-def _produce_outline_transfer(token, record, builder, handler):
-    """Build off the request thread; the producer slot lasts until real exit."""
+def _produce_outline_transfer(token, record, builder, handler,
+                              handoff=None):
+    """Build off the request thread; the producer slot lasts until real exit.
+
+    #787 / #861 spec 5.1: the producer thread starts with no authority and
+    reads under the request's (``handoff``), inside a boundary of its own."""
     global _OUTLINE_TRANSFERS_PRODUCERS
     proxy = _OutlineTransferBuildHandler(handler)
     try:
         try:
-            ok, full_body = builder(proxy, record.cancelled.is_set)
+            with _cctally_core.establish_handoff(handoff), \
+                    _cctally_core.operation_boundary("outline-build"):
+                ok, full_body = builder(proxy, record.cancelled.is_set)
+                _cctally_core.check_publishable()
             if record.cancelled.is_set():
                 return
             if ok is None or full_body is None and ok:
@@ -2354,6 +2478,12 @@ def _produce_outline_transfer(token, record, builder, handler):
                 _reject_outline_transfer_too_large(token, claim=record)
             else:
                 _materialize_outline_transfer(token, payload, claim=record)
+        except _cctally_core.QueryAuthorityViolation as exc:
+            # A BaseException: refused, never published (spec 5.2).
+            handler.log_error("outline transfer refused: store authority "
+                              "violation: %s", exc)
+            _finish_outline_transfer_failure(
+                token, record, 500, {"error": "outline transfer failed"})
         except Exception as exc:  # noqa: BLE001
             handler.log_error("outline transfer build failed: %r", exc)
             _finish_outline_transfer_failure(
@@ -2438,7 +2568,8 @@ def _handle_get_conversation_outline_transfer_impl(handler, path: str) -> None:
         try:
             threading.Thread(
                 target=_produce_outline_transfer,
-                args=(token, record, builder, handler),
+                args=(token, record, builder, handler,
+                      _cctally_core.authority_handoff()),
                 name="cctally-outline-build", daemon=True,
             ).start()
         except RuntimeError:

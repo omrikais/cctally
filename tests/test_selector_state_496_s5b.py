@@ -1473,6 +1473,53 @@ def test_a_corrupt_index_is_not_reported_as_an_incomplete_projection(
         conn.close()
 
 
+@pytest.mark.parametrize(
+    "denied", ["quota_window_blocks", "quota_projection_state"])
+def test_the_publication_pass_reads_never_take_a_denial_as_empty(
+    core, tmp_path, denied,
+):
+    """The #1069/#1071 `projector` reads fail toward MORE work, not less.
+
+    They run while the incomplete flag is set (they are the pass that
+    re-projects), so they do not call the gate; what keeps them safe is that a
+    read they cannot complete is never rendered as an empty projection. The
+    witness becomes the unreadable witness, which never compares equal and so
+    forces the in-lock re-preparation; the historical spans become
+    ``readable=False``, which brings every affected family whole instead of
+    narrowing the interleave closure to the windows the read happened to see.
+    """
+    quota = _quota()
+    conn = _open_stats(core, tmp_path)
+    try:
+        # Non-vacuity: undenied, both reads succeed on this store.
+        witness = quota._codex_projection_witness(conn)
+        assert isinstance(witness, tuple), witness
+        assert quota._codex_historical_block_spans(conn).readable is True
+        assert quota._codex_projected_rows_present(conn) is False
+
+        def deny(action, arg1, arg2, dbname, source):
+            if arg1 == denied:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny)
+        witness = quota._codex_projection_witness(conn)
+        spans = quota._codex_historical_block_spans(conn)
+        # #1069 Q4: the empty-store probe reads a denial as rows present, so
+        # a store it cannot read is never certified as owing nothing.
+        rows_present = quota._codex_projected_rows_present(conn)
+    finally:
+        conn.set_authorizer(None)
+        conn.close()
+    if denied == "quota_projection_state":
+        assert isinstance(witness, quota._UnreadableWitness), witness
+        assert not quota._codex_witnesses_equal(witness, witness)
+    else:
+        assert not spans.readable, spans
+        assert spans.by_family == {} and spans.unit_tuples == {}
+        assert rows_present is True
+
+
 def test_every_projection_read_site_is_enumerated():
     """Projection reads are scattered across the dashboard, milestone-history,
     quota and library modules, frequently inside `except sqlite3.Error`

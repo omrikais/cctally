@@ -270,6 +270,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import pathlib
 import queue
@@ -536,6 +537,11 @@ class _DiagnosisAdmission:
         if not acquired:
             self._finish(key, flight, error=_DiagnosisTimedOut())
             return
+        # A worker whose retirement the bounded build could not show (#1087
+        # §4.10, plan §R G1-G2): its `_RetirementPending`, or the `wait()`s
+        # it appended to RETIREMENT after delivering its result.
+        retirement = []
+        pending = None
         try:
             # A queued flight may have expired while a prior producer held the
             # single process-wide slot. It must never start a late build.
@@ -544,11 +550,21 @@ class _DiagnosisAdmission:
                 return
             try:
                 remaining = max(0.0, flight.deadline - time.monotonic())
-                result = (
-                    bounded_build(remaining)
-                    if bounded_build is not None else build()
-                )
-            except TimeoutError:
+                # #787 / #861 spec 5.1: a new thread has no authority; the
+                # diagnosis is a read route's work, so its producer reads at
+                # the route's `query(interactive)` ceiling.
+                with _cctally_core.establish_authority(
+                        "query", policy="interactive"), \
+                        _cctally_core.operation_boundary("diagnosis"):
+                    if bounded_build is not None:
+                        result = bounded_build(remaining,
+                                               retirement=retirement)
+                    else:
+                        result = build()
+                    _cctally_core.check_publishable()
+            except TimeoutError as exc:
+                if callable(getattr(exc, "wait", None)):
+                    pending = exc.wait
                 self._finish(key, flight, error=_DiagnosisTimedOut())
             except BaseException as exc:
                 self._finish(
@@ -562,11 +578,33 @@ class _DiagnosisAdmission:
                 else:
                     self._finish(key, flight, result=result)
         finally:
-            # Production passes a killable process build, so reaching the
-            # deadline retires that process tree before this slot is released.
+            # Production passes a bounded worker build that retires its
+            # worker tree itself. The slot is released only once that tree is
+            # shown retired: at once when the build showed it, otherwise from
+            # a daemon thread after the pending retirement's `wait()`, so a
+            # worker tree that may still run never has a second started
+            # beside it (later flights time out on their own deadlines).
             # Direct in-process builds remain available only to focused unit
             # callers whose producer is known to terminate.
-            self._admission.release()
+            waits = ([pending] if pending is not None else []) + list(retirement)
+            if waits:
+                self._release_after(waits)
+            else:
+                self._admission.release()
+
+    def _release_after(self, waits) -> None:
+        def retire():
+            try:
+                for wait in waits:
+                    wait()
+            finally:
+                self._admission.release()
+        try:
+            threading.Thread(target=retire, name="cctally-diagnosis-retire",
+                             daemon=True).start()
+        except BaseException:
+            # No thread: this producer, itself a daemon thread, waits.
+            retire()
 
     def run(self, key: tuple[Any, bool, bool], build, *, peer_gone=None,
             bounded_build=None):
@@ -754,15 +792,15 @@ from _lib_dashboard_settings_contract import (
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
 from _cctally_cache import (
-    get_entries, iter_entries, iter_entries_with_id,
+    get_entries as _facade_get_entries, iter_entries, iter_entries_with_id,
     open_cache_db as _raw_open_cache_db,
     open_conversations_db, sync_cache, sync_claude_conversations,
+    sync_claude_rollup,
     sync_codex_conversations, read_codex_startup_deferral_facts,
     # #780 read-route admission. Imported here so the conversation route module
     # reaches them the same way it reaches `open_conversations_db` — through
     # `sys.modules["_cctally_dashboard"]`, which is the seam its tests patch.
     open_conversations_db_readonly,
-    probe_conversations_maintenance_free,
     ConversationReaderUnavailable, MaintenanceInProgress,
     SchemaBehind, SchemaAhead, LegacyBridgePending,
     pricing_refusal_cause_phrase,
@@ -785,7 +823,8 @@ import _lib_write_io
 
 # === F22a: count the silent Group A cache-open failures (#583 S1 §1.6) =====
 # `_group_a_daily_buckets`, `_group_a_weekly_buckets` and
-# `_group_a_monthly_buckets` each wrap their `open_cache_db()` in
+# `_group_a_monthly_buckets` each wrap their cache open (since #787 / #861 the
+# `open_cache_query_counted()` query session) in
 # `try: … except Exception: return None`, where `None` means "fall back to the
 # wide from-scratch fetch". Output stays byte-identical, so no golden moves and
 # nothing surfaces — the failure is invisible even to `doctor`.
@@ -818,27 +857,84 @@ def _group_a_cache_failure_kind(code):
     return None
 
 
-def open_cache_db(*args, **kwargs):
-    """``_cctally_cache.open_cache_db``, plus the Group A failure count.
+def open_cache_db_owner(*args, **kwargs):
+    """The owner cache opener (`_cctally_cache.open_cache_db`), for the
+    dashboard's owner phases only (#787 / #861 spec 5.7, X14): it may create,
+    migrate and recover, so it runs at the `process` authority of an owner
+    thread, never under a request ceiling or a snapshot build's query scope.
+    """
+    return _raw_open_cache_db(*args, **kwargs)
 
-    Behaviour-preserving. On an exception it identifies the caller, increments
-    the matching fixed counter, and re-raises the ORIGINAL exception unchanged.
 
-    It fails open in both directions: on no caller match, or on any failure of
-    the frame introspection itself, it increments nothing and still re-raises.
-    A diagnostic must never replace the error it was observing. Introspection
-    runs only on the already-exceptional path, so the steady-state cost is nil.
+def open_cache_query_counted(*, policy: str = "interactive"):
+    """A cache.db query session for one read unit, plus the Group A failure
+    count (#583 S1 §1.6; #787 / #861 spec 5.7).
+
+    Returns a connection-shaped `HeldSessionConnection` whose ``close()``
+    ends the session (AD21: the calling function is the read unit). It never
+    creates, migrates or recovers: an unreadable store raises
+    `StoreUnavailable`, which every caller already degrades on as an open
+    failure.
+
+    The caller is identified BEFORE entering the service frames, so a Group
+    A bucket builder's refusal increments its fixed counter exactly once, and
+    the original exception is re-raised unchanged. It fails open in both
+    directions: on no caller match, or on any failure of the frame
+    introspection itself, it increments nothing and still re-raises. A
+    diagnostic must never replace the error it was observing.
     """
     try:
-        return _raw_open_cache_db(*args, **kwargs)
+        caller = sys._getframe(1).f_code
+    except Exception:  # noqa: BLE001 — introspection never blocks the open
+        caller = None
+    try:
+        return _store_access().held_session("cache", policy=policy)
     except Exception:
         try:
-            kind = _group_a_cache_failure_kind(sys._getframe(1).f_code)
+            kind = (_group_a_cache_failure_kind(caller)
+                    if caller is not None else None)
             if kind is not None:
                 _lib_tick_stats.note_cache_open_failure(kind)
         except Exception:  # noqa: BLE001 — never mask the original failure
             pass
         raise
+
+
+def _store_access():
+    """`_cctally_store_access`, resolved at call time (conftest reloads it)."""
+    import _cctally_store_access
+    return _cctally_store_access
+
+
+def _query_held(primary: str, **kwargs):
+    """One query read unit over `primary` as a closeable connection
+    (`HeldSessionConnection`): stats gets ``sqlite3.Row`` rows, as its owner
+    connection did; cache and conversations plain tuples."""
+    if primary == "stats":
+        kwargs.setdefault("row_factory", sqlite3.Row)
+    return _store_access().held_session(primary, **kwargs)
+
+
+def _reads_through_query() -> bool:
+    """Whether this thread reads as a query caller (#787 / #861 spec 5.11):
+    a request ceiling or a narrowed query scope, which holds no WRITE. An
+    owner phase (`process`) and a thread with no authority keep the owner
+    facades, as before."""
+    return _store_access().reads_through_query()
+
+
+def get_entries(range_start, range_end, *, project=None, skip_sync=False,
+                account_key=None):
+    """The dashboard's entry read. Inside a query scope (a request route; a
+    snapshot build once it is narrowed) it is a pure query read that never
+    syncs (`query_entries`, spec 5.11); in an owner phase it is the owner
+    facade, unchanged."""
+    if _reads_through_query():
+        return _cctally()._load_sibling("_cctally_cache").query_entries(
+            "entries", range_start, range_end, project=project,
+            account_key=account_key)
+    return _facade_get_entries(range_start, range_end, project=project,
+                               skip_sync=skip_sync, account_key=account_key)
 
 
 # === #279 S5: consumer-only dashboard siblings ============================
@@ -1013,7 +1109,6 @@ def _codex_detail_context(snapshot):
     third value that function yielded — ``_codex_entries_from_qualified(
     qualified)`` — was consumed by neither builder.
     """
-    from _cctally_cache import open_cache_db
     from _cctally_dashboard_sources import (
         DashboardReadContext,
         resolve_dashboard_source_semantics,
@@ -1035,8 +1130,14 @@ def _codex_detail_context(snapshot):
     semantics = resolve_dashboard_source_semantics(
         config, display_tz_name=display_tz_name,
     )
-    cache_conn = open_cache_db()
-    stats_conn = open_db()
+    # #787 / #861 (spec 5.12, AD21): detail assembly is one read unit; both
+    # stores are query sessions, closed in reverse order of opening.
+    cache_conn = open_cache_query_counted()
+    try:
+        stats_conn = _query_held("stats")
+    except BaseException:
+        cache_conn.close()
+        raise
     try:
         context = DashboardReadContext(
             cache_conn=cache_conn,
@@ -1054,8 +1155,8 @@ def _codex_detail_context(snapshot):
         )
         yield context
     finally:
-        cache_conn.close()
         stats_conn.close()
+        cache_conn.close()
 
 
 def _codex_generation_metadata_state(snapshot) -> str:
@@ -1282,8 +1383,12 @@ def _build_codex_block_detail(context, *, key: str,
     """
     import _lib_accounts
     from _lib_quota import build_blocks, forecast_quota, percent_milestones, quota_freshness
-    from _cctally_quota import assert_projection_readable, load_codex_quota_observations
-    from _lib_quota_ledger import loading_unit_from_identity, snap_equivalent_raw_groups
+    from _cctally_quota import (
+        assert_projection_readable,
+        codex_unit_loading_closure,
+        load_codex_quota_observations,
+    )
+    from _lib_quota_ledger import loading_unit_from_identity
 
     published = row if isinstance(row, Mapping) else {}
     # BEFORE the SQL, per #496 S5b section 4.7.
@@ -1352,10 +1457,15 @@ def _build_codex_block_detail(context, *, key: str,
     # THE ORDER IS LOAD-BEARING. The loader matches RAW stored coordinates, and
     # rows are stored under whichever spelling the provider sent, so the
     # interpreted block tuple has to be converted to its loading unit and then
-    # closed under the `window_minutes` snap before it can name a stored row.
-    # Passing the interpreted tuple straight through matches nothing and turns
-    # this route into a silent 404 generator.
-    groups = snap_equivalent_raw_groups((
+    # closed over every stored spelling of that unit before it can name a
+    # stored row. Passing the interpreted tuple straight through matches
+    # nothing and turns this route into a silent 404 generator. The closure
+    # (#1071) reaches the `modelPool` key a Spark row is stored under as well
+    # as the minute jitter: the unit is pool-free, so a snap-only closure of it
+    # asked for the ordinary key alone and rendered a Spark block from the
+    # ordinary-key rows whose observed model is Spark — a partial series, or a
+    # 404 for a block stored only under the pool key.
+    groups = codex_unit_loading_closure(context.cache_conn, {
         loading_unit_from_identity(
             source_root_key=str(matched[0]),
             logical_limit_key=str(matched[1]),
@@ -1363,7 +1473,7 @@ def _build_codex_block_detail(context, *, key: str,
             window_minutes=int(matched[3]),
             canonical_reset_iso=str(matched[5]),
         ),
-    ))
+    })
     # The whole ACCOUNT-INDEPENDENT group, never pre-filtered by account, so
     # `adopt_unidentified_observations` still sees every witness.
     #
@@ -1664,6 +1774,27 @@ def _source_safe_claude_block_detail(detail: Mapping, *, key: str) -> dict[str, 
     }
 
 
+def _owner_resolved_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` refuses a store for a reason its owner resolves (#787 /
+    #861 spec 5.11: absent, behind, ahead, a pending recovery or bridge;
+    `_cctally_core.OWNER_RESOLVED_REASONS`)."""
+    return (isinstance(exc, _cctally_core.StoreUnavailable)
+            and exc.reason in _cctally_core.OWNER_RESOLVED_REASONS)
+
+
+def _send_detail_unavailable(handler, what: str) -> None:
+    """The typed, retryable answer a detail route gives a store that is not
+    readable now (spec 5.11, AD10): 503 with ``Retry-After``, never "not
+    found" and never the generic failure. The shape `/api/block` sends."""
+    body = encode_dashboard_json_bytes({"error": f"{what} unavailable"})
+    handler.send_response(503)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Retry-After", "1")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 def _claude_session_row_for_source_key(snapshot, key: str):
     for row in getattr(snapshot, "sessions", ()) or ():
         session_id = getattr(row, "session_id", None)
@@ -1687,7 +1818,15 @@ def _claude_session_id_for_source_key(snapshot, key: str) -> str | None:
     if row is not None:
         return getattr(row, "session_id", None)
     try:
-        conn = open_cache_db()
+        conn = open_cache_query_counted()
+    except _cctally_core.StoreUnavailable as exc:
+        # #787 / #861 spec 5.11: "detail routes never turn unavailability
+        # into 'not found'". A store that cannot be read now (the owner
+        # resolving it, maintenance, contention, an unusable store) is
+        # answered retryably by the route; corruption keeps its path.
+        if exc.reason != "corrupt":
+            raise
+        return None
     except (sqlite3.DatabaseError, OSError):
         return None
     try:
@@ -1969,9 +2108,10 @@ def _build_claude_source_detail(
         window_weeks = _project_window_weeks_for_key(
             snapshot, key, window_weeks,
         )
-        conn = open_db()
+        # One read unit (AD21): stats with cache attached read-only as
+        # `cache_db`, the TEMP views inside the session; its close drops them.
+        conn = _query_held("stats", attach=("cache",))
         try:
-            conn.execute("ATTACH DATABASE ? AS cache_db", (str(_cctally_core.CACHE_DB_PATH),))
             conn.execute("CREATE TEMP VIEW session_entries AS SELECT * FROM cache_db.session_entries")
             conn.execute("CREATE TEMP VIEW session_files AS SELECT * FROM cache_db.session_files")
             detail = _project_detail_for_window(
@@ -1983,12 +2123,6 @@ def _build_claude_source_detail(
                 projects_envelope=getattr(snapshot, "projects_envelope", None),
             )
         finally:
-            try:
-                conn.execute("DROP VIEW IF EXISTS session_entries")
-                conn.execute("DROP VIEW IF EXISTS session_files")
-                conn.execute("DETACH DATABASE cache_db")
-            except sqlite3.Error:
-                pass
             conn.close()
         if detail is None:
             raise SourceResourceNotFound()
@@ -2000,7 +2134,7 @@ def _build_claude_source_detail(
     if start_at is None:
         raise SourceResourceNotFound()
     end_at = start_at + BLOCK_DURATION
-    cache_conn = open_cache_db()
+    cache_conn = open_cache_query_counted()
     try:
         entries = list(iter_entries(cache_conn, start_at, end_at))
     finally:
@@ -2185,8 +2319,17 @@ def load_config(*args, **kwargs):
     return sys.modules["cctally"].load_config(*args, **kwargs)
 
 
-def get_claude_session_entries(*args, **kwargs):
-    return sys.modules["cctally"].get_claude_session_entries(*args, **kwargs)
+def get_claude_session_entries(range_start, range_end, *, project=None,
+                               skip_sync=False, account_key=None):
+    """The joined Claude entry read; a pure query read inside a query scope
+    (spec 5.11), the owner facade in an owner phase (see `get_entries`)."""
+    if _reads_through_query():
+        return _cctally()._load_sibling("_cctally_cache").query_entries(
+            "claude_session_entries", range_start, range_end,
+            project=project, account_key=account_key)
+    return sys.modules["cctally"].get_claude_session_entries(
+        range_start, range_end, project=project, skip_sync=skip_sync,
+        account_key=account_key)
 
 
 def _warn_alerts_bad_config_once(*args, **kwargs):
@@ -2379,8 +2522,17 @@ def _dashboard_sync_loop(
     capture_batch=None,
     settle=None,
     mark_rebuilding=None,
+    attention=None,
 ) -> None:
     """Periodic rebuild loop with a #313-preserving request floor (#583 S2).
+
+    ``attention`` (#787 / #861 spec 5.5) is the owner-attention event a query
+    sets for a stats state or an obligation the owner drains; like a queued
+    request, it starts the next iteration early, never before the duty floor.
+    Each iteration runs inside one `operation_boundary`; a
+    `QueryAuthorityViolation` (a BaseException) is logged, that iteration's
+    publication is skipped (snapshot publication refuses on the latch) and the
+    loop continues (spec 5.2).
 
     ``run_iteration`` performs one whole automatic iteration (rebuild plus any
     orphan self-heal / retention maintenance the thread does), so its measured
@@ -2420,12 +2572,15 @@ def _dashboard_sync_loop(
         with _rebuilding_claim(mark_rebuilding, prepare=prepare) as batch:
             t0 = monotonic()
             status, warnings = "ok", ()
+            if attention is not None:
+                attention.clear()   # this iteration's owner phase drains it
             try:
-                result = (run_iteration(batch=batch) if batch is not None
-                          else run_iteration())
+                with _cctally_core.operation_boundary("snapshot-build"):
+                    result = (run_iteration(batch=batch) if batch is not None
+                              else run_iteration())
                 if isinstance(result, dict):
                     warnings = tuple(result.get("warnings") or ())
-            except Exception:  # noqa: BLE001 — see below
+            except (Exception, _cctally_core.QueryAuthorityViolation):  # noqa: BLE001 — see below
                 # An escaped exception must not kill the only drainer: an
                 # accepted 202 would then never reach a terminal state.
                 status = "failed"
@@ -2443,6 +2598,9 @@ def _dashboard_sync_loop(
             now = monotonic()
             ready = (pending_request is not None and capture_batch is not None
                      and now >= floor and pending_request())
+            if (not ready and attention is not None and now >= floor
+                    and attention.is_set()):
+                ready = True
             if ready or now >= deadline:
                 break
             if take_sync_request is not None and take_sync_request():
@@ -2498,8 +2656,15 @@ def _frozen_deferral_settle_loop(
                 return
             t0 = monotonic()
             try:
-                with _rebuilding_claim(mark_rebuilding):
+                with _rebuilding_claim(mark_rebuilding), \
+                        _cctally_core.operation_boundary("snapshot-build"):
                     run_locked(skip_sync=True)
+            except _cctally_core.QueryAuthorityViolation:
+                # Logged, that publication skipped; the next cadence retries
+                # (spec 5.2: an owner thread survives a violation).
+                _log_sync_iteration_failure()
+                deadline = monotonic() + interval
+                continue
             except Exception:  # noqa: BLE001 — logged; the loop is done
                 _log_sync_iteration_failure()
                 return
@@ -2519,7 +2684,7 @@ def _make_frozen_deferral_settle_thread(
     collaborators = _make_sync_loop_collaborators(ref=ref, hub=hub)
     tui = _cctally()._cctally_tui
     return threading.Thread(
-        target=lambda: _frozen_deferral_settle_loop(
+        target=_owner_thread_target(lambda: _frozen_deferral_settle_loop(
             stop=stop,
             interval=float(interval),
             ref=ref,
@@ -2527,7 +2692,7 @@ def _make_frozen_deferral_settle_thread(
             run_locked=run_sync_now_locked,
             mark_rebuilding=collaborators["mark_rebuilding"],
             is_deferred=tui._tui_snapshot_is_stats_deferral,
-        ),
+        )),
         daemon=True,
         name="dashboard-frozen-deferral-settle",
     )
@@ -2579,6 +2744,8 @@ def _dashboard_startup_schema_migration(*, run_derivations: bool = True) -> None
     process-level policy, because the read-route fallback and the live-tail
     opener each reach the same full opener from a request thread.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("STARTUP", entry="_dashboard_startup_schema_migration")
     try:
         conn = sys.modules["cctally"].open_conversations_db(
             run_derivations=run_derivations)
@@ -2614,7 +2781,14 @@ def _join_schema_wake_thread(timeout: float = 30.0) -> None:
         thread.join(timeout)
 
 
-def _wake_schema_writer() -> None:
+#: #787 / #861 spec 5.5: the derivation policy a wake-up open runs with.
+#: `cmd_dashboard` sets it to ``not --no-sync`` before the first route can
+#: serve, so a `--no-sync` wake never runs the legacy bridge or the Codex
+#: contract rebuild (the frozen dashboard ingests nothing).
+_SCHEMA_WAKE_RUN_DERIVATIONS = True
+
+
+def _wake_schema_writer(*, run_derivations: "bool | None" = None) -> None:
     """`SCHEMA_WAKE_HOOK`: a reader found a store behind head (#780).
 
     The reader raised rather than migrating, because a request thread must
@@ -2651,8 +2825,12 @@ def _wake_schema_writer() -> None:
     with _SCHEMA_WAKE_LOCK:
         if _SCHEMA_WAKE_THREAD is not None and _SCHEMA_WAKE_THREAD.is_alive():
             return
+        derivations = (_SCHEMA_WAKE_RUN_DERIVATIONS if run_derivations is None
+                       else bool(run_derivations))
         thread = threading.Thread(
-            target=_dashboard_startup_schema_migration,
+            target=_owner_thread_target(
+                lambda: _dashboard_startup_schema_migration(
+                    run_derivations=derivations)),
             name="cctally-schema-wake",
             daemon=True,
         )
@@ -2662,6 +2840,361 @@ def _wake_schema_writer() -> None:
         except RuntimeError as exc:  # interpreter shutdown, thread limit
             eprint(f"[conversations] schema wake-up not dispatched ({exc})")
             _SCHEMA_WAKE_THREAD = None
+
+
+#: #787 / #861 spec 5.5 owner attention. The event is the one wake signal for
+#: stats states and readable-store obligations; the `--no-sync` flag decides
+#: whether a Codex-debt-only notification is acted on (it never is: draining
+#: that debt can ingest, V1). `_OWNER_ATTENTION_DEBT_DEFERRED` counts the
+#: notifications recorded and not acted on, for tests and diagnostics.
+_OWNER_ATTENTION_EVENT = threading.Event()
+_OWNER_ATTENTION_NO_SYNC = False
+_OWNER_ATTENTION_DEBT_DEFERRED = 0
+#: Not-readable reasons no owner work resolves: contention ends by itself, and
+#: a conversations store ahead of head waits for a newer binary.
+_OWNER_ATTENTION_NOT_OWNER_WORK = frozenset({"maintenance", "busy",
+                                             "schema_ahead"})
+#: Stores whose version-ahead state today's owner opens heal (revision 32,
+#: R32-2): the owner cache open trims cache.db back to the known head, and
+#: owner `open_db` defers a version-ahead stats index to the epoch rebuild
+#: worker, which rebuilds it from the journal.
+_OWNER_HEALS_SCHEMA_AHEAD = frozenset({"cache", "stats"})
+
+
+def _not_owner_work(store: str, reason) -> bool:
+    """Whether a not-readable `store` reported with `reason` is nobody's
+    owner work: contention (`maintenance`, `busy`) ends by itself, and a
+    conversations store ahead of this binary stays refused as today (the
+    binary cannot read a newer conversations schema). A version-ahead
+    cache.db or stats.db is owner work (spec 5.5, revision 32: a reason
+    today's full opener resolved inline, #787 / #861)."""
+    if reason == "schema_ahead" and store in _OWNER_HEALS_SCHEMA_AHEAD:
+        return False
+    return reason in _OWNER_ATTENTION_NOT_OWNER_WORK
+
+
+def _dashboard_owner_attention(store, readiness) -> None:
+    """`register_owner_attention` callback (spec 5.5 Notification).
+
+    Conversations and cache not-readable states go to `_wake_schema_writer`
+    (its full conversations open also opens the cache owner first); stats
+    states and every readable-store obligation set the owner-attention event,
+    which the sync thread or the `--no-sync` obligation thread consumes.
+    Never blocks, never opens a store: it runs on the reporting thread.
+    """
+    global _OWNER_ATTENTION_DEBT_DEFERRED
+    reason = getattr(readiness, "reason", None)
+    readable = bool(getattr(readiness, "readable", False))
+    if not readable and _not_owner_work(store, reason):
+        return
+    if not readable and store in ("cache", "conversations"):
+        _wake_schema_writer()
+        return
+    obligations = frozenset(getattr(readiness, "obligations", ()) or ())
+    if store == _cctally_core.DOCTOR_OWNER_STORE:
+        # AD28: a Doctor block to recompute. The sync thread's next build
+        # does that; under `--no-sync` the obligation thread does.
+        _OWNER_ATTENTION_EVENT.set()
+        return
+    if (readable and _OWNER_ATTENTION_NO_SYNC
+            and obligations <= {"codex_maintenance_debt"}):
+        # V1: a `--no-sync` dashboard records Codex debt (and a request's
+        # pending ingest, which only a sync drains) and leaves it pending.
+        _OWNER_ATTENTION_DEBT_DEFERRED += 1
+        return
+    _OWNER_ATTENTION_EVENT.set()
+    if readable and "codex_maintenance_debt" in obligations:
+        # A request's Codex debt can be conversations work too (a stale
+        # contract, a from-zero replay's transcript half), which the full
+        # conversations open performs; before #787 the live-tail ran that
+        # open itself, so the owner runs it now rather than at the next
+        # conversation-sync interval (parity rule).
+        _wake_schema_writer()
+
+
+#: Obligations the `--no-sync` obligation thread's owner opens drain (5.5).
+_OBLIGATION_THREAD_DRAINS = frozenset({
+    "quota_projection_incomplete", "content_revision_missing",
+    "migration_error_sentinel", "legacy_migration_pending",
+})
+
+
+def _obligation_readiness(store: str):
+    """The obligation thread's outstanding-work probe (revision 33, R32-V2):
+    `QueryService.readiness` without the owner notification, so a refusal
+    the probe observes never wakes the thread itself and resets its backoff;
+    a state the owner cannot heal is retried on the backoff alone."""
+    return _store_access().QueryService.readiness(store, notify=False)
+
+
+def _cache_repair_marker_present() -> bool:
+    """Whether a cache.db repair marker exists (revision 33, R32-V1): a
+    stat, never an open. A query reads a marker whose owner PID is alive as
+    `maintenance` without checking the owner's identity, so only an owner
+    cache open recovers a stale one; the obligation thread runs that open
+    once per interval while a marker exists."""
+    import _cctally_db
+    return _cctally_db._repair_marker_path(
+        pathlib.Path(_cctally_core.CACHE_DB_PATH)).exists()
+
+
+def _obligation_outstanding(readiness_of) -> bool:
+    """True while a state the obligation thread drains is still reported.
+
+    ``readiness_of(store)`` is `_obligation_readiness` (it never notifies).
+    A conversations legacy bridge is not one: `--no-sync` never runs the
+    bridge (5.5). A cache.db repair marker (R32-V1) is not counted here: the
+    loop's own marker cadence (``marker_present`` / ``marker_drain``) runs
+    only the owner cache open for it, never the whole drain."""
+    for store in ("stats", "cache", "conversations"):
+        try:
+            r = readiness_of(store)
+        except Exception:  # noqa: BLE001 — undecidable: keep the cadence
+            return True
+        if not r.readable:
+            if _not_owner_work(store, r.reason):
+                if r.reason == "schema_ahead":
+                    continue
+                return True     # contention: retry after it ends
+            if store == "conversations" and r.reason == "legacy_bridge_pending":
+                continue
+            return True
+        if frozenset(r.obligations or ()) & _OBLIGATION_THREAD_DRAINS:
+            return True
+    return False
+
+
+def _dashboard_obligation_drain() -> None:
+    """One `--no-sync` obligation pass (AD12): exactly the owner opens a
+    `--no-sync` request thread performed before #787, and nothing else.
+
+    Owner `open_db()` (cutover, content revision, migration-error
+    reconciliation, the armed incomplete-projection reconcile, epoch deferral
+    and its rebuild-worker launch), owner `open_cache_db()` (schema,
+    migration, recovery; it launches no worker) and, for a conversations store
+    that is not readable, `_wake_schema_writer(run_derivations=False)`. It
+    never calls a `sync_*` or request entry and never requests a Codex drain,
+    replay, inventory-bootstrap or quota-index worker, so recorded
+    `codex_maintenance_debt` stays pending (V1)."""
+    try:
+        conn = open_db()
+    except _cctally().StatsRebuildDeferred:
+        pass    # a rebuild worker owns the index now; the next pass reads
+    except Exception as exc:  # noqa: BLE001 — logged; the next pass retries
+        eprint(f"[dashboard] obligation pass: stats open failed ({exc})")
+    else:
+        conn.close()
+    try:
+        open_cache_db_owner().close()
+    except Exception as exc:  # noqa: BLE001
+        eprint(f"[dashboard] obligation pass: cache open failed ({exc})")
+    access = _store_access()
+    conversations = access.QueryService.readiness("conversations")
+    if (not conversations.readable
+            and not _not_owner_work("conversations", conversations.reason)):
+        _wake_schema_writer(run_derivations=False)
+
+
+def _cache_repair_marker_identity():
+    """The cache.db repair marker's file identity (device, inode, mtime), or
+    None when it cannot be stat'ed: what "once per marker" keys on."""
+    import _cctally_db
+    try:
+        st = os.stat(_cctally_db._repair_marker_path(
+            pathlib.Path(_cctally_core.CACHE_DB_PATH)))
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns)
+
+
+def _make_dashboard_marker_drain():
+    """The marker-only obligation pass (revision 33, R32-V1; round 9 F5):
+    exactly the owner cache open, whose full identity check recovers a stale
+    marker and refuses a live one. A refusal is logged once per marker, not
+    once per interval, so a repair that runs long (or hangs) does not print
+    the same line forever."""
+    logged = [object()]     # a sentinel no marker identity equals
+
+    def marker_drain() -> None:
+        try:
+            open_cache_db_owner().close()
+        except Exception as exc:  # noqa: BLE001 — the next interval retries
+            identity = _cache_repair_marker_identity()
+            if identity != logged[0]:
+                logged[0] = identity
+                eprint(f"[dashboard] obligation pass: cache open failed ({exc})")
+
+    return marker_drain
+
+
+#: The longest wait between timed obligation passes that drain nothing.
+_OBLIGATION_BACKOFF_CAP_S = 300.0
+
+
+def _dashboard_obligation_loop(*, stop, attention, interval, drain,
+                               outstanding, marker_present=None,
+                               marker_drain=None) -> None:
+    """`_DashboardObligationThread`'s loop (AD12): wake on owner attention, or
+    on a timer only while an obligation it drains is outstanding.
+
+    The timer starts at ``interval``. A timed pass that leaves an obligation
+    outstanding doubles it, up to `_OBLIGATION_BACKOFF_CAP_S`, so an
+    obligation the owner opens cannot drain (a migration that fails the same
+    way each time, an armed projection reconcile that swallows its failure
+    after reading the whole journal) is not retried every interval for the
+    dashboard's lifetime. Owner attention or a pass that drains everything
+    resets it to ``interval``: a query that meets the obligation is a reason
+    to try again now, as a `--no-sync` request did before #787.
+
+    ``marker_present()`` (revision 33, R32-V1), when given, is a stat of the
+    cache.db repair marker. Nothing notifies the owner about a marker (a
+    query reads a live-looking one as `maintenance`, which is nobody's owner
+    work), so the thread checks it once per ``interval``, and while one
+    exists it runs ``marker_drain()`` (the owner cache open alone, which
+    applies the full identity check, recovers a stale marker and refuses a
+    live one) once per ``interval``, without backoff, between the whole
+    drain's own passes (round 9 F5). When the marker is gone, one whole pass
+    drains whatever the repair left behind. A stat that raises counts as a
+    marker, retried on the next interval (F8). Without ``marker_drain`` the
+    marker pass is ``drain``.
+
+    Each pass runs inside its own `operation_boundary`, and a violation is
+    logged and the loop continues (spec 5.2). ``stop`` is honoured on every
+    wake; the shutdown path also sets ``attention`` so a blocked wait ends."""
+    interval = max(0.05, float(interval))
+    wait_s = interval
+    remaining = wait_s  # of the whole drain's timed wait
+    pending = True      # the first pass checks what startup left behind
+    after_marker = False
+
+    def _marker_outstanding() -> bool:
+        if marker_present is None:
+            return False
+        try:
+            return bool(marker_present())
+        except Exception:  # noqa: BLE001 — unreadable: treat as outstanding
+            return True
+
+    def _pass(body) -> bool:
+        try:
+            with _cctally_core.operation_boundary("obligation-pass"):
+                body()
+            return True
+        except (Exception, _cctally_core.QueryAuthorityViolation):  # noqa: BLE001
+            _log_sync_iteration_failure()
+            return False
+
+    while not stop.is_set():
+        if pending:
+            timeout = remaining
+            if _marker_outstanding():
+                timeout = min(timeout, interval)
+        elif marker_present is None:
+            timeout = None
+        else:
+            timeout = interval
+        woken = attention.wait(timeout=timeout)
+        if stop.is_set():
+            return
+        if not woken:
+            if pending:
+                remaining -= timeout
+            if not (pending and remaining <= 1e-9):
+                if _marker_outstanding():
+                    _pass(marker_drain or drain)
+                    after_marker = True
+                    continue
+                if not after_marker:
+                    continue
+                # The marker is gone: one whole pass for what it left.
+        attention.clear()
+        after_marker = False
+        drained = False
+
+        def _whole():
+            nonlocal drained
+            drain()
+            drained = not outstanding()
+
+        _pass(_whole)
+        pending = not drained
+        if woken or not pending:
+            wait_s = interval
+        else:
+            wait_s = min(_OBLIGATION_BACKOFF_CAP_S, wait_s * 2.0)
+        remaining = wait_s
+
+
+def _dashboard_doctor_recovery(*, ref, hub, sync_lock, runtime_bind) -> bool:
+    """The `--no-sync` Doctor-only obligation (AD28): when the published
+    snapshot's Doctor block is missing or records a gather exception
+    (``_error``), recompute it (bypassing the memo, which may hold the very
+    block being replaced), replace only ``doctor_payload`` and republish.
+    The frozen accounting data is untouched. Returns whether the block still
+    awaits an owner afterwards (the gather failed again).
+
+    The gather runs outside ``sync_lock``; the patch and its publish run
+    inside it, serialized with every other publisher (the update thread's
+    republish has the same shape)."""
+    tui = _cctally()._cctally_tui
+    if not tui._tui_doctor_payload_needs_owner(ref.get()):
+        return False
+    payload = tui._tui_precompute_doctor_payload(
+        dt.datetime.now(dt.timezone.utc), runtime_bind, use_memo=False)
+    with sync_lock:
+        if not tui._tui_doctor_payload_needs_owner(ref.get()):
+            return False   # a publisher replaced it meanwhile
+        fresh = ref.replace_fields(doctor_payload=payload)
+        hub.publish(fresh)
+    return "_error" in payload
+
+
+class _DoctorRecovery:
+    """`_dashboard_doctor_recovery` bound to one dashboard's publishers."""
+
+    def __init__(self, *, ref, hub, sync_lock, runtime_bind):
+        self.ref = ref
+        self._kwargs = dict(ref=ref, hub=hub, sync_lock=sync_lock,
+                            runtime_bind=runtime_bind)
+
+    def __call__(self) -> bool:
+        return _dashboard_doctor_recovery(**self._kwargs)
+
+
+def _make_dashboard_obligation_thread(*, stop, attention, interval,
+                                      doctor_recovery=None):
+    """The `--no-sync` obligation owner thread (AD12), at ``process``.
+
+    ``doctor_recovery()``, when given, is the AD28 Doctor-only obligation:
+    it runs after the store drain on every pass, and a block that still
+    awaits an owner keeps the pass pending, so it retries on the same
+    backoff."""
+
+    def drain():
+        _dashboard_obligation_drain()
+        if doctor_recovery is not None:
+            doctor_recovery()
+
+    def outstanding():
+        if _obligation_outstanding(_obligation_readiness):
+            return True
+        if doctor_recovery is None:
+            return False
+        return _cctally()._cctally_tui._tui_doctor_payload_needs_owner(
+            doctor_recovery.ref.get())
+
+    return threading.Thread(
+        target=_owner_thread_target(lambda: _dashboard_obligation_loop(
+            stop=stop, attention=attention,
+            interval=max(5.0, float(interval)),
+            drain=drain,
+            outstanding=outstanding,
+            marker_present=_cache_repair_marker_present,
+            marker_drain=_make_dashboard_marker_drain(),
+        )),
+        daemon=True,
+        name="dashboard-obligations",
+    )
 
 
 _INSTALL_WATCH = None
@@ -2812,14 +3345,156 @@ class _ConversationPassStatus(str):
     """Validated status string carrying fixed-size pass diagnostics.
 
     ``drain`` is the pass's evidence for writeIo's startup admission hold
-    (#939 D5, `_conversation_drain_info`), or ``None``."""
+    (#939 D5, `_conversation_drain_info`), or ``None``. ``changed_rows`` says
+    whether the pass changed any row on its connection (unknown reads as
+    changed) and ``fts_eligible`` whether the conversation FTS verification
+    is automatically due on the store (``None`` when it could not be read);
+    the loop's `_ConversationFtsStep` reads both (#1094 D6)."""
 
-    def __new__(cls, status, *, modes=None, files=None, drain=None):
+    def __new__(cls, status, *, modes=None, files=None, drain=None,
+                changed_rows=True, fts_eligible=None):
         obj = str.__new__(cls, status)
         obj.modes = dict(modes or {})
         obj.files = dict(files or {})
         obj.drain = drain
+        obj.changed_rows = bool(changed_rows)
+        obj.fts_eligible = fts_eligible
         return obj
+
+
+def _conversation_fts_eligible(conn) -> "bool | None":
+    """Whether the conversation FTS verification is automatically due on the
+    pass's store (#1094 D5/D6), read on the pass's own connection; ``None``
+    when it cannot be read (a double without ``execute``, a store error)."""
+    if not callable(getattr(conn, "execute", None)):
+        return None
+    try:
+        import _lib_conversation_fts_integrity as fts
+        return bool(fts.automatically_eligible(
+            fts.read_state(conn), now=dt.datetime.now(dt.timezone.utc)))
+    except Exception:  # noqa: BLE001 — diagnostic only: unknown eligibility
+        return None
+
+
+class _ConversationFtsStep:
+    """The dashboard's automatic conversation FTS verification (#1094 D6).
+
+    The conversation loop calls `maybe_run` after every pass. The step runs
+    after a pass that ended ``ok`` and changed no rows, or after any ``ok``
+    pass once the store has been automatically eligible for
+    ``POSTPONE_SECONDS`` without such an idle pass, so a dashboard that
+    ingests on every pass cannot postpone it forever. It runs in its own
+    write-I/O maintenance interval, outside the pass, which writeIo excludes
+    from its steady statistic as index maintenance from the moment it begins
+    (review F1, C2); a failure is logged and swallowed.
+
+    An outcome that commits no ``lastAttemptAt`` leaves the store eligible,
+    so the step backs off in this process (review F5): ``RETRY_AFTER_SECONDS``
+    per outcome, ``RETRY_AFTER_FAILURE_SECONDS`` after an exception (its
+    failure line is logged once per attempt), and never again after
+    ``unavailable``. The other outcomes commit ``lastAttemptAt``, whose
+    24-hour cooldown makes the pass read the store ineligible. A backoff
+    does not restart the postponement clock (review C3): the step runs at
+    the first idle ``ok`` pass after the retry deadline, or at the first
+    ``ok`` pass after both the deadline and ``POSTPONE_SECONDS`` from when
+    the store became eligible.
+
+    `pending` feeds writeIo's startup hold: eligible on the pass's own
+    reading, and no outcome other than ``busy`` yet in this process (a
+    failure counts as an outcome, so a store the step cannot open never holds
+    admission for the dashboard's life). A step that has only ever been
+    ``busy`` stops holding once the store has been eligible for
+    ``POSTPONE_SECONDS``: writeIo's hold has no maximum of its own."""
+
+    POSTPONE_SECONDS = 3600.0
+    RETRY_AFTER_SECONDS = {"busy": 300.0, "deferred": 900.0,
+                           "skipped": 900.0, "unavailable": math.inf}
+    RETRY_AFTER_FAILURE_SECONDS = 3600.0
+
+    def __init__(self, run=None):
+        self._run = run if run is not None else self._verify
+        self._settled = False
+        self._busy = False
+        self._eligible_since = None
+        self._first_eligible = None
+        self._retry_after = 0.0
+        self._retry_at = None
+
+    @staticmethod
+    def _verify():
+        import _lib_conversation_fts_integrity as fts
+        return fts.verify_conversation_fts(mode="automatic", notice=eprint)
+
+    def pending(self, eligible, now=None) -> bool:
+        # Only a positive reading holds: an error pass cannot read the store,
+        # and the step never runs after one.
+        if eligible is not True or self._settled:
+            return False
+        if now is not None:
+            if self._first_eligible is None:
+                self._first_eligible = now
+            elif (self._busy and now - self._first_eligible
+                    >= self.POSTPONE_SECONDS):
+                return False
+        return True
+
+    def maybe_run(self, status, monotonic) -> "float | None":
+        """Run the step when this pass calls for it; return the monotonic
+        time it ended (the next pass's anchor), or None when it did not run."""
+        if status != "ok":
+            return None
+        eligible = getattr(status, "fts_eligible", None)
+        now = monotonic()
+        if eligible is False:
+            self._eligible_since = None
+            return None
+        if self._first_eligible is None and eligible is True:
+            self._first_eligible = now
+        # The postponement clock runs through a retry backoff (review C3):
+        # only an ineligible reading or an outcome that records an attempt
+        # restarts it.
+        if self._eligible_since is None:
+            self._eligible_since = now
+        if self._retry_at is not None and now < self._retry_at:
+            return None
+        idle = not getattr(status, "changed_rows", True)
+        if not idle and now - self._eligible_since < self.POSTPONE_SECONDS:
+            return None
+        self.run()
+        if self._retry_after <= 0:
+            self._eligible_since = None
+        ended = monotonic()
+        self._retry_at = (ended + self._retry_after
+                          if self._retry_after > 0 else None)
+        return ended
+
+    def run(self) -> "str | None":
+        import _lib_conversation_fts_integrity as fts
+        interval = _lib_write_io.begin_interval("maintenance")
+        raised = False
+        try:
+            # Excluded from the steady statistic from its start (review C2),
+            # not only once it has ended.
+            _lib_write_io.open_index_maintenance(interval)
+            try:
+                outcome = getattr(self._run(), "outcome", None)
+            except Exception as exc:  # noqa: BLE001 — never stops ingest
+                eprint(fts.TEXT_CHECK_FAILED.format(
+                    kind=type(exc).__name__, error=exc))
+                outcome = None
+                raised = True
+        finally:
+            _lib_write_io.mark_index_maintenance(
+                _lib_write_io.end_interval(interval), interval=interval)
+        if raised:
+            self._retry_after = self.RETRY_AFTER_FAILURE_SECONDS
+        else:
+            self._retry_after = self.RETRY_AFTER_SECONDS.get(outcome, 0.0)
+        if outcome == "busy":
+            self._busy = True
+        else:
+            self._settled = True
+        return outcome
 
 
 def _conversation_drain_info(conn, status, modes, plans, results,
@@ -2988,6 +3663,7 @@ def _conversation_sync_pass() -> str:
     plans = None
     certifiable = False
     drain = None
+    fts_eligible = None
     try:
         planned = _conversation_frontier_plans(conn)
         if planned is None:
@@ -3011,6 +3687,27 @@ def _conversation_sync_pass() -> str:
             ):
                 plan = plans[provider]
                 if plan.mode == "caught_up":
+                    if provider == "claude":
+                        # #1072 §4.12: accounting changes and durable rollup
+                        # work reach a pass even when no transcript changed.
+                        # The result leaves the certificate as it is: what
+                        # this step cannot finish leaves a durable pending key
+                        # (a full plan next) or is retried next tick, so a
+                        # transient store error here (a `database is locked`)
+                        # is logged and costs this tick neither its Codex leg
+                        # nor a `store_unavailable` status. Only operational
+                        # and I/O errors are transient: a malformed store
+                        # (`sqlite3.DatabaseError`) still reaches the tick's
+                        # store handler.
+                        try:
+                            sync_claude_rollup(conn)
+                        except (OSError, sqlite3.OperationalError) as exc:
+                            eprint("[conversations] claude rollup step "
+                                   f"deferred: {exc}")
+                            try:
+                                conn.rollback()
+                            except Exception:  # noqa: BLE001 — best effort
+                                pass
                     results[provider] = None
                     continue
                 sync_kwargs = {}
@@ -3047,6 +3744,7 @@ def _conversation_sync_pass() -> str:
                         frontier.commit_provider(
                             plan, conn, roots=roots, guard_paths=guards,
                             trusted=trusted, cutoff=cutoff)
+        fts_eligible = _conversation_fts_eligible(conn)
         try:
             drain = _conversation_drain_info(
                 conn, status, modes, plans, results, certifiable)
@@ -3093,7 +3791,8 @@ def _conversation_sync_pass() -> str:
         drain = {"census_complete": False, "certifiable": False,
                  "providers": {}, "deferrals": None, "facts": {}}
     return _ConversationPassStatus(status, modes=modes, files=files,
-                                   drain=drain)
+                                   drain=drain, changed_rows=changed_rows,
+                                   fts_eligible=fts_eligible)
 
 
 def _conversation_sync_loop(
@@ -3105,6 +3804,7 @@ def _conversation_sync_loop(
     thread_time_ns=None,
     wait=None,
     record=None,
+    fts_step=None,
 ) -> None:
     """Transcript ingest loop, bounded like the main one (#583 S4 / F5).
 
@@ -3122,18 +3822,25 @@ def _conversation_sync_loop(
     releases it in a ``finally`` ("loopExit"), so a dead loop never holds
     admission. An exception from the evaluator is logged once and read as no
     verdict (the hold stays), never as the end of ingest.
+
+    #1094 D6: ``fts_step`` (a `_ConversationFtsStep`; production passes one)
+    runs the conversation FTS verification after the pass, outside its
+    measured `work`, and the next deadline is anchored at the step's end;
+    while the step is pending the pass's drain evidence says so and the
+    evaluator withholds its verdict.
     """
     try:
         _conversation_sync_loop_body(
             stop=stop, interval=interval, run_iteration=run_iteration,
             monotonic=monotonic, thread_time_ns=thread_time_ns, wait=wait,
-            record=record)
+            record=record, fts_step=fts_step)
     finally:
         _lib_write_io.release_admission("loopExit")
 
 
 def _conversation_sync_loop_body(
     *, stop, interval, run_iteration, monotonic, thread_time_ns, wait, record,
+    fts_step=None,
 ) -> None:
     if thread_time_ns is None:
         thread_time_ns = time.thread_time_ns
@@ -3146,18 +3853,23 @@ def _conversation_sync_loop_body(
         cpu0 = thread_time_ns()
         written = _lib_write_io.begin_interval("conversation")
         try:
-            status = run_iteration() or "ok"
-        except Exception:  # noqa: BLE001 — the worker must outlive one bad pass
+            with _cctally_core.operation_boundary("conversation-sync"):
+                status = run_iteration() or "ok"
+        except (Exception, _cctally_core.QueryAuthorityViolation):  # noqa: BLE001 — the worker must outlive one bad pass
             _log_sync_iteration_failure()
             status = "error"
         observation = _lib_write_io.end_interval(written)
         work = max(0.0, monotonic() - t0)
         cpu_ns = max(0, thread_time_ns() - cpu0)
         seq += 1
+        drain = getattr(status, "drain", None)
+        if fts_step is not None and drain is not None:
+            # #1094 D6: the startup hold waits for the FTS step to settle.
+            drain = dict(drain, fts_pending=fts_step.pending(
+                getattr(status, "fts_eligible", None), monotonic()))
         try:
             verdict = _lib_write_io.observe_conversation_pass(
-                getattr(status, "drain", None), started_ns=int(t0 * 1e9),
-                seq=seq)
+                drain, started_ns=int(t0 * 1e9), seq=seq)
             if verdict is not None:
                 _lib_write_io.release_admission(verdict)
         except Exception as exc:  # noqa: BLE001 — an evaluator bug must not
@@ -3195,6 +3907,13 @@ def _conversation_sync_loop_body(
                 write_overlap=observation.overlap,
             )
         deadline = _conversation_next_deadline(t0, interval, work)
+        if fts_step is not None and not stop.is_set():
+            # #1094 D6: the step runs after the pass's interval, in its own
+            # maintenance interval, and is not `work`: the next pass starts
+            # one bound after the step's END, not one step-duration later.
+            step_end = fts_step.maybe_run(status, monotonic)
+            if step_end is not None:
+                deadline += max(0.0, step_end - (t0 + work))
         remaining = deadline - monotonic()
         if remaining > 0:
             wait(remaining)
@@ -3212,15 +3931,26 @@ def _make_conversation_sync_thread(*, stop, sync_interval, no_sync):
     if no_sync:
         return None
     return threading.Thread(
-        target=lambda: _conversation_sync_loop(
+        target=_owner_thread_target(lambda: _conversation_sync_loop(
             stop=stop,
             interval=max(5.0, float(sync_interval)),
             run_iteration=_conversation_sync_pass,
             record=_lib_tick_stats.record_conversation_pass,
-        ),
+            fts_step=_ConversationFtsStep(),
+        )),
         daemon=True,
         name="dashboard-conversations-sync",
     )
+
+
+def _owner_thread_target(body):
+    """Wrap a dashboard owner thread's body (#787 / #861 spec 5.1): a new
+    thread has no authority, so it establishes `process` at its entry, with
+    today's unbounded owner waits (AD7: owner threads keep ``None``)."""
+    def target():
+        with _cctally_core.establish_authority("process"):
+            return body()
+    return target
 
 
 def _make_run_sync_now(*args, **kwargs):
@@ -3262,7 +3992,7 @@ def _dashboard_self_heal_orphans(*, skip_sync):
     if skip_sync:
         return None
     try:
-        conn = open_cache_db()
+        conn = open_cache_db_owner()
         try:
             result = _prune_orphaned_cache_entries(conn, lock_timeout=None)
         finally:
@@ -3773,6 +4503,9 @@ class _SnapshotRef:
         not their local build result, or a request accepted mid-build has its
         counter erased by the older snapshot the builder assembled.
         """
+        # #787 / #861 spec 5.2: a build that recorded a violation publishes
+        # nothing.
+        _cctally_core.check_publishable()
         with self._lock:
             self._snap = self._stamped_locked(snap)
             return self._snap
@@ -3789,6 +4522,7 @@ class _SnapshotRef:
         object.
         """
         import dataclasses
+        _cctally_core.check_publishable()   # #787 spec 5.2
         with self._lock:
             self._snap = self._stamped_locked(
                 dataclasses.replace(self._snap, **changes)
@@ -3818,6 +4552,7 @@ class _SnapshotRef:
         periodic rebuild that had already marked itself and was still blocked on
         ``sync_lock``, and nothing would correct that until the next tick.
         """
+        _cctally_core.check_publishable()   # #787 spec 5.2
         with self._lock:
             self._rebuilding_owners.discard(threading.get_ident())
             self._snap = self._stamped_locked(snap)
@@ -4171,13 +4906,17 @@ class SSEHub:
     delivery during shutdown.
     """
 
-    def __init__(self, maxsize: int = 1) -> None:
+    def __init__(self, maxsize: int = 1, *, on_publish=None) -> None:
         import threading
         import queue as _queue
         self._lock = threading.Lock()
         self._queues: list[_queue.Queue] = []
         self._maxsize = maxsize
         self._closed = False
+        # #787 / #861 revision 34 L1: told of every snapshot this hub
+        # publishes, after it is enqueued. `cmd_dashboard` passes
+        # `_StartupHeapFreeze.observe`, which reads attributes only.
+        self._on_publish = on_publish
         self._frame_cache = _SSEFrameCache()
         # Held so we can send the current state to a newly-subscribed
         # client without waiting for the next sync tick.
@@ -4257,6 +4996,7 @@ class SSEHub:
 
     def publish(self, snapshot) -> None:
         import queue as _queue
+        _cctally_core.check_publishable()   # #787 spec 5.2
         with self._lock:
             if self._closed:
                 return
@@ -4298,6 +5038,79 @@ class SSEHub:
                     # Defensive: only this publisher writes while holding the
                     # hub lock; a consumer can remove but never add an item.
                     pass
+        if self._on_publish is not None:
+            self._on_publish(snapshot)
+
+
+class _StartupHeapFreeze:
+    """One full collection, then `gc.freeze()`, after the dashboard's first
+    complete publication (#787 / #861 revision 34 L1).
+
+    A dashboard tracks about 2.6 million objects once its first real build is
+    held, so each full (generation 2) collection holds the GIL for 580-820 ms,
+    and most of them free nothing. Those pauses were every process-wide stall
+    of 250 ms or more, and the cause of the interactive admissions over AD1's
+    500 ms bound. Freezing the heap that first build leaves moves it into the
+    permanent generation, so a later full collection traverses only what
+    changed since. It runs once: freezing after every build would also freeze
+    each build's cyclic garbage and grow RSS without bound. Raising the
+    threshold instead does not help, because each pass still traverses the
+    whole heap.
+
+    `observe` is the hub's publication observer and reads attributes only. A
+    frame qualifies when it is not hydrating and
+    `_tui_dashboard_frame_is_coherent` holds: the sync-mode seed, a deferral
+    frame and an A2 partial copy are hydrating, and a frame kept over the
+    seed, a crash over it and a build that recorded a refused store leg are
+    not coherent, so a first build that fails or keeps a pending frame
+    freezes nothing until a complete publication follows. Both modes publish
+    through the same hub, so a `--no-sync` dashboard freezes after its
+    initial build, or after the publication that settles it.
+
+    The work runs on its own thread (`run`), started by `cmd_dashboard`, so
+    the publisher returns at once: a request thread that publishes the first
+    complete frame (a settings rebuild, a frozen dashboard's manual sync)
+    never answers late on its account. The collection still pauses the
+    process once, as every full collection does. The TUI publishes through no
+    hub and is unchanged (bugfix-only maintenance). One instance per
+    `cmd_dashboard`, which runs once per process.
+    """
+
+    THREAD_NAME = "dashboard-heap-freeze"
+
+    def __init__(self, *, collect=None, freeze=None) -> None:
+        # Resolved at run time, so the process's `gc` is the default.
+        self._collect = collect
+        self._freeze = freeze
+        self._wake = threading.Event()
+        self._requested = False
+        self._stopped = False
+
+    def observe(self, snapshot) -> None:
+        if self._requested or getattr(snapshot, "hydrating", False):
+            return
+        if not _cctally()._cctally_tui._tui_dashboard_frame_is_coherent(
+                snapshot):
+            return
+        self._requested = True
+        self._wake.set()
+
+    def requested(self) -> bool:
+        return self._requested
+
+    def run(self) -> None:
+        import gc
+        self._wake.wait()
+        if self._stopped:
+            return
+        perf = _cctally()._load_sibling("_lib_perf")
+        with perf.phase("dashboard.heap_freeze"):
+            (self._collect or gc.collect)()
+            (self._freeze or gc.freeze)()
+
+    def stop(self) -> None:
+        self._stopped = True
+        self._wake.set()
 
 
 def _format_url(host: str, port: int) -> str:
@@ -4386,7 +5199,7 @@ def _group_a_monthly_buckets(now_utc, *, n, range_start, display_tz):
     if not _GROUP_A_CACHE_ENABLED:
         return None
     try:
-        cache_conn = open_cache_db()
+        cache_conn = open_cache_query_counted()
     except Exception:
         return None
     try:
@@ -4575,7 +5388,7 @@ def _group_a_weekly_buckets(stats_conn, now_utc, *, weeks):
     if not _GROUP_A_CACHE_ENABLED:
         return None
     try:
-        cache_conn = open_cache_db()
+        cache_conn = open_cache_query_counted()
     except Exception:
         return None
     try:
@@ -5379,7 +6192,7 @@ def _group_a_daily_buckets(now_utc, *, n, display_tz):
     if not _GROUP_A_CACHE_ENABLED:
         return None
     try:
-        cache_conn = open_cache_db()
+        cache_conn = open_cache_query_counted()
     except Exception:
         return None
     try:
@@ -8657,15 +9470,21 @@ def _stats_ro_guarded():
 
     Raises `StatsDbMaintenanceError` (an `sqlite3.OperationalError`) during a
     replacement; both callers already degrade on `sqlite3.Error`.
-    """
-    import _cctally_store
 
-    return _cctally_store.stats_open_guarded(
-        _cctally_core.DB_PATH,
-        # #778: forward the opener's `cached_statements=0`.
-        connect=lambda p, **kw: sqlite3.connect(
-            f"{pathlib.Path(p).as_uri()}?mode=ro", uri=True, **kw),
-    )
+    #787 / #861 spec 5.12: a diagnostic query session (``mode=ro`` under
+    diagnostic admission, recovery suppressed, ``cached_statements=0``). It
+    used to be `stats_open_guarded` with its default
+    ``recover_interruptions=True``, so a diagnostic route could resume a
+    stats recovery. Every refusal is a `sqlite3.Error`.
+    """
+    access = _store_access()
+    try:
+        return access.held_session("stats", policy="diagnostic")
+    except _cctally_core.StoreUnavailable as exc:
+        mapped = access._command_unavailable(exc)
+        if mapped is None:
+            raise
+        raise mapped from exc
 
 
 def _debug_cache_state(cache_conn, *, faults=None) -> dict:
@@ -8964,6 +9783,27 @@ _GET_ROUTES = (
      ("scope", "endpoint.conversation_detail"), True),
 )
 
+#: Each route's request ceiling (#787 / #861 spec 5.1 orchestration table,
+#: AD13). A route not named here runs under `query(interactive)`, including
+#: those that touch no store (`/api/data`, `/api/events`, the update routes).
+#: The snapshot routes render the owner's published Doctor block; one with
+#: none renders the deferred placeholder and notifies the owner, and never
+#: gathers (AD28, which supersedes AD27's `diagnostic` ceiling here).
+_ROUTE_CEILINGS = {
+    # Diagnostics: diagnostic sessions and the metadata reader, recovery
+    # suppressed (spec 5.12).
+    "_handle_get_debug_backend": "diagnostic",
+    "_handle_get_debug_backend_write_io": "diagnostic",
+    "_handle_post_alerts_test": "diagnostic",
+    # Live-tail: the read phase narrows to `query(interactive)` per cycle,
+    # the ingest phase runs the request entries at this ceiling (5.9).
+    "_handle_get_conversation_events": "request_writer",
+    # Effectful routes: today's refresh and persistence (AD6, AD13).
+    "_handle_get_doctor": "process",
+    "_handle_post_sync": "process",
+    "_handle_post_settings": "process",
+}
+
 _POST_ROUTES = (
     ("exact", "/api/auth", "_handle_post_auth", None, False),
     ("exact", "/api/sync", "_handle_post_sync", None, False),
@@ -8987,6 +9827,14 @@ _DELETE_ROUTES = (
     ("prefix", "/api/share/presets/", "_handle_share_presets_delete", None, False),
     ("exact", "/api/share/history", "_handle_share_history_delete", None, False),
 )
+
+
+def _doctor_route_owner_phase(state) -> None:
+    """`GET /api/doctor`'s owner step after its gather (AD6): it runs at the
+    route's `process` ceiling. The dashboard's gather is shallow
+    (``deep=False``), so it produces no #1054 scan checkpoint and there is
+    nothing to publish; the step is the seam where a publication belongs."""
+    return None
 
 
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
@@ -9112,16 +9960,62 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 continue
             fn = getattr(self, name)
             args = (path,) if wants_path else ()
-            if perf is None:
-                fn(*args)
-            elif perf[0] == "scope":
-                with self._perf_scope(perf[1]):
+            with self._route_ceiling(name):
+                if perf is None:
                     fn(*args)
-            else:  # "phase"
-                with self._perf_gate().phase(perf[1]):
-                    fn(*args)
+                elif perf[0] == "scope":
+                    with self._perf_scope(perf[1]):
+                        fn(*args)
+                else:  # "phase"
+                    with self._perf_gate().phase(perf[1]):
+                        fn(*args)
             return True
         return False
+
+    @contextlib.contextmanager
+    def _route_ceiling(self, name: str):
+        """Run one routed request under its ceiling (#787 / #861 spec 5.1,
+        AD13): a fresh `operation_boundary` (the request's violation latch)
+        and the route's authority from `_ROUTE_CEILINGS`, both cleared on
+        exit, so a keep-alive request served next on this thread starts with
+        no authority and no latch.
+
+        A `QueryAuthorityViolation` (a BaseException, so no handler's
+        ``except Exception`` swallowed it) is logged and answered with the
+        existing privacy-safe 500 when no response has started; after the
+        headers, the only valid recovery is closing the connection.
+        `send_response` refuses publication while the latch is set (5.2)."""
+        kind = _ROUTE_CEILINGS.get(name, "query")
+        policy = {"query": "interactive", "request_writer": "interactive",
+                  "diagnostic": "diagnostic"}.get(kind)
+        self._cctally_response_started = False
+        self._cctally_refusing = False
+        try:
+            with _cctally_core.operation_boundary(f"http:{name}"):
+                with _cctally_core.establish_authority(kind, policy=policy):
+                    yield
+        except _cctally_core.QueryAuthorityViolation as exc:
+            self.log_error("%s refused: store authority violation: %s",
+                           name, exc)
+            if self._cctally_response_started:
+                self.close_connection = True
+                return
+            self._cctally_refusing = True
+            try:
+                self._respond_json(500, {"error": "internal error"})
+            except OSError:
+                self.close_connection = True
+        finally:
+            self._cctally_refusing = False
+
+    def send_response(self, code, message=None) -> None:
+        """Every response status goes through here: refuse publication when
+        the request's operation recorded a store-authority violation, even
+        one a handler swallowed (#787 / #861 spec 5.2)."""
+        if not getattr(self, "_cctally_refusing", False):
+            _cctally_core.check_publishable()
+        self._cctally_response_started = True
+        super().send_response(code, message)
 
     def _require_api_auth(self) -> bool:
         """Authenticate an API request before any route or method dispatch."""
@@ -9584,7 +10478,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         stats_faults: list[dict] = []
         sources = _debug_source_counts(None, source_bundle, faults=stats_faults)
         try:
-            conn = open_cache_db()
+            # #787 / #861 spec 5.12: a diagnostic session, never the owner
+            # opener (which may create, migrate or recover from a request).
+            conn = open_cache_query_counted(policy="diagnostic")
             try:
                 dataset = _debug_cache_table_counts(conn)
                 cache_state = _debug_cache_state(conn, faults=stats_faults)
@@ -11019,9 +11915,20 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # corrupt the stream, so the only valid recovery is log + close.
         try:
             _ld = sys.modules["cctally"]._load_sibling("_lib_doctor")
+            # #787 / #861 AD6, AD13, AD28: the route's ceiling is `process`
+            # and the gather runs there, in the one shape every caller uses
+            # (CLI `doctor`, this route, the owner's precompute): its
+            # database-reading legs open diagnostic sessions (recovery
+            # suppressed, the diagnostic wait budget) and its other legs
+            # (keychain, lock state, filesystem facts) run at `process`. Any
+            # owner step then runs at the ceiling, after the gather, as CLI
+            # doctor publishes its #1054 scan checkpoint after its gather.
+            # This route gathers with ``deep=False`` (the scan never runs
+            # here), so today that owner step has nothing to publish.
             state = doctor_gather_state(
                 runtime_bind=type(self).cctally_host,
             )
+            _doctor_route_owner_phase(state)
             report = _ld.run_checks(state)
             body = encode_dashboard_json_bytes(
                 _ld.serialize_json(report), ensure_ascii=False,
@@ -11177,7 +12084,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         import _lib_accounts as accounts
         kernel = _cctally()._load_sibling("_lib_diagnosis")
         try:
-            conn = sources.open_read_only("stats")
+            # #787 / #861 spec 5.12: one query session (``mode=ro``, no
+            # sidecar, no schema work), never a raw connect.
+            try:
+                conn = _query_held("stats")
+            except sqlite3.Error as exc:
+                raise kernel.EstablishmentFailure(
+                    kernel.EstablishmentError.STORE_UNAVAILABLE.value,
+                    "stats store could not be opened read-only") from exc
         except kernel.EstablishmentFailure as exc:
             raise kernel.EstablishmentFailure(
                 kernel.EstablishmentError.ACCOUNT_UNRESOLVED.value,
@@ -11267,13 +12181,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                         transcripts_visible=transcripts_visible,
                     ))
 
-                def _prepare_bounded_diagnosis(remaining):
+                def _prepare_bounded_diagnosis(remaining, retirement=None):
                     return _project_diagnosis(
                         sources.build_diagnosis_bounded(
                             scope,
                             measured_at=now_utc,
                             transcripts_visible=transcripts_visible,
                             timeout_seconds=remaining,
+                            retirement=retirement,
                         )
                     )
 
@@ -11368,6 +12283,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 now_utc=snap.generated_at,
             )
         except Exception as exc:
+            if (isinstance(exc, _cctally_core.StoreUnavailable)
+                    and exc.reason != "corrupt"):
+                # #787 / #861 spec 5.11: unavailability is retryable, as on
+                # `/api/block`; a corrupt store and a build failure stay 500.
+                self.log_message("/api/session store not ready: %s",
+                                 exc.reason)
+                _send_detail_unavailable(self, "session detail")
+                return
             self.log_error("/api/session failed: %r", exc)
             self.send_error(500, "session detail failed")
             return
@@ -11485,6 +12408,26 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "action": "cctally cache-sync",
             })
             return
+        except _cctally_core.StoreUnavailable as exc:
+            if exc.reason == "corrupt":
+                self.log_error("/api/source/%s/%s failed: %r",
+                               source, resource, exc)
+                self._respond_json(400, {
+                    "code": "source_capability_unavailable",
+                    "error": "source capability unavailable",
+                })
+                return
+            # #787 / #861 spec 5.11: unavailability is retryable, as on
+            # `/api/block`, never "capability unavailable" or "not found". A
+            # store its owner resolves is handed to it, as on `/api/project`.
+            if _owner_resolved_refusal(exc):
+                _cctally_core.notify_owner(
+                    exc.store, _cctally_core.Readiness(
+                        exc.store, False, exc.reason, frozenset()))
+            self.log_message("/api/source/%s/%s store not ready: %s",
+                             source, resource, exc.reason)
+            _send_detail_unavailable(self, "source detail")
+            return
         except Exception as exc:  # noqa: BLE001 — detailed diagnostics stay server-only.
             self.log_error("/api/source/%s/%s failed: %r", source, resource, exc)
             self._respond_json(400, {
@@ -11511,8 +12454,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     def _parse_search_kind(self, q, valid=_CONV_SEARCH_KINDS):
         return _parse_search_kind_impl(self, q, valid)
 
-    def _run_conversation_query(self, kernel_call, log_label):
-        return _run_conversation_query_impl(self, kernel_call, log_label)
+    def _run_conversation_query(self, kernel_call, log_label, *,
+                                cache_free=None):
+        return _run_conversation_query_impl(self, kernel_call, log_label,
+                                            cache_free=cache_free)
 
     def _parse_conversation_filters(self, q):
         return _parse_conversation_filters_impl(self, q)
@@ -11569,18 +12514,30 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         surface — no CSRF needed for GETs.
         """
         try:
-            conn = open_db()
+            # #787 / #861 spec 5.12: one query session, stats with cache
+            # attached read-only as `cache_db` (5.13); its close drops the
+            # TEMP views and detaches.
+            conn = _query_held("stats", attach=("cache",))
         except Exception as exc:
+            if (isinstance(exc, _cctally_core.StoreUnavailable)
+                    and exc.reason != "corrupt"):
+                # #787 / #861 spec 5.11: unavailability is retryable, as on
+                # `/api/session` and `/api/block`; a corrupt store and a
+                # genuine failure stay 500. A store its owner resolves
+                # (absent, behind, a pending recovery) is handed to it.
+                if _owner_resolved_refusal(exc):
+                    _cctally_core.notify_owner(
+                        exc.store, _cctally_core.Readiness(
+                            exc.store, False, exc.reason, frozenset()))
+                self.log_message("/api/project store not ready: %s",
+                                 exc.reason)
+                _send_detail_unavailable(self, "project detail")
+                return
             self.log_error("/api/project open_db failed: %r", exc)
             self.send_error(500, "project detail failed")
             return
         try:
             try:
-                c = _cctally()
-                conn.execute(
-                    "ATTACH DATABASE ? AS cache_db",
-                    (str(_cctally_core.CACHE_DB_PATH),),
-                )
                 conn.execute(
                     "CREATE TEMP VIEW IF NOT EXISTS session_entries AS "
                     "SELECT * FROM cache_db.session_entries"
@@ -11599,15 +12556,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 return
             _handle_get_project_detail_impl(self, conn=conn)
         finally:
-            try:
-                conn.execute("DROP VIEW IF EXISTS session_entries")
-                conn.execute("DROP VIEW IF EXISTS session_files")
-            except Exception:
-                pass
-            try:
-                conn.execute("DETACH DATABASE cache_db")
-            except Exception:
-                pass
             conn.close()
 
     def _handle_get_block_detail(self, path: str) -> None:
@@ -11652,15 +12600,20 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # _dashboard_build_blocks_panel) so a cross-week-boundary
             # entry just outside the requested block can't shift a
             # heuristic anchor and turn the requested block into a 404.
-            # skip_sync mirrors cmd_dashboard's --no-sync flag (set as a
-            # class attr by cmd_dashboard). Default False keeps
-            # panel<->detail symmetric: if the panel's get_entries() fell
-            # back to direct JSONL parse on cache contention, the detail
-            # call will too -- no 404 on click during a cache rebuild.
-            # Under --no-sync, both paths stay cache-only.
-            entries_in_window = list(get_entries(
-                start_at, end_at, skip_sync=self.no_sync,
-            ))
+            # #787 / #861 AD10: current retained data at request time, read
+            # through one query session and never synced (the sync owner
+            # ingests). Maintenance or contention keeps the direct-JSONL
+            # fallback, so a click during a cache rebuild is still no 404.
+            # A store the owner resolves (absent, behind, a pending recovery)
+            # is handed to it and answered 503, never "not found".
+            try:
+                entries_in_window = list(get_entries(
+                    start_at, end_at, skip_sync=True,
+                ))
+            except _cctally_core.StoreUnavailable as exc:
+                self.log_message("/api/block store not ready: %s", exc.reason)
+                _send_detail_unavailable(self, "block detail")
+                return
             entry_membership: dict[int, list[UsageEntry]] = {}
             blocks = _group_entries_into_blocks(
                 entries_in_window, mode="auto",
@@ -11697,7 +12650,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 # may have grown since the close (#399, #751a).
                 frozen_facts = None
                 try:
-                    _stats = open_db()
+                    _stats = _query_held("stats")
                 except Exception:
                     _stats = None
                 if _stats is not None:
@@ -11766,7 +12719,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         """
         import re as _re
         import urllib.parse as _urlparse
-        from _cctally_cache import open_cache_db
 
         tail = path[len("/api/milestones/"):]
         parts = tail.split("/week/", 1)
@@ -11799,11 +12751,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 if not _re.fullmatch(r"milestone_cycle:[A-Za-z0-9_-]{43}", key):
                     self._send_milestones_json(400, {"error": "invalid cycle key"})
                     return
-                conn = open_db()
+                # #787 / #861 (AD21): the gate and the assembly are one read
+                # unit, one query session (its own snapshot transaction).
+                conn = _query_held("stats")
                 rejected = False
                 detail = None
                 try:
-                    conn.execute("BEGIN")
                     if account_key is None:
                         detail = c.build_claude_week_detail(conn, key)
                     else:
@@ -11826,7 +12779,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                             detail = c.build_claude_week_detail(
                                 conn, key, account_key=account_key,
                                 now_utc=_command_as_of())
-                    conn.commit()
                 finally:
                     conn.close()
                 if rejected:
@@ -11854,14 +12806,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 load_config(), display_tz_name="UTC",
             ).speed
             now_utc = _command_as_of()
-            stats_conn = open_db()
-            cache_conn = open_cache_db()
+            # Stable read across BOTH DBs for a single response (spec §2):
+            # each store is one query session, whose own transaction is the
+            # snapshot (#787 / #861 AD21: one read unit), closed in reverse.
+            stats_conn = _query_held("stats")
             try:
-                # Stable read across BOTH DBs for a single response (spec §2):
-                # the cache conn supplies the physical cost correlation, so it
-                # gets the same BEGIN/commit envelope as the stats conn.
-                stats_conn.execute("BEGIN")
-                cache_conn.execute("BEGIN")
+                cache_conn = open_cache_query_counted()
+            except BaseException:
+                stats_conn.close()
+                raise
+            try:
                 # The gate acquires no lock, so it is safe INSIDE this
                 # transaction — and inside is the only placement that covers a
                 # connection opened before the publication (#496 S5b section 4.7).
@@ -11890,11 +12844,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     stats_conn, cache_conn, identity=identity, key=key,
                     speed=speed, now_utc=now_utc, account_key=account_key,
                 )
-                stats_conn.commit()
-                cache_conn.commit()
             finally:
-                stats_conn.close()
                 cache_conn.close()
+                stats_conn.close()
             if isinstance(result, tuple):
                 _none, reason = result
                 self._send_milestones_json(404, {
@@ -12723,6 +13675,35 @@ def _dashboard_apply_qa_state(snapshot, state: str | None):
     )
 
 
+#: Process-global registrations a `cmd_dashboard` run made, undone when it
+#: returns or raises (#787 / #861). `_cctally_core` is never reloaded, so an
+#: owner-attention callback left behind by a run that stopped before its
+#: shutdown region would outlive it: a later reader meeting a behind store
+#: would wake a schema writer through that run's namespace.
+_CMD_DASHBOARD_CLEANUPS: list = []
+
+
+def _undo_dashboard_registrations_on_exit(fn):
+    """Run every cleanup `fn` registered in `_CMD_DASHBOARD_CLEANUPS`, newest
+    first, however it exits. Each cleanup is idempotent and best-effort."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        mark = len(_CMD_DASHBOARD_CLEANUPS)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            while len(_CMD_DASHBOARD_CLEANUPS) > mark:
+                cleanup = _CMD_DASHBOARD_CLEANUPS.pop()
+                try:
+                    cleanup()
+                except Exception:  # noqa: BLE001 — finish every cleanup
+                    pass
+    return wrapper
+
+
+@_undo_dashboard_registrations_on_exit
 def cmd_dashboard(args: argparse.Namespace) -> int:
     """Launch the live web dashboard."""
     import signal as _signal
@@ -12832,7 +13813,23 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # #780: arm the reader's writer wake-up before any route can serve, then
     # advance the schema once. Both run in EVERY mode, including --no-sync.
     _cctally_cache_module = _cctally()._load_sibling("_cctally_cache")
+    _prior_schema_wake_hook = _cctally_cache_module.SCHEMA_WAKE_HOOK
     _cctally_cache_module.SCHEMA_WAKE_HOOK = _wake_schema_writer
+
+    def _restore_schema_wake_hook():
+        if _cctally_cache_module.SCHEMA_WAKE_HOOK is _wake_schema_writer:
+            _cctally_cache_module.SCHEMA_WAKE_HOOK = _prior_schema_wake_hook
+    _CMD_DASHBOARD_CLEANUPS.append(_restore_schema_wake_hook)
+    # #787 / #861 spec 5.5: owner attention. A query that meets a state an
+    # owner resolves notifies; this process's owners act on it. Set before any
+    # route can serve; unregistered at shutdown.
+    global _SCHEMA_WAKE_RUN_DERIVATIONS, _OWNER_ATTENTION_NO_SYNC
+    _SCHEMA_WAKE_RUN_DERIVATIONS = not bool(args.no_sync)
+    _OWNER_ATTENTION_NO_SYNC = bool(args.no_sync)
+    _OWNER_ATTENTION_EVENT.clear()
+    unregister_owner_attention = _cctally_core.register_owner_attention(
+        _dashboard_owner_attention)
+    _CMD_DASHBOARD_CLEANUPS.append(unregister_owner_attention)
     # #769 S6 / #802: set the PROCESS-level derivation policy before the first
     # open, so the read-route fallback and the live-tail opener inherit it.
     # A startup-only flag would freeze nothing, because both of those reach the
@@ -12879,7 +13876,15 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     initial = _dashboard_apply_qa_state(initial, _dashboard_qa_state_from_env())
 
     ref = _SnapshotRef(initial)
-    hub = SSEHub()
+    # #787 / #861 revision 34 L1: armed before the seed publishes, so every
+    # publication in either mode is observed; the worker waits for the first
+    # complete one.
+    heap_freeze = _StartupHeapFreeze()
+    hub = SSEHub(on_publish=heap_freeze.observe)
+    heap_freeze_thread = threading.Thread(
+        target=heap_freeze.run, daemon=True,
+        name=_StartupHeapFreeze.THREAD_NAME)
+    heap_freeze_thread.start()
     # #583 S2: seed for early subscribers, published from the reference so the
     # very first frame already carries the process's `server_epoch`. A seed
     # published without it would make the client discard its (empty) outstanding
@@ -12963,6 +13968,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
     class _DashboardSyncThread(_c_for_subclass._TuiSyncThread):
         def _run(self) -> None:
+            # #787 / #861 spec 5.1: an owner thread establishes `process`.
+            with _cctally_core.establish_authority("process"):
+                self._run_owner()
+
+        def _run_owner(self) -> None:
             run_iteration = _make_dashboard_run_iteration(
                 sync_lock=sync_lock,
                 run_sync_now=_run_sync_now,
@@ -12983,6 +13993,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 run_iteration=run_iteration,
                 monotonic=_time.monotonic,
                 sleep=_time.sleep,
+                attention=_OWNER_ATTENTION_EVENT,
                 **_make_sync_loop_collaborators(ref=ref, hub=hub),
             )
 
@@ -13018,6 +14029,20 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     )
     if conversation_sync_thread is not None:
         conversation_sync_thread.start()
+
+    # #787 / #861 AD12: a `--no-sync` dashboard has no sync thread, so an
+    # obligation owner thread performs the owner opens its request threads
+    # performed before, on owner attention or while an obligation is pending.
+    obligation_stop = threading.Event()
+    obligation_thread = None
+    if args.no_sync:
+        doctor_recovery = _DoctorRecovery(
+            ref=ref, hub=hub, sync_lock=sync_lock, runtime_bind=args.host)
+        obligation_thread = _make_dashboard_obligation_thread(
+            stop=obligation_stop, attention=_OWNER_ATTENTION_EVENT,
+            interval=float(args.sync_interval),
+            doctor_recovery=doctor_recovery)
+        obligation_thread.start()
 
     # Spec §3.5 (codex review fix #5): update-check thread runs even
     # under --no-sync (frozen-data sessions still surface new versions).
@@ -13173,10 +14198,18 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         conversation_sync_stop.set()
         if conversation_sync_thread is not None:
             conversation_sync_thread.join(timeout=2)
+        unregister_owner_attention()
+        obligation_stop.set()
+        _OWNER_ATTENTION_EVENT.set()
+        if obligation_thread is not None:
+            obligation_thread.join(timeout=2)
         # #939 D5: the loop's own `finally` releases the hold; a loop still
         # finishing a pass after the bounded join must not leave it placed.
         _lib_write_io.release_admission("loopExit")
         update_check_stop.set()
+        # L1: a worker still waiting (no complete frame yet) exits unfrozen.
+        heap_freeze.stop()
+        heap_freeze_thread.join(timeout=2)
         memory_shutdown_errors = []
         try:
             shutdown_codex_source_memory_worker()

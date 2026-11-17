@@ -37,7 +37,11 @@ from _cctally_source_analytics import (
     load_cached_rooted_codex_accounting_entries,
     load_codex_project_metadata_health,
     load_codex_thread_metadata_inventory,
-    load_qualified_codex_entries,
+    # #787 / #861: the dashboard's qualified read runs inside the snapshot
+    # build's query scope over the build's own cache session, so it is the
+    # query variant (no owner open, no sync), bound under the name this
+    # module's readers and their tests have always used.
+    query_qualified_codex_entries as load_qualified_codex_entries,
     probe_codex_detail_metadata_health,
 )
 from _lib_codex_metadata import (

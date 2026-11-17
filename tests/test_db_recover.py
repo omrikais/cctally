@@ -109,3 +109,21 @@ def test_recover_cache_prod_exempt(ns_factory, monkeypatch, capsys):
     assert rc == 0
     conn = sqlite3.connect(c._cctally_core.CACHE_DB_PATH)
     assert conn.execute("PRAGMA user_version").fetchone()[0] == len(head)
+
+
+def test_eager_cache_migration_never_unlinks_corrupt_cache(ns_factory):
+    """#787 / #861 section 11 legacy unlink row. Detects the stats-008 eager
+    cache path deleting a corrupt cache.db outside the guarded quarantine
+    (no repair marker, no maintenance drain, no forensics, sidecars left
+    behind). The guarded `open_cache_db` recovery owns corruption; the eager
+    path must defer and leave the corrupt family in place for it."""
+    import sys
+    c, tmp_path = ns_factory
+    db = sys.modules["_cctally_db"]
+    path = c._cctally_core.CACHE_DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt = b"this is not an sqlite database " * 256
+    path.write_bytes(corrupt)
+    with pytest.raises(db.MigrationGateNotMet):
+        db._open_cache_ro_with_gate_defer()
+    assert path.read_bytes() == corrupt

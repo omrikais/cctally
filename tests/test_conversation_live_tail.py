@@ -373,3 +373,92 @@ def test_live_tail_set_false_then_read(tmp_path, monkeypatch):
     redirect_paths(ns, monkeypatch, tmp_path)
     cfg = {"dashboard": {"live_tail": False}}
     assert ns["_config_known_value"](cfg, "dashboard.live_tail") is False
+
+
+# --- #787 / #861 spec 5.9: the live-tail cycle's two phases -----------------
+#
+# A live-tail stream runs under the request_writer ceiling. Each cycle reads
+# through a query(interactive) session and ingests growth only through the
+# request-writer entries, so a stream can never create, migrate, recover or
+# launch anything (owner work) on a request thread.
+
+
+def _tail_once(port, jsonl, events_path, appends):
+    from tests._support_http import read_event
+    from tests.test_dashboard_conversation_events import _open_sse
+    s = _open_sse(port, events_path)
+    try:
+        read_event(s, marker="event: baselined")
+        for line in appends:
+            with open(jsonl, "a", encoding="utf-8") as fh:
+                fh.write(line)
+            read_event(s, marker="event: tail")
+    finally:
+        s.close()
+
+
+def test_live_tail_cycle_only_ingest_current(tmp_path, monkeypatch):
+    """Detects a live-tail cycle that reaches an owner entry (WRITE, STARTUP,
+    MAINTENANCE or LAUNCH) from the request thread: every guard event while a
+    stream tails growth asks only for READ or INGEST_CURRENT, and is granted."""
+    from tests._support_http import stop
+    from tests.test_dashboard_conversation_events import _asst_line as line
+    from tests.test_dashboard_conversation_events import _boot
+    ns = load_script()
+    srv, _projects, jsonl = _boot(ns, tmp_path, monkeypatch)
+    core = ns["_cctally_core"]
+    events = []
+    monkeypatch.setattr(core, "CAPABILITY_OBSERVERS", [events.append])
+    try:
+        _tail_once(srv.server_address[1], jsonl, "/api/conversation/s1/events",
+                   [line("a2", "m2", "r2", "answer two", sid="s1")])
+    finally:
+        stop(srv, srv._test_thread)
+    assert events, "the cycle reached no guarded entry at all"
+    assert {e.capability for e in events} <= {"READ", "INGEST_CURRENT"}, (
+        sorted({(e.entry, e.capability) for e in events
+                if e.capability not in ("READ", "INGEST_CURRENT")}))
+    assert all(e.permitted for e in events)
+
+
+def test_live_tail_phase_switching_under_ceiling(tmp_path, monkeypatch):
+    """Detects a read phase that holds the ingest capability, or an ingest
+    that runs at a query authority: across two growth cycles, every statement
+    the stream reads runs at query (no INGEST_CURRENT), every request entry
+    runs at the request_writer ceiling, and the phases alternate."""
+    from tests._support_http import stop
+    from tests.test_dashboard_conversation_events import _asst_line as line
+    from tests.test_dashboard_conversation_events import _boot
+    ns = load_script()
+    srv, _projects, jsonl = _boot(ns, tmp_path, monkeypatch)
+    core = ns["_cctally_core"]
+    store = sys.modules["_cctally_store"]
+    trail = []
+
+    def on_read(_sql):
+        a = core.current_authority()
+        trail.append(("read", a.kind if a else None,
+                      bool(a and "INGEST_CURRENT" in a.capabilities)))
+
+    def on_event(e):
+        if e.capability == "INGEST_CURRENT":
+            trail.append(("ingest", e.authority, True))
+
+    monkeypatch.setattr(store, "_TRACE_HOOK", on_read)
+    monkeypatch.setattr(core, "CAPABILITY_OBSERVERS", [on_event])
+    try:
+        _tail_once(srv.server_address[1], jsonl, "/api/conversation/s1/events",
+                   [line("a2", "m2", "r2", "answer two", sid="s1"),
+                    line("a3", "m3", "r3", "answer three", sid="s1")])
+    finally:
+        stop(srv, srv._test_thread)
+    reads = [t for t in trail if t[0] == "read"]
+    ingests = [t for t in trail if t[0] == "ingest"]
+    assert reads and ingests, trail
+    assert {t[1] for t in reads} == {"query"}, sorted(set(reads))
+    assert not any(t[2] for t in reads), "a read phase held INGEST_CURRENT"
+    assert {t[1] for t in ingests} == {"request_writer"}, sorted(set(ingests))
+    # read -> ingest -> read, at least twice.
+    phases = [t[0] for i, t in enumerate(trail)
+              if i == 0 or trail[i - 1][0] != t[0]]
+    assert phases.count("ingest") >= 2 and phases[-1] == "read", phases

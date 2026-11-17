@@ -174,7 +174,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 
 def _cctally():
@@ -1347,11 +1347,14 @@ def _record_budget_milestone_for_vendor(
         # ladder is skipped this tick — nothing armed (the spend leg precedes
         # every crossing, so `pending_alerts` is empty), never re-raised — and
         # recorded on the policy so the hook leaves its lifecycle markers due
-        # and the next due hook retries. Only the Codex vendor reads under the
-        # policy; a Claude ladder can never raise it.
+        # and the next due hook retries. #1076: under the off-hook policy (an
+        # off-hook reconcile's own ingest) every Codex read defers, and the
+        # deferral is recorded on that policy for the reconcile's caller. Only
+        # the Codex vendor reads under a policy; a Claude ladder can never
+        # raise it.
         if vendor != "codex":
             raise
-        policy = _cctally_cache._active_hook_codex_read_policy()
+        policy = _cctally_cache._active_codex_read_policy()
         if policy is not None:
             policy.record_deferral(f"codex_budget:{account_key}", exc.reason)
         return 0
@@ -2186,11 +2189,11 @@ def maybe_record_projected_alert(
                         )
                     except _cctally_cache.CodexReadDeferred as exc:
                         # #981 A5: the Codex axis only is skipped this tick
-                        # and recorded on the hook's read policy; the weekly
-                        # and Claude budget legs above already evaluated.
+                        # and recorded on the active read policy (the hook's,
+                        # or #1076's off-hook one); the weekly and Claude
+                        # budget legs above already evaluated.
                         c_inputs = None
-                        policy = (
-                            _cctally_cache._active_hook_codex_read_policy())
+                        policy = _cctally_cache._active_codex_read_policy()
                         if policy is not None:
                             policy.record_deferral(
                                 "codex_projected", exc.reason)
@@ -7453,9 +7456,13 @@ def _codex_lifecycle_log_line(
         char for char in str(reason)[:40] if char.isalnum() or char in "-_")
     suffix = f" reason={safe_reason}" if safe_reason else ""
     # #980 D6: the fixed token `deferred` when the quota projection refused to
-    # publish over an unresolved model; absent otherwise.
-    if projection == "deferred":
-        suffix += " projection=deferred"
+    # publish over an unresolved model; #1070: the projection's status token
+    # (`published`, `current`, `unavailable`, ...) on a tick whose alert work
+    # is still pending; absent otherwise. A fixed token, never free text.
+    safe_projection = "".join(
+        char for char in str(projection)[:40] if char.isalnum() or char in "-_")
+    if safe_projection:
+        suffix += f" projection={safe_projection}"
     if drain_request:
         suffix += f" drain_request={drain_request}"
     if error:
@@ -7493,80 +7500,87 @@ def _defer_stats_epoch_rebuild() -> str:
     return _cctally_store.defer_stats_epoch_rebuild()
 
 
-def _cmd_hook_tick_codex(
-    args: argparse.Namespace, *, event: str = "unknown",
-    transcript_path: str = "",
-) -> int:
-    """Run one quiet, foreground Codex lifecycle tick.
+@dataclass(frozen=True)
+class CodexLifecycleCoreOutcome:
+    """What one run of the Codex lifecycle execution core did (#1034 §5.1).
 
-    Native Codex Stop/SubagentStop hooks may fire concurrently.  Per-root
-    lifecycle locks narrow alert eligibility while the one S1 cache sync and
-    reporting reconciliation still observe the complete active root set.
+    The fields carry exactly the values the hook's lifecycle line prints, plus
+    the phase facts the drain settlement maps to its aggregate token:
+    ``reconciled`` separates a decline before the reconcile from a
+    post-reconcile ``noop``, ``pinned`` says the read policy proved both
+    vendor-wide and account-scoped eligibility when the reconcile was
+    entered, and ``budget_completed`` says the budget leg's authoritative
+    ingest ran without deferral or contention."""
+
+    sync: str
+    result: str                 # "success" | "noop" | "error"
+    reason: str = ""
+    projection: Any = None      # the reconcile's result, or None
+    budget_alerts: int = 0
+    backlog: int = 0
+    drain_request: str = ""
+    error: str = ""             # already narrowed by `_hook_log_error_detail`
+    request_verify: bool = False
+    pinned: bool = False
+    reconciled: bool = False
+    budget_completed: bool = False
+
+
+def _run_codex_lifecycle_core(
+    locks, roots, *, transcript_path: str,
+    kind: Literal["hook", "settlement"],
+) -> CodexLifecycleCoreOutcome:
+    """The Codex lifecycle execution core, with caller-owned locks (#1034).
+
+    The epoch-rebuild hand-off, the hook read policy, the budgeted sync and
+    its declines, the alert-eligible reconcile, the budget leg and the
+    outcome classification, shared by the real hook (``kind="hook"``) and the
+    prune drain's settlement (``kind="settlement"``). Lock acquisition,
+    acknowledgement and logging stay with the caller. The settlement differs
+    at exactly three points (spec §5.1): a contended sync publishes no waiting
+    request (R-b); a usable pin is required before the reconcile, so no
+    journal observation is consumed on an unproven snapshot; and nothing here
+    ever acknowledges or logs. Every exception is caught and returned as
+    ``result="error"``, keeping the projection and verify request computed so
+    far.
     """
     c = _cctally()
-    roots = _codex_lifecycle_roots()
-    locks = acquire_due_lifecycle_locks(
-        _cctally_core.APP_DIR,
-        roots,
-        now=time.time(),
-        throttle_seconds=CODEX_HOOK_THROTTLE_SECONDS,
-    )
-    if not locks:
-        return 0
     all_root_keys = tuple(root.source_root_key for root in roots)
     due_root_keys = tuple(lock.root.source_root_key for lock in locks)
-    started_at = time.monotonic()
+    # #1069 spec §5.4: bound before the try so a budget-leg failure after a
+    # committed publication still logs the projection's counts.
+    projection = None
+    # #1070 Q13: a projection whose alert work is pending requests the verify
+    # worker, but only once this tick has RELEASED its lifecycle locks — the
+    # worker acquires the owed roots' locks and would otherwise lose its
+    # throttle window to an `alert_lifecycle_contended` run. The caller makes
+    # the request from the outcome, after its release.
+    request_verify = False
+    pinned = reconciled = budget_completed = False
 
-    def log_outcome(
-        *, sync: str, result: str, projection=None, budget_alerts: int = 0,
-        backlog: int = 0, error: str = "", drain_request: str = "",
-        reason: str = "",
-    ) -> None:
-        blocks = int(getattr(projection, "blocks_upserted", 0) or 0)
-        milestones = int(getattr(projection, "milestones_upserted", 0) or 0)
-        quota_alerts = int(getattr(projection, "alerts_dispatched", 0) or 0)
-        projection_state = (
-            "deferred"
-            if getattr(projection, "status", None) == "deferred_model" else "")
-        dur_ms = int((time.monotonic() - started_at) * 1000)
-        for lock in locks:
-            _hook_tick_log_line(_codex_lifecycle_log_line(
-                source_root_key=lock.root.source_root_key,
-                event=event,
-                sync=sync,
-                result=result,
-                blocks=blocks,
-                milestones=milestones,
-                alert_eligible_roots=len(due_root_keys),
-                quota_alerts=quota_alerts,
-                budget_alerts=budget_alerts,
-                backlog=backlog,
-                dur_ms=dur_ms,
-                error=error,
-                drain_request=drain_request,
-                reason=reason,
-                projection=projection_state,
-            ))
-        _hook_tick_log_rotate_if_needed()
-
-    # public #5: a pending stats.db epoch rebuild is the one operation on this
-    # path that neither the ingest budget nor the projection's `defer` can
-    # bound, because it happens inside `open_db()` before any of this code gets
-    # a say. Measured on a real 211K-observation / 1,859-rollout store, the
-    # first tick after the epoch bump cost 82.05s wall — 76.45s of it the
-    # journal rebuild — against Codex's 30-second hook timeout. A killed rebuild
-    # commits nothing, so the next tick repeats it: a non-converging
-    # 30-second-per-turn loop, which is the reported defect delivered by the
-    # fix. Hand it to the dedicated store-owned epoch worker and acknowledge
-    # this tick as a no-op. No lifecycle marker is stamped, so the next Codex
-    # turn re-checks immediately; store admission suppresses duplicate workers.
-    if _stats_epoch_rebuild_pending():
-        _defer_stats_epoch_rebuild()
-        log_outcome(sync="deferred", result="noop")
-        release_lifecycle_locks(locks)
-        return 0
+    def outcome(**fields) -> CodexLifecycleCoreOutcome:
+        return CodexLifecycleCoreOutcome(
+            projection=projection, request_verify=request_verify,
+            pinned=pinned, reconciled=reconciled,
+            budget_completed=budget_completed, **fields)
 
     try:
+        # public #5: a pending stats.db epoch rebuild is the one operation on
+        # this path that neither the ingest budget nor the projection's
+        # `defer` can bound, because it happens inside `open_db()` before any
+        # of this code gets a say. Measured on a real 211K-observation /
+        # 1,859-rollout store, the first tick after the epoch bump cost 82.05s
+        # wall — 76.45s of it the journal rebuild — against Codex's 30-second
+        # hook timeout. A killed rebuild commits nothing, so the next tick
+        # repeats it: a non-converging 30-second-per-turn loop, which is the
+        # reported defect delivered by the fix. Hand it to the dedicated
+        # store-owned epoch worker and acknowledge this tick as a no-op. No
+        # lifecycle marker is stamped, so the next Codex turn re-checks
+        # immediately; store admission suppresses duplicate workers.
+        if _stats_epoch_rebuild_pending():
+            _defer_stats_epoch_rebuild()
+            return outcome(sync="deferred", result="noop")
+
         # Hook stdout/stderr is contractually silent.  Cache migration and
         # ingest diagnostics remain available to explicit CLI operations.
         with open(os.devnull, "w", encoding="utf-8") as quiet, \
@@ -7615,20 +7629,25 @@ def _cmd_hook_tick_codex(
                     # 60 s lifetime. Request the worker instead, as the
                     # declining tick does, and publish nothing.
                     cache_mod._defer_codex_replay_drain()
-                    log_outcome(sync="contended", result="noop",
-                                reason="replay_pending")
-                    return 0
+                    return outcome(sync="contended", result="noop",
+                                   reason="replay_pending")
                 if stats.lock_contended:
+                    if kind == "settlement":
+                        # #1034 R-b: the settlement runs inside the drain
+                        # process, so a waiting request it published would
+                        # only make the drain's own continuation wait out the
+                        # request's lifetime; no hook is waiting on it.
+                        return outcome(sync="contended", result="noop",
+                                       reason="sync_contended")
                     # #968 spec 5.7: publish this hook's own waiting request so
                     # drain workers yield once their admitted work commits. The
                     # hook never waits and never touches the drain gate.
                     import _lib_codex_drain_admission as _drain_adm
                     request_id = _drain_adm.publish_waiting_request(
                         _cctally_core.APP_DIR, root_keys=all_root_keys)
-                    log_outcome(
+                    return outcome(
                         sync="contended", result="noop",
                         drain_request="published" if request_id else "failed")
-                    return 0
                 walk_deferral = getattr(stats, "deferred_reason", None)
                 if (walk_deferral == "replay_pending"
                         and getattr(stats, "replay_refill", False)):
@@ -7639,11 +7658,10 @@ def _cmd_hook_tick_codex(
                     # recorded the deferral) and requests the worker, which
                     # resumes the executor from the replay record.
                     cache_mod._defer_codex_replay_drain()
-                    log_outcome(
+                    return outcome(
                         sync="deferred", result="noop",
                         reason="replay_pending",
                         backlog=int(getattr(stats, "backlog_files", 0) or 0))
-                    return 0
                 if walk_deferral in ("quota_index_pending", "inventory_pending"):
                     # #977 C5 / #927 B4: the walk stopped before ingesting
                     # (the quota natural-key index or the retained-identity
@@ -7652,11 +7670,39 @@ def _cmd_hook_tick_codex(
                     # contended tick this is neither success nor error: no root
                     # is acknowledged, so the next Codex turn retries at once,
                     # and no budget is evaluated on a walk that never ran.
-                    log_outcome(
+                    return outcome(
                         sync="deferred", result="noop",
                         reason=walk_deferral,
                         backlog=int(getattr(stats, "backlog_files", 0) or 0))
-                    return 0
+                usable_pin = bool(read_policy.eligible
+                                  and read_policy.account_eligible)
+                if kind == "settlement" and not usable_pin:
+                    # #1034 Q1/Q4: the reconcile's journal pipeline can consume
+                    # a pending Claude observation and reach the dollar axes,
+                    # so the settlement enters it only on a snapshot the sync
+                    # proved complete for both scopes. The hook keeps its
+                    # deferral-per-reader behaviour instead.
+                    if walk_deferral == "replay_pending":
+                        # §5.1: the replay-drain request is identical for both
+                        # kinds; the hook makes it below once its legs ran.
+                        cache_mod._defer_codex_replay_drain()
+                    if (read_policy.snapshot is None
+                            and read_policy.account_reason
+                            == type(read_policy).account_reason):
+                        # Neither `pin` nor `invalidate` ran: the policy still
+                        # holds its class default, which names a contention
+                        # this uncontended sync never had.
+                        pin_reason = "not_pinned"
+                    else:
+                        pin_reason = str(read_policy.account_reason
+                                         or read_policy.reason
+                                         or "cache_unavailable")
+                    return outcome(
+                        sync="deferred" if walk_deferral else "ok",
+                        result="noop",
+                        reason="pin_" + pin_reason,
+                        backlog=int(getattr(stats, "backlog_files", 0) or 0))
+                pinned = usable_pin
                 projection = c.reconcile_codex_quota_projection(
                     source_root_keys=all_root_keys,
                     alert_eligible_root_keys=due_root_keys,
@@ -7675,6 +7721,9 @@ def _cmd_hook_tick_codex(
                     # precede the turn.
                     full_pass="defer",
                 )
+                reconciled = True
+                request_verify = bool(
+                    getattr(projection, "alert_work_pending", False))
                 # Vendor-scoped spend is intentionally evaluated once per
                 # successful due-set tick, not once per root. Task 7 Item 4:
                 # the on-demand Codex budget firing routes through the
@@ -7704,13 +7753,13 @@ def _cmd_hook_tick_codex(
                     # skipped budget evaluation.  Keep the lifecycle markers
                     # due so the first uncontended tick retries the
                     # forward-only budget crossing.
-                    log_outcome(
-                        sync="contended", result="noop", projection=projection,
+                    return outcome(
+                        sync="contended", result="noop",
                         backlog=int(getattr(stats, "backlog_files", 0) or 0),
                     )
-                    return 0
                 budget_alerts = _budget_holder["n"]
                 budget_deferral = read_policy.first_deferral_reason()
+                budget_completed = budget_deferral is None
         if getattr(stats, "deferred_reason", None) == "replay_pending":
             # public #5: the budgeted tick declined a byte-zero replay, and on
             # a hook-only install nothing else would ever perform one — no
@@ -7727,21 +7776,50 @@ def _cmd_hook_tick_codex(
             # partial total. Neither success nor error, exactly like a
             # contended tick: no root is acknowledged, so every following due
             # hook retries, and doctor reads a growing last-success age.
-            log_outcome(
-                sync="deferred", result="noop", projection=projection,
+            return outcome(
+                sync="deferred", result="noop",
                 budget_alerts=budget_alerts,
                 backlog=int(getattr(stats, "backlog_files", 0) or 0),
                 reason=f"budget_{budget_deferral}",
             )
-            return 0
-        mark_lifecycle_success(locks)
-        log_outcome(
+        if getattr(projection, "alert_work_pending", False):
+            # #1070 spec §5.6: the projection kept its bounded scope and
+            # recorded (or still holds) a durable alert obligation the verify
+            # worker completes. Its publication committed and its counts are
+            # logged, but the roots are not acknowledged: the activation is
+            # owed, and the worker is requested after the locks release.
+            return outcome(
+                sync="deferred" if getattr(stats, "deferred_reason", None)
+                else "ok",
+                result="noop",
+                budget_alerts=budget_alerts,
+                backlog=int(getattr(stats, "backlog_files", 0) or 0),
+                reason="alert_work_pending",
+            )
+        # #1069 spec §5.4: only a projection that applied (`published`) or
+        # proved itself current acknowledges the roots. A deferred, contended
+        # or unavailable one applied nothing, so stamping the success marker
+        # would throttle the next turn over a stale window. The budget leg
+        # above still ran; its worker hand-offs carry their own attempt
+        # throttle, so repeated unacknowledged ticks do not spawn per tick. A
+        # result without a status (older callers, test doubles) is published.
+        projection_status = getattr(projection, "status", None) or "published"
+        if projection_status not in ("published", "current"):
+            return outcome(
+                sync="deferred" if getattr(stats, "deferred_reason", None)
+                else "ok",
+                result="noop",
+                budget_alerts=budget_alerts,
+                backlog=int(getattr(stats, "backlog_files", 0) or 0),
+                reason=f"projection_{projection_status}",
+            )
+        return outcome(
             # A byte-zero Codex replay is not sliceable, so a budgeted tick
             # declines it outright and hands the unbudgeted drain to a detached
             # worker (above). Say so in the lifecycle line rather than reporting
             # a sync that did not walk anything as "ok".
             sync="deferred" if getattr(stats, "deferred_reason", None) else "ok",
-            result="success", projection=projection,
+            result="success",
             budget_alerts=budget_alerts,
             backlog=int(getattr(stats, "backlog_files", 0) or 0),
         )
@@ -7761,13 +7839,105 @@ def _cmd_hook_tick_codex(
         # for carrying paths and then interpolating `str(exc)` was the same leak
         # one layer down, because the whole `OSError` family embeds `filename`
         # — a rollout path is a username plus a conversation UUID.
+        return outcome(sync="error", result="error",
+                       error=_hook_log_error_detail(exc))
+
+
+def _cmd_hook_tick_codex(
+    args: argparse.Namespace, *, event: str = "unknown",
+    transcript_path: str = "",
+) -> int:
+    """Run one quiet, foreground Codex lifecycle tick.
+
+    Native Codex Stop/SubagentStop hooks may fire concurrently.  Per-root
+    lifecycle locks narrow alert eligibility while the one S1 cache sync and
+    reporting reconciliation still observe the complete active root set. The
+    execution itself is ``_run_codex_lifecycle_core``; this wrapper owns the
+    locks, the acknowledgement and the lifecycle lines (#1034 §5.1).
+    """
+    roots = _codex_lifecycle_roots()
+    locks = acquire_due_lifecycle_locks(
+        _cctally_core.APP_DIR,
+        roots,
+        now=time.time(),
+        throttle_seconds=CODEX_HOOK_THROTTLE_SECONDS,
+    )
+    if not locks:
+        return 0
+    due_root_keys = tuple(lock.root.source_root_key for lock in locks)
+    started_at = time.monotonic()
+
+    def log_outcome(
+        *, sync: str, result: str, projection=None, budget_alerts: int = 0,
+        backlog: int = 0, error: str = "", drain_request: str = "",
+        reason: str = "",
+    ) -> None:
+        blocks = int(getattr(projection, "blocks_upserted", 0) or 0)
+        milestones = int(getattr(projection, "milestones_upserted", 0) or 0)
+        quota_alerts = int(getattr(projection, "alerts_dispatched", 0) or 0)
+        status = getattr(projection, "status", None)
+        if status == "deferred_model":
+            projection_state = "deferred"
+        elif getattr(projection, "alert_work_pending", False):
+            # #1070: say what the committed projection did on a tick that
+            # still owes alert activation work.
+            projection_state = str(status or "published")
+        else:
+            projection_state = ""
+        dur_ms = int((time.monotonic() - started_at) * 1000)
+        for lock in locks:
+            _hook_tick_log_line(_codex_lifecycle_log_line(
+                source_root_key=lock.root.source_root_key,
+                event=event,
+                sync=sync,
+                result=result,
+                blocks=blocks,
+                milestones=milestones,
+                alert_eligible_roots=len(due_root_keys),
+                quota_alerts=quota_alerts,
+                budget_alerts=budget_alerts,
+                backlog=backlog,
+                dur_ms=dur_ms,
+                error=error,
+                drain_request=drain_request,
+                reason=reason,
+                projection=projection_state,
+            ))
+        _hook_tick_log_rotate_if_needed()
+
+    outcome = None
+    try:
+        outcome = _run_codex_lifecycle_core(
+            locks, roots, transcript_path=transcript_path, kind="hook")
+        if outcome.result == "success":
+            mark_lifecycle_success(locks)
+        log_outcome(
+            sync=outcome.sync, result=outcome.result,
+            projection=outcome.projection,
+            budget_alerts=outcome.budget_alerts, backlog=outcome.backlog,
+            error=outcome.error, drain_request=outcome.drain_request,
+            reason=outcome.reason,
+        )
+    except Exception as exc:
+        # #1034 spec §5.1: the acknowledgement and the lifecycle lines keep
+        # the hook's single exception boundary. A marker write (`os.open`,
+        # `os.utime`, `os.chmod`) or a log write can raise after the core
+        # returned; it logs one error line with the projection's counts and
+        # stays a silent no-op to Codex, as every failure here always has.
         log_outcome(
             sync="error", result="error",
+            projection=getattr(outcome, "projection", None),
             error=_hook_log_error_detail(exc),
         )
         return 0
     finally:
         release_lifecycle_locks(locks)
+        if outcome is not None and outcome.request_verify:
+            try:
+                import _cctally_quota
+                _cctally_quota._defer_codex_quota_verification()
+            except Exception:  # noqa: BLE001 - hooks stay a silent no-op
+                pass
     return 0
 
 
@@ -7898,6 +8068,11 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
             return 0
         # Either: child of successful fork, OR inline fallback after fork failure.
         if forked:
+            # #787 / #861 AD16: the forked child starts with no authority
+            # (the at-fork handler cleared it) and establishes `process`
+            # itself, unbounded (AD7: a hook owner keeps today's wait). It
+            # holds for the rest of the child's life.
+            _cctally_core.establish_authority("process").__enter__()
             # Detach from parent's session so SIGHUP from CC doesn't kill us.
             try:
                 os.setsid()

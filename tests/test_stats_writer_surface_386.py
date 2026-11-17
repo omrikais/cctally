@@ -577,11 +577,40 @@ FROZEN_WRITE_SITES = {
 # `stats_open_time_guard` (the sanctioned open-time write scope), and
 # `tests/test_stats_content_revision.py` reaches each through a real install
 # and repair.
+# #1068 adds three to `_cctally_cache.py`. `_fill_conversation_sessions_filter_columns`
+# stamps a certified row's `UPDATE {target} SET input_fingerprint`, where
+# `target` is the same fixed live/staging rollup pair as its other writes.
+# `_rewrite_temp_rollup_in_key_order`'s `DELETE FROM temp.{table}` and
+# `INSERT INTO temp.{table}` rewrite a fixed TEMP rollup table
+# (`conversation_sessions` or `codex_conversation_rollups`) on the
+# account-scoped reader connection, which is opened `mode=ro` with no stats.db
+# attachment, so it can write TEMP objects only.
+# test_conversation_account_dimension's scoped reuse tests reach both
+# helpers. Neither can write stats main.
+# #1041 adds one to `_cctally_cache.py`: `_write_conversation_fts_merge_options`'
+# `INSERT INTO main.{table}({table}, rank)` writes an FTS5 option command
+# (`automerge`, `crisismerge`) into one of the hardcoded
+# `CONVERSATION_FTS_TABLES` on the conversation sync's connection, whose `main`
+# is conversations.db, so it cannot write stats main.
+# test_conversation_fts_merge_policy observes it with an SQLite authorizer: its
+# only direct INSERTs are into those three tables.
+# #1094 adds `_lib_conversation_fts_integrity.py`'s four: the guard install's
+# `DROP TRIGGER IF EXISTS temp.{name}` and `CREATE TEMP TRIGGER IF NOT EXISTS
+# {name}` (names from the fixed `cctally_fts_guard_` prefix and the hardcoded
+# `CONTENT_TABLES`), `conversation_fts_command`'s `INSERT INTO
+# {table}({table})` FTS5 command (`rebuild`, `delete-all`) and the rank-1
+# check's `INSERT INTO {fts}({fts}, rank)` `integrity-check`, both over the
+# three hardcoded conversation FTS tables. Every one runs on a conversations
+# connection, whose `main` is conversations.db, or in its TEMP schema.
+# test_seeded_stale_posting_is_detected_and_repaired observes the step's
+# connection with an SQLite authorizer: no database is attached to it, and
+# every write lands in `main` or `temp`.
 FROZEN_DYNAMIC_SITES = {
-    "_cctally_cache.py": 17,
+    "_cctally_cache.py": 21,
     "_cctally_db.py": 9,
     "_cctally_journal.py": 11,
     "_cctally_store.py": 1,
+    "_lib_conversation_fts_integrity.py": 4,
     "_lib_stats_content_revision.py": 5,
 }
 

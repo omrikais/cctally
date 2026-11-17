@@ -58,6 +58,12 @@ def _state(source, now, data):
 
 def _boot(ns, tmp_path, monkeypatch):
     redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # #787 / #861: a dashboard's startup owner creates its stores before any
+    # route serves; a request thread no longer creates one.
+    core = ns["_cctally_core"]
+    with core.establish_authority("process"):
+        core.open_db().close()
+        ns["_cctally_cache"].open_cache_db().close()
     now = dt.datetime(2026, 7, 16, tzinfo=UTC)
     claude = _state("claude", now, {
         "sessions": {"rows": ({"key": "session:claude", "label": "Claude session"},)},
@@ -412,7 +418,9 @@ def test_claude_session_identity_resolves_project_recent_key_outside_panel_rows(
         "INSERT INTO session_files(session_id) VALUES (?)",
         [("panel-session",), (native_session_id,), (None,)],
     )
-    monkeypatch.setattr(dashboard, "open_cache_db", lambda: conn)
+    # #787 / #861: the route reads through the counted query session.
+    monkeypatch.setattr(dashboard, "open_cache_query_counted",
+                        lambda **_kwargs: conn)
 
     assert dashboard._claude_session_id_for_source_key(
         SimpleNamespace(sessions=()), session_key,
@@ -699,20 +707,24 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
     qualified_calls = []
     scoped_calls = []
     quota_calls = []
-    original_open_cache = cache_module.open_cache_db
-    original_open_stats = dashboard.open_db
+    # #787 / #861: the detail routes read through query sessions (the
+    # counted cache session and the held stats session), not the owner
+    # openers, so those are what the trace wraps.
+    original_open_cache = dashboard.open_cache_query_counted
+    original_open_stats = dashboard._query_held
     original_qualified = analytics.load_qualified_codex_entries
     original_scoped = analytics.load_codex_project_scoped_entries
     original_quota = quota.load_codex_quota_observations
 
-    def _traced_open_cache():
-        conn = original_open_cache()
+    def _traced_open_cache(**kwargs):
+        conn = original_open_cache(**kwargs)
         conn.set_trace_callback(cache_sql.append)
         return conn
 
-    def _traced_open_stats():
-        conn = original_open_stats()
-        conn.set_trace_callback(stats_sql.append)
+    def _traced_open_stats(primary, **kwargs):
+        conn = original_open_stats(primary, **kwargs)
+        conn.set_trace_callback(
+            stats_sql.append if primary == "stats" else cache_sql.append)
         return conn
 
     def _traced_qualified(start, end, *, speed, sync=True, group="git-root", cache_conn=None):
@@ -750,8 +762,9 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
     def _forbidden(*_args, **_kwargs):
         raise AssertionError("source detail route attempted ingest or rollout parsing")
 
-    monkeypatch.setattr(cache_module, "open_cache_db", _traced_open_cache)
-    monkeypatch.setattr(dashboard, "open_db", _traced_open_stats)
+    monkeypatch.setattr(dashboard, "open_cache_query_counted",
+                        _traced_open_cache)
+    monkeypatch.setattr(dashboard, "_query_held", _traced_open_stats)
     monkeypatch.setattr(analytics, "load_qualified_codex_entries", _traced_qualified)
     monkeypatch.setattr(
         analytics, "load_codex_project_scoped_entries", _traced_scoped)
@@ -873,6 +886,20 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
             if "quota_window_snapshots" in statement
             and not statement.upper().startswith("PRAGMA")
         ]
+        # #1071: the block detail first discovers the root's stored key
+        # spellings (a Spark block's rows sit under two keys). That read is a
+        # loose index scan, ONE statement per root whatever the key count
+        # (this fixture holds 5,000 keys), forced onto the physical-group index
+        # so it can never walk the root's rows; its plan is pinned in
+        # tests/test_codex_quota_group_filter.py. It is counted on its own and
+        # every other statement still has to satisfy the bounds below.
+        discovery = [sql for sql in quota_queries if "MIN(logical_limit_key)" in sql]
+        assert len(discovery) <= 1, discovery
+        assert all(
+            "INDEXED BY idx_qws_physical_group" in sql
+            and "logical_limit_key >" in sql for sql in discovery
+        ), discovery
+        quota_queries = [sql for sql in quota_queries if sql not in discovery]
         # ONE SHARD PER GROUP, never a disjunction over all of them: a
         # multi-identity OR makes SQLite abandon the index and scan. The
         # snap-equivalent closure is bounded at nine tuples per input group.
@@ -1018,3 +1045,86 @@ def test_the_milestones_route_answers_503_rather_than_a_generic_500(
         }
     finally:
         _close(server, thread)
+
+
+def _reaped_pid() -> int:
+    """A PID that names no process: a child that has exited and been reaped."""
+    import subprocess
+    child = subprocess.Popen(["true"])
+    child.wait()
+    return child.pid
+
+
+@pytest.mark.parametrize(("reason", "owner_resolved"), [
+    # A dead owner's real marker, refused by the query precheck.
+    ("recovery_pending", True),
+    ("schema_behind", True),
+    # A live owner's real marker (R32-1): maintenance, which no owner work
+    # resolves, and still the typed 503 (no identity-less fallback here).
+    ("live_repair", False),
+    # The reasons a facade raised before the query layer.
+    ("maintenance", False),
+    ("busy", False),
+    ("unavailable", False),
+])
+def test_source_session_route_answers_a_pending_cache_with_a_retryable_503(
+        monkeypatch, tmp_path, reason, owner_resolved):
+    """#787 / #861 spec 5.11 ("detail routes never turn unavailability into
+    not found"), Task C acceptance P3's source twin: a Claude session key the
+    published bundle does not list resolves through a cache read, and a store
+    that cannot be read now refuses it. Detects a route that reports the
+    unreadable store as "source resource not found" (404, which the modal
+    renders as a permanent miss) instead of the retryable 503 with
+    ``Retry-After`` the block route sends, and one that never hands an
+    owner-resolved state (a pending recovery, a schema behind) to its owner,
+    so nothing resolves it on a `--no-sync` dashboard."""
+    ns = load_script()
+    server, thread = _boot(ns, tmp_path, monkeypatch)
+    core = ns["_cctally_core"]
+    db = __import__("sys").modules["_cctally_db"]
+    heard: list = []
+    monkeypatch.setattr(core, "_OWNER_ATTENTION_COALESCE_S", 0.0)
+    monkeypatch.setattr(core, "_OWNER_ATTENTION_CALLBACKS", [
+        lambda store, r: heard.append((store, r.readable, r.reason))])
+    cache_path = pathlib.Path(core.CACHE_DB_PATH)
+    claim = None
+    if reason == "recovery_pending":
+        # A dead owner's marker (R32-1): the owner recovers it; a live
+        # owner's is maintenance instead.
+        claim = db._repair_marker_path(cache_path)
+        claim.write_text(json.dumps({
+            "version": db._REPAIR_OWNER_VERSION, "pid": _reaped_pid(),
+            "process_start": "proc:1", "claim_id": "test-dead"}))
+    elif reason == "live_repair":
+        claim, why = db._claim_repair_marker(cache_path)
+        assert claim is not None, why
+    else:
+        dashboard = __import__("sys").modules["_cctally_dashboard"]
+
+        def refused(**_k):
+            raise core.StoreUnavailable(f"cache.db is not readable ({reason})",
+                                        store="cache", reason=reason)
+
+        monkeypatch.setattr(dashboard, "open_cache_query_counted", refused)
+    import http.client
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1],
+            timeout=PRESENCE_BACKSTOP_SECONDS)
+        try:
+            conn.request("GET", "/api/source/claude/session/session:claude")
+            response = conn.getresponse()
+            status, body = response.status, json.loads(response.read())
+            retry_after = response.getheader("Retry-After")
+        finally:
+            conn.close()
+    finally:
+        if reason == "live_repair":
+            db._release_repair_marker(cache_path, claim)
+        elif claim is not None:
+            claim.unlink(missing_ok=True)
+        _close(server, thread)
+    assert status == 503, (status, body)
+    assert body == {"error": "source detail unavailable"}, body
+    assert retry_after == "1"
+    assert (("cache", False, reason) in heard) is owner_resolved, heard

@@ -29,8 +29,8 @@
 # against tests/fixtures/conversation/<scenario>/golden-*.json. A missing golden
 # fails unless CCTALLY_REGEN_GOLDENS=1 explicitly creates it; steady-state is a
 # byte-stable diff. Every decision routes through bin/_lib-golden-diff.sh
-# (NEVER inline `diff -u <(…)` — #106/#107). A trap kills any stray server PID
-# on exit / Ctrl-C.
+# (NEVER inline `diff -u <(…)` — #106/#107). A trap stops any server still
+# running on exit / Ctrl-C, through its holder.
 #
 # Single scenario, run sequentially (the gate truth-table is driven by Host
 # headers, not by separate fixture trees), so no xargs fan-out here.
@@ -61,9 +61,10 @@ GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/conversation"
 # shellcheck source=bin/_lib-golden-diff.sh
 . "$REPO_ROOT/bin/_lib-golden-diff.sh"
 
-# Bounded server teardown (issue #153): SIGTERM -> grace poll -> SIGKILL, so a
-# dropped single SIGTERM (CPython signal/Event lost-wakeup race) can't hang the
-# suite on an unbounded `wait`. shellcheck source=bin/_lib-kill-server.sh
+# Bounded server teardown (issues #153, #1087): the server runs under a
+# child-scope holder, which sends SIGTERM, then SIGKILL after the grace, while
+# it holds the server unreaped; this harness never signals a process number.
+# shellcheck source=bin/_lib-kill-server.sh
 . "$REPO_ROOT/bin/_lib-kill-server.sh"
 
 # Per-run scratch root. The scenario's HOME is a clone of the in-tree fixture's
@@ -75,10 +76,10 @@ GOLDEN_DIFF_TMPDIR="$SCRATCH_ROOT"
 pass_count=0
 fail_count=0
 
-declare -a BG_PIDS=()
+declare -a BG_HOLDS=()
 cleanup () {
-    for p in "${BG_PIDS[@]:-}"; do
-        [ -n "$p" ] && kill_server_bounded "$p"
+    for h in "${BG_HOLDS[@]:-}"; do
+        [ -n "$h" ] && stop_server_bounded "$h"
     done
     rm -rf "$SCRATCH_ROOT" "$FIXTURE_STAGE"
 }
@@ -187,11 +188,12 @@ run_scenario () {
     local log="$scratch_home/server.log"
     # Loopback bind + default expose (unset → false). The gate's 403 leg below
     # rejects a LAN-hostname Host even on this loopback bind.
+    local hold="$scratch_home/.hold"
     HOME="$scratch_home" TZ=Etc/UTC \
-        "$BIN" dashboard --port 0 --no-browser --no-sync \
-        --sync-interval 9999 --host 127.0.0.1 >"$log" 2>&1 &
-    local pid=$!
-    BG_PIDS+=("$pid")
+        hold_start "$hold" child -- "$BIN" dashboard --port 0 --no-browser --no-sync \
+        --sync-interval 9999 --host 127.0.0.1 >"$log" 2>&1
+    local holder=$HOLD_PID
+    BG_HOLDS+=("$hold")
 
     # Discover the ephemeral port from the banner (up to ~15s for cold runners).
     local port="" tries=0
@@ -200,7 +202,7 @@ run_scenario () {
             port=$(grep -Eo 'http://(127\.0\.0\.1|localhost):[0-9]+' "$log" | head -1 | sed 's#.*:##')
             [ -n "$port" ] && break
         fi
-        if ! kill -0 "$pid" 2>/dev/null; then
+        if ! hold_alive "$holder"; then
             break
         fi
         sleep 0.1
@@ -210,7 +212,7 @@ run_scenario () {
     if [ -z "$port" ]; then
         fail "could not discover port (log: $log)"
         sed 's/^/    /' "$log" 2>/dev/null || true
-        kill_server_bounded "$pid"
+        stop_server_bounded "$hold"
         return 1
     fi
 
@@ -902,7 +904,7 @@ print("ok")
         fail "gate: LAN-hostname Host /api/conversation/s5/outline returned $lan_outline_code (expected 403)"
     fi
 
-    kill_server_bounded "$pid"
+    stop_server_bounded "$hold"
 
     if [ "$ok" = "1" ]; then
         echo "PASS $name"

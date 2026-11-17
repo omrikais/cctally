@@ -2302,7 +2302,10 @@ def _account_tail_cycle(env: Env, key: str, account: str, path: str,
     import _lib_conversation_watch as watch
 
     conv = sys.modules["_cctally_dashboard_conversation"]
-    real_transcript = conv.sync_codex_conversations
+    # #787 / #861 spec 5.9: the transcript ingest runs through the request
+    # entry, whose body calls the cache module's full function.
+    cache = sys.modules["_cctally_cache"]
+    real_transcript = cache.sync_codex_conversations
     out: dict = {"transcript": [], "losses": None}
 
     def transcript(writer, **kwargs):
@@ -2317,7 +2320,7 @@ def _account_tail_cycle(env: Env, key: str, account: str, path: str,
         probe = kwargs["stat_fn"]
         committed = kwargs["committed_sig"]
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(conv, "sync_codex_conversations", transcript)
+            patch.setattr(cache, "sync_codex_conversations", transcript)
             if inject is not None:
                 out["losses"] = inject(patch)
             out["seen"], out["emitted"] = watch.watch_step(
@@ -2369,9 +2372,15 @@ def test_n_a_lost_targeted_accounting_batch_holds_the_account_switch_tail(
     batch lost its finalization transaction, the withdrawal still reported a
     clean ingest: the tail went on to ingest the transcript under the surviving
     A range, stamped B's messages as A, committed its cursor, and the watch
-    acknowledged it, so no later accounting retry could repair them. The lost
-    batch must read dirty, run no transcript ingest, leave the watch
-    unacknowledged, and converge with the control on the retry."""
+    acknowledged it, so no later accounting retry could repair them.
+
+    #787 / #861 spec 5.9: the tail's accounting now runs through the request
+    entry's budgeted walk, which commits the file before its parse-health
+    write. The same injected loss therefore rolls back only that write: the
+    batch is not lost, B's range is durable before the transcript runs, and
+    the tail converges with the control in one cycle. The owner walk's
+    withdrawal stays covered by
+    ``test_n_a_finalization_transaction_loss_never_publishes_the_last_batch``."""
     active = {"key": _ACCOUNT_A}
     _identify_codex_roots(env, monkeypatch, active)
     rollout = env.sessions / "rollout-switch.jsonl"
@@ -2430,28 +2439,19 @@ def test_n_a_lost_targeted_accounting_batch_holds_the_account_switch_tail(
     assert lost["losses"] == [True], (
         "the injected loss did not strike the targeted accounting batch",
         lost["losses"])
-    assert not lost["stats"].targeted_clean, (
-        "a lost accounting batch read clean", lost["stats"])
-    assert lost["transcript"] == [], (
-        "transcript ingest ran after a lost accounting batch",
+    assert lost["stats"].targeted_clean, (
+        "the request walk withdrew a batch its loss did not strike",
+        lost["stats"])
+    assert lost["transcript"] == [[path]], (
+        "the transcript was not ingested after a durable accounting batch",
         lost["transcript"])
-    assert (lost["seen"], lost["emitted"]) == (seen, False), (
-        "the watch acknowledged a lost accounting batch", lost["seen"])
 
     redirect_paths(
         env.ns, env.mp, env.tmp / "control")
     control = _account_tail_cycle(env, key, _ACCOUNT_A, path, seen)
     assert control["stats"].targeted_clean
     assert control["transcript"] == [[path]]
-    assert control["seen"] == {path: ("plain", rollout.stat().st_size)}
-
-    # The retry: the watch still owes the growth, and this time it is clean.
-    redirect_paths(
-        env.ns, env.mp, env.tmp / "store")
-    retry = _account_tail_cycle(env, key, _ACCOUNT_A, path, lost["seen"])
-    assert retry["stats"].targeted_clean
-    assert retry["transcript"] == [[path]]
-    assert retry["seen"] == control["seen"]
+    assert lost["seen"] == control["seen"]
     mine, theirs = _tail_state(env, "store"), _tail_state(env, "control")
     assert ("bravo codex tail", _ACCOUNT_B) in theirs["messages"], (
         "non-vacuity: the control stamps the B tail as B")

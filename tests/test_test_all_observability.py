@@ -141,13 +141,10 @@ def _estate(tmp_path, harnesses=None, exits=None, smoke=True):
         path.write_text("\n".join(body) + "\n", encoding="utf-8")
         path.chmod(0o755)
 
-    # The durations plugin is loaded with `-p tests._pytest_durations_plugin`
-    # on an authoritative evidence run, so an estate without it would fail to
-    # start pytest at all (#630 S1).
-    shutil.copy2(
-        REPO / "tests" / "_pytest_durations_plugin.py",
-        testsdir / "_pytest_durations_plugin.py",
-    )
+    # The durations plugin (an authoritative evidence run, #630 S1) and the
+    # xdist recovery plugin (every xdist leg, #1086) are loaded with `-p`, so
+    # an estate without them would fail to start pytest at all.
+    _ct.copy_pytest_plugins(testsdir)
     if smoke:
         (testsdir / "test_scratch_smoke.py").write_text(
             "def test_ok():\n    assert True\n"

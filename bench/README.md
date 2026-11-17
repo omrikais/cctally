@@ -123,6 +123,78 @@ Production-copy runs explicitly remove `CCTALLY_AS_OF` from the dashboard
 environment so current retention, window selection and freshness are measured;
 only deterministic synthetic runs keep the January 2026 fixture pin.
 
+#### Copied fixtures: corpus precondition
+
+A copied fixture's normalization (`cache-sync --rebuild`) keeps a `conversation_source_files` row whose path is not genuinely absent on the measurement host, which is the product's own retention rule: a path whose `lstat` succeeds survives, and so does one whose `lstat` fails with anything other than `ENOENT` or `ENOTDIR`. Such a row describes a corpus outside the clone, so the copy would refuse in its cursor evidence only after the full rebuild. Before copying, the harness therefore reads that one table from the fixture's `data/conversations.db` (read-only) and `lstat`s every path. One surviving or unreadable row refuses the copy with exit 2, naming the count, the first path, and whether the rows lie under the marker's `root` or its `retainedPriorSourceRoot`. Accounting cursors and Codex conversation cursors are not consulted, because normalization clears them whether their files exist or not. A present `.cctally-soak-normalized.json` marker must be a regular file with one of the two shapes the harness writes: `schemaVersion` 1, an absolute `root` and a 64-hex `fixtureSourceFingerprint`, optionally with both `retainedPriorSourceRoot` and `retainedPriorSourceSha256`. Anything else refuses as malformed.
+
+The remedy is to run on a host where those paths are absent, or to move that corpus away first. Never move or delete another task's retained evidence without its owner's approval of the exact paths. For the §6.4 write-budget leg, use preparation v2, which mounts the fixture at its own root instead of copying it.
+
+#### Write-budget leg, preparation v2
+
+The §6.4 write-budget leg (and its `56e66f07a` baseline reference) no longer measures a copy of the fixture. A copy re-derives under a new path and a new device, so its first sync replays the corpus and the leg measures that replay. Preparation v2 instead keeps the fixture inside an APFS sparse-bundle disk image, attached without sudo at the fixture marker's own `root` (the canonical root, `/private/tmp/cctally-dashboard-evidence-f7709be6a636` by default), so every stored path names a real file at its stored spelling. Everything runs as a direct admin-ssh job on the runner, not through `bin/cctally-test-remote`, under one working root `W` on an external volume. Data lives under the canonical root inside the image; logs, receipts and evidence live under `W/evidence/<step>/`, and temp files under `W/tmp/<step>/`, so they outlive every detach. `--fixture-copy` is refused by every v2 step.
+
+Since `#1080` the Codex quota index survives an attach. A cloned or re-attached image keeps its volume UUID, inode numbers and birth times when its device number changes, so a tree from `#1080` on keeps using the index the fixture was sealed with. An earlier tree that has the index rebuilds it whenever an attach gives the volume a different device number. The P1 receipt's `quotaIndex` records whether the index was rebuilt and by what (`rebuiltBy`). A write-budget comparison between trees on either side of `#1080` can therefore differ by that one rebuild.
+
+P0 runs once. It reads the fixture as a pax tar stream on stdin, extracts it into a new image, checks the census and the two-sided content digest against the source host's read-only pre-pass, normalizes it with its producer `4892abbec` (retention deferred, then the pinned prune on the fixture's recorded clock), compares the normalized stores with the retained originals, and seals the detached bundle:
+
+```bash
+ssh <source-host> "tar --no-mac-metadata --format pax -C <fixture> -cf - ." | \
+  ssh <runner-admin-host> "cd '<W>/repo' && python3 -I bench/dashboard-soak.py \
+    --prepare-fixture-image --root '<W>' --output '<W>/p0-receipt.json' \
+    --source-fingerprint <pre-pass fingerprint> --source-digest <pre-pass digest>"
+```
+
+Create the stream with `--no-mac-metadata` when the source host runs macOS: bsdtar's default `--mac-metadata` adds AppleDouble `._*` entries, which break the census.
+
+The local machine only pipes the stream. The source host computes both values in a read-only pre-pass in the same session, from a checkout of this tree: the fingerprint with `python3 -I bench/soak_image.py fingerprint <fixture>` (exactly the harness's `_fixture_source_fingerprint`) and the digest with `python3 -I bench/soak_image.py digest <fixture>`. P0 refuses unless both equal what it measures on the extracted image.
+
+The stream can be slow when it passes through another machine. To compress it in transit, pipe it through `zstd` on both sides; the job still reads a plain pax stream on stdin:
+
+```bash
+ssh <source-host> "tar --no-mac-metadata --format pax -C <fixture> -cf - . | zstd -3 -T0 -q -c" | \
+  ssh <runner-admin-host> "zstd -dc -q | (cd '<W>/repo' && python3 -I bench/dashboard-soak.py \
+    --prepare-fixture-image --extract-only --root '<W>' --output '<W>/p0-checkpoint-extracted.json' \
+    --source-fingerprint <pre-pass fingerprint> --source-digest <pre-pass digest>)"
+```
+
+P0 seals two checkpoints, so a later failure never repeats the stream or the rebuild. Each one detaches the working bundle, clones it with one `clonefile(2)` to `<W>/p0-<stage>-<UTC>.sparsebundle`, seals the clone, writes `<W>/p0-checkpoint-<stage>-<UTC>.json` and reattaches the working bundle. The `extracted` checkpoint follows a verified extraction; the `rebuilt` checkpoint follows the producer's successful `cache-sync --rebuild --source all`, before the pinned prune. The final receipt lists both under `checkpoints`.
+
+`--extract-only` stops after the `extracted` checkpoint, and `--output` names its JSON (the job's own receipt goes to `<W>/p0-extract-<UTC>-receipt.json`). `--resume-from <checkpoint.json>` replaces stdin and takes the pre-pass values from the checkpoint, so it refuses `--source-fingerprint` and `--source-digest`. It never attaches the checkpoint bundle: it refuses a bundle that no longer matches its seal, attaches a fresh clone, requires the checkpoint's exact inventory, and re-runs the fingerprint and the content digest before it continues. From `extracted` it runs the rebuild and everything after it; from `rebuilt` it runs the pinned prune, the comparison and the seal:
+
+```bash
+ssh <runner-admin-host> "cd '<W>/repo' && python3 -I bench/dashboard-soak.py \
+  --prepare-fixture-image --root '<W>' --resume-from '<W>/p0-checkpoint-extracted.json' \
+  --output '<W>/p0-receipt.json'"
+```
+
+P1 runs once per tree. It clones P0's bundle with one `clonefile(2)`, lets the tree's own migrating openers, stats rebuild, sync and catchup drain settle it, refuses any replay that no migration's pending key accounts for, and seals the result on the device it presents:
+
+```bash
+python3 -I bench/dashboard-soak.py --prepare-tree-image --root '<W>' \
+  --p0-receipt '<W>/p0-receipt.json' --tree <sha> --output '<W>/p1-<sha>-receipt.json'
+```
+
+The leg and the reference then take the tree's P1 image. Each arm clones it, attaches it at the canonical root, requires the sealed `(st_dev, st_ino, size, mtime_ns)` identity before any product process starts, and admits through catchup's image mode (`WRITE_ATTRIBUTION_INPUTS=image:<manifest>`), whose manifest is bound to that identity receipt:
+
+```bash
+python3 -I bench/dashboard-soak.py --write-budget-leg --capture-baseline-reference --root '<W>' \
+  --fixture-image '<W>/p1-<baseline-sha>-<UTC>.sparsebundle' --image-receipt '<W>/p1-<baseline-sha>-receipt.json' \
+  --output '<W>/reference.json'
+python3 -I bench/dashboard-soak.py --write-budget-leg --root '<W>' \
+  --fixture-image '<W>/p1-<candidate-sha>-<UTC>.sparsebundle' --image-receipt '<W>/p1-<candidate-sha>-receipt.json' \
+  --baseline-reference '<W>/reference.json' --gate
+```
+
+A reference and a candidate qualify against each other on the shared keys only: the P0 seal and receipt digest, the preparation contract (version 2), host, runtime, instrumentation, storage plus the image descriptor, and the workload. Each run's P1 attests on its own: its tree must be the run's tree, its P0 seal the shared one, and its seal must still match the bundle its arms clone. A v1 reference or one built on another P0 does not qualify.
+
+A faithfully prepared backlog arm can be append-free on `56e66f07a`. Every tick then takes the idle decision, and the reference has no warm full build in that arm (#937 measured this on the #857 fixture). The loader therefore adjudicates a reference arm by arm (policy `per-arm/1`). When the reference's only defect is that backlog population, it is `usable` but not `valid`. That population must have complete, gap-free tick evidence with no sample over the arm's full duration, recorded and recomputed from the digest-bound raw diagnostics at the capture's recorded poll times. The capture's own verdict and job records must be consistent with exactly that defect. The capture file is never rewritten. The leg then runs every requested arm and gates append against append. It records backlog's full-build comparison as INVALID and uncertified, whatever the candidate's samples, and it still judges backlog's write, steady, RSS, API and maintenance gates. Such a leg exits 2 and never carries a verdict. Any other reference defect leaves the reference unusable, and no arm runs: incomplete evidence, an empty append population, a job or teardown problem, or a changed artifact. Builds are never manufactured to fill the population.
+
+Every job holds the runner's host lock (retried every 30 s for at most 30 minutes, then refused) until its teardown completes, so the reference and the candidate run serially and never beside another runner job. A budget watchdog meters the backing disk's cumulative write counter: full-size jobs share 1.5 TB and 16 hours across P0, both P1s, the reference and the leg in `W/budget.json` (P0's rebuild alone writes about 600 GB, about 20 times the stores' net growth), and the relocation oracle has 30 GB and 1 hour per tree. A job stops early enough that its teardown still fits inside the budget, and an unreadable meter refuses or stops it.
+
+Teardown is owned by the image lifecycle: it stops the appender, reaps the processes the job started, reaps the job's own detached workers, lists every holder of a file on the volume, detaches only the owned device and verifies the canonical root is gone. Every job mints a random owner token and passes it to each child in `CCTALLY_BENCH_OWNER_TOKEN`; a product worker that a child started in its own session inherits it. A holder whose own environment (read only for processes of the same user) carries exactly that token is an owned worker: its start identity is recorded when it is classified and checked again before each signal, and it is sent SIGTERM, then SIGKILL after the grace. The receipt lists each one under `ownedWorkers` with its proof and outcome; the product's own worker records, where the tree has them, only corroborate. The same rule runs before every seal and checkpoint. Any other holder the job did not start is reported and never signalled, and it makes the attempt INVALID, as does an owned worker that cannot be reaped. A watchdog stop makes the receipt INVALID even when it fires during in-process work. A refusal names its remedy; a stale mount or leftover directory at the canonical root is never removed automatically, so run the printed `hdiutil detach <device>` or `rmdir <canonical root>` yourself. A step's own images (arm clones, the oracle's clones) are removed after a clean detach; P0 and P1 bundles stay under `W` until the operator removes `W`.
+
+The relocation oracle checks the mechanism for one tree on a synthetic small corpus, at its own canonical root `/private/tmp/cctally-937-oracle-<UTC>`, and writes one `W/oracle/<tree>/<case>.json` per case: `python3 -I bench/dashboard-soak.py --relocation-oracle --tree <sha> --root '<W>'`. Its v1 case must show a replay, and every other case (control, v2, a clean second verification, Codex and Claude replacement, append and discovery) must pass. The control is held to the same identity equality as the image cases, and the summary records the result as `controlIdentity`. In the replacement and append cases, catch-up reports the backlog not drained because the same-size Claude replacement is observed only and never detected. Exactly that cause, the one unconsumed entry being that file with reason "not consumed", is recorded as `expectedNotDrained` with its evidence; any other not-drained cause fails the case.
+
 Absolute candidate ceilings are: 5% true-idle process CPU, 50%
 sampled whole-process CPU, 25% combined main/conversation CPU duty, 1.5 GiB
 RSS, 768 MiB summed retained-owner bytes, +4 MiB/min one-sided 95% post-warm
@@ -296,6 +368,34 @@ CCTALLY_REMOTE_HOST=<runner-alias> bin/cctally-test-remote \
 ```
 
 Pin one runner for a campaign, and clear the pin before any authoritative test run: a pinned host makes the receipt non-authoritative.
+
+### Quota index remount control (`quota-index-remount.py`)
+
+`#1080`: the Codex quota natural-key index records the identity of its keys file and of every journal segment it covers, and a sync whose stat no longer matches rebuilds the index. This driver checks, on real disk images, that remounting the volume that holds the data folder keeps the index valid. A remount gives the volume a new device number but keeps every inode, size, birth time and the volume UUID. The driver also checks that a store which is not the recorded one still invalidates the index. It is macOS only (`hdiutil`, `getattrlist`), runs on the Mac itself because it attaches disk images, takes about a minute, and is never part of a test run.
+
+It extracts `git archive <sha>` of `--repo` under `--work`, so the receipt names the commit and tree that ran. It then creates fresh APFS sparse bundles A (the store), S (a spacer) and B, C, D (controls) under `--work`, attaches them without sudo under `/Volumes`, and builds the small bench fixture on A. `CCTALLY_DATA_DIR`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `HOME` all point into the images. Every image is detached before the driver exits. `--work` must not exist; put it on an external volume.
+
+```sh
+python3 bench/quota-index-remount.py --repo . --sha <commit> \
+    --work /Volumes/<external>/<new dir> --label <tag>
+```
+
+- **Remount.** After sync-1 the driver detaches A, attaches S so that S takes A's device number, and re-attaches A, which therefore gets a new device number. It requires the keys file and every covered segment to keep their inode, size, birth time and volume while only the device changes, with the raw bytes of the sidecar and keys file unchanged.
+- **Sync-2.** The driver appends one new Codex token_count event: a copy of a rollout's newest rate_limits line with a rising cumulative total. Before sync-2 runs, it fixes the two expected natural keys from the injected line's path and offset and from the logical limit keys the journal already records for the copied line. After sync-2, the index must have been consumed, not rebuilt:
+  - the journal gained exactly those keys, once each;
+  - the keys file is the same file;
+  - its bytes are the old bytes plus exactly those two 19-byte lines;
+  - the rebuild state is untouched;
+  - the index is valid.
+- **Sync-3.** The driver remounts back and runs sync-3, which must change nothing.
+- **Controls.** Each control must leave the index invalid:
+  - a copied store;
+  - the store copied to another volume;
+  - a forged store on another volume, with the keys file and every covered segment at A's recorded inode numbers and sizes, A's sidecar and different key content, with fresh and with A's birth times, attached beside A and then alone (where it reuses A's device number);
+  - a replaced keys file;
+  - a replaced covered segment.
+
+The receipt is one JSON object on stdout. `checks` holds every boolean and `allChecks` is the verdict. `models` gives, for every state, the product's verdict and the verdict of each candidate identity rule evaluated on the same stats. On a tree before `#1080` the product must agree with `devIno` at every state, and the remount checks and both device-reuse controls fail. A pass is `allChecks: true`.
 
 ### Tunable constants
 

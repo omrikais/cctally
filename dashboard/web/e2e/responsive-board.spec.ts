@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Locator, type Page } from '@playwright/test';
 import { fulfilJson } from './utils';
 
 // #293 S1 — the durable responsive-board contract (the smoke test only checks
@@ -31,7 +31,7 @@ const HEADER_CONTAINMENT_WIDTHS = [320, 390, 1200, 1250, 1300, 1330, 1340, 1440]
 // browser exercises the title + status-chip flex pressure that the issue
 // measured. The one-shot EventSource prevents a live server tick from
 // replacing the routed envelope before geometry is read.
-async function serveDegradedProjects(page: Page) {
+async function serveRoutedEnvelope(page: Page, mutate: (envelope: Record<string, any>) => void) {
   await page.addInitScript(() => {
     class StableEventSource {
       static readonly CONNECTING = 0;
@@ -79,6 +79,13 @@ async function serveDegradedProjects(page: Page) {
   await page.route('**/api/data', async (route) => {
     const response = await route.fetch();
     const envelope = await response.json() as Record<string, any>;
+    mutate(envelope);
+    await fulfilJson(route, response, envelope);
+  });
+}
+
+async function serveDegradedProjects(page: Page) {
+  await serveRoutedEnvelope(page, (envelope) => {
     const codex = envelope.sources?.codex;
     if (codex?.data == null) throw new Error('fixture has no Codex source data');
     codex.availability = 'partial';
@@ -88,7 +95,38 @@ async function serveDegradedProjects(page: Page) {
       domain: 'projects',
       message: 'Projects are unavailable while the source is degraded.',
     }];
-    await fulfilJson(route, response, envelope);
+  });
+}
+
+// #1111 — measured layout of the Projects title: the sub must never paint
+// under the "partial" chip or the action cluster, and the heading must never
+// wrap away from its folder icon.
+async function projectsTitleLayout(heading: Locator) {
+  return heading.evaluate((node) => {
+    const style = getComputedStyle(node);
+    const sub = node.querySelector('.sub');
+    const header = node.closest('.panel-header');
+    const overlaps = (a: Element | null | undefined, b: Element | null | undefined) => {
+      if (a == null || b == null) return false;
+      const x = a.getBoundingClientRect();
+      const y = b.getBoundingClientRect();
+      return x.left < y.right - 0.5 && y.left < x.right - 0.5
+        && x.top < y.bottom - 0.5 && y.top < x.bottom - 0.5;
+    };
+    const chip = header?.querySelector('.panel-degraded-chip');
+    const icon = header?.querySelector('svg.icon')?.getBoundingClientRect();
+    const headingRect = node.getBoundingClientRect();
+    return {
+      isStatus: node.classList.contains('is-status'),
+      ellipsized: style.textOverflow === 'ellipsis' && style.overflow === 'hidden'
+        && node.scrollWidth > node.clientWidth + 1,
+      text: node.textContent,
+      chipRendered: chip != null,
+      subOverlapsChip: overlaps(sub, chip),
+      subOverlapsActions: overlaps(sub, header?.querySelector('.panel-header-actions')),
+      iconBesideHeading: icon != null
+        && icon.top < headingRect.bottom && headingRect.top < icon.bottom,
+    };
   });
 }
 
@@ -156,23 +194,46 @@ test('#762 — degraded Projects title keeps every header action in its cluster 
           .toBeLessThanOrEqual(geometry.panel.right + 1);
       }
     }
-    const titleStyle = await heading.evaluate((node) => {
-      const style = getComputedStyle(node);
-      return {
-        overflow: style.overflow,
-        textOverflow: style.textOverflow,
-        whiteSpace: style.whiteSpace,
-        text: node.textContent,
-      };
-    });
+    const titleStyle = await projectsTitleLayout(heading);
     expect(titleStyle.text).toBe('Projects (unavailable)');
+    // The degraded fixture renders the "partial" chip; the sub must never paint
+    // under it or under the action cluster (#1111: from 1200 to 1440px a 52-112px
+    // h2 let the 120px "(unavailable)" run under the chip), and the heading
+    // never wraps away from its folder icon.
+    expect(titleStyle.chipRendered, `partial chip rendered at ${width}px`).toBe(true);
+    expect(titleStyle.subOverlapsChip, `sub clear of the partial chip at ${width}px`).toBe(false);
+    expect(titleStyle.subOverlapsActions, `sub clear of the actions at ${width}px`).toBe(false);
+    expect(titleStyle.iconBesideHeading, `icon on the heading's row at ${width}px`).toBe(true);
     if (width > 640) {
-      expect(titleStyle.overflow).toBe('hidden');
-      expect(titleStyle.textOverflow).toBe('ellipsis');
-      expect(titleStyle.whiteSpace).toBe('nowrap');
+      // #787 / #861 round 9b: above 640px a Projects status sub wraps onto its
+      // own line instead of ellipsizing, so "(unavailable)" stays whole.
+      expect(titleStyle.isStatus, `Projects status class at ${width}px`).toBe(true);
+      expect(titleStyle.ellipsized, `status heading not ellipsized at ${width}px`).toBe(false);
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth))
       .toBeLessThanOrEqual(width);
+  }
+});
+
+// #1111 — a has-count sub longer than "(unavailable)" ("(12 this week)" is
+// 14 characters) once put the folder icon on its own row from 1200 to 1240px,
+// because the icon and the heading wrapped as separate items. They are one row.
+test('#1111 — a two-digit Projects count keeps its heading beside the icon', async ({ page }) => {
+  await serveRoutedEnvelope(page, (envelope) => {
+    const rows = envelope.projects?.current_week?.rows;
+    if (!Array.isArray(rows) || rows.length === 0) throw new Error('fixture has no Claude project rows');
+    envelope.projects.current_week.rows = Array.from({ length: 12 }, (_, i) => ({
+      ...rows[i % rows.length],
+      key: `${rows[i % rows.length].key}-${i}`,
+    }));
+  });
+  for (const width of [1200, 1215, 1230, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto('/');
+    const heading = page.locator('#panel-projects .panel-header h2');
+    await expect(heading).toHaveText('Projects (12 this week)');
+    const layout = await projectsTitleLayout(heading);
+    expect(layout.iconBesideHeading, `icon on the heading's row at ${width}px`).toBe(true);
   }
 });
 

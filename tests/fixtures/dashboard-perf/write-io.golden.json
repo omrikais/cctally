@@ -25,6 +25,11 @@
     "operations": 1,
     "rows": 1000
   },
+  "excludedIndexMaintenance": {
+    "bytes": 0,
+    "lastEndedAt": null,
+    "operations": 0
+  },
   "instanceId": "0123456789abcdef",
   "maintenance": {
     "allowanceBytes": 6431965184,

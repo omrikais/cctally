@@ -144,7 +144,7 @@ explicitly per window in `windows.{a,b}.used_pct_mode`.
 | `--min-delta-pct PCT` | `1.0` | Override the `|Δ%|` noise threshold. |
 | `--sort {delta,cost-a,cost-b,name,status}` | `delta` | Per-section row sort key. Ties break on `key` ascending. |
 | `--top N` | unlimited | Cap rows per section after filter+sort. |
-| `--sync` | off | Run `sync_cache` + `sync-week` before computing (otherwise reads cache as-is). |
+| `--sync` | off | Refresh the selected providers' cached usage data before computing (otherwise reads the cache as-is). |
 | `--tz TZ` | config | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
 | `--json` | off | Emit structured JSON envelope. |
 | `--no-color` | off | Disable ANSI color. |
@@ -268,7 +268,7 @@ top-level keys:
   spend since the reset, not since the original week start.
 - **`--sync` is opt-in**, unlike some other subcommands. By default
   `diff` reads the existing cache; pass `--sync` if you want the
-  command to refresh JSONL ingest + weekly cost snapshot before
+  command to refresh the selected providers' cached usage data before
   computing.
 
 ## See also

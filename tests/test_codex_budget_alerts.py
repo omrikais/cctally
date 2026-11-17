@@ -539,3 +539,113 @@ def test_pending_claude_obs_reaches_run_dollar_axes_codex_axis_snapshot_or_defer
     assert codex_full and all(
         t == pytest.approx(oracle, abs=1e-12) for t in codex_full), h.spend
     assert oracle > 0
+
+
+# ── #1076: no reconcile inside record-usage's own ingest ─────────────────────
+
+
+def _quota_rollout(h, name, points):
+    """A rollout whose token counts are Codex spend and whose rate-limit
+    events are Codex quota observations (``points``: (minute, used))."""
+    from _codex_zstd_fixtures import token_records, write_rollout
+    from test_codex_quota_incremental import settle_rate_limit_event
+    base = dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc)
+    path = h.root / "sessions" / f"{name}.jsonl"
+    write_rollout(path, token_records(3, session_id=name) + [
+        settle_rate_limit_event(base, minute, used, 1)
+        for minute, used in points])
+    return path
+
+
+def _certificate_current(h):
+    quota = sys.modules["_cctally_quota"]
+    conn = h.ns["open_cache_db"]()
+    try:
+        certificate = quota.load_codex_quota_projection_certificate(conn)
+        roots = quota._cache_root_keys(conn)
+        return (certificate is not None and bool(roots)
+                and certificate[0] == quota.codex_physical_mutation_seq(conn)
+                and roots <= set(certificate[1]))
+    finally:
+        conn.close()
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("case", ["stale", "current", "r5-projected-only"])
+def test_record_usage_ingest_never_nests_a_reconcile(tmp_path, monkeypatch, case):
+    """#1076 T3 (spec D4). `record-usage`'s own opportunistic ingest runs a
+    Claude observation's dollar axes, whose Codex readers sync Codex by design
+    (R5). Detects that sync's auto projection running inside the held ingest:
+    with a stale quota certificate a nested reconcile that waits 10 s for the
+    ingest lock its own context holds, with a current one the stats-side
+    signature probe. The designed sync must still run exactly once and its
+    reader must evaluate on it."""
+    import _lib_journal as jl
+    from test_968_gate_reader_contracts import BUDGET_PERIOD_START, BudgetHarness
+    projected = case == "r5-projected-only"
+    codex_budget = {"amount_usd": 0.001 if projected else 1000.0,
+                    "period": "calendar-month", "alerts_enabled": True,
+                    "alert_thresholds": [50 if projected else 90]}
+    h = BudgetHarness(tmp_path, monkeypatch, codex_budget=codex_budget)
+    # After the harness: `load_script()` reloads the journal module, and only
+    # the reloaded one carries the Claude usage pipeline hook.
+    jr = sys.modules["_cctally_journal"]
+    _quota_rollout(h, "seed", [(10, 10.0)])
+    h.seed_sync()
+    if projected:
+        # The actual ladder latched; only the projected Codex axis is open.
+        assert h.ns["maybe_record_codex_budget_milestone"]({}) == 1
+        h.core.CONFIG_PATH.write_text(json.dumps({
+            "display": {"tz": "utc"},
+            "budget": {"codex": dict(codex_budget, projected_enabled=True)},
+        }) + "\n")
+        h.syncs.clear()
+        h.spend.clear()
+    if case != "current":
+        # One ingested quota row no reconcile has projected yet.
+        _quota_rollout(h, "seed", [(10, 10.0), (20, 12.0)])
+        conn = h.ns["open_cache_db"]()
+        try:
+            h.ns["sync_codex_cache"](
+                conn, maintenance="caller", quota_reconcile="defer")
+        finally:
+            conn.close()
+        h.syncs.clear()
+    assert _certificate_current(h) is (case == "current"), "premise"
+    quota = sys.modules["_cctally_quota"]
+    calls: list = []
+    real_reconcile = quota.reconcile_codex_quota_projection
+    real_probe = quota._stats_projection_signatures_match
+    monkeypatch.setattr(
+        quota, "reconcile_codex_quota_projection",
+        lambda **kw: calls.append("reconcile") or real_reconcile(**kw))
+    monkeypatch.setattr(
+        quota, "_stats_projection_signatures_match",
+        lambda *a, **kw: calls.append("probe") or real_probe(*a, **kw))
+    jr.append_record(jl.make_obs(
+        at="2026-07-25T11:59:00Z", src="record-usage", provider="claude",
+        payload={"weekly_percent": 12.0, "source": "statusline",
+                 "resets_at": int(dt.datetime(
+                     2026, 7, 28, tzinfo=dt.timezone.utc).timestamp())},
+        account=None))
+
+    result = jr.run_stats_ingest(mode="opportunistic")
+
+    assert getattr(result, "ran", False), result
+    assert calls == [], "the ingest's Codex sync reconciled or probed inside it"
+    assert h.syncs == ["unbudgeted"], h.syncs
+    assert h.direct_parses == []
+    oracle = h.oracle()
+    full = [t for start, acct, t in h.spend
+            if acct is None and start == BUDGET_PERIOD_START]
+    assert oracle > 0 and full and all(
+        t == pytest.approx(oracle, abs=1e-12) for t in full), h.spend
+    if projected:
+        conn = h.ns["open_db"]()
+        try:
+            rows = conn.execute(
+                "SELECT threshold FROM projected_milestones "
+                "WHERE metric='codex_budget_usd'").fetchall()
+        finally:
+            conn.close()
+        assert [tuple(r) for r in rows] == [(50,)], rows

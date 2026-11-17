@@ -366,7 +366,6 @@ def test_the_marker_survives_a_browse_and_a_live_tail_request(
     would survive the marker whether the policy existed or not.
     """
     ns = _stage(tmp_path, monkeypatch)
-    conversation = sys.modules["_cctally_dashboard_conversation"]
     _arm(ns)
     _suppress(ns)
     _owe_the_legacy_bridge(ns)
@@ -374,20 +373,21 @@ def test_the_marker_survives_a_browse_and_a_live_tail_request(
     server, thread, port = _serve(ns)
     try:
         status, body = _get_json(port, "/api/conversations?source=codex")
+        tail_status, tail = _get_json(port, "/api/conversation/s1/events")
     finally:
         stop(server, thread)
     assert status == 200, body
-    # The request reached the full opener and was refused there, which is what
-    # makes the survival below evidence rather than an accident of admission.
+    # #787 / #861 spec 5.8: the request is refused by its query session, which
+    # never reaches the full opener, and `--no-sync` names the bridge.
     assert body["degraded_reason"] == "legacy_bridge_pending", body
     assert _marker_value(ns) == "armed-1", (
-        "a browse request's full-opener fallback consumed the marker")
+        "a browse request consumed the marker")
 
-    # The live-tail opener, at its real seam.
-    with pytest.raises(sys.modules["_cctally_dashboard"].LegacyBridgePending):
-        conversation._live_tail_read_connection()
+    # The live-tail preflight, as a request.
+    assert tail_status == 200, tail
+    assert tail["degraded_reason"] == "legacy_bridge_pending", tail
     assert _marker_value(ns) == "armed-1", (
-        "the live-tail opener consumed the marker")
+        "the live-tail request consumed the marker")
 
 
 def test_a_no_sync_store_owing_the_rebuild_reads_normalization_pending(
@@ -440,10 +440,26 @@ def test_a_no_sync_browse_over_an_owed_legacy_bridge_is_typed_degraded(
     the derivation is suppressed, so the route cannot inherit the policy — and
     spec §9's own alternative applies: it returns a typed degraded response
     naming the state instead of serving an empty surface with nothing said.
+
+    No connection the probe saw may stay in the resolver cache (#854 R2).
+    #787 / #861 spec 5.8: the probe now runs inside the route's query
+    session, which has no hand-back to a full opener; the session's teardown
+    must evict what it seeded.
     """
+    import _lib_codex_metadata as metadata
+
     ns = _stage(tmp_path, monkeypatch)
     _suppress(ns)
     _owe_the_legacy_bridge(ns)
+    cache_module = sys.modules["_cctally_cache"]
+    real_pending = cache_module.conversation_legacy_bridge_pending
+    checked = []
+
+    def pending(conn):
+        checked.append((conn, conn in metadata._threads_table_resolution_cache))
+        return real_pending(conn)
+
+    monkeypatch.setattr(cache_module, "conversation_legacy_bridge_pending", pending)
 
     server, thread, port = _serve(ns)
     try:
@@ -462,6 +478,9 @@ def test_a_no_sync_browse_over_an_owed_legacy_bridge_is_typed_degraded(
     # The route's own empty shape, so the marker is additive.
     assert rail["conversations"] == [] and rail["total"] == 0, rail
     assert facets["projects"] == [] and facets["models"] == [], facets
+    assert checked, "no route reached the legacy-bridge probe"
+    assert not [conn for conn, _member in checked
+                if conn in metadata._threads_table_resolution_cache], checked
 
 
 def test_a_browse_over_an_owed_legacy_bridge_still_derives_when_allowed(
@@ -469,26 +488,65 @@ def test_a_browse_over_an_owed_legacy_bridge_still_derives_when_allowed(
 ):
     """The refusal is bounded to the suppressed mode.
 
-    A mode allowed to do work reaches the same full opener, runs the bridge,
-    and serves an ordinary 200 — so the degraded answer above is the policy
-    speaking, not a new refusal on every owed bridge.
+    #787 / #861 spec 5.8: a read route never runs the bridge itself, so a
+    mode allowed to do work answers the owed bridge as transient owner work
+    (``maintenance``, which the client retries) rather than naming the
+    suppressed state, and once the owner's opener runs the bridge the same
+    route serves an ordinary 200. Detects a read route that migrates the
+    transcript store, or a degraded answer that outlives the owner's bridge.
+
+    #787 / #861 I3b: the owner is the dashboard's own, woken by the read:
+    the session reports the pending bridge to `_dashboard_owner_attention`,
+    which dispatches `_wake_schema_writer`; no test call runs the bridge.
     """
     ns = _stage(tmp_path, monkeypatch)
     _owe_the_legacy_bridge(ns)
+    core = ns["_cctally_core"]
+    dash = sys.modules["_cctally_dashboard"]
+    monkeypatch.setattr(dash, "_OWNER_ATTENTION_NO_SYNC", False)
+    monkeypatch.setattr(dash, "_SCHEMA_WAKE_RUN_DERIVATIONS", True)
+    monkeypatch.setattr(core, "_OWNER_ATTENTION_LAST", {})
+    dash._reset_schema_wake_state()
+    woken = []
+    real_wake = dash._wake_schema_writer
+
+    def recording_wake(**kwargs):
+        # Recorded, then deferred: the bridge must not have run before the
+        # route's degraded answer is checked below.
+        woken.append(kwargs)
+
+    monkeypatch.setattr(dash, "_wake_schema_writer", recording_wake)
+    unregister = core.register_owner_attention(dash._dashboard_owner_attention)
 
     server, thread, port = _serve(ns)
+    ns["DashboardHTTPHandler"].no_sync = False
     try:
+        owed_status, owed = _get_json(port, "/api/conversations")
+        conv = ns["open_conversations_db"](attach_cache=False)
+        try:
+            assert conv.execute(
+                f"SELECT COUNT(*) FROM {_BRIDGE_TABLE}").fetchone()[0] == 0, (
+                "a read route ran the bridge")
+        finally:
+            conv.close()
+        assert woken, "the pending bridge never reached the owner"
+        real_wake(**woken[0])
+        dash._join_schema_wake_thread()
         status, body = _get_json(port, "/api/conversations")
     finally:
+        unregister()
         stop(server, thread)
 
+    assert owed_status == 200, owed
+    assert owed["status"] == "degraded", owed
+    assert owed["degraded_reason"] == "maintenance", owed
     assert status == 200, body
     assert body.get("status") != "degraded", body
     conv = ns["open_conversations_db"](attach_cache=False)
     try:
         assert conv.execute(
             f"SELECT COUNT(*) FROM {_BRIDGE_TABLE}").fetchone()[0] == 1, (
-            "the bridge did not run in a mode allowed to do work")
+            "the owner's opener did not run the bridge")
     finally:
         conv.close()
 
@@ -545,3 +603,387 @@ def test_a_no_sync_startup_is_comparable_to_a_no_marker_control(
         f"suppressed startup {suppressed:.3f}s exceeded the no-marker control "
         f"{control:.3f}s by more than {_STARTUP_DELTA_S}s"
     )
+
+
+# ── #787 / #861 I3b: owner attention and the `--no-sync` obligation owner ──
+#
+# Spec 5.5 / AD12. A request thread no longer performs owner opens, so the
+# states those opens drained before are drained by an owner the query
+# notifies. Each test below names the availability failure it detects: a
+# state that, with the owner path gone from the request thread, nothing would
+# ever drain, or a `--no-sync` owner that drains by ingesting.
+
+import os
+import sqlite3
+
+_SYNC_ENTRIES = ("sync_cache", "sync_codex_cache", "sync_conversations",
+                 "sync_codex_conversations", "sync_cache_request",
+                 "sync_codex_cache_request")
+
+
+def _owner_stores(tmp_path, monkeypatch, *, conversations=True):
+    """Isolated stores the owner openers created under `process`, in a
+    private data directory, plus the dashboard's attention state reset."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    core = ns["_cctally_core"]
+    cache = ns["_cctally_cache"]
+    app = pathlib.Path(core.APP_DIR)
+    app.mkdir(parents=True, exist_ok=True)
+    os.chmod(app, 0o700)
+    with core.establish_authority("process"):
+        core.open_db().close()
+        cache.open_cache_db().close()
+        if conversations:
+            cache.open_conversations_db().close()
+    dash = sys.modules["_cctally_dashboard"]
+    event = threading.Event()
+    monkeypatch.setattr(dash, "_OWNER_ATTENTION_EVENT", event)
+    monkeypatch.setattr(dash, "_OWNER_ATTENTION_DEBT_DEFERRED", 0)
+    # Notifications coalesce process-wide; an earlier test's identical one
+    # must not swallow this test's.
+    monkeypatch.setattr(core, "_OWNER_ATTENTION_LAST", {})
+    dash._reset_schema_wake_state()
+    import _cctally_store_access as access
+    return ns, core, dash, access, event
+
+
+def _flag_projection_incomplete(core):
+    conn = sqlite3.connect(str(core.DB_PATH))
+    try:
+        conn.execute("INSERT OR REPLACE INTO stats_quota_projection_state"
+                     "(id, incomplete) VALUES (1, 1)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _stats_obligations(access):
+    with access.QueryService.session("stats") as s:
+        return s.readiness["primary"].obligations
+
+
+def _projection_drained(access):
+    """Whether a query session reads the projection as reconciled. Read only
+    once the owner pass the notification woke has finished (see
+    `_count_obligation_passes`): a read DURING the pass holds stats's shared
+    maintenance lock, and the reconciling `open_db` takes the exclusive one
+    non-blocking, so a polled read made that pass lose the lock and leave the
+    flag set, and with an hour's interval no timed pass retried it."""
+    return "quota_projection_incomplete" not in _stats_obligations(access)
+
+
+def _record_every_sync(monkeypatch, ns, calls):
+    """Recording stand-ins for every ingest entry. Recording rather than
+    raising, because several owner paths swallow an exception, which would
+    hide a call a raising stand-in was meant to catch."""
+    cache_module = ns["_cctally_cache"]
+
+    def _recorder(name):
+        def _call(*_args, **_kwargs):
+            calls.append(name)
+        return _call
+
+    for name in _SYNC_ENTRIES:
+        if hasattr(cache_module, name):
+            monkeypatch.setattr(cache_module, name, _recorder(name))
+
+
+def _count_obligation_passes(monkeypatch, dash):
+    """A semaphore released each time a `--no-sync` obligation drain returns,
+    so a test waits for the owner pass itself rather than polling the store
+    while that pass runs."""
+    passes = threading.Semaphore(0)
+    real_drain = dash._dashboard_obligation_drain
+
+    def drain():
+        try:
+            real_drain()
+        finally:
+            passes.release()
+    monkeypatch.setattr(dash, "_dashboard_obligation_drain", drain)
+    return passes
+
+
+def _run_obligation_thread(dash, event, body):
+    stop_event = threading.Event()
+    thread = dash._make_dashboard_obligation_thread(
+        stop=stop_event, attention=event, interval=3600)
+    thread.start()
+    try:
+        return body()
+    finally:
+        stop_event.set()
+        event.set()
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "the obligation thread did not stop"
+
+
+def _notify_projection(core):
+    core.notify_owner("stats", core.Readiness(
+        "stats", True, None, frozenset({"quota_projection_incomplete"})))
+
+
+def test_no_sync_obligation_drains_without_ingest(tmp_path, monkeypatch):
+    """Detects a `--no-sync` dashboard whose incomplete quota projection is
+    never reconciled once request threads stop running the owner `open_db`
+    (AD12), or whose obligation owner drains it by ingesting: the flag reaches
+    the recovered read through `_DashboardObligationThread`, with zero ingest
+    calls and no restart."""
+    ns, core, dash, access, event = _owner_stores(tmp_path, monkeypatch)
+    _flag_projection_incomplete(core)
+    assert "quota_projection_incomplete" in _stats_obligations(access)
+    monkeypatch.setattr(core, "QUOTA_PROJECTION_RECONCILE_ENABLED", True)
+    monkeypatch.setattr(dash, "_OWNER_ATTENTION_NO_SYNC", True)
+    calls, events = [], []
+    _record_every_sync(monkeypatch, ns, calls)
+    monkeypatch.setattr(core, "CAPABILITY_OBSERVERS", [events.append])
+    passes = _count_obligation_passes(monkeypatch, dash)
+    unregister = core.register_owner_attention(dash._dashboard_owner_attention)
+    try:
+        ran = _run_obligation_thread(dash, event, lambda: (
+            _notify_projection(core), passes.acquire(timeout=30))[1])
+    finally:
+        unregister()
+    assert ran, "the notification never woke an obligation pass"
+    assert _projection_drained(access), (
+        "the obligation thread never reconciled the projection")
+    assert calls == [], calls
+    assert not [e for e in events if e.capability == "INGEST_CURRENT"], events
+
+
+def test_sync_mode_obligation_drains(tmp_path, monkeypatch):
+    """Detects a sync-mode notification that the sync thread ignores until
+    its next automatic tick (or never): the owner-attention event starts the
+    owner iteration early, and the owner `open_db` it performs reconciles."""
+    ns, core, dash, access, event = _owner_stores(tmp_path, monkeypatch)
+    _flag_projection_incomplete(core)
+    # Disarmed for the loop's first, automatic pass: a reconciliation leaves a
+    # durable throttle marker, so only the attention-woken pass may run one.
+    monkeypatch.setattr(core, "QUOTA_PROJECTION_RECONCILE_ENABLED", False)
+    monkeypatch.setattr(dash, "_OWNER_ATTENTION_NO_SYNC", False)
+    passes = []
+    # Set once the first pass's `open_db` has RETURNED. Waiting on the pass
+    # being recorded instead let a loaded machine arm reconciliation while
+    # that first open was still running, so the automatic pass drained the
+    # flag itself and the attention-woken pass this test is about never ran.
+    first_pass_done = threading.Event()
+    # Set once the attention-woken pass's `open_db` has returned; the drain is
+    # read only then, for the reason `_projection_drained` gives.
+    second_pass_done = threading.Event()
+
+    def owner_iteration():
+        # The sync thread's owner phase: its build opens stats as `process`.
+        passes.append(core.current_authority().kind)
+        core.open_db().close()
+        (second_pass_done if first_pass_done.is_set()
+         else first_pass_done).set()
+
+    stop_event = threading.Event()
+    loop = threading.Thread(target=dash._owner_thread_target(
+        lambda: dash._dashboard_sync_loop(
+            stop=stop_event, interval=3600.0, run_iteration=owner_iteration,
+            attention=event)), daemon=True)
+    unregister = core.register_owner_attention(dash._dashboard_owner_attention)
+    loop.start()
+    try:
+        assert first_pass_done.wait(timeout=30)
+        assert passes == ["process"], passes
+        assert "quota_projection_incomplete" in _stats_obligations(access)
+        monkeypatch.setattr(core, "QUOTA_PROJECTION_RECONCILE_ENABLED", True)
+        _notify_projection(core)
+        woken = second_pass_done.wait(timeout=30)
+    finally:
+        unregister()
+        stop_event.set()
+        loop.join(timeout=10)
+    assert woken, f"the notification never woke an owner iteration: {passes}"
+    assert _projection_drained(access), (
+        f"the attention-woken owner iteration did not reconcile: {passes}")
+    assert len(passes) == 2, passes      # the interval is an hour
+    assert set(passes) == {"process"}, passes
+
+
+def test_failed_startup_retried_through_wake(tmp_path, monkeypatch):
+    """Detects a `--no-sync` dashboard whose failed startup schema open
+    leaves the conversation surface degraded forever: the next read reports
+    the absent store to the owner, `_wake_schema_writer` retries the open
+    (without derivations), and the same route then serves."""
+    ns, core, dash, access, event = _owner_stores(
+        tmp_path, monkeypatch, conversations=False)
+    cctally = sys.modules["cctally"]
+    real_open = cctally.open_conversations_db
+    failures = []
+
+    def failing_once(**kwargs):
+        if not failures:
+            failures.append(kwargs)
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_open(**kwargs)
+
+    monkeypatch.setattr(cctally, "open_conversations_db", failing_once)
+    with core.establish_authority("process"):
+        dash._dashboard_startup_schema_migration(run_derivations=False)
+    assert failures, "the startup open was not attempted"
+    assert not pathlib.Path(core.CONVERSATIONS_DB_PATH).exists()
+    monkeypatch.setattr(dash, "_OWNER_ATTENTION_NO_SYNC", True)
+    monkeypatch.setattr(dash, "_SCHEMA_WAKE_RUN_DERIVATIONS", False)
+    unregister = core.register_owner_attention(dash._dashboard_owner_attention)
+    server, thread, port = _serve(ns)
+    try:
+        degraded_status, degraded = _get_json(port, "/api/conversations")
+        dash._join_schema_wake_thread()
+        status, body = _get_json(port, "/api/conversations")
+    finally:
+        unregister()
+        stop(server, thread)
+    assert degraded_status == 200 and degraded["status"] == "degraded", degraded
+    assert len(failures) == 1
+    assert pathlib.Path(core.CONVERSATIONS_DB_PATH).exists(), (
+        "the wake never retried the failed startup open")
+    assert status == 200 and body.get("status") != "degraded", body
+
+
+def test_no_sync_codex_debt_stays_pending(tmp_path, monkeypatch):
+    """V1. Detects a `--no-sync` obligation owner that drains Codex
+    maintenance debt, which can ingest: with recorded replay and catch-up
+    debt and new rollout records present, the projection still drains, but
+    no ingest entry runs, no Codex worker is spawned and the debt is still
+    recorded afterwards."""
+    ns, core, dash, access, event = _owner_stores(tmp_path, monkeypatch)
+    cache = ns["_cctally_cache"]
+    provider_root = tmp_path / "provider"
+    rollout = provider_root / "sessions" / "2026" / "07" / "15" / "rollout.jsonl"
+    rollout.parent.mkdir(parents=True)
+    shutil.copyfile(CORPUS / "modern-full.jsonl", rollout)
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+    debt = {cache.CODEX_REPLAY_FROM_ZERO_KEY: "1",
+            cache.CODEX_FINALIZATION_DEBT_KEY: "catch-up"}
+    conn = sqlite3.connect(str(core.CACHE_DB_PATH))
+    try:
+        for key, value in debt.items():
+            conn.execute("INSERT OR REPLACE INTO cache_meta(key, value) "
+                         "VALUES (?, ?)", (key, value))
+        conn.commit()
+    finally:
+        conn.close()
+    _flag_projection_incomplete(core)
+    monkeypatch.setattr(core, "QUOTA_PROJECTION_RECONCILE_ENABLED", True)
+    monkeypatch.setattr(dash, "_OWNER_ATTENTION_NO_SYNC", True)
+    calls, spawned = [], []
+    _record_every_sync(monkeypatch, ns, calls)
+    import _cctally_journal
+    for module, name in ((cache, "_spawn_codex_worker"),
+                         (cache, "request_codex_inventory_bootstrap"),
+                         (cache, "_request_codex_drain_worker"),
+                         (_cctally_journal, "request_quota_index_rebuild")):
+        monkeypatch.setattr(module, name,
+                            lambda *a, _n=name, **k: spawned.append(_n))
+    passes = _count_obligation_passes(monkeypatch, dash)
+    unregister = core.register_owner_attention(dash._dashboard_owner_attention)
+    try:
+        # The request-side debt report a `--no-sync` owner records only.
+        core.notify_owner("cache", core.Readiness(
+            "cache", True, None, frozenset({"codex_maintenance_debt"})))
+        assert dash._OWNER_ATTENTION_DEBT_DEFERRED == 1
+        assert not event.is_set(), "Codex debt woke the --no-sync owner"
+        ran = _run_obligation_thread(dash, event, lambda: (
+            _notify_projection(core), passes.acquire(timeout=30))[1])
+    finally:
+        unregister()
+    assert ran, "the notification never woke an obligation pass"
+    assert _projection_drained(access), (
+        "the projection did not drain beside the Codex debt")
+    assert calls == [], calls
+    assert spawned == [], spawned
+    conn = sqlite3.connect(str(core.CACHE_DB_PATH))
+    try:
+        recorded = dict(conn.execute(
+            "SELECT key, value FROM cache_meta WHERE key IN (?, ?)",
+            tuple(debt)).fetchall())
+    finally:
+        conn.close()
+    assert recorded == debt, recorded
+    with access.QueryService.session("cache") as s:
+        assert "codex_maintenance_debt" in s.readiness["primary"].obligations
+
+
+class _ScriptedAttention:
+    """An owner-attention stand-in whose waits return at once: ``woken``
+    scripts each wait's result, and the scripted run ends by setting ``stop``
+    on the last wait. Records each wait's timeout (``None`` is unbounded)."""
+
+    def __init__(self, woken, stop):
+        self._woken = list(woken)
+        self._stop = stop
+        self.timeouts = []
+
+    def wait(self, timeout=None):
+        self.timeouts.append(timeout)
+        if not self._woken:
+            self._stop.set()
+            return True
+        return self._woken.pop(0)
+
+    def clear(self):
+        pass
+
+    def set(self):
+        pass
+
+    def is_set(self):
+        return False
+
+
+def test_an_unreadable_repair_marker_does_not_end_the_obligation_thread(
+        tmp_path, monkeypatch):
+    """F8 (#787 / #861 round 9): the marker stat runs inside the loop's
+    guard, and an unreadable marker counts as outstanding, so an `OSError`
+    from the stat retries the marker's owner open on the next interval
+    instead of ending the thread for the dashboard's life (and with it every
+    `--no-sync` obligation pass)."""
+    load_script()
+    dash = sys.modules["_cctally_dashboard"]
+    stop_event = threading.Event()
+    # The startup pass drains everything; then four timed waits whose
+    # marker stat raises, then a timed wait that finds no marker.
+    attention = _ScriptedAttention([False] * 6, stop_event)
+    stats = iter([OSError("stat failed")] * 4 + [False] * 4)
+    passes, marker_passes = [], []
+
+    def marker_present():
+        value = next(stats, False)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    dash._dashboard_obligation_loop(
+        stop=stop_event, attention=attention, interval=5.0,
+        drain=lambda: passes.append(1), outstanding=lambda: False,
+        marker_present=marker_present,
+        marker_drain=lambda: marker_passes.append(1))
+    assert marker_passes, "an unreadable marker was not treated as outstanding"
+    assert passes, "non-vacuity: the startup pass ran"
+
+
+def test_undrainable_obligation_backs_off(tmp_path, monkeypatch):
+    """Detects a `--no-sync` dashboard that reruns the owner opens every sync
+    interval for as long as an obligation it cannot drain stays reported (a
+    migration that fails the same way each time, an armed projection reconcile
+    that swallows its failure and reads the whole journal again): timed passes
+    that leave the obligation outstanding double their wait up to the cap,
+    and owner attention or a drained pass resets it to the interval."""
+    load_script()
+    dash = sys.modules["_cctally_dashboard"]
+    stop_event = threading.Event()
+    # Eight timed passes fail, then attention wakes one (still failing), then
+    # a timed pass drains everything and the thread waits on attention only.
+    attention = _ScriptedAttention([False] * 8 + [True, False], stop_event)
+    outstanding = iter([True] * 9 + [False])
+    passes = []
+    dash._dashboard_obligation_loop(
+        stop=stop_event, attention=attention, interval=5.0,
+        drain=lambda: passes.append(1), outstanding=lambda: next(outstanding))
+    assert len(passes) == 10, passes
+    assert attention.timeouts == [
+        5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 300.0, 300.0, 300.0, 5.0, None]

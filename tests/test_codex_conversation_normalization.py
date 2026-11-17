@@ -7580,6 +7580,29 @@ def test_every_outline_caller_arrives_outside_a_transaction(tmp_path, monkeypatc
         conn.close()
 
 
+def test_outline_borrows_a_query_session_snapshot(tmp_path, monkeypatch):
+    """A dashboard read runs inside a query session whose deferred ``BEGIN`` is
+    the read snapshot (#787 spec 5.13 step 5). That transaction can never write
+    (``mode=ro`` and the session's permanent authorizer), so it is a snapshot the
+    envelope may borrow, and it must not end it: the session owns the rollback,
+    and an envelope that rolled it back would leave the session's later reads on
+    a different snapshot. Detects every Codex outline route answering 500."""
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    conn.close()
+    import _cctally_store_access as access
+    os.chmod(core.APP_DIR, 0o700)
+    with core.establish_authority("process"):
+        with core.authority_scope("query", policy="interactive"):
+            with access.QueryService.session(
+                    "conversations", attach=("cache",)) as session:
+                assert session.conn.in_transaction
+                body = disp.neutral_outline(
+                    session.conn, ck, effective_speed="standard")
+                assert body["status"] == "ok"
+                assert session.conn.in_transaction, (
+                    "the envelope ended the session's snapshot")
+
+
 # ── #463 S4 Task 3 — tier-1 enrichment and the stats block ───────────────────
 #
 # These live here rather than in tests/test_codex_conversation_api.py, which the
@@ -9416,6 +9439,63 @@ def test_850_fail_closed_count_propagates_a_read_failure(tmp_path, monkeypatch):
                 blocked, home_dir="/home/a22-user", sources={"codex"})
     finally:
         cache.close()
+
+
+_854_LAST_GOOD_SOURCES = frozenset({
+    "codex_conversation_threads", "codex_conversation_published_threads",
+    "codex_barrier_entry_threads",
+})
+
+
+@pytest.mark.parametrize("reader", ["undecodable_keys", "anon_count", "scoped_anon"])
+def test_854_a_seeded_reader_failure_propagates(v850_store, reader):
+    """A seeded viewer connection still fails closed on a failed thread read.
+
+    #854 R2 seeds the read-only opener's threads-table resolution, so on that
+    connection the resolver performs no read and the first statement that can
+    fail is the reader's own read of the last-good view. That failure must
+    propagate. Answering the empty key set, a zero undecodable count or a
+    scrub vocabulary instead would serve the pre-corruption attribution on
+    the viewer, or emit anonymized output whose undecodable paths were never
+    counted. The injection is an authorizer on the SAME connection object,
+    because the seed is keyed on that identity and a wrapper would bypass it.
+    """
+    import _lib_codex_metadata as metadata
+
+    _ns, cache, _conversations = v850_store
+    _v850_corrupt(cache, "v850-a", "cwd")
+    read = {
+        "undecodable_keys": q.undecodable_codex_conversation_keys,
+        "anon_count": lcq._count_undecodable_codex_cwd,
+        "scoped_anon": lambda conn: lcq._scoped_codex_anon_paths(
+            conn, _V850_ACCOUNT),
+    }[reader]
+    ro = sys.modules["_cctally_cache"].open_conversations_db_readonly()
+    try:
+        assert ro in metadata._threads_table_resolution_cache
+        healthy = read(ro)
+        if reader == "undecodable_keys":
+            assert "v850-a" in healthy, healthy
+        elif reader == "anon_count":
+            assert healthy >= 1, healthy
+
+        def deny_thread_reads(action, table, *_args):
+            if action == sqlite3.SQLITE_READ and table in _854_LAST_GOOD_SOURCES:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        ro.set_authorizer(deny_thread_reads)
+        try:
+            with pytest.raises(sqlite3.DatabaseError):
+                ro.execute(
+                    "SELECT cwd FROM temp.codex_last_good_threads").fetchall()
+            with pytest.raises(sqlite3.DatabaseError):
+                read(ro)
+        finally:
+            ro.set_authorizer(None)
+    finally:
+        metadata.invalidate_codex_threads_table_resolution(ro)
+        ro.close()
 
 
 def test_850_fail_closed_count_still_answers_zero_without_the_table(

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>framework</key>
+	<string>710</string>
+	<key>images</key>
+	<array>
+		<dict>
+			<key>autodiskmount</key>
+			<true/>
+			<key>blockcount</key>
+			<integer>4194304</integer>
+			<key>blocksize</key>
+			<integer>512</integer>
+			<key>diskimages2</key>
+			<false/>
+			<key>hdid-pid</key>
+			<integer>@HDID_PID@</integer>
+			<key>icon-path</key>
+			<string>/System/Library/PrivateFrameworks/DiskImages.framework/Resources/CDiskImage.icns</string>
+			<key>image-encrypted</key>
+			<false/>
+			<key>image-path</key>
+			<string>@BUNDLE@</string>
+			<key>image-type</key>
+			<string>sparse bundle disk image</string>
+			<key>owner-uid</key>
+			<integer>@UID@</integer>
+			<key>removable</key>
+			<true/>
+			<key>system-entities</key>
+			<array>
+				<dict>
+					<key>content-hint</key>
+					<string>GUID_partition_scheme</string>
+					<key>dev-entry</key>
+					<string>/dev/@IMAGE_WHOLE@</string>
+				</dict>
+				<dict>
+					<key>content-hint</key>
+					<string>7C3457EF-0000-11AA-AA11-00306543ECAC</string>
+					<key>dev-entry</key>
+					<string>/dev/@IMAGE_SLICE@</string>
+				</dict>
+				<dict>
+					<key>content-hint</key>
+					<string>EF57347C-0000-11AA-AA11-00306543ECAC</string>
+					<key>dev-entry</key>
+					<string>/dev/@VOLUME_WHOLE@</string>
+				</dict>
+				<dict>
+					<key>content-hint</key>
+					<string>41504653-0000-11AA-AA11-00306543ECAC</string>
+					<key>dev-entry</key>
+					<string>/dev/@VOLUME_SLICE@</string>
+					<key>mount-point</key>
+					<string>@MOUNTPOINT@</string>
+				</dict>
+			</array>
+			<key>writeable</key>
+			<true/>
+		</dict>
+	</array>
+	<key>revision</key>
+	<string>710</string>
+	<key>vendor</key>
+	<string>Apple</string>
+</dict>
+</plist>

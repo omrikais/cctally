@@ -78,6 +78,7 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, NamedTuple
 
@@ -103,6 +104,9 @@ from _cctally_core import (
 # CCTALLY_DEBUG verbosity is decided in one place.
 import _lib_log
 from _lib_codex_find_projection import CODEX_FIND_PROJECTION_VERSION
+# #1094: the conversation FTS write guard and the direct-FTS-command
+# chokepoint. Stdlib-only, imports only _cctally_core at module top.
+import _lib_conversation_fts_integrity as _fts_integrity
 
 
 # Production cache dispatchers hold maintenance-exclusive + the global cache
@@ -1946,6 +1950,224 @@ def _first_pending_migration_name(
     return registry[cur_version].name
 
 
+# #1068 D3 — the migration fence and the per-store incarnation id. A fence is
+# one ``cache_meta`` row per dispatcher run, keyed ``migration_fence:<token>``;
+# a store holding any such row is mid-migration, so a reader must not reuse a
+# stored rollup row and a writer must not certify one. The fence lock
+# ``<main database path>.fence.lock`` is held SHARED by every run for its whole
+# lifetime (taken outside any SQLite transaction), and EXCLUSIVE, non-blocking,
+# only by the one cleanup transaction that removes rows left by finished or
+# dead runs. Every transaction that removes a fence row or deletes ledger rows
+# replaces the store's incarnation id, so a fingerprint epoch recorded before a
+# migration-state change never becomes current again.
+_FENCED_DB_LABELS = ("cache.db", "conversations.db")
+_MIGRATION_FENCE_PREFIX = "migration_fence:"
+# The exclusive upper bound of the prefix range (':' + 1 == ';'), so the
+# fence lookup is a primary-key range seek on ``cache_meta``.
+_MIGRATION_FENCE_UPPER = "migration_fence;"
+_INCARNATION_KEYS = {
+    "cache.db": "cache_incarnation_id",
+    "conversations.db": "conversations_incarnation_id",
+}
+
+
+def _ensure_store_incarnation_id(conn: sqlite3.Connection, db_label: str) -> None:
+    """Insert the store's incarnation id when absent. Does not commit.
+
+    Reads first, so a store that already carries its id opens no write
+    transaction (this runs on every writer open and every ``sync_cache``)."""
+    key = _INCARNATION_KEYS[db_label]
+    try:
+        if conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?", (key,)
+        ).fetchone() is not None:
+            return
+    except sqlite3.OperationalError:
+        pass  # cache_meta absent: created below
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute(
+        "INSERT OR IGNORE INTO cache_meta(key, value) VALUES(?, ?)",
+        (key, uuid.uuid4().hex),
+    )
+
+
+def _rotate_store_incarnation_id(conn: sqlite3.Connection, db_label: str) -> None:
+    """Replace the store's incarnation id with a fresh random value. Does not
+    commit: the caller's transaction carries the change it accompanies."""
+    _set_cache_meta(conn, _INCARNATION_KEYS[db_label], uuid.uuid4().hex)
+
+
+def _fence_lock_path(conn: sqlite3.Connection) -> "pathlib.Path | None":
+    """``<main database path>.fence.lock``, or None for a connection without a
+    main file (in-memory or temporary), where the fence protocol is skipped."""
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if row[1] == "main":
+            db_file = row[2]
+            if not db_file:
+                return None
+            return pathlib.Path(f"{db_file}.fence.lock")
+    return None
+
+
+def _store_fence_rows_present(conn: sqlite3.Connection) -> bool:
+    """True when ``main.cache_meta`` holds a fence row; False when it holds
+    none or the table is absent (the dispatcher's own probe, not the reader's
+    fail-closed ``migration_fence_present``)."""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key >= ? AND key < ? LIMIT 1",
+            (_MIGRATION_FENCE_PREFIX, _MIGRATION_FENCE_UPPER),
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def migration_fence_present(conn: sqlite3.Connection, schema: str) -> bool:
+    """True when ``<schema>.cache_meta`` holds any fence row, or when that
+    store's ``cache_meta`` cannot be read (fail closed). False when the store
+    has no ``cache_meta`` table at all."""
+    if not _MIGRATION_IDENT_RE.match(schema):
+        raise ValueError(f"invalid identifier: {schema!r}")
+    try:
+        if conn.execute(
+            f"SELECT 1 FROM {schema}.sqlite_master "
+            "WHERE type='table' AND name='cache_meta'"
+        ).fetchone() is None:
+            return False
+        return conn.execute(
+            f"SELECT 1 FROM {schema}.cache_meta "
+            "WHERE key >= ? AND key < ? LIMIT 1",
+            (_MIGRATION_FENCE_PREFIX, _MIGRATION_FENCE_UPPER),
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return True
+
+
+def _open_fence_lock_fd(lock_path: pathlib.Path) -> int:
+    return os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+
+
+def _try_clear_inactive_migration_fences(
+    conn: sqlite3.Connection, db_label: str,
+) -> bool:
+    """Remove every fence row when no dispatcher run is active (D3).
+
+    Takes the fence lock EXCLUSIVE without waiting; holding it proves no run
+    holds the shared side, so every remaining row belongs to a finished or dead
+    run. Deletes them all and rotates the incarnation id in one transaction,
+    acquiring no other lock. True only when it held the lock and removed rows.
+    Skipped on a connection without a main file or one already inside a
+    transaction (committing a caller's transaction is never this helper's
+    call)."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="_try_clear_inactive_migration_fences")
+    if db_label not in _FENCED_DB_LABELS:
+        return False
+    lock_path = _fence_lock_path(conn)
+    if lock_path is None or conn.in_transaction:
+        return False
+    if not _store_fence_rows_present(conn):
+        return False
+    try:
+        fd = _open_fence_lock_fd(lock_path)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False  # an active run holds it shared: its row stays
+        try:
+            cur = conn.execute(
+                "DELETE FROM cache_meta WHERE key >= ? AND key < ?",
+                (_MIGRATION_FENCE_PREFIX, _MIGRATION_FENCE_UPPER),
+            )
+            removed = max(cur.rowcount, 0)
+            if removed:
+                _rotate_store_incarnation_id(conn, db_label)
+            conn.commit()
+        except sqlite3.OperationalError:
+            # Best effort: a busy store keeps its rows (still fenced, so
+            # still safe) and the next entry retries.
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            return False
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        return removed > 0
+    finally:
+        os.close(fd)  # closing the descriptor releases the flock
+
+
+class _MigrationFenceRun:
+    """One dispatcher run's fence: its shared fence lock and its own row (D3).
+
+    Inert for an unfenced label and for a connection without a main file."""
+
+    def __init__(self, conn: sqlite3.Connection, db_label: str) -> None:
+        self._conn = conn
+        self._db_label = db_label
+        self._fd: "int | None" = None
+        self.token: "str | None" = None
+
+    def begin(self) -> None:
+        if self._db_label not in _FENCED_DB_LABELS:
+            return
+        lock_path = _fence_lock_path(self._conn)
+        if lock_path is None:
+            return
+        try:
+            self._fd = _open_fence_lock_fd(lock_path)
+        except OSError:
+            # No lock file can be made beside the store: the row is still
+            # written, so readers and certifying writers are still fenced.
+            self._fd = None
+        try:
+            if self._fd is not None:
+                # Blocking: it waits only for an exclusive cleanup's single
+                # transaction, and this connection holds no SQLite lock here.
+                fcntl.flock(self._fd, fcntl.LOCK_SH)
+            self.token = uuid.uuid4().hex
+            _set_cache_meta(
+                self._conn, _MIGRATION_FENCE_PREFIX + self.token, now_utc_iso())
+            self._conn.commit()
+        except BaseException:
+            # #1068 review F2: the caller's release runs only after begin()
+            # returns, so any setup failure once the descriptor is open (the
+            # lock, the token, the row write or its commit) must release the
+            # shared lock itself; held until process exit, it would block
+            # every exclusive cleanup of leftover fence rows.
+            self.token = None
+            self.release()
+            raise
+
+    def retire_in_current_transaction(self) -> None:
+        """Delete this run's row and rotate the incarnation id; the caller's
+        ``user_version`` commit carries both."""
+        if self.token is None:
+            return
+        self._conn.execute(
+            "DELETE FROM cache_meta WHERE key=?",
+            (_MIGRATION_FENCE_PREFIX + self.token,),
+        )
+        _rotate_store_incarnation_id(self._conn, self._db_label)
+        self.token = None
+
+    def release(self) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            finally:
+                self._fd = None
+
+
 def _recover_version_ahead(
     conn: sqlite3.Connection,
     registry: list[Migration],
@@ -2013,7 +2235,15 @@ def _recover_version_ahead(
     all_known_done = all((m.name in applied or m.name in skipped) for m in registry)
     new_version = len(registry) if all_known_done else 0
     conn.execute(f"PRAGMA user_version = {new_version}")
+    if db_label in _FENCED_DB_LABELS:
+        # #1068 D3: the trim can restore an earlier ledger digest, so the
+        # incarnation id changes in the same commit; a fingerprint certified
+        # before the newer migration's untracked writes never becomes current.
+        _rotate_store_incarnation_id(conn, db_label)
     conn.commit()
+    # Fence rows go only through the exclusive protocol: a stranded row of a
+    # finished or dead run is released here, an active run's row is kept.
+    _try_clear_inactive_migration_fences(conn, db_label)
     return {"reverted_from": cur_version, "reverted_to": new_version, "trimmed": trimmed}
 
 
@@ -2039,6 +2269,8 @@ def _reconcile_durable_applied_migration_errors(
     db_label: str,
 ) -> None:
     """Retry stale-sentinel cleanup for every durably applied migration."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("STARTUP", entry="_reconcile_durable_applied_migration_errors")
     if not _cctally_core.MIGRATION_ERROR_LOG_PATH.exists():
         return
     try:
@@ -2105,7 +2337,18 @@ def _run_pending_migrations(
         applied OR skipped post-loop. A failure in the middle of the
         registry leaves user_version unchanged so the next open re-tries
         from the failed entry.
+      - #1068 D3 fence (cache.db / conversations.db, file-backed only): every
+        entry first releases fence rows left by finished or dead runs (the
+        exclusive, non-blocking cleanup). A non-fresh walk with pending work
+        takes the fence lock shared and commits its own fence row before the
+        first handler, deletes that row and rotates the incarnation id in the
+        commit that advances user_version, and releases the lock on return. A
+        failing or deferred run keeps its row. The fresh-install branch writes
+        none.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("STARTUP", entry="_run_pending_migrations")
+    _try_clear_inactive_migration_fences(conn, db_label)
     cur_version = conn.execute("PRAGMA user_version").fetchone()[0]
     if cur_version > len(registry):
         if recover_version_ahead:
@@ -2335,75 +2578,90 @@ def _run_pending_migrations(
 
     now_iso = now_utc_iso()
     stamp_only_applied: list[str] = []
-    for m in registry:
-        if m.name in applied or m.name in skipped:
-            continue
-        qualified_name = f"{db_label}:{m.name}"
-        if fresh_install:
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
-                (m.name, now_iso),
-            )
-            applied.add(m.name)
-            stamp_only_applied.append(qualified_name)
-            continue
-        try:
-            m.handler(conn)
-            _stamp_applied(conn, m.name, now_iso)      # central stamp (#140)
-            _clear_migration_error_log_entries(qualified_name)
-            applied.add(m.name)
-        except MigrationGateNotMet as gate_exc:
-            # Transient cross-DB gating: do NOT log to migration-errors.log,
-            # do NOT mark as skipped, do NOT render the error banner. The
-            # migration stays pending; the next open re-tries it. Spec
-            # docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §D4.
-            #
-            # P2 — defensive log-entry clear, symmetric with the success
-            # branch above. A prior run may have logged a hard failure
-            # for this migration; if the underlying state has since
-            # shifted such that the migration now gate-defers (e.g. a
-            # prereq vanished mid-cycle, or the handler was rewritten to
-            # gate where it previously raised), the stale error log
-            # entry would persist forever and the banner would mislead.
-            # Clearing here keeps the contract crisp: any non-failure
-            # outcome (apply OR gate-defer) clears any prior failure log
-            # for this migration's qualified name.
-            _clear_migration_error_log_entries(qualified_name)
-            if _lib_log.debug_enabled():
-                _lib_log.get_logger("db").debug(
-                    f"[migration {qualified_name}] deferred: {gate_exc}"
+    fence = _MigrationFenceRun(conn, db_label)
+    if not fresh_install and any(
+        m.name not in applied and m.name not in skipped for m in registry
+    ):
+        # #1068 D3: the run's own fence row is durable before its first
+        # handler, so every untracked handler write commits while it is
+        # present. Taken outside any SQLite transaction (the bootstrap commit
+        # above left the connection in autocommit).
+        fence.begin()
+    try:
+        for m in registry:
+            if m.name in applied or m.name in skipped:
+                continue
+            qualified_name = f"{db_label}:{m.name}"
+            if fresh_install:
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
+                    (m.name, now_iso),
                 )
-            # D2 — ``continue``, NOT ``break``. A gate-defer leaves the DB
-            # in a fully-consistent prior state (the handler raised before
-            # touching anything, or rolled back its own BEGIN); later
-            # registry entries can legitimately attempt to run. The
-            # all-applied predicate below uses ``applied | skipped``, so
-            # this gated migration's absence from both sets keeps
-            # ``user_version`` from advancing — a future open re-tries
-            # the gated migration even if every later one succeeded.
-            #
-            # Contrast the Exception branch below, which DOES break: a
-            # generic handler exception may have left a partial transaction
-            # state, so later migrations should not see it.
-            continue
-        except Exception as exc:
-            _log_migration_error(
-                name=qualified_name,
-                exc=exc,
-                tb=traceback.format_exc(),
-            )
-            eprint(f"[migration {qualified_name}] failed: {exc}")
-            break  # stop on first failure (Codex P1 #3)
+                applied.add(m.name)
+                stamp_only_applied.append(qualified_name)
+                continue
+            try:
+                m.handler(conn)
+                _stamp_applied(conn, m.name, now_iso)      # central stamp (#140)
+                _clear_migration_error_log_entries(qualified_name)
+                applied.add(m.name)
+            except MigrationGateNotMet as gate_exc:
+                # Transient cross-DB gating: do NOT log to migration-errors.log,
+                # do NOT mark as skipped, do NOT render the error banner. The
+                # migration stays pending; the next open re-tries it. Spec
+                # docs/superpowers/specs/2026-05-22-ccusage-dedup-parity.md §D4.
+                #
+                # P2 — defensive log-entry clear, symmetric with the success
+                # branch above. A prior run may have logged a hard failure
+                # for this migration; if the underlying state has since
+                # shifted such that the migration now gate-defers (e.g. a
+                # prereq vanished mid-cycle, or the handler was rewritten to
+                # gate where it previously raised), the stale error log
+                # entry would persist forever and the banner would mislead.
+                # Clearing here keeps the contract crisp: any non-failure
+                # outcome (apply OR gate-defer) clears any prior failure log
+                # for this migration's qualified name.
+                _clear_migration_error_log_entries(qualified_name)
+                if _lib_log.debug_enabled():
+                    _lib_log.get_logger("db").debug(
+                        f"[migration {qualified_name}] deferred: {gate_exc}"
+                    )
+                # D2 — ``continue``, NOT ``break``. A gate-defer leaves the DB
+                # in a fully-consistent prior state (the handler raised before
+                # touching anything, or rolled back its own BEGIN); later
+                # registry entries can legitimately attempt to run. The
+                # all-applied predicate below uses ``applied | skipped``, so
+                # this gated migration's absence from both sets keeps
+                # ``user_version`` from advancing — a future open re-tries
+                # the gated migration even if every later one succeeded.
+                #
+                # Contrast the Exception branch below, which DOES break: a
+                # generic handler exception may have left a partial transaction
+                # state, so later migrations should not see it.
+                continue
+            except Exception as exc:
+                _log_migration_error(
+                    name=qualified_name,
+                    exc=exc,
+                    tb=traceback.format_exc(),
+                )
+                eprint(f"[migration {qualified_name}] failed: {exc}")
+                break  # stop on first failure (Codex P1 #3)
 
-    if fresh_install:
-        conn.commit()  # commit fresh-install stamps so they're durable
-        for qualified_name in stamp_only_applied:
-            _clear_migration_error_log_entries(qualified_name)
+        if fresh_install:
+            conn.commit()  # commit fresh-install stamps so they're durable
+            for qualified_name in stamp_only_applied:
+                _clear_migration_error_log_entries(qualified_name)
 
-    # Advance user_version only when every migration is applied OR skipped.
-    if all((m.name in applied or m.name in skipped) for m in registry):
-        conn.execute(f"PRAGMA user_version = {len(registry)}")
-        conn.commit()
+        # Advance user_version only when every migration is applied OR skipped.
+        if all((m.name in applied or m.name in skipped) for m in registry):
+            # The owner removes its fence row and rotates the incarnation id
+            # in the same commit that advances user_version (D3).
+            fence.retire_in_current_transaction()
+            conn.execute(f"PRAGMA user_version = {len(registry)}")
+            conn.commit()
+    finally:
+        fence.release()
 
 
 def _accounts_cutover_value_or_defer(what: str):
@@ -5958,6 +6216,8 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     Normal ``open_cache_db`` remains responsible for the ALTER and its historic
     purge, so leaving it outside this shared schema is safe.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("STARTUP", entry="_apply_cache_schema")
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS session_files (
@@ -6714,15 +6974,14 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
                 # Repopulate the freshly-(re)created index from the base table
                 # so pre-recovery history is searchable. Cheap no-op when
                 # conversation_messages is empty.
-                conn.execute(
-                    "INSERT INTO conversation_fts(conversation_fts) VALUES('rebuild')")
+                _fts_integrity.conversation_fts_command(
+                    conn, "conversation_fts", "rebuild")
                 # The title FTS is external-content over conversation_ai_titles,
                 # so a prior FTS5-unavailable run that ingested titles without the
                 # AI trigger left the title index stale too — rebuild it the same
                 # way (cheap no-op when conversation_ai_titles is empty).
-                conn.execute(
-                    "INSERT INTO conversation_title_fts(conversation_title_fts) "
-                    "VALUES('rebuild')")
+                _fts_integrity.conversation_fts_command(
+                    conn, "conversation_title_fts", "rebuild")
             conn.execute("DELETE FROM cache_meta WHERE key='fts5_unavailable'")
         except sqlite3.OperationalError:
             # partial create cleanup, then mark unavailable. _drop drops the
@@ -6878,6 +7137,12 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "conversation_messages", "account_key", "TEXT")
     add_column_if_missing(conn, "codex_conversation_events", "account_key", "TEXT")
     add_column_if_missing(conn, "codex_conversation_messages", "account_key", "TEXT")
+    # #1068 D2: the rollup row's input fingerprint (NULL = uncertified). A
+    # fresh install gets it here, because it stamps migration 013 without
+    # running it; existing stores receive it from 013, since this branch runs
+    # only for a store without the current schema marker.
+    add_column_if_missing(
+        conn, "conversation_sessions", "input_fingerprint", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_conv_messages_account_session "
         "ON conversation_messages(account_key, session_id, timestamp_utc, id)"
@@ -6972,7 +7237,8 @@ _CONVERSATION_GENERATION_DDL = """
         git_branch          TEXT,
         models_json         TEXT,
         title               TEXT,
-        render_revision     INTEGER NOT NULL DEFAULT 0
+        render_revision     INTEGER NOT NULL DEFAULT 0,
+        input_fingerprint   TEXT
     );
     CREATE TABLE IF NOT EXISTS claude_conversation_account_stamps (
         canonical_source_path TEXT    NOT NULL,
@@ -7294,6 +7560,9 @@ CONVERSATIONS_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "table", "claude_conversation_account_stamp_gaps",
         "_apply_conversation_generation_schema",
         "009_conversation_title_staging_and_account_stamps"),
+    SchemaDeliveryObject(
+        "column", "conversation_sessions.input_fingerprint", None,
+        "013_conversation_sessions_input_fingerprint"),
     SchemaDeliveryObject(
         "table", "claude_conversation_account_stamps",
         "_apply_conversation_generation_schema",
@@ -7971,6 +8240,28 @@ def _conv_012_codex_conversation_containers(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@conversations_migration("013_conversation_sessions_input_fingerprint")
+def _conv_013_conversation_sessions_input_fingerprint(
+    conn: sqlite3.Connection,
+) -> None:
+    """#1068 D2: deliver ``input_fingerprint TEXT`` to both rollup tables.
+
+    The opener applies the conversations schema only to a store that is behind,
+    and that apply returns early on an existing store's marker, so without this
+    migration a current store would never receive the column. Pure column
+    additions (``add_column_if_missing``): existing rows read NULL, which is
+    "uncertified", and the steady pass's convergence refresh fills them.
+    Re-running is a no-op. NO self-stamp (#140).
+    """
+    if _table_exists(conn, "conversation_sessions"):
+        add_column_if_missing(
+            conn, "conversation_sessions", "input_fingerprint", "TEXT")
+    if _table_exists(conn, "conversation_sessions_staging"):
+        add_column_if_missing(
+            conn, "conversation_sessions_staging", "input_fingerprint", "TEXT")
+    conn.commit()
+
+
 # #177 S6: the consolidated multi-column external-content FTS5 table that
 # replaces the old conversation_fts(text) + conversation_fts_aux(search_aux)
 # pair. The three column names MUST match the conversation_messages columns BY
@@ -8106,9 +8397,11 @@ def _create_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
     and ``clear_conversation_messages`` (#138). The caller must have already
     created ``conversation_fts`` in the split shape (the consolidated table
     replaced the old prose+aux pair, so there is no separate aux trigger set to
-    create)."""
+    create). #1094: reinstalls this connection's TEMP write guard, which the
+    matching drop helper removed for the truncate fast path."""
     for stmt in _CONV_FTS_TRIGGER_DDL:
         conn.execute(stmt)
+    _fts_integrity.install_conversation_fts_guard(conn)
 
 
 def _create_conversation_fts_legacy_triggers(conn: sqlite3.Connection) -> None:
@@ -8130,7 +8423,15 @@ def _drop_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
     (``IF EXISTS``). Swallows ``OperationalError`` per statement so a
     partial/absent trigger set (e.g. an FTS-unavailable build) is tolerated. One
     call site drops both sets so a failed aux create can't strand a live aux
-    trigger over a missing conversation_fts_aux."""
+    trigger over a missing conversation_fts_aux.
+
+    #1094: also drops this connection's TEMP write guard on
+    conversation_messages (a TEMP trigger would defeat the truncate fast path
+    the callers drop the triggers for), after running the guard's retraction
+    in the caller's transaction, since writes while it is gone are unguarded.
+    ``_create_conversation_fts_triggers`` reinstalls it."""
+    _fts_integrity.retract_unless_listed(conn)
+    _fts_integrity.drop_conversation_fts_guard(conn, "conversation_messages")
     for name in _CONV_FTS_TRIGGER_NAMES + _CONV_FTS_AUX_TRIGGER_NAMES:
         try:
             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
@@ -8178,9 +8479,11 @@ _CONV_TITLE_FTS_TRIGGER_NAMES = (
 def _create_conversation_title_fts_triggers(conn: sqlite3.Connection) -> None:
     """Create the #217 S2 title-FTS sync trigger set — idempotent (each is
     ``IF NOT EXISTS``). The caller must have already created
-    ``conversation_title_fts`` (the triggers reference it)."""
+    ``conversation_title_fts`` (the triggers reference it). #1094: reinstalls
+    this connection's TEMP write guard."""
     for stmt in _CONV_TITLE_FTS_TRIGGER_DDL:
         conn.execute(stmt)
+    _fts_integrity.install_conversation_fts_guard(conn)
 
 
 def _drop_conversation_title_fts_triggers(conn: sqlite3.Connection) -> None:
@@ -8188,7 +8491,13 @@ def _drop_conversation_title_fts_triggers(conn: sqlite3.Connection) -> None:
     ``OperationalError`` per statement so an absent set (FTS5-unavailable build)
     is tolerated. P1-6: dropping these on a no-FTS5 build is what keeps a
     ``conversation_ai_titles`` upsert from firing a trigger against the missing
-    vtable and rolling back the shared per-file ingest transaction."""
+    vtable and rolling back the shared per-file ingest transaction.
+
+    #1094: retracts for an unlisted build first, then drops this connection's
+    TEMP write guard on conversation_ai_titles (see
+    ``_drop_conversation_fts_triggers``)."""
+    _fts_integrity.retract_unless_listed(conn)
+    _fts_integrity.drop_conversation_fts_guard(conn, "conversation_ai_titles")
     for name in _CONV_TITLE_FTS_TRIGGER_NAMES:
         try:
             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
@@ -8235,7 +8544,18 @@ def clear_conversation_messages(conn: sqlite3.Connection) -> None:
     caller owns the commit. When FTS5 is unavailable
     (``cache_meta.fts5_unavailable`` set → no triggers, no usable vtable),
     falls back to a plain base ``DELETE`` — there are no triggers to storm and a
-    ``'delete-all'`` would error on the absent vtable."""
+    ``'delete-all'`` would error on the absent vtable.
+
+    #1094 (review F4, F8): the whole clear runs under the write lock taken
+    before the guard's retraction check (``write_locked``: a no-op inside the
+    caller's transaction), and both branches drop this connection's TEMP
+    guard on ``conversation_messages`` around the ``DELETE`` (a TEMP trigger
+    forfeits the truncate fast path too), then reinstall it."""
+    with _fts_integrity.write_locked(conn):
+        _clear_conversation_messages_locked(conn)
+
+
+def _clear_conversation_messages_locked(conn: sqlite3.Connection) -> None:
     try:
         fts_unavailable = conn.execute(
             "SELECT 1 FROM cache_meta WHERE key='fts5_unavailable'"
@@ -8247,14 +8567,18 @@ def clear_conversation_messages(conn: sqlite3.Connection) -> None:
         fts_unavailable = True
 
     if fts_unavailable:
+        _fts_integrity.retract_unless_listed(conn)
+        _fts_integrity.drop_conversation_fts_guard(
+            conn, "conversation_messages")
         conn.execute("DELETE FROM conversation_messages")
         _clear_conversation_file_touches(conn)
+        _fts_integrity.install_conversation_fts_guard(conn)
         return
 
     _drop_conversation_fts_triggers(conn)
     conn.execute("DELETE FROM conversation_messages")
     _clear_conversation_file_touches(conn)
-    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('delete-all')")
+    _fts_integrity.conversation_fts_command(conn, "conversation_fts", "delete-all")
     # #177 S6: the consolidated split table is the only FTS vtable on a swapped /
     # fresh DB. A pre-swap legacy install still carries conversation_fts_aux, so
     # reset it the same storm-free way ONLY when it physically exists (the swap
@@ -8263,8 +8587,8 @@ def clear_conversation_messages(conn: sqlite3.Connection) -> None:
     if conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_fts_aux'"
     ).fetchone() is not None:
-        conn.execute(
-            "INSERT INTO conversation_fts_aux(conversation_fts_aux) VALUES('delete-all')")
+        _fts_integrity.conversation_fts_command(
+            conn, "conversation_fts_aux", "delete-all")
     _create_conversation_fts_triggers(conn)
 
 
@@ -8305,9 +8629,11 @@ _CODEX_CONV_FTS_TRIGGER_NAMES = ("codex_conv_fts_au", "codex_conv_fts_ad", "code
 def _create_codex_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
     """Create the Codex FTS sync trigger set — idempotent (each ``IF NOT EXISTS``).
     Single source of truth, shared by ``_apply_codex_conversation_fts`` and the
-    storm-free full-clear. The caller must have already created the vtable."""
+    storm-free full-clear. The caller must have already created the vtable.
+    #1094: reinstalls this connection's TEMP write guard."""
     for stmt in _CODEX_CONV_FTS_TRIGGER_DDL:
         conn.execute(stmt)
+    _fts_integrity.install_conversation_fts_guard(conn)
 
 
 def _drop_codex_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
@@ -8315,7 +8641,14 @@ def _drop_codex_conversation_fts_triggers(conn: sqlite3.Connection) -> None:
     ``OperationalError`` per statement so an absent set (FTS5-unavailable build) is
     tolerated. Dropping these on a no-FTS5 build is what keeps a normalized INSERT
     from firing a trigger against the missing vtable and rolling back the shared
-    per-file ingest transaction. NEVER touches any Claude FTS trigger."""
+    per-file ingest transaction. NEVER touches any Claude FTS trigger.
+
+    #1094: retracts for an unlisted build first, then drops this connection's
+    TEMP write guard on codex_conversation_messages (see
+    ``_drop_conversation_fts_triggers``)."""
+    _fts_integrity.retract_unless_listed(conn)
+    _fts_integrity.drop_conversation_fts_guard(
+        conn, "codex_conversation_messages")
     for name in _CODEX_CONV_FTS_TRIGGER_NAMES:
         try:
             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
@@ -8347,8 +8680,8 @@ def _apply_codex_conversation_fts(conn: sqlite3.Connection) -> None:
             conn.execute(_CODEX_CONV_FTS_DDL)
             _create_codex_conversation_fts_triggers(conn)
             if recovering:
-                conn.execute(
-                    "INSERT INTO codex_conversation_fts(codex_conversation_fts) VALUES('rebuild')")
+                _fts_integrity.conversation_fts_command(
+                    conn, "codex_conversation_fts", "rebuild")
             conn.execute("DELETE FROM cache_meta WHERE key='codex_fts_unavailable'")
         except sqlite3.OperationalError:
             # Partial create cleanup, then mark unavailable so search uses LIKE.
@@ -8386,14 +8719,21 @@ def _codex_conversation_fts_full_clear(conn: sqlite3.Connection) -> None:
         ).fetchone() is not None
     except sqlite3.OperationalError:
         fts_unavailable = True
-    if fts_unavailable:
-        conn.execute("DELETE FROM codex_conversation_messages")
-    else:
-        _drop_codex_conversation_fts_triggers(conn)
-        conn.execute("DELETE FROM codex_conversation_messages")
-        conn.execute(
-            "INSERT INTO codex_conversation_fts(codex_conversation_fts) VALUES('delete-all')")
-        _create_codex_conversation_fts_triggers(conn)
+    # #1094 (review F4, F8): the write lock before the guard's retraction
+    # check, and no TEMP guard trigger on the table during the DELETE.
+    with _fts_integrity.write_locked(conn):
+        if fts_unavailable:
+            _fts_integrity.retract_unless_listed(conn)
+            _fts_integrity.drop_conversation_fts_guard(
+                conn, "codex_conversation_messages")
+            conn.execute("DELETE FROM codex_conversation_messages")
+            _fts_integrity.install_conversation_fts_guard(conn)
+        else:
+            _drop_codex_conversation_fts_triggers(conn)
+            conn.execute("DELETE FROM codex_conversation_messages")
+            _fts_integrity.conversation_fts_command(
+                conn, "codex_conversation_fts", "delete-all")
+            _create_codex_conversation_fts_triggers(conn)
     for stmt in (
         "DELETE FROM codex_find_projection",
         "DELETE FROM codex_conversation_file_touches",
@@ -8409,6 +8749,8 @@ def _run_pending_cache_migrations_under_writer_lock(
     conn: sqlite3.Connection,
 ) -> None:
     """Run the cache dispatcher while marking its global flock as owned."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("STARTUP", entry="_run_pending_cache_migrations_under_writer_lock")
     token = _CACHE_DISPATCH_WRITER_LOCK_HELD.set(True)
     try:
         _run_pending_migrations(
@@ -8525,17 +8867,24 @@ def _eagerly_apply_cache_migrations_under_writer_lock() -> None:
         conn = sqlite3.connect(cache_db_path)
         conn.execute("SELECT 1").fetchone()
     except sqlite3.DatabaseError as exc:
-        # Corruption recovery mirrors the contract in
-        # ``_cctally_cache.open_cache_db``: cache.db is fully
-        # re-derivable from JSONL, so we unlink + recreate. Stay quiet
-        # under tests — the dispatcher's gate-defer machinery handles
-        # the case where this fails outright.
-        eprint(f"[cache] corrupt cache DB ({exc}); recreating")
+        # #787 / #861 section 11: never unlink here. A bare unlink skipped
+        # the guarded quarantine (repair marker, maintenance drain of live
+        # handles, forensics, whole-family move) and left the -wal/-shm
+        # sidecars beside the fresh file. This path also runs under the
+        # maintenance flock, so it cannot call `_recover_corrupt_cache`
+        # without self-deadlocking. Defer instead: the next
+        # `open_cache_db` owns the recovery, and the stats migration
+        # retries on a later invocation.
         try:
-            cache_db_path.unlink()
-        except FileNotFoundError:
+            conn.close()
+        except (NameError, UnboundLocalError, sqlite3.Error):
             pass
-        conn = sqlite3.connect(cache_db_path)
+        if _is_sqlite_corruption_error(exc):
+            raise MigrationGateNotMet(
+                "cache.db is corrupt; deferring until a JSONL-reading command "
+                "(e.g. `cctally weekly`) recovers it"
+            ) from exc
+        raise
     try:
         # #566: the refusal must precede the DDL it exists to prevent. Both
         # cache-open paths used to reach the dispatcher's #142 guard only after
@@ -9249,7 +9598,7 @@ def _swap_conversation_fts_to_split(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS conversation_fts_aux")
     conn.execute(_CONV_FTS_SPLIT_DDL)
     _create_conversation_fts_triggers(conn)
-    conn.execute("INSERT INTO conversation_fts(conversation_fts) VALUES('rebuild')")
+    _fts_integrity.conversation_fts_command(conn, "conversation_fts", "rebuild")
 
 
 def conversation_search_depth(conn: sqlite3.Connection) -> str:
@@ -9861,6 +10210,9 @@ def _028_split_conversation_store(conn: sqlite3.Connection) -> None:
         try:
             conv.execute("PRAGMA auto_vacuum=INCREMENTAL")
             conv.execute("PRAGMA journal_mode=WAL")
+            # #1094: a writable conversations connection carries the FTS
+            # write guard (its schema apply can run a direct FTS command).
+            _fts_integrity.install_conversation_fts_guard(conv)
             _apply_conversations_schema(conv)
             _set_cache_meta(conv, "conversation_rebuild_claude_pending", "1")
             _set_cache_meta(conv, "conversation_rebuild_codex_pending", "1")
@@ -12215,24 +12567,28 @@ def cmd_db_status(args: argparse.Namespace) -> int:
     # protocol, so it can legitimately DECLINE while a repair / quarantine owns
     # the family. Report that the way doctor already reports the cache
     # equivalent (`_open_error`) instead of surfacing a traceback.
+    # #787 / #861 D5: every leg reads through the restricted metadata reader
+    # (spec 5.12): no recovery, no migration, no created file.
     try:
         stats_status = _db_status_for(
-            _cctally_core.DB_PATH, _STATS_MIGRATIONS, "stats.db")
+            _cctally_core.DB_PATH, _STATS_MIGRATIONS, "stats.db",
+            recover_interrupted_stats=False, metadata_reader=True)
     except sqlite3.DatabaseError as exc:
         stats_status = {
             "path": str(_cctally_core.DB_PATH),
             "user_version": 0,
             "registry_size": len(_STATS_MIGRATIONS),
             "migrations": [],
-            "_open_error": str(exc),
+            "_open_error": _cctally_core.store_refusal_text(exc),
         }
+        _db_status_note_refusal(stats_status, exc)
     # #1000 §5.10: the conversations leg opens under the diagnostic read
     # admission and DECLINES while the probe, recovery or another maintenance
     # holder owns the family; report that the same way.
     try:
         conversations_status = _db_status_for(
             _cctally_core.CONVERSATIONS_DB_PATH, _CONVERSATIONS_MIGRATIONS,
-            "conversations.db",
+            "conversations.db", metadata_reader=True,
         )
     # An admission whose lock file cannot be opened (an unwritable data
     # folder) is a decline as well, never a traceback.
@@ -12242,13 +12598,29 @@ def cmd_db_status(args: argparse.Namespace) -> int:
             "user_version": 0,
             "registry_size": len(_CONVERSATIONS_MIGRATIONS),
             "migrations": [],
-            "_open_error": str(exc),
+            "_open_error": _cctally_core.store_refusal_text(exc),
         }
+        _db_status_note_refusal(conversations_status, exc)
+    try:
+        cache_status = _db_status_for(
+            _cctally_core.CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db",
+            metadata_reader=True)
+    except (sqlite3.DatabaseError, OSError) as exc:
+        # A maintenance-owned or refused cache is a decline, reported the way
+        # the other legs report theirs, never a traceback.
+        cache_status = {
+            "path": str(_cctally_core.CACHE_DB_PATH),
+            "user_version": 0,
+            "registry_size": len(_CACHE_MIGRATIONS),
+            "migrations": [],
+            "_open_error": _cctally_core.store_refusal_text(exc),
+        }
+        _db_status_note_refusal(cache_status, exc)
     payload = {
         "schema_version": 1,
         "databases": {
             "stats.db": stats_status,
-            "cache.db": _db_status_for(_cctally_core.CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db"),
+            "cache.db": cache_status,
             "conversations.db": conversations_status,
         },
     }
@@ -12277,6 +12649,15 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         if info["classification"]["row"] != "idle":
             print(info["classification"]["summary"])
     return 0
+
+
+def _db_status_note_refusal(status: dict, exc: BaseException) -> None:
+    """#787 / #861 Q-W1: a query-layer refusal's reason and detail appear
+    only in `--json`, as the additive ``openRefusal`` key; the text output
+    prints ``_open_error``, the existing sentence."""
+    record = _cctally_core.store_refusal_record(exc)
+    if record is not None:
+        status["openRefusal"] = record
 
 
 def _db_status_rebuild_workers() -> dict:
@@ -12318,6 +12699,8 @@ def _db_status_for(
     db_label: str,
     *,
     recover_interrupted_stats: bool = True,
+    metadata_reader: bool = False,
+    diagnostic_session: bool = False,
 ) -> dict:
     """Build per-DB status dict.
 
@@ -12325,9 +12708,53 @@ def _db_status_for(
     (registry empty in v1) won't have schema_migrations /
     schema_migrations_skipped, so each lookup is wrapped in a try /
     except sqlite3.OperationalError.
+
+    ``metadata_reader`` (#787 / #861 spec 5.12, D5) reads every store
+    through ``QueryService.metadata``: ``mode=ro`` under diagnostic
+    admission with recovery suppressed, so `db status` never resumes a
+    stats recovery, never migrates and never creates a file. A repair
+    marker or a pending quarantine refuses before connect; the caller
+    reports the refusal as the leg's ``_open_error``.
+
+    ``diagnostic_session`` (spec 5.12, AD22) is Doctor's form: the same rows
+    read through a diagnostic query session, which admits a behind, ahead,
+    fenced or recovery-pending store read-only and refuses, before any
+    connection, what the diagnostic contract cannot read without an effect
+    (a WAL-header stats.db, a missing maintenance lock, a data directory
+    not established as private).
     """
     if not db_path.exists():
         return _db_status_absent(db_path, registry)
+    if metadata_reader or diagnostic_session:
+        import _cctally_store_access
+        store = {"stats.db": "stats", "cache.db": "cache",
+                 "conversations.db": "conversations"}[db_label]
+        service = _cctally_store_access.QueryService
+        try:
+            if metadata_reader:
+                with service.metadata(store) as conn:
+                    return _db_status_rows(conn, db_path, registry, db_label)
+            with service.session(store, policy="diagnostic") as session:
+                return _db_status_rows(session.conn, db_path, registry,
+                                       db_label)
+        except _cctally_core.StoreUnavailable as exc:
+            if exc.reason == "absent" and not os.path.lexists(db_path):
+                return _db_status_absent(db_path, registry)
+            mapped = _cctally_store_access._command_unavailable(exc)
+            if diagnostic_session and mapped is not None:
+                # Today's stats maintenance error and text.
+                raise mapped from exc
+            if (db_label == "conversations.db"
+                    and exc.reason in ("maintenance", "recovery_pending")):
+                # Today's conversations decline text (#1000 5.10): a held
+                # recovery names its remedy rather than "maintenance".
+                import _cctally_cache
+                raise sqlite3.DatabaseError(
+                    _cctally_cache.conversation_ro_decline_reason()) from exc
+            # Every other refusal, a not-yet-converted WAL-header stats.db
+            # and a missing maintenance lock included (AD22), is this leg's
+            # existing unreadable state; the next owner open converts it.
+            raise
     if db_path == _cctally_core.DB_PATH:
         # #386: participate in the replacement protocol, and connect `mode=rw`
         # so this diagnostic can never MATERIALISE the very stats.db a
@@ -12755,6 +13182,10 @@ def cmd_db_unskip(args: argparse.Namespace) -> int:
             return 0
         # Invalidate the fast path so the dispatcher re-walks (Codex P1 #1).
         conn.execute("PRAGMA user_version = 0")
+        if db_label in _FENCED_DB_LABELS:
+            # #1068 D3: the ledger lost a row, so a later digest can equal an
+            # earlier one; the incarnation id changes in the same commit.
+            _rotate_store_incarnation_id(conn, db_label)
         conn.commit()
     finally:
         conn.close()
@@ -12870,7 +13301,9 @@ def _pid_is_alive(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, OverflowError):
+        # OverflowError: a PID beyond a C int (a legacy or corrupt record)
+        # names no process (#787 / #861 round 9 F9).
         return False
     except PermissionError:
         return True
@@ -14642,6 +15075,8 @@ def cmd_db_vacuum(args: argparse.Namespace) -> int:
     acquisition for at most 20 s; a handle still open then gets the same
     refusal. Refuses when free disk is below ~2x the file + WAL. Exit 0 on
     success, 3 when a target is in use or disk is short."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="cmd_db_vacuum")
     which = getattr(args, "db", "cache")
     targets = []
     if which in ("cache", "all"):
@@ -14658,3 +15093,113 @@ def cmd_db_vacuum(args: argparse.Namespace) -> int:
         if rc != 0:
             overall = rc
     return overall
+
+
+def cmd_db_reindex_search(args: argparse.Namespace) -> int:
+    """``cctally db reindex-search [--check] [--json]`` (#1094 D8).
+
+    Runs the conversation FTS verification step: ``force`` (rank 1 over every
+    required index, rebuilding each one that disagrees with its messages,
+    then certifying), or ``check`` under ``--check`` (rank 1 only; a finding
+    retracts the stored verification but rebuilds nothing). Exit 0 when every
+    required index is consistent (after any rebuild); 1 when ``--check``
+    found one that disagrees; 2 usage (argparse); 3 when the step is busy,
+    unavailable, deferred, failed its repair or was refused by the disk
+    guard, or the store could not be opened.
+    """
+    from _lib_json_envelope import stamp_schema_version
+
+    fts = _fts_integrity
+    as_json = bool(getattr(args, "json", False))
+    mode = "check" if getattr(args, "check", False) else "force"
+    def error_payload(outcome: str, exc: BaseException) -> int:
+        if as_json:
+            # The envelope holds on an error payload too: every key the
+            # normal envelope carries, with nothing measured.
+            print(json.dumps(stamp_schema_version({
+                "outcome": outcome,
+                "error": str(exc),
+                "indexes": [],
+                "deferredBy": None,
+                "sqliteVersion": sqlite3.sqlite_version,
+                "fingerprint": None,
+                "state": None,
+                "needBytes": None,
+                "availBytes": None,
+            }, version=1), indent=2))
+        return 3
+
+    try:
+        result = fts.verify_conversation_fts(mode=mode)
+    except fts.StoreOpenError as exc:
+        # Only a store that could not be opened; every lock or I/O failure
+        # on a write after it opened is an outcome (#1094 review F6).
+        eprint(fts.TEXT_OPEN_FAILED.format(error=exc))
+        return error_payload("store-unavailable", exc)
+    except sqlite3.DatabaseError as exc:
+        # A database error from the step's own reads after the store opened
+        # (a malformed store, an I/O error): exit 3 like every other failure,
+        # never a traceback (#1094 review FR2 verification).
+        eprint(fts.TEXT_CHECK_FAILED.format(kind=type(exc).__name__,
+                                            error=exc))
+        return error_payload("error", exc)
+    code = {"verified": 0, "mismatch": 1}.get(result.outcome, 3)
+    state = result.state
+    if as_json:
+        print(json.dumps(stamp_schema_version({
+            "outcome": result.outcome,
+            "indexes": [
+                {"name": ix.name, "before": ix.before, "action": ix.action,
+                 "after": ix.after, "seconds": round(ix.seconds, 3)}
+                for ix in result.indexes],
+            "deferredBy": result.deferred_by,
+            "sqliteVersion": result.sqlite_version,
+            "fingerprint": result.fingerprint,
+            "state": {
+                "verified": "verified" if state.verified else "unverified",
+                "reason": None if state.verified else state.reason,
+                "verifiedAt": state.meta.get("verifiedAt"),
+                "lastAttemptAt": state.meta.get("lastAttemptAt"),
+            },
+            "needBytes": result.need_bytes,
+            "availBytes": result.avail_bytes,
+        }, version=1), indent=2))
+        return code
+    for ix in result.indexes:
+        if ix.action == "rebuilt":
+            dur = fts.format_duration(ix.seconds)
+            if ix.after == "consistent":
+                print(fts.TEXT_REBUILT.format(name=ix.name, dur=dur))
+            elif ix.after == "error":
+                print(fts.TEXT_REBUILT_NOT_RECHECKED.format(
+                    name=ix.name, dur=dur, error=ix.error))
+            else:
+                print(fts.TEXT_REBUILT_STILL_BAD.format(name=ix.name,
+                                                        dur=dur))
+        elif ix.action == "refused":
+            print(fts.TEXT_DISK_REFUSED.format(
+                name=ix.name,
+                need=fts.format_bytes(result.need_bytes or 0),
+                avail=fts.format_bytes(result.avail_bytes or 0)))
+        elif ix.before == "consistent":
+            print(fts.TEXT_CONSISTENT.format(
+                name=ix.name, secs=fts.format_secs(ix.seconds)))
+        elif ix.before == "mismatch":
+            print(fts.TEXT_CHECK_MISMATCH.format(name=ix.name))
+        elif ix.before == "error":
+            print(fts.TEXT_CHECK_ERROR.format(name=ix.name, error=ix.error))
+    if result.outcome == "verified":
+        print(fts.TEXT_SUMMARY_OK.format(sqlite_version=result.sqlite_version))
+    elif result.outcome == "mismatch":
+        print(fts.TEXT_SUMMARY_CHECK_MISMATCH)
+    elif result.outcome == "deferred":
+        eprint(fts.TEXT_DEFERRED.format(marker=result.deferred_by))
+    elif result.outcome == "busy":
+        eprint(fts.TEXT_BUSY)
+    elif result.outcome == "unavailable":
+        eprint(fts.TEXT_UNAVAILABLE)
+    elif result.outcome == "disk":
+        eprint(fts.TEXT_SUMMARY_DISK)
+    elif result.outcome == "repair-failed":
+        eprint(fts.TEXT_SUMMARY_REPAIR_FAILED)
+    return code

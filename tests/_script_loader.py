@@ -155,6 +155,11 @@ def load_script_module(name: str = "cctally", register: bool = True) -> types.Mo
             else:
                 sys.modules.pop(name, None)
     _install_inline_statusline_continuation()
+    # #787 / #861 spec 5.1: a process that loads the namespace and calls it
+    # in-process (a `python -c` driver or a subprocess helper a test starts)
+    # is a process owner, like the CLI main thread. On a test thread the D5
+    # fixture already established `process`, so this is a no-op there.
+    sys.modules["_cctally_core"].establish_script_owner()
     return mod
 
 

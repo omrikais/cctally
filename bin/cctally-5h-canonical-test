@@ -300,6 +300,7 @@ mod = importlib.util.module_from_spec(spec)
 # so cls.__module__ resolves correctly during class construction.
 _sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 BASE = 1746014400
 assert BASE % 600 == 0, "BASE must be 600-aligned for this test"
@@ -346,6 +347,7 @@ mod = importlib.util.module_from_spec(spec)
 # so cls.__module__ resolves correctly during class construction.
 _sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 UTC = dt.timezone.utc
 test_epochs = [

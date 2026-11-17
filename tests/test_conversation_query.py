@@ -5812,3 +5812,127 @@ def test_1036_search_snapshot_transaction_ownership(tmp_path, monkeypatch):
     out = cq.search_conversations(ro, "needle")
     assert out["mode"] == "like" and out["hits"]
     assert ro.in_transaction is False
+
+
+# --- #1068 D5: the session cost sum follows (uuid, id), never the plan -------
+
+def _cost_order_db(scope):
+    """One session whose document (id) order and timestamp order both differ
+    from its (uuid, id) order, with a NULL uuid, an equal-uuid pair and every
+    turn key repeated. Under a scope, every row is in that scope."""
+    c = sqlite3.connect(":memory:")
+    c.executescript(
+        "CREATE TABLE conversation_messages (id INTEGER PRIMARY KEY, "
+        "session_id TEXT, uuid TEXT, msg_id TEXT, req_id TEXT, "
+        "account_key TEXT, timestamp_utc TEXT);"
+        "CREATE INDEX idx_conv_session_uuid ON conversation_messages"
+        "(session_id, uuid);"
+        "CREATE INDEX idx_conv_messages_account_session ON conversation_messages"
+        "(account_key, session_id, timestamp_utc, id);"
+        "CREATE TABLE session_entries (msg_id TEXT, req_id TEXT, model TEXT, "
+        "input_tokens INTEGER, output_tokens INTEGER, cache_create_tokens "
+        "INTEGER, cache_read_tokens INTEGER, cost_usd_raw REAL, "
+        "cache_create_1h_tokens INTEGER, speed TEXT, mutation_seq INTEGER, "
+        "account_key TEXT);")
+    accounts = {"table": ["x", None, "y", "unattributed", "x"],
+                "real": ["acct-a"] * 5,
+                "unattributed": [None, "unattributed", None, "unattributed",
+                                 None]}[scope]
+    # (id, uuid, key, timestamp): (uuid, id) order -> K2, K3, K1;
+    # id order -> K1, K2, K3; timestamp order -> K1, K3, K2.
+    rows = [(1, "c", "K1", 1), (2, None, "K2", 5), (3, "a", "K3", 2),
+            (4, "a", "K1", 4), (5, "b", "K2", 3)]
+    for (rid, uuid, key, ts), acct in zip(rows, accounts):
+        c.execute("INSERT INTO conversation_messages VALUES (?,?,?,?,?,?,?)",
+                  (rid, "s", uuid, "m" + key, "r" + key, acct, f"t{ts}"))
+    for key, raw, seq in (("K1", 1.0, None), ("K2", 1e16, 7), ("K3", -1e16, 3)):
+        c.execute("INSERT INTO session_entries VALUES "
+                  "(?,?,'m',0,0,0,0,?,0,NULL,?,?)",
+                  ("m" + key, "r" + key, raw, seq, accounts[0]))
+    c.execute("CREATE TEMP TABLE _scope (account_key TEXT)")
+    c.execute("INSERT INTO _scope VALUES ('acct-a')")
+    predicate = {
+        "table": None,
+        "real": "account_key = (SELECT account_key FROM _scope)",
+        "unattributed": "(account_key IS NULL OR account_key = 'unattributed')",
+    }[scope]
+    if predicate:
+        c.execute("CREATE TEMP VIEW conversation_messages AS SELECT * FROM "
+                  f"main.conversation_messages WHERE {predicate}")
+    return c
+
+
+def _sum_in(c, order_sql, costs):
+    total = 0.0
+    keys = dict.fromkeys(c.execute(
+        "SELECT msg_id, req_id FROM main.conversation_messages " + order_sql))
+    for key in keys:
+        total = total + costs[key]
+    return total
+
+
+@pytest.mark.parametrize("scope", ["table", "real", "unattributed"])
+def test_session_cost_map_sums_in_uuid_then_id_order(monkeypatch, scope):
+    """#1068 D5 (T7). Accuracy failure detected: a session cost whose float
+    sum follows the query plan, so a scoped derivation (reading through the
+    account index) and the stored unscoped row disagree in the last bits and a
+    reused row stops being byte-identical to a fresh one."""
+    monkeypatch.setattr(cq, "_entry_cost",
+                        lambda model, inp, out, cc, cr, raw, **_kw: raw)
+    c = _cost_order_db(scope)
+    costs = {("mK1", "rK1"): 1.0, ("mK2", "rK2"): 1e16, ("mK3", "rK3"): -1e16}
+    # The frozen pre-#1068 traversal: the old statement's encounter order
+    # through idx_conv_session_uuid, first occurrence of each key, summed.
+    frozen = 0.0
+    for key in dict.fromkeys(
+            (m, r) for _sid, m, r in c.execute(
+                "SELECT session_id, msg_id, req_id FROM main.conversation_messages "
+                "INDEXED BY idx_conv_session_uuid WHERE session_id IN ('s') "
+                "AND msg_id IS NOT NULL AND req_id IS NOT NULL")):
+        frozen = frozen + costs[key]
+    oracle = _sum_in(c, "ORDER BY uuid IS NOT NULL, uuid, id", costs)
+    assert frozen == oracle == 1.0
+    # Non-vacuity: the document and timestamp orders give another float.
+    assert _sum_in(c, "ORDER BY id", costs) == 0.0
+    assert _sum_in(c, "ORDER BY timestamp_utc, id", costs) == 0.0
+
+    assert cq._session_cost_map(c, ["s"]) == {"s": 1.0}
+    # The accounting half: three distinct keys with an entry, the NULL
+    # mutation_seq one included, and the largest non-NULL sequence.
+    assert cq._session_cost_and_accounting_map(c, ["s"]) == {"s": (1.0, 3, 7)}
+
+
+def test_turn_cost_rows_carry_the_mutation_seq_and_project_to_costs():
+    """#1068 D2: the rows behind a session's cost also carry each entry's
+    mutation_seq, so the fingerprint's accounting half is read from the very
+    rows the cost is."""
+    c = _conn()
+    _entry(c, source_path="a.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=1000, out=500)
+    c.execute("UPDATE session_entries SET mutation_seq=41 WHERE msg_id='m1'")
+    keys = [("m1", "r1"), ("m-absent", "r-absent")]
+    rows = cq._turn_cost_rows_for_keys(c, keys)
+    assert set(rows) == {("m1", "r1")} and rows[("m1", "r1")][1] == 41
+    assert cq._turn_costs_for_keys(c, keys) == {
+        ("m1", "r1"): rows[("m1", "r1")][0]}
+
+
+def test_missing_column_takes_todays_path():
+    """#1068: a store whose rollup lacks input_fingerprint (here the cache
+    schema's legacy table) recomputes exactly as before and the refresh is a
+    no-op. Stored-data failure detected: a writer raising `no such column` on
+    a store migration 013 has not reached."""
+    c = _conn()
+    _msg(c, session_id="s1", uuid="a1", source_path="a.jsonl", byte_offset=0,
+         timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
+         model=_MODEL, msg_id="m1", req_id="r1")
+    _entry(c, source_path="a.jsonl", line_offset=0, model=_MODEL,
+           msg_id="m1", req_id="r1", inp=1000, out=500)
+    assert "input_fingerprint" not in {
+        r[1] for r in c.execute("PRAGMA table_info(conversation_sessions)")}
+    assert cc._recompute_conversation_sessions(c) is True
+    row = c.execute("SELECT msg_count, cost_usd FROM conversation_sessions "
+                    "WHERE session_id='s1'").fetchone()
+    assert row[0] == 1 and row[1] == round(
+        cq._session_cost_map(c, ["s1"])["s1"], 6) > 0
+    assert cc._refresh_uncertified_conversation_sessions(c) == 0

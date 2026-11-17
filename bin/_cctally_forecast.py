@@ -28,6 +28,7 @@ Spec: docs/superpowers/specs/2026-05-31-extract-forecast-budget-cmd-design.md
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import json
@@ -108,6 +109,7 @@ from _lib_five_hour import latest_five_hour_reading
 # #620 S1 D11: the one affordance shape every warning state renders.
 _ensure_sibling_loaded("_lib_alert_scope")
 import _lib_alert_scope
+import _cctally_store_access as _store_access
 
 
 def _cctally():
@@ -1383,8 +1385,9 @@ def _select_dollars_per_percent(
         if not shared_cache["opened"]:
             shared_cache["opened"] = True
             try:
-                shared_cache["conn"] = c._load_sibling(
-                    "_cctally_cache").open_cache_db()
+                # #787 / #861 AD21: per-statement cache read units.
+                shared_cache["conn"] = _store_access.statement_reader(
+                    "cache")
             except Exception:                          # noqa: BLE001
                 shared_cache["conn"] = None
         return shared_cache["conn"]
@@ -1721,7 +1724,7 @@ def _week_entry_records(start, end, *, account_key,
     glue = c._load_sibling("_cctally_quota_model")
     shared = None if cache_conn_factory is None else cache_conn_factory()
     owned = shared is None
-    cache = (c._load_sibling("_cctally_cache").open_cache_db()
+    cache = (_store_access.statement_reader("cache")   # #787 AD21
              if owned else shared)
     try:
         sql = (
@@ -2602,7 +2605,9 @@ def cmd_report(args: argparse.Namespace) -> int:
     args._resolved_tz = tz
     week_start_name = get_week_start_name(config, args.week_start_name)
 
-    conn = open_db()
+    # #787 / #861 AD21: each statement is one read unit, so no stats
+    # session is held across the report's computation and rendering.
+    conn = _store_access.statement_reader("stats")
     try:
         _rep_acct_pred = "" if acct_key is None else " WHERE account_key = ?"
         _rep_acct_p = () if acct_key is None else (acct_key,)
@@ -2943,6 +2948,13 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def cmd_forecast(args: argparse.Namespace) -> int:
+    """`cmd_forecast` with its stats connection closed on every return
+    (#787 / #861 D10: the connection used to be left open)."""
+    with contextlib.ExitStack() as stack:
+        return _cmd_forecast_body(args, stack)
+
+
+def _cmd_forecast_body(args: argparse.Namespace, stack) -> int:
     """Project current-week usage to reset boundary. Emit terminal report,
     JSON, or status-line one-liner. See docs/commands/forecast.md.
     """
@@ -2975,7 +2987,9 @@ def cmd_forecast(args: argparse.Namespace) -> int:
     _acct_fields = c.account_json_fields(acct_key)  # #341 R8 (empty unless --account)
 
     now_utc = _resolve_forecast_now(args.as_of)
-    conn = open_db()
+    # #787 / #861 AD21: per-statement read units over stats (the cache
+    # refresh stays in get_entries' owner phase).
+    conn = _store_access.statement_reader("stats")
     # Cache sync is gated inside get_entries(..., skip_sync=args.no_sync); no
     # sync_cache(conn) here — that prior call ran on the stats DB connection
     # (wrong conn) and was a no-op for the real cache anyway.
@@ -3384,7 +3398,7 @@ def _build_vendor_budget_inputs(
     """
     c = _cctally()
     if vendor == "claude" and period == "subscription-week":
-        conn = open_db()
+        conn = _store_access.statement_reader("stats")   # #787 AD21
         try:
             # #341 `*`-anchor: the projected vendor-budget metric passes the
             # active account so its window matches the actual-budget ladder;
@@ -3524,7 +3538,7 @@ def cmd_budget(args: argparse.Namespace) -> int:
     project_rows = None
     project_window_resolved = False
     if has_projects:
-        pj_conn = open_db()
+        pj_conn = _store_access.statement_reader("stats")   # #787 AD21
         try:
             project_rows = _build_project_budget_rows(pj_conn, budget_cfg, now_utc)
         finally:

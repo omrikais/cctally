@@ -330,6 +330,94 @@ describe('<ProjectsPanel /> withheld and titled', () => {
 });
 
 
+// #787 / #861 revision 35 — a dashboard started during a live cache repair has
+// no Projects envelope until the repair finishes (only cache.db can answer the
+// projects leg, and the repair forbids reading it). The published sync status
+// already names the repair (`maintenance_active`), and the panel keys on it:
+// the loading skeleton, not advice to restart a dashboard that will fill in by
+// itself. A withheld All aggregate waits the same way during a repair (round
+// 10); empty rows, and every state outside a repair, keep their own copy.
+describe('<ProjectsPanel /> during a cache repair', () => {
+  const repairing = {
+    kind: 'maintenance_active' as const,
+    label: 'cache repair in progress',
+    detail: 'Another cctally process is repairing the server cache.',
+    action: null,
+  };
+
+  it('shows the loading skeleton, not the restart copy, for a null envelope', () => {
+    updateSnapshot({ ...baseEnvelope(), sync_failure: repairing });
+    const { container } = render(<ProjectsPanel />);
+    expect(container.querySelector('.panel-skeleton')).not.toBeNull();
+    expect(container.textContent).not.toContain('restart the dashboard');
+    expect(container.textContent).not.toContain('Projects data unavailable');
+    expect(container.querySelector('.panel-header h2 .sub')?.textContent).toBe('(loading)');
+  });
+
+  it('keeps the restart copy for a null envelope with no repair', () => {
+    for (const failure of [null, { ...repairing, kind: 'server_sync' as const }]) {
+      updateSnapshot({ ...baseEnvelope(), sync_failure: failure });
+      const { container, unmount } = render(<ProjectsPanel />);
+      expect(container.textContent).toContain('Projects data unavailable — restart the dashboard.');
+      expect(container.querySelector('.panel-skeleton')).toBeNull();
+      unmount();
+    }
+  });
+
+  // Round 10: a dashboard started during a repair has no Claude projects
+  // envelope, so the All aggregate is withheld (`rows_absent`) and the panel
+  // printed "...does not publish the combined ranking. Reload..." — a wrong
+  // cause and an action that does not help until the repair ends. A withheld
+  // aggregate waits on the repair exactly like the null envelope.
+  it('shows the loading skeleton, not the withheld copy, for a withheld All aggregate', () => {
+    for (const outcome of [
+      { state: 'withheld', code: 'rows_absent' },
+      { state: 'withheld', code: 'provider_incoherent', provider: 'codex' },
+    ]) {
+      const env = structuredClone(fixture) as unknown as Envelope;
+      env.sources!.all.data!.aggregates!.projects = outcome as never;
+      updateSnapshot({ ...env, sync_failure: repairing });
+      dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+      const { container, unmount } = render(<ProjectsPanel />);
+      expect(container.querySelector('.panel-skeleton')).not.toBeNull();
+      expect(container.querySelector('.panel-withheld')).toBeNull();
+      const h2 = container.querySelector('.panel-header h2');
+      expect(h2?.querySelector('.sub')?.textContent).toBe('(loading)');
+      expect(h2?.classList.contains('is-status')).toBe(true);
+      unmount();
+    }
+  });
+
+  it('keeps the withheld copy for a withheld aggregate with no repair', () => {
+    for (const failure of [null, { ...repairing, kind: 'server_sync' as const }]) {
+      const env = structuredClone(fixture) as unknown as Envelope;
+      env.sources!.all.data!.aggregates!.projects = { state: 'withheld', code: 'rows_absent' } as never;
+      updateSnapshot({ ...env, sync_failure: failure });
+      dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+      const { container, unmount } = render(<ProjectsPanel />);
+      expect(container.querySelector('.panel-withheld')!.textContent).toContain('does not publish the combined ranking');
+      expect(container.querySelector('.panel-header h2 .sub')?.textContent).toBe('(withheld)');
+      expect(container.querySelector('.panel-skeleton')).toBeNull();
+      unmount();
+    }
+  });
+
+  it('keeps the no-activity copy for empty rows during a repair', () => {
+    const env = baseEnvelope();
+    env.projects = {
+      current_week: {
+        week_label: 'wk May 13', week_start_date: null, week_start_at: null,
+        total_cost_usd: 0, rows: [],
+      },
+      trend: { window_weeks: 0, weeks: [], projects: [] },
+    };
+    updateSnapshot({ ...env, sync_failure: repairing });
+    const { container } = render(<ProjectsPanel />);
+    expect(screen.getByText(/No project activity yet this week/)).toBeInTheDocument();
+    expect(container.querySelector('.panel-skeleton')).toBeNull();
+  });
+});
+
 // #556 S2 QA P1-1 — a COLD load of the All tab must not accuse the server.
 //
 // The store's initial snapshot is `null` and `activeSource` is persisted, so a
@@ -533,5 +621,65 @@ describe('the Codex metadata retry notice (#846 M2)', () => {
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
     const { container } = render(<ProjectsPanel />);
     expect(container.textContent).not.toContain(NOTE);
+  });
+});
+
+// #923 S2 — the label renders as prefix, base and suffix spans so the base can
+// truncate while the distinguishing suffix and the All prefix cannot. The text,
+// title and accessible name must stay exactly what they were.
+describe('<ProjectsPanel /> label spans (#923 S2)', () => {
+  function renderAllWithCodexLabel(label: string) {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.codex.data!.projects!.rows[0].label = label;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    return render(<ProjectsPanel />);
+  }
+
+  it('splits a same-name suffix under All without changing the row text', () => {
+    const { container } = renderAllWithCodexLabel('alpha (2)');
+    const row = container.querySelector('[data-project-key="project:codex-alpha"]')!;
+    const name = row.querySelector('.name')!;
+    expect(name.textContent).toBe('Codex · alpha (2)');
+    expect(name.querySelector('.pl-source')?.textContent).toBe('Codex · ');
+    expect(name.querySelector('.pl-base')?.textContent).toBe('alpha');
+    expect(name.querySelector('.pl-suffix')?.textContent).toBe(' (2)');
+    expect(row.getAttribute('title')).toBe('alpha (2)');
+    expect(row.getAttribute('aria-label')).toContain('Open codex project details: alpha (2):');
+  });
+
+  it('renders no suffix span for a plain label', () => {
+    const { container } = renderAllWithCodexLabel('alpha (2)');
+    const name = container.querySelector('[data-project-key="project:agg-orphan"] .name')!;
+    expect(name.textContent).toBe('Claude · project-rolled-over');
+    expect(name.querySelector('.pl-suffix')).toBeNull();
+  });
+
+  it('keeps an unbalanced label whole and marks it ambiguous', () => {
+    const { container } = renderAllWithCodexLabel('app (customer-alpha (b) (1)');
+    const label = container.querySelector('[data-project-key="project:codex-alpha"] .project-label')!;
+    expect(label.getAttribute('data-label-kind')).toBe('ambiguous');
+    expect(label.textContent).toBe('Codex · app (customer-alpha (b) (1)');
+    expect(label.querySelector('.pl-suffix')).toBeNull();
+  });
+
+  it('renders the Codex tab label without a source prefix', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.codex.data!.projects!.rows[0].label = 'alpha (2)';
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<ProjectsPanel />);
+    const name = container.querySelector('[data-project-key="project:codex-alpha"] .name')!;
+    expect(name.textContent).toBe('alpha (2)');
+    expect(name.querySelector('.pl-source')).toBeNull();
+    expect(name.querySelector('.pl-suffix')?.textContent).toBe(' (2)');
+  });
+
+  it('leaves the tail row a plain muted name', () => {
+    updateSnapshot(envelopeWithProjects(8));
+    const { container } = render(<ProjectsPanel />);
+    const tail = container.querySelector('.projects-row.tail .name.muted')!;
+    expect(tail.textContent).toBe('+3 more');
+    expect(tail.querySelector('.project-label')).toBeNull();
   });
 });

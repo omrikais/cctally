@@ -142,10 +142,12 @@ GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/dashboard"
 # shellcheck source=bin/_lib-golden-diff.sh
 . "$REPO_ROOT/bin/_lib-golden-diff.sh"
 
-# Bounded server teardown (issue #153): SIGTERM -> grace poll -> SIGKILL, so a
-# server that drops a single SIGTERM (CPython signal/Event lost-wakeup race)
-# can't hang the suite on an unbounded `wait`. export -f'd below for the xargs
-# `bash -c` workers. shellcheck source=bin/_lib-kill-server.sh
+# Bounded server teardown (issues #153, #1087): each server runs under a
+# child-scope holder, which sends SIGTERM, then SIGKILL after the grace, while
+# it holds the server unreaped; this harness never signals a process number.
+# The hold functions and stop_server_bounded are export -f'd below for the
+# xargs `bash -c` workers (with the exported `_HOLD_PY`).
+# shellcheck source=bin/_lib-kill-server.sh
 . "$REPO_ROOT/bin/_lib-kill-server.sh"
 
 default_jobs() {
@@ -166,11 +168,12 @@ SCRATCH_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cctally-dashboard-test.XXXXXX") || exi
 pass_count=0
 fail_count=0
 
-# Track PIDs we launch so the EXIT trap can clean up even on Ctrl-C / abort.
-declare -a BG_PIDS=()
+# The holder directories of the servers this shell starts, so the EXIT trap
+# can stop them even on Ctrl-C / abort (a stopped one is a no-op).
+declare -a BG_HOLDS=()
 cleanup () {
-    for p in "${BG_PIDS[@]:-}"; do
-        [ -n "$p" ] && kill_server_bounded "$p"
+    for h in "${BG_HOLDS[@]:-}"; do
+        [ -n "$h" ] && stop_server_bounded "$h"
     done
     rm -rf "$SCRATCH_ROOT" "$FIXTURE_STAGE"
 }
@@ -340,15 +343,16 @@ _run_scenario_inner () {
     # Golden-diff helpers materialize temp compare files here; cleaned with
     # $SCRATCH_ROOT on harness exit.
     local GOLDEN_DIFF_TMPDIR="$scratch_home"
+    local hold="$scratch_home/.hold"
     CCTALLY_AS_OF="$as_of" HOME="$scratch_home" TZ=Etc/UTC \
-        "$BIN" dashboard --port 0 --no-browser --no-sync \
-        --sync-interval 9999 --host 127.0.0.1 $extra_flags >"$log" 2>&1 &
-    local pid=$!
-    # The dashboard server is a child of this worker bash. Under xargs
-    # parallelism, the parent shell's BG_PIDS array can't reach it; the
-    # explicit kill+wait at the end of this function handles normal
-    # completion, and on Ctrl-C the worker bash dies and SIGCHLDs the
-    # server with it. So no BG_PIDS append here.
+        hold_start "$hold" child -- "$BIN" dashboard --port 0 --no-browser --no-sync \
+        --sync-interval 9999 --host 127.0.0.1 $extra_flags >"$log" 2>&1
+    local holder=$HOLD_PID
+    # The server's holder is a child of this worker bash. Under xargs
+    # parallelism, the parent shell's BG_HOLDS array can't reach it; the
+    # explicit stop at the end of this function handles normal completion,
+    # and when the worker bash dies the holder sees its launcher gone and
+    # stops the server itself. So no BG_HOLDS append here.
 
     # Wait up to ~15s for the banner line to appear. With --host 127.0.0.1
     # (loopback), the banner emits "dashboard: serving http://localhost:PORT/
@@ -367,7 +371,7 @@ _run_scenario_inner () {
             fi
         fi
         # Bail early if the server crashed before printing the banner.
-        if ! kill -0 "$pid" 2>/dev/null; then
+        if ! hold_alive "$holder"; then
             break
         fi
         sleep 0.1
@@ -377,7 +381,7 @@ _run_scenario_inner () {
     if [ -z "$port" ]; then
         echo "FAIL $name: could not discover port (log: $log)"
         sed 's/^/    /' "$log" || true
-        kill_server_bounded "$pid"
+        stop_server_bounded "$hold"
         return 1
     fi
 
@@ -995,8 +999,11 @@ print("ok")
     # contract runs on the merge path in tests/test_dashboard_api_sync_refresh.py
     # (refresh, --no-sync skip warning, queue=1 nudge) and
     # tests/test_dashboard_csrf.py (Origin), both in the dashboard-server row.
-    # Repeating it per scenario ran a full snapshot rebuild under a 5 s curl
-    # limit in every fixture, which is what timed out under a loaded pool.
+    # The per-scenario repetition was removed after the valid-Origin check
+    # returned 000 under --max-time 5 in two account scenarios of one loaded
+    # run (2026-10-19). That 000's cause was not determined. Under --no-sync
+    # the request was measured at about 10 ms: run_sync_now_locked's rebuild
+    # idle-short-circuits on an unchanged composite signature (#985).
     if [ "$name" = "ok" ]; then
         # POST /api/sync (v2): valid Origin → 200, bogus → 403, missing → 403.
         #
@@ -1367,7 +1374,7 @@ print("ok")
         ok=0
     fi
 
-    kill_server_bounded "$pid"
+    stop_server_bounded "$hold"
     rm -f "$log"
 
     if [ "$ok" = "1" ]; then
@@ -1400,7 +1407,8 @@ run_scenario () {
 # them in fixed scenario order so the harness output reads identically
 # to the old sequential version.
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json normalize_block_json
-export -f kill_server_bounded
+export -f hold_start hold_alive hold_cont hold_wait hold_stop _hold_read
+export -f stop_server_bounded
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.
 export -f _golden_diff_files _golden_diff_str _golden_diff_two_str
 export -f _golden_require _golden_require_str
@@ -1463,18 +1471,18 @@ assert_not_contains () {
 # Wait for a backgrounded `cctally dashboard` to print its full startup
 # banner (sentinel: "Ctrl-C to stop", which appears at the END of every
 # banner shape — single-line loopback and multi-line all-interfaces),
-# then kill it. Polls 100×0.1s for a 10s ceiling so cold CI runners
+# then stop it. Polls 100×0.1s for a 10s ceiling so cold CI runners
 # (where 26K-line bin/cctally takes longer to import + bind a socket)
 # don't false-fail on a fixed `sleep 0.5`.
 wait_for_banner_then_kill () {
-    local out="$1" pid="$2"
+    local out="$1" hold="$2"
     for _ in $(seq 1 100); do
         if grep -q "Ctrl-C to stop" "$out" 2>/dev/null; then
             break
         fi
         sleep 0.1
     done
-    kill_server_bounded "$pid"
+    stop_server_bounded "$hold"
 }
 
 # Banner scenarios (Task 2). Each launches the dashboard against an
@@ -1483,6 +1491,9 @@ wait_for_banner_then_kill () {
 # avoid bringing up the cache-sync path unnecessarily.
 banner_scratch="$SCRATCH_ROOT/banner"
 mkdir -p "$banner_scratch"
+# The banner servers run one at a time, each under a holder in this directory.
+BANNER_HOLD="$SCRATCH_ROOT/banner.hold"
+BG_HOLDS+=("$BANNER_HOLD")
 # Seed a minimal HOME tree so cctally finds STATIC_DIR via the symlink
 # the install path uses; the in-tree static/ is what matters here.
 cp -R "$FIX_DIR/no-data/.local" "$banner_scratch/" 2>/dev/null || true
@@ -1491,11 +1502,9 @@ cp -R "$FIX_DIR/no-data/.local" "$banner_scratch/" 2>/dev/null || true
 # using "localhost" as the printed alias. (Default flipped from LAN to
 # loopback for public-release safety.)
 HOME="$banner_scratch" TZ=Etc/UTC \
-    "$BIN" dashboard --port 0 --no-sync --no-browser \
-    >"$banner_scratch/banner.txt" 2>&1 &
-banner_pid=$!
-BG_PIDS+=("$banner_pid")
-wait_for_banner_then_kill "$banner_scratch/banner.txt" "$banner_pid"
+    hold_start "$BANNER_HOLD" child -- "$BIN" dashboard --port 0 --no-sync --no-browser \
+    >"$banner_scratch/banner.txt" 2>&1
+wait_for_banner_then_kill "$banner_scratch/banner.txt" "$BANNER_HOLD"
 
 assert_contains "banner default loopback: single-line localhost" \
     "serving http://localhost:" "$(cat "$banner_scratch/banner.txt")"
@@ -1507,11 +1516,9 @@ assert_not_contains "banner default loopback: no access token" \
 # 2) --host 0.0.0.0 -> binds all interfaces -> all-interfaces banner with
 # both localhost and (forced) LAN URLs. Explicit LAN opt-in.
 HOME="$banner_scratch" TZ=Etc/UTC CCTALLY_TEST_LAN_IP=192.0.2.42 \
-    "$BIN" dashboard --port 0 --no-sync --no-browser --host 0.0.0.0 \
-    >"$banner_scratch/banner-lan.txt" 2>&1 &
-banner_pid=$!
-BG_PIDS+=("$banner_pid")
-wait_for_banner_then_kill "$banner_scratch/banner-lan.txt" "$banner_pid"
+    hold_start "$BANNER_HOLD" child -- "$BIN" dashboard --port 0 --no-sync --no-browser --host 0.0.0.0 \
+    >"$banner_scratch/banner-lan.txt" 2>&1
+wait_for_banner_then_kill "$banner_scratch/banner-lan.txt" "$BANNER_HOLD"
 
 content=$(cat "$banner_scratch/banner-lan.txt")
 assert_contains "banner explicit LAN: all-interfaces line" \
@@ -1528,11 +1535,9 @@ assert_contains "banner explicit LAN: raw access token" \
 # 3) --host 0.0.0.0 with LAN-IP suppressed -> all-interfaces banner emits
 # localhost line but omits the LAN line entirely (no "(LAN)" trailing tag).
 HOME="$banner_scratch" TZ=Etc/UTC CCTALLY_TEST_LAN_IP=__SUPPRESS__ \
-    "$BIN" dashboard --port 0 --no-sync --no-browser --host 0.0.0.0 \
-    >"$banner_scratch/banner-noLan.txt" 2>&1 &
-banner_pid=$!
-BG_PIDS+=("$banner_pid")
-wait_for_banner_then_kill "$banner_scratch/banner-noLan.txt" "$banner_pid"
+    hold_start "$BANNER_HOLD" child -- "$BIN" dashboard --port 0 --no-sync --no-browser --host 0.0.0.0 \
+    >"$banner_scratch/banner-noLan.txt" 2>&1
+wait_for_banner_then_kill "$banner_scratch/banner-noLan.txt" "$BANNER_HOLD"
 
 content=$(cat "$banner_scratch/banner-noLan.txt")
 assert_contains "banner LAN-suppressed: localhost line present" \
@@ -1559,11 +1564,9 @@ cat > "$banner_lan_scratch/.local/share/cctally/config.json" <<'JSON'
 {"dashboard": {"bind": "lan"}}
 JSON
 HOME="$banner_lan_scratch" TZ=Etc/UTC CCTALLY_TEST_LAN_IP=192.0.2.42 \
-    "$BIN" dashboard --port 0 --no-sync --no-browser \
-    >"$banner_lan_scratch/banner.txt" 2>&1 &
-banner_pid=$!
-BG_PIDS+=("$banner_pid")
-wait_for_banner_then_kill "$banner_lan_scratch/banner.txt" "$banner_pid"
+    hold_start "$BANNER_HOLD" child -- "$BIN" dashboard --port 0 --no-sync --no-browser \
+    >"$banner_lan_scratch/banner.txt" 2>&1
+wait_for_banner_then_kill "$banner_lan_scratch/banner.txt" "$BANNER_HOLD"
 
 content=$(cat "$banner_lan_scratch/banner.txt")
 assert_contains "banner config-bind-lan: all-interfaces line" \
@@ -1584,11 +1587,9 @@ cat > "$banner_lo_scratch/.local/share/cctally/config.json" <<'JSON'
 {"dashboard": {"bind": "loopback"}}
 JSON
 HOME="$banner_lo_scratch" TZ=Etc/UTC \
-    "$BIN" dashboard --port 0 --no-sync --no-browser \
-    >"$banner_lo_scratch/banner.txt" 2>&1 &
-banner_pid=$!
-BG_PIDS+=("$banner_pid")
-wait_for_banner_then_kill "$banner_lo_scratch/banner.txt" "$banner_pid"
+    hold_start "$BANNER_HOLD" child -- "$BIN" dashboard --port 0 --no-sync --no-browser \
+    >"$banner_lo_scratch/banner.txt" 2>&1
+wait_for_banner_then_kill "$banner_lo_scratch/banner.txt" "$BANNER_HOLD"
 
 content=$(cat "$banner_lo_scratch/banner.txt")
 assert_contains "banner config-bind-loopback: single-line localhost" \
@@ -1615,11 +1616,9 @@ cat > "$banner_optout_scratch/.local/share/cctally/config.json" <<'JSON'
 {"dashboard": {"bind": "lan", "lan_auth": false}}
 JSON
 HOME="$banner_optout_scratch" TZ=Etc/UTC CCTALLY_TEST_LAN_IP=192.0.2.42 \
-    "$BIN" dashboard --port 0 --no-sync --no-browser \
-    >"$banner_optout_scratch/banner.txt" 2>&1 &
-banner_pid=$!
-BG_PIDS+=("$banner_pid")
-wait_for_banner_then_kill "$banner_optout_scratch/banner.txt" "$banner_pid"
+    hold_start "$BANNER_HOLD" child -- "$BIN" dashboard --port 0 --no-sync --no-browser \
+    >"$banner_optout_scratch/banner.txt" 2>&1
+wait_for_banner_then_kill "$banner_optout_scratch/banner.txt" "$BANNER_HOLD"
 
 content=$(cat "$banner_optout_scratch/banner.txt")
 assert_contains "banner LAN auth opt-out: warning" \

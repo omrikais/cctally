@@ -726,6 +726,7 @@ spec = importlib.util.spec_from_loader("cctally", loader)
 mod = importlib.util.module_from_spec(spec)
 sys.modules["cctally"] = mod
 loader.exec_module(mod)
+sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
 payload = {
     "session_id": "issue-394-statusline",
     "rate_limits": {

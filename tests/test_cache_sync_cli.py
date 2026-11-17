@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse, fcntl, json, multiprocessing, os, pathlib, shutil, sqlite3, subprocess, sys, time
 import pytest
 from conftest import load_script, redirect_paths
+from _fts5_gate import requires_fts5
 
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
@@ -11,6 +12,7 @@ import _lib_test_isolation as _iso
 from _retention_fixtures import (
     LAUNCH_TIMEOUT_S, SWITCH, assert_holds_expired, copy_layout, counts, fork,
     seed, stage, write_retention)
+from conftest import as_process_owner  # noqa: E402
 
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 
@@ -339,7 +341,7 @@ def test_explicit_rebuild_bounds_a_stuck_claude_transcript_phase(env, capfd):
     def invoke() -> None:
         results.put(ns["cmd_cache_sync"](args))
 
-    proc = ctx.Process(target=invoke)
+    proc = ctx.Process(target=as_process_owner(invoke))
     started = time.monotonic()
     proc.start()
     # timing-budget: the cache-sync child has exited; `finished` below records whether it did, and the assertion reads that flag rather than the elapsed time
@@ -580,12 +582,12 @@ def test_real_claude_file_loop_reraises_classified_corruption_for_recovery(
     real_ensure = cache_mod._ensure_session_files_row
     attempts = 0
 
-    def corrupt_once(conn, source_path):
+    def corrupt_once(conn, source_path, **kw):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise sqlite3.DatabaseError("database disk image is malformed")
-        return real_ensure(conn, source_path)
+        return real_ensure(conn, source_path, **kw)
 
     monkeypatch.setattr(cache_mod, "_ensure_session_files_row", corrupt_once)
     args = argparse.Namespace(
@@ -613,7 +615,7 @@ def test_rebuild_file_failure_is_not_reported_as_success(env, monkeypatch):
     cache_mod = ns["_cctally_cache"]
     _write_claude_entry(tmp_path)
 
-    def fail_file(_conn, _source_path):
+    def fail_file(_conn, _source_path, **_kw):
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(cache_mod, "_ensure_session_files_row", fail_file)
@@ -1139,3 +1141,124 @@ def test_965_explicit_prune_under_the_test_default(retention_template, tmp_path,
             f"the test default deleted expired transcripts on --prune-conversations: {got}")
     else:
         assert got["expired_claude"] == 0 and got["expired_codex"] == 0, got
+
+
+# --- #1094 D6: cache-sync runs the automatic FTS verification step ---------
+
+
+def _fts_spy(monkeypatch):
+    """Wrap the kernel's step so a test sees each call and its result."""
+    import _lib_conversation_fts_integrity as fts
+    calls = []
+    real = fts.verify_conversation_fts
+
+    def spy(**kw):
+        result = real(**kw)
+        calls.append((kw, result))
+        return result
+
+    monkeypatch.setattr(fts, "verify_conversation_fts", spy)
+    return calls
+
+
+def _write_claude_text_entry(tmp_path: pathlib.Path) -> None:
+    pdir = tmp_path / ".claude" / "projects" / "-p"
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "s.jsonl").write_text(json.dumps({
+        "type": "assistant", "timestamp": "2026-07-01T00:00:00Z",
+        "requestId": "r1", "sessionId": "S1", "uuid": "u1",
+        "message": {"id": "m1", "model": "claude-opus-4-7", "role": "assistant",
+                    "content": [{"type": "text",
+                                 "text": "hello world from the assistant"}],
+                    "usage": {"input_tokens": 0, "output_tokens": 5,
+                              "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 0}},
+    }) + "\n")
+
+
+def _seed_stale_postings_unverified(path: pathlib.Path) -> None:
+    """Give one ingested message postings its content does not produce (what
+    a build with another tokenizer leaves behind) and drop the tokenizer
+    state, as on a store from before #1094."""
+    conn = sqlite3.connect(str(path))
+    try:
+        row = conn.execute(
+            "SELECT id, text, search_tool, search_thinking "
+            "FROM conversation_messages ORDER BY id LIMIT 1").fetchone()
+        assert row is not None, "the entry was not ingested"
+        conn.execute(
+            "INSERT INTO conversation_fts(conversation_fts, rowid, text, "
+            "search_tool, search_thinking) VALUES('delete', ?, ?, ?, ?)", row)
+        conn.execute(
+            "INSERT INTO conversation_fts(rowid, text, search_tool, "
+            "search_thinking) VALUES(?, ?, ?, ?)",
+            (row[0], "phantom postings", row[2], row[3]))
+        conn.execute("DELETE FROM cache_meta "
+                     "WHERE key LIKE 'conversation_fts_tokenizer%'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _rank1_consistent(path: pathlib.Path) -> bool:
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("INSERT INTO conversation_fts(conversation_fts, rank) "
+                     "VALUES('integrity-check', 1)")
+        return True
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        conn.close()
+
+
+@requires_fts5
+@pytest.mark.parametrize("rebuild", [False, True], ids=["routine", "rebuild"])
+def test_cache_sync_verifies_and_repairs_the_conversation_search_index(
+        env, rebuild):
+    """Detects (#1094 D6): a store whose search postings another SQLite
+    tokenizer wrote staying broken after `cache-sync` (search misses the
+    message, deleting it orphans postings), whether the run is routine or
+    `--rebuild`; and a verified store paying a rank-1 pass on every run."""
+    ns, tmp_path, monkeypatch = env
+    _write_claude_text_entry(tmp_path)
+    args = argparse.Namespace(source="claude", rebuild=False,
+                              prune_orphans=False, prune_conversations=False)
+    assert ns["cmd_cache_sync"](args) == 0
+    path = pathlib.Path(ns["_cctally_core"].CONVERSATIONS_DB_PATH)
+    _seed_stale_postings_unverified(path)
+    assert not _rank1_consistent(path)
+    calls = _fts_spy(monkeypatch)
+
+    args.rebuild = rebuild
+    assert ns["cmd_cache_sync"](args) == 0
+    [(kw, result)] = calls
+    assert kw["mode"] == "automatic"
+    assert result.outcome == "verified", result
+    claude = {ix.name: ix for ix in result.indexes}["conversation_fts"]
+    # A routine run repairs the index; `--rebuild` already rebuilt it.
+    assert claude.action == ("none" if rebuild else "rebuilt")
+    assert _rank1_consistent(path)
+
+    calls.clear()
+    args.rebuild = False
+    assert ns["cmd_cache_sync"](args) == 0
+    assert [result.outcome for _kw, result in calls] == ["skipped"]
+
+
+def test_a_failing_search_index_check_never_fails_cache_sync(env, capsys):
+    """Detects (#1094 D6): a conversation store the verification cannot open
+    turning a successful `cache-sync` (a launchd prime) into a failure exit,
+    or the failure going unreported."""
+    ns, tmp_path, monkeypatch = env
+    import _lib_conversation_fts_integrity as fts
+
+    def unopenable(**_kw):
+        raise sqlite3.DatabaseError("file is not a database")
+
+    monkeypatch.setattr(fts, "verify_conversation_fts", unopenable)
+    _write_claude_entry(tmp_path)
+    args = argparse.Namespace(source="claude", rebuild=False,
+                              prune_orphans=False, prune_conversations=False)
+    assert ns["cmd_cache_sync"](args) == 0
+    assert "file is not a database" in capsys.readouterr().err

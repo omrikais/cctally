@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>APFSContainerReference</key>
+	<string>@BACKING_CONTAINER@</string>
+	<key>APFSPhysicalStores</key>
+	<array>
+		<dict>
+			<key>APFSPhysicalStore</key>
+			<string>@PHYSICAL_STORE@</string>
+		</dict>
+	</array>
+	<key>BusProtocol</key>
+	<string>USB</string>
+	<key>DeviceIdentifier</key>
+	<string>@BACKING_DEVICE@</string>
+	<key>DeviceNode</key>
+	<string>/dev/@BACKING_DEVICE@</string>
+	<key>FilesystemName</key>
+	<string>APFS</string>
+	<key>FilesystemType</key>
+	<string>apfs</string>
+	<key>Internal</key>
+	<false/>
+	<key>MountPoint</key>
+	<string>@BACKING_VOLUME@</string>
+	<key>ParentWholeDisk</key>
+	<string>@BACKING_CONTAINER@</string>
+	<key>RemovableMediaOrExternalDevice</key>
+	<true/>
+	<key>SolidState</key>
+	<true/>
+	<key>VolumeName</key>
+	<string>@BACKING_VOLUME_NAME@</string>
+	<key>WholeDisk</key>
+	<false/>
+	<key>Writable</key>
+	<true/>
+</dict>
+</plist>

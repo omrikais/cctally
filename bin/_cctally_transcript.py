@@ -27,6 +27,7 @@ import os
 import pathlib
 import sys
 
+import _cctally_store_access as _store_access
 from _cctally_core import eprint
 from _lib_fmt import _boxed_table
 
@@ -97,10 +98,14 @@ def _cmd_transcript_export(args) -> int:
     if account_error is not None:
         return account_error
 
-    conn = c.open_conversations_db()
+    # #787 / #861 (spec 5.11, D7): the startup phase ensures cache and
+    # conversations at `process` (create, migrate, legacy bridge, as today);
+    # the read runs in a `query(command)` conversations session with
+    # in-session account scope.
+    _session, _phase = _store_access.open_command_session(
+        "conversations", attach=("cache",), account=account_key)
+    conn = _session.conn
     try:
-        if account_key is not None:
-            c.scope_conversations_db_to_account(conn, account_key)
         cq = c._load_sibling("_lib_conversation_query")
         md = cq.get_conversation_export(conn, session_id, scope)
         if md is None:
@@ -111,7 +116,7 @@ def _cmd_transcript_export(args) -> int:
             plan = cq.build_anon_plan_for_db(conn, home_dir=os.path.expanduser("~"))
             md = anon.scrub_text(md, plan)
     finally:
-        conn.close()
+        _phase.close()
 
     _emit_export(md, output)
     return 0
@@ -149,10 +154,14 @@ def _cmd_transcript_export_qualified(
     if account_error is not None:
         return account_error
 
-    conn = c.open_conversations_db()
+    # #787 / #861 (spec 5.11, D7): the startup phase ensures cache and
+    # conversations at `process` (create, migrate, legacy bridge, as today);
+    # the read runs in a `query(command)` conversations session with
+    # in-session account scope.
+    _session, _phase = _store_access.open_command_session(
+        "conversations", attach=("cache",), account=account_key)
+    conn = _session.conn
     try:
-        if account_key is not None:
-            c.scope_conversations_db_to_account(conn, account_key)
         env = disp.neutral_export(
             conn, session_id, scope=scope, effective_speed=speed)
         status = env.get("status")
@@ -188,7 +197,7 @@ def _cmd_transcript_export_qualified(
                 return 3
             md = anon.scrub_text(md, result.plan)
     finally:
-        conn.close()
+        _phase.close()
 
     _emit_export(md, output)
     return 0
@@ -240,10 +249,14 @@ def _cmd_transcript_search_claude(args) -> int:
             eprint(f"transcript: {exc}")
             return 2
 
-    conn = c.open_conversations_db()
+    # #787 / #861 (spec 5.11, D7): the startup phase ensures cache and
+    # conversations at `process` (create, migrate, legacy bridge, as today);
+    # the read runs in a `query(command)` conversations session with
+    # in-session account scope.
+    _session, _phase = _store_access.open_command_session(
+        "conversations", attach=("cache",), account=account_key)
+    conn = _session.conn
     try:
-        if account_key is not None:
-            c.scope_conversations_db_to_account(conn, account_key)
         cq = c._load_sibling("_lib_conversation_query")
         try:
             result = cq.search_conversations(
@@ -254,7 +267,7 @@ def _cmd_transcript_search_claude(args) -> int:
             eprint(f"transcript: {exc}")
             return 2
     finally:
-        conn.close()
+        _phase.close()
 
     if getattr(args, "json", False):
         payload = c.stamp_schema_version(_search_to_camel(result))
@@ -323,16 +336,20 @@ def _cmd_transcript_search_codex(args) -> int:
             eprint("transcript: invalid --cursor")
             return 2
 
-    conn = c.open_conversations_db()
+    # #787 / #861 (spec 5.11, D7): the startup phase ensures cache and
+    # conversations at `process` (create, migrate, legacy bridge, as today);
+    # the read runs in a `query(command)` conversations session with
+    # in-session account scope.
+    _session, _phase = _store_access.open_command_session(
+        "conversations", attach=("cache",), account=account_key)
+    conn = _session.conn
     try:
-        if account_key is not None:
-            c.scope_conversations_db_to_account(conn, account_key)
         result = disp.neutral_search(
             conn, query, source="codex", kind=kind,
             effective_speed=c._resolve_codex_speed("auto"),
             limit=limit, cursor=cursor)
     finally:
-        conn.close()
+        _phase.close()
 
     # normalization_pending: an empty, exit-0 answer with one stderr note — search
     # is navigation, and "nothing yet" is truthful (§4.3).

@@ -1,6 +1,8 @@
 """#968 T1 + T7 transitions: verified compression is invisible; changes are not."""
 from __future__ import annotations
 
+import datetime as dt
+import importlib
 import json
 import os
 import pathlib
@@ -1300,3 +1302,1351 @@ def test_unchanged_second_pass_is_quiet(env, monkeypatch, compressed):
     _sync_both(ns)
     assert calls["n"] == 0
     assert _full_state(ns) == adopted
+
+
+# ── #1090: retention-aware legacy equivalence (conversations side) ─────────
+
+#: A cutoff every fixture row precedes (they are stamped 2026-07-20).
+RETENTION_CUTOFF = "2026-08-01T00:00:00Z"
+RETENTION_NOW = dt.datetime(2026, 11, 13, 12, 0, tzinfo=dt.timezone.utc)
+RETRY_PREFIX = "codex_legacy_retry:v1:"
+
+
+def _session(i):
+    return f"0199aaaa-bbbb-7ccc-8ddd-eeeeffff1{i:03d}"
+
+
+def _conv_cursor(ns, path):
+    conv = ns["open_conversations_db"]()
+    try:
+        conv.row_factory = sqlite3.Row
+        return dict(conv.execute(
+            "SELECT * FROM codex_conversation_source_files WHERE path=?",
+            (str(path),)).fetchone())
+    finally:
+        conv.close()
+
+
+def _conv_keys(ns, path):
+    conv = ns["open_conversations_db"]()
+    try:
+        return sorted({r[0] for r in conv.execute(
+            "SELECT conversation_key FROM codex_conversation_events "
+            "WHERE source_path=? AND conversation_key IS NOT NULL",
+            (str(path),))})
+    finally:
+        conv.close()
+
+
+def _retry_record(ns, path):
+    conv = ns["open_conversations_db"]()
+    try:
+        row = conv.execute("SELECT value FROM cache_meta WHERE key=?",
+                           (RETRY_PREFIX + str(path),)).fetchone()
+    finally:
+        conv.close()
+    return None if row is None else json.loads(row[0])
+
+
+def _retention_delete_key(key, cutoff=RETENTION_CUTOFF):
+    """The real paced deletion of one Codex conversation key."""
+    import _cctally_core
+    retention = importlib.import_module("_lib_conversation_retention")
+    conn = retention.open_deletion_connection(_cctally_core.CONVERSATIONS_DB_PATH)
+    try:
+        result = retention.delete_group(
+            conn, retention.ExpiredGroup("codex", False, key),
+            now_utc=RETENTION_NOW, cutoff_iso=cutoff)
+    finally:
+        conn.close()
+    assert result.outcome == "ok", result
+    return result
+
+
+def _alter_first_event(ns, path):
+    conv = ns["open_conversations_db"]()
+    try:
+        cur = conv.execute(
+            "UPDATE codex_conversation_events SET payload_json=payload_json||' ' "
+            "WHERE id=(SELECT MIN(id) FROM codex_conversation_events "
+            "WHERE source_path=?)", (str(path),))
+        assert cur.rowcount == 1
+        conv.commit()
+    finally:
+        conv.close()
+
+
+def test_pruned_proven_legacy_cursor_verifies_and_differing_control_stays_rejected(env):
+    """#1090 T1 (A1, A2): a legacy conversations cursor whose only key the
+    real `delete_group` removed under a cutoff its rows precede verifies,
+    while a cursor with one genuinely differing retained event stays
+    rejected. Detects the defect: a pruned rollout stays unverified forever,
+    and its converse, a retained difference being adopted."""
+    ns, _provider, day = env
+    pruned, control = day / _name(1), day / _name(2)
+    write_rollout(pruned, conversation_records(2, session_id=_session(1), label="p"))
+    write_rollout(control, conversation_records(2, session_id=_session(2), label="c"))
+    _sync_both(ns)
+    _drop_anchors(ns)
+    [key] = _conv_keys(ns, pruned)
+    _retention_delete_key(key)
+    assert _conv_keys(ns, pruned) == []
+    _alter_first_event(ns, control)
+    _compress(pruned)
+    _compress(control)
+    _sync_both(ns)
+    assert _conv_cursor(ns, pruned)["container_state"] == "pending"
+    _drain(ns)
+    a, b = _conv_cursor(ns, pruned), _conv_cursor(ns, control)
+    assert (a["container_state"], a["container_state_reason"]) == ("accepted", None)
+    assert (b["container_state"], b["container_state_reason"]) == (
+        "unverified", "legacy-inequivalent")
+    assert _conv_keys(ns, pruned) == [], "no row is recreated at adoption"
+    assert _retry_record(ns, pruned) is None
+    record = _retry_record(ns, control)
+    assert record is not None and record["keys"] == _conv_keys(ns, control)
+    assert record["fp"] == b["pending_container_fingerprint"]
+
+
+def _retention_lib():
+    return importlib.import_module("_lib_conversation_retention")
+
+
+def _with_conv(ns, action):
+    conv = ns["open_conversations_db"]()
+    try:
+        result = action(conv)
+        conv.commit()
+        return result
+    finally:
+        conv.close()
+
+
+def _set_proof(ns, cutoff):
+    _with_conv(ns, lambda c: _retention_lib()._merge_applied_cutoff(c, cutoff))
+
+
+def _prune_key(ns, key):
+    """Retention's own deletion kernel for one key (unpaced; proof is set
+    separately so each case controls it)."""
+    _with_conv(ns, lambda c: _retention_lib()._delete_codex_conversation(c, key))
+
+
+def _prune_null_path(ns, path):
+    _with_conv(ns, lambda c: _retention_lib()._delete_codex_null_path(c, str(path)))
+
+
+def _root_key(ns, path):
+    return _conv_cursor(ns, path)["source_root_key"]
+
+
+FOREIGN = "/elsewhere/rollout-foreign.jsonl"
+
+
+def _insert_foreign_event(ns, key, root, *, line_offset=0):
+    _with_conv(ns, lambda c: c.execute(
+        "INSERT INTO codex_conversation_events (source_path, line_offset, "
+        "source_root_key, conversation_key, timestamp_utc, record_type, "
+        "payload_json) VALUES (?, ?, ?, ?, '2026-07-20T10:00:00Z', "
+        "'event_msg', '{}')", (FOREIGN, line_offset, root, key)))
+
+
+def _insert_foreign_message(ns, key, root):
+    _with_conv(ns, lambda c: c.execute(
+        "INSERT INTO codex_conversation_messages (conversation_key, "
+        "source_root_key, source_path, line_offset, timestamp_utc, kind, "
+        "record_family, content_digest, content_len) VALUES "
+        "(?, ?, ?, 0, '2026-07-20T10:00:00Z', 'user', 'message', 'd', 0)",
+        (key, root, FOREIGN)))
+
+
+def _delete_foreign(ns):
+    _with_conv(ns, lambda c: c.execute(
+        "DELETE FROM codex_conversation_events WHERE source_path=?", (FOREIGN,)))
+
+
+def _newest_stamp(ns, key):
+    def read(conn):
+        return max(v for (v,) in conn.execute(
+            "SELECT MAX(timestamp_utc) FROM codex_conversation_events "
+            "WHERE conversation_key=? UNION ALL SELECT MAX(timestamp_utc) "
+            "FROM codex_conversation_messages WHERE conversation_key=?",
+            (key, key)) if v is not None)
+    return _with_conv(ns, read)
+
+
+def _null_lead():
+    """Two identity-less physical events ahead of the first session_meta."""
+    return [{"timestamp": "2026-07-20T09:59:5%d.000Z" % i, "type": "event_msg",
+             "payload": {"type": "task_started", "seq": i}} for i in (1, 2)]
+
+
+def _undated(records):
+    return [{k: v for k, v in r.items() if k != "timestamp"} for r in records]
+
+
+def _null_events(ns, path):
+    return _with_conv(ns, lambda c: c.execute(
+        "SELECT COUNT(*) FROM codex_conversation_events "
+        "WHERE conversation_key IS NULL AND source_path=?",
+        (str(path),)).fetchone()[0])
+
+
+#: case -> (files, expected (state, reason)). Files: "target" plus optional
+#: "sibling"; each a records list.
+def _t2_files(case):
+    one = conversation_records(2, session_id=_session(1), label="t")
+    two = one + conversation_records(1, session_id=_session(2), label="u")
+    if case in ("mixed-differing", "mixed-matching"):
+        return {"target": two}
+    if case in ("derived-null-message", "null-group-per-path"):
+        files = {"target": _null_lead() + one}
+        if case == "null-group-per-path":
+            files["sibling"] = _null_lead() + conversation_records(
+                1, session_id=_session(3), label="s")
+        return files
+    if case == "sibling-path":
+        return {"target": one, "sibling": conversation_records(
+            1, session_id=_session(1), label="s")}
+    if case == "all-null-timestamps":
+        return {"target": _undated(one)}
+    if case == "text-order-spelling":
+        records = [dict(r) for r in one]
+        records[-1]["timestamp"] = "2026-07-20T10:00:14.500Z"
+        return {"target": records}
+    return {"target": one}
+
+
+T2_CASES = {
+    "mixed-differing": ("unverified", "legacy-inequivalent"),
+    "mixed-matching": ("accepted", None),
+    "derived-null-message": ("unverified", "legacy-inequivalent"),
+    "events-elsewhere": ("unverified", "legacy-inequivalent"),
+    "messages-elsewhere": ("unverified", "legacy-inequivalent"),
+    "sibling-path": ("unverified", "legacy-inequivalent"),
+    "null-group-per-path": ("accepted", None),
+    "all-null-timestamps": ("unverified", "legacy-inequivalent"),
+    "newest-equals-cutoff": ("unverified", "legacy-inequivalent"),
+    "text-order-spelling": ("accepted", None),
+    "stamp-only": ("unverified", "legacy-inequivalent"),
+    "retention-off-history": ("accepted", None),
+}
+
+
+def _t2_mutate(ns, monkeypatch, case, target, sibling):
+    """Retention's effect on the store, the proof, and the case's twist."""
+    keys = _conv_keys(ns, target)
+    key = keys[0]
+    root = _root_key(ns, target)
+    proof = RETENTION_CUTOFF
+    if case in ("mixed-differing", "mixed-matching"):
+        assert len(keys) == 2
+        first = min(keys, key=lambda k: _with_conv(ns, lambda c: c.execute(
+            "SELECT MIN(line_offset) FROM codex_conversation_events "
+            "WHERE conversation_key=?", (k,)).fetchone()[0]))
+        _prune_key(ns, first)
+        if case == "mixed-differing":
+            _alter_first_event(ns, target)
+    elif case in ("derived-null-message", "null-group-per-path"):
+        assert _null_events(ns, target) == 2
+        _prune_null_path(ns, target)
+        if case == "null-group-per-path":
+            assert _null_events(ns, sibling) == 2
+        else:
+            cache = sys.modules["_cctally_cache"]
+            real = cache._codex_prefix_facts
+
+            def with_null_message(*args, **kwargs):
+                facts = real(*args, **kwargs)
+                stray = (-1, None) + facts.messages[0][2:]
+                return facts._replace(messages=sorted(facts.messages + [stray]))
+
+            monkeypatch.setattr(cache, "_codex_prefix_facts", with_null_message)
+    elif case == "sibling-path":
+        _with_conv(ns, lambda c: (
+            c.execute("DELETE FROM codex_conversation_messages "
+                      "WHERE source_path=?", (str(target),)),
+            c.execute("DELETE FROM codex_conversation_events "
+                      "WHERE source_path=?", (str(target),))))
+        assert _conv_keys(ns, sibling) == [key]
+    else:
+        if case == "newest-equals-cutoff":
+            proof = _newest_stamp(ns, key)
+        elif case == "text-order-spelling":
+            newest = _newest_stamp(ns, key)
+            assert newest == "2026-07-20T10:00:14.500000Z", newest
+            proof = "2026-07-20T10:00:14Z"   # chronologically earlier
+        _prune_key(ns, key)
+        if case == "events-elsewhere":
+            _insert_foreign_event(ns, key, root)
+        elif case == "messages-elsewhere":
+            _insert_foreign_message(ns, key, root)
+    if case == "stamp-only":
+        _with_conv(ns, lambda c: _retention_lib()._stamp_retention_prune(
+            c, RETENTION_NOW))
+    else:
+        _set_proof(ns, proof)
+    if case == "retention-off-history":
+        import _cctally_core
+        import _retention_fixtures as rfx
+        rfx.write_retention(pathlib.Path(_cctally_core.APP_DIR), 0)
+
+
+@pytest.mark.parametrize("case", sorted(T2_CASES))
+def test_retention_absent_group_boundaries(env, monkeypatch, case):
+    """#1090 T2: one builder, one case per §6 T2 bullet. Detects false
+    acceptance (a group present anywhere, an unproven or undated group, a
+    NULL group with a derived NULL-key message) and the likely false
+    rejection (a mixed file whose exempt group sits beside a matching
+    retained one; SQLite text order of timestamp spellings; proof kept with
+    retention off)."""
+    ns, _provider, day = env
+    files = _t2_files(case)
+    target = day / _name(1)
+    sibling = day / _name(2) if "sibling" in files else None
+    write_rollout(target, files["target"])
+    if sibling is not None:
+        write_rollout(sibling, files["sibling"])
+    _sync_both(ns)
+    _drop_anchors(ns)
+    _compress(target)
+    _sync_both(ns)
+    assert _conv_cursor(ns, target)["container_state"] == "pending"
+    derived_keys = _conv_keys(ns, target)
+    _t2_mutate(ns, monkeypatch, case, target, sibling)
+    _drain(ns)
+    cursor = _conv_cursor(ns, target)
+    assert (cursor["container_state"],
+            cursor["container_state_reason"]) == T2_CASES[case], case
+    record = _retry_record(ns, target)
+    if T2_CASES[case][0] == "accepted":
+        assert record is None
+        return
+    assert record["fp"] == cursor["pending_container_fingerprint"]
+    if case == "all-null-timestamps":
+        assert record["permanent"] is True, record
+    if case in ("newest-equals-cutoff", "stamp-only"):
+        assert record["permanent"] is False
+        assert record["threshold"] == "2026-07-20T10:00:14Z", record
+    if case in ("events-elsewhere", "messages-elsewhere", "sibling-path"):
+        # The group still has rows elsewhere: its deletion could matter.
+        assert record["keys"] == derived_keys, record
+        assert record["threshold"] is None and record["permanent"] is False
+    if case == "mixed-differing":
+        assert record["keys"] == _conv_keys(ns, target), record
+    if case == "derived-null-message":
+        # The NULL group can never qualify; the retained key stays a
+        # dependency and the path no longer holds NULL-key events.
+        assert record["permanent"] is True and record["nullGroup"] is False
+        assert record["keys"] == derived_keys, record
+
+
+def _legacy_single(env, *, label="t"):
+    ns, _provider, day = env
+    path = day / _name(1)
+    write_rollout(path, conversation_records(2, session_id=_session(1),
+                                             label=label))
+    _sync_both(ns)
+    _drop_anchors(ns)
+    _compress(path)
+    _sync_both(ns)
+    assert _conv_cursor(ns, path)["container_state"] == "pending"
+    [key] = _conv_keys(ns, path)
+    return ns, path, key
+
+
+@pytest.mark.parametrize("rows", ["retained", "absent"])
+def test_watermark_only_resume_difference_adopts_and_keeps_stored_watermark(
+        env, rows):
+    """#1090 T3 (Q3): a conversations-side legacy cursor whose resume tuple
+    differs only in `last_total_tokens` adopts, with its rows retained and
+    with them retention-absent, and the stored watermark survives adoption.
+    Detects a lost resume field and a rewritten watermark."""
+    ns, path, key = _legacy_single(env)
+    _with_conv(ns, lambda c: c.execute(
+        "UPDATE codex_conversation_source_files SET last_total_tokens=? "
+        "WHERE path=?", (4_843_451, str(path))))
+    if rows == "absent":
+        _prune_key(ns, key)
+        _set_proof(ns, RETENTION_CUTOFF)
+    _drain(ns)
+    cursor = _conv_cursor(ns, path)
+    assert (cursor["container_state"], cursor["container_state_reason"]) == (
+        "accepted", None)
+    assert cursor["last_total_tokens"] == 4_843_451
+    assert _retry_record(ns, path) is None
+
+
+def test_turn_resume_difference_stays_rejected_with_permanent_record(env):
+    """#1090 T3: a turn difference is a compared resume field, so the row
+    stays `unverified/legacy-inequivalent` with a permanent record that no
+    retention transition re-arms. Detects a dropped turn comparison."""
+    ns, path, key = _legacy_single(env)
+    _with_conv(ns, lambda c: c.execute(
+        "UPDATE codex_conversation_source_files SET last_turn_id=? "
+        "WHERE path=?", ("different-turn", str(path))))
+    _set_proof(ns, RETENTION_CUTOFF)
+    _drain(ns)
+    cursor = _conv_cursor(ns, path)
+    assert (cursor["container_state"], cursor["container_state_reason"]) == (
+        "unverified", "legacy-inequivalent")
+    assert cursor["last_turn_id"] == "different-turn"
+    record = _retry_record(ns, path)
+    assert record == {"fp": cursor["pending_container_fingerprint"],
+                      "permanent": True, "cacheHeld": False, "keys": [key],
+                      "nullGroup": False, "threshold": None}
+
+
+def _race_seam(monkeypatch, mutate):
+    """Run `mutate(n)` after the n-th conversations-side preparation."""
+    cache = sys.modules["_cctally_cache"]
+    real = cache._verify_codex_container
+    calls = []
+
+    def seam(conn, table, snap, selected):
+        verdict = real(conn, table, snap, selected)
+        if table == "codex_conversation_source_files":
+            calls.append(verdict.outcome)
+            mutate(len(calls))
+        return verdict
+
+    monkeypatch.setattr(cache, "_verify_codex_container", seam)
+    return calls
+
+
+def test_deletion_between_prepare_and_apply_ends_in_adoption(env, monkeypatch):
+    """#1090 T5 race (§5.5): a deletion that lands after preparation turns
+    the prepared rejection into equality; application sees the change,
+    writes nothing and re-prepares, and the row adopts. Detects a stale
+    rejection committed against a changed store."""
+    ns, path, key = _legacy_single(env)
+    _set_proof(ns, RETENTION_CUTOFF)
+    _alter_first_event(ns, path)
+
+    def mutate(n):
+        if n == 1:
+            _prune_key(ns, key)
+
+    calls = _race_seam(monkeypatch, mutate)
+    result = _drain(ns)
+    assert calls == ["unverified", "adopt"]
+    cursor = _conv_cursor(ns, path)
+    assert (cursor["container_state"], cursor["container_state_reason"]) == (
+        "accepted", None)
+    assert result.retried >= 1 and _retry_record(ns, path) is None
+
+
+def test_sibling_insertion_between_prepare_and_apply_ends_in_rejection_naming_key(
+        env, monkeypatch):
+    """#1090 T5 race (§5.5): rows for an exempt key inserted on a sibling
+    path after preparation turn equality into rejection; the row ends
+    rejected, and its record names that key. Detects an adoption committed
+    while the exempt group was reappearing."""
+    ns, path, key = _legacy_single(env)
+    root = _root_key(ns, path)
+    _prune_key(ns, key)
+    _set_proof(ns, RETENTION_CUTOFF)
+
+    def mutate(n):
+        if n == 1:
+            _insert_foreign_event(ns, key, root)
+
+    calls = _race_seam(monkeypatch, mutate)
+    _drain(ns)
+    assert calls == ["adopt", "unverified"]
+    cursor = _conv_cursor(ns, path)
+    assert (cursor["container_state"], cursor["container_state_reason"]) == (
+        "unverified", "legacy-inequivalent")
+    record = _retry_record(ns, path)
+    assert record["keys"] == [key] and record["permanent"] is False
+
+
+def test_three_changes_leave_row_pending_and_drain_completes(env, monkeypatch):
+    """#1090 T5 race (§5.5): a writer that changes the result after every
+    preparation costs at most two retries; the third change leaves the row
+    `pending` and the drain still completes. Detects an unbounded retry
+    loop that would stall the drain."""
+    ns, path, key = _legacy_single(env)
+    root = _root_key(ns, path)
+    _prune_key(ns, key)
+    _set_proof(ns, RETENTION_CUTOFF)
+
+    def mutate(n):
+        if n % 2:
+            _insert_foreign_event(ns, key, root)
+        else:
+            _delete_foreign(ns)
+
+    calls = _race_seam(monkeypatch, mutate)
+    result = _drain(ns)
+    assert calls == ["adopt", "unverified", "adopt"]
+    assert result.outcome == "drained"
+    assert result.pending >= 1
+    cursor = _conv_cursor(ns, path)
+    assert cursor["container_state"] == "pending"
+    assert _retry_record(ns, path) is None
+
+
+# ── #1090 T5: the re-arm evaluator and its two entrances (§5.4) ────────────
+
+ENTRANCES = ["pass", "drain"]
+REARM = "_reevaluate_codex_legacy_rejections"
+
+
+def _rearm_spy(monkeypatch):
+    """Record every evaluator call: (re-armed, writes it made, rows after).
+
+    `writes` is the connection's `total_changes` delta across the call, so an
+    unchanged state is observable at either entrance."""
+    cache = sys.modules["_cctally_cache"]
+    real = getattr(cache, REARM, None)
+    calls = []
+    if real is None:                       # RED on a tree without it
+        return calls
+
+    def spy(conn):
+        before = conn.total_changes
+        rearmed = real(conn)
+        rows = {r[0]: tuple(r[1:]) for r in conn.execute(
+            "SELECT path, container_state, container_state_reason, "
+            "pending_container_fingerprint FROM codex_conversation_source_files")}
+        calls.append((rearmed, conn.total_changes - before, rows))
+        return rearmed
+
+    monkeypatch.setattr(cache, REARM, spy)
+    return calls
+
+
+def _enter(ns, entrance):
+    """One evaluator entrance: a full conversation pass, or a drain run."""
+    if entrance == "pass":
+        conv = ns["open_conversations_db"]()
+        try:
+            return ns["sync_codex_conversations"](conv, maintenance="caller")
+        finally:
+            conv.close()
+    return _drain(ns)
+
+
+def _state_of(ns, path):
+    cursor = _conv_cursor(ns, path)
+    return (cursor["container_state"], cursor["container_state_reason"])
+
+
+def _assert_rearms_and_adopts(ns, entrance, calls, path, fp):
+    """The entrance re-arms ``path`` keeping ``fp``; the drain then adopts."""
+    result = _enter(ns, entrance)
+    rearmed = [rows[str(path)] for n, _w, rows in calls if n]
+    assert rearmed and rearmed[0] == ("pending", "legacy-reverify", fp), calls
+    if entrance == "pass":
+        assert _state_of(ns, path) == ("pending", "legacy-reverify")
+        assert _conv_cursor(ns, path)["pending_container_fingerprint"] == fp
+        assert "_codex-replay-drain" in result.drain_requested
+        _drain(ns)
+    assert _state_of(ns, path) == ("accepted", None)
+    assert _retry_record(ns, path) is None
+
+
+def _proof(ns):
+    return _with_conv(ns, lambda c: _retention_lib().retention_cutoff_proof(c))
+
+
+def _reject_directly(ns, path, *, reason="legacy-inequivalent", fp=None):
+    """A rejection as an older binary writes it: no retry record."""
+    def write(conn):
+        if fp is None:
+            conn.execute(
+                "UPDATE codex_conversation_source_files SET "
+                "container_state='unverified', container_state_reason=? "
+                "WHERE path=?", (reason, str(path)))
+        else:
+            conn.execute(
+                "UPDATE codex_conversation_source_files SET "
+                "container_state='unverified', container_state_reason=?, "
+                "pending_container_fingerprint=? WHERE path=?",
+                (reason, fp, str(path)))
+    _with_conv(ns, write)
+    assert _retry_record(ns, path) is None
+
+
+def _sibling_dependency(env):
+    """A legacy target whose only key K still has rows on a sibling path S:
+    rejected, with a non-permanent record whose dependency is K."""
+    ns, _provider, day = env
+    target, sibling = day / _name(1), day / _name(2)
+    write_rollout(target, conversation_records(2, session_id=_session(1),
+                                               label="t"))
+    write_rollout(sibling, conversation_records(2, session_id=_session(1),
+                                                label="s"))
+    _sync_both(ns)
+    _drop_anchors(ns)
+    _compress(target)
+    _sync_both(ns)
+    [key] = _conv_keys(ns, target)
+    assert _conv_keys(ns, sibling) == [key]
+    _with_conv(ns, lambda c: (
+        c.execute("DELETE FROM codex_conversation_messages WHERE source_path=?",
+                  (str(target),)),
+        c.execute("DELETE FROM codex_conversation_events WHERE source_path=?",
+                  (str(target),))))
+    _set_proof(ns, RETENTION_CUTOFF)
+    _drain(ns)
+    assert _state_of(ns, target) == ("unverified", "legacy-inequivalent")
+    record = _retry_record(ns, target)
+    assert record["keys"] == [key] and record["permanent"] is False, record
+    assert record["threshold"] is None and record["cacheHeld"] is False
+    return ns, target, sibling, key
+
+
+def _leave_population(ns, key):
+    """Take ``key`` out of the publication barrier's population (a
+    conversation outside it keeps the ordinary walk, #968 residual R4)."""
+    conn = ns["open_cache_db"]()
+    try:
+        for table in ("codex_barrier_population", "codex_barrier_certificates",
+                      "codex_barrier_repairs", "codex_barrier_entry_threads"):
+            conn.execute(f"DELETE FROM {table} WHERE conversation_key=?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _legacy_files(env, count):
+    ns, _provider, day = env
+    paths = [day / _name(i) for i in range(1, count + 1)]
+    for i, path in enumerate(paths, start=1):
+        write_rollout(path, conversation_records(2, session_id=_session(i),
+                                                 label=f"f{i}"))
+    _sync_both(ns)
+    _drop_anchors(ns)
+    for path in paths:
+        _compress(path)
+    _sync_both(ns)
+    keys = []
+    for path in paths:
+        assert _state_of(ns, path)[0] == "pending"
+        [key] = _conv_keys(ns, path)
+        keys.append(key)
+    return ns, paths, keys
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+def test_bootstrap_rearms_recordless_prefix_rejection(env, monkeypatch, entrance):
+    """#1090 T5 bootstrap (§5.4 (a), §5.6): a pre-fix `legacy-inequivalent`
+    row with no retry record, on a store with proof, is re-armed at the next
+    entrance with its fingerprint kept, and drains to adoption. Detects the
+    pre-fix backlog staying terminal after the upgrade (no migration runs)."""
+    ns, [path], [key] = _legacy_files(env, 1)
+    _prune_key(ns, key)
+    _set_proof(ns, RETENTION_CUTOFF)
+    _reject_directly(ns, path)
+    fp = _conv_cursor(ns, path)["pending_container_fingerprint"]
+    assert fp is not None
+    calls = _rearm_spy(monkeypatch)
+    _assert_rearms_and_adopts(ns, entrance, calls, path, fp)
+    assert _conv_keys(ns, path) == []
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+def test_compressed_rejection_is_not_rearmed_while_the_decoder_is_unavailable(
+        env, monkeypatch, entrance):
+    """#1090 T5 (§5.4): a rejected compressed row whose trigger fired is left
+    `unverified` while no zstd decoder is available, with no writes, and is
+    re-armed and adopted once the decoder returns. Re-arming it then would
+    leave a `pending` row the drain can never verify: verification debt and a
+    drain request on every pass, where `main` keeps the row quiet."""
+    ns, [path], [key] = _legacy_files(env, 1)
+    _prune_key(ns, key)
+    _set_proof(ns, RETENTION_CUTOFF)
+    _reject_directly(ns, path)
+    fp = _conv_cursor(ns, path)["pending_container_fingerprint"]
+    assert rc.ContainerFingerprint.from_json(fp).kind == rc.ZSTD
+    before = _conv_cursor(ns, path)
+    backend = rc.resolve_zstd_backend
+    monkeypatch.setattr(rc, "resolve_zstd_backend", lambda: rc.UNAVAILABLE)
+    calls = _rearm_spy(monkeypatch)
+    _enter(ns, entrance)
+    assert calls and all(n == 0 and w == 0 for n, w, _rows in calls), calls
+    assert _conv_cursor(ns, path) == before
+    monkeypatch.setattr(rc, "resolve_zstd_backend", backend)
+    calls.clear()
+    _assert_rearms_and_adopts(ns, entrance, calls, path, fp)
+
+
+def _stamp_prune(ns):
+    """Retention's own history stamp, as its visit writes it after a prune."""
+    _with_conv(ns, lambda c: _retention_lib()._stamp_retention_prune(
+        c, RETENTION_NOW))
+
+
+def _prune_stamp(ns):
+    rows = _with_conv(ns, lambda c: c.execute(
+        "SELECT value FROM cache_meta WHERE key=?",
+        (_retention_lib()._RETENTION_LAST_PRUNE_KEY,)).fetchall())
+    return rows[0][0] if rows else None
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+def test_recordless_rejection_on_a_never_pruned_store_rearms_without_proof(
+        env, monkeypatch, entrance):
+    """#1090 T5 (§5.4 (a)): a store with no retention history (no prune
+    stamp) and no proof cannot owe a rejection to retention, so a recordless
+    pre-fix rejection — here a watermark-only resume difference, which Q3 now
+    accepts — is re-armed at the next entrance and adopts, keeping its stored
+    watermark. Detects a never-pruned store's backlog staying terminal."""
+    ns, path, _key = _legacy_single(env)
+    _with_conv(ns, lambda c: c.execute(
+        "UPDATE codex_conversation_source_files SET last_total_tokens=? "
+        "WHERE path=?", (4_843_451, str(path))))
+    _reject_directly(ns, path)
+    assert _proof(ns) is None and _prune_stamp(ns) is None
+    fp = _conv_cursor(ns, path)["pending_container_fingerprint"]
+    assert fp is not None
+    calls = _rearm_spy(monkeypatch)
+    _assert_rearms_and_adopts(ns, entrance, calls, path, fp)
+    assert _conv_cursor(ns, path)["last_total_tokens"] == 4_843_451
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+def test_recordless_rejection_on_a_pruned_store_waits_for_proof(
+        env, monkeypatch, entrance):
+    """#1090 T5 (§5.4 (a)): on a store that has pruned (a prune stamp) but
+    holds no proof yet, a recordless rejection is left as it is, with no
+    writes, and is re-armed once an applied cutoff is merged. Detects a
+    pruned store re-verifying its backlog twice (before and after proof)."""
+    ns, path, key = _legacy_single(env)
+    _prune_key(ns, key)
+    _stamp_prune(ns)
+    _reject_directly(ns, path)
+    assert _proof(ns) is None and _prune_stamp(ns) is not None
+    before = _conv_cursor(ns, path)
+    calls = _rearm_spy(monkeypatch)
+    _enter(ns, entrance)
+    assert calls and all(n == 0 and w == 0 for n, w, _rows in calls), calls
+    assert _conv_cursor(ns, path) == before
+    assert _retry_record(ns, path) is None
+    _set_proof(ns, RETENTION_CUTOFF)
+    calls.clear()
+    _assert_rearms_and_adopts(ns, entrance, calls, path,
+                              before["pending_container_fingerprint"])
+    assert _conv_keys(ns, path) == []
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+@pytest.mark.parametrize("writer", ["delete_group", "orphan_prune",
+                                    "sibling_reset"])
+def test_dependency_deletion_by_any_writer_rearms(env, monkeypatch, entrance,
+                                                  writer):
+    """#1090 T5 dependency deletion (§5.4 (b)): the rejected row's dependency
+    key loses its last rows elsewhere — by retention's `delete_group`, by the
+    orphan-prune worker deleting the sibling path, or by the sibling's file
+    reset — with no change to the retention proof; the row is re-armed at the
+    next entrance and adopts. Detects a missed retry when a writer other than
+    retention removes the blocking rows."""
+    ns, target, sibling, key = _sibling_dependency(env)
+    proof = _proof(ns)
+    fp = _conv_cursor(ns, target)["pending_container_fingerprint"]
+    if writer == "delete_group":
+        _retention_delete_key(key)
+    elif writer == "orphan_prune":
+        sibling.unlink()
+        _sync_both(ns)
+        cache = sys.modules["_cctally_cache"]
+        cache.run_codex_prune_drain(wait_for_requests=False)
+        result = cache.run_codex_conversation_prune_drain(wait_for_requests=False)
+        assert result.identities_deleted == 1, result
+    else:
+        # Inside the barrier population the walk defers this reset for as
+        # long as K's other contributor (the target) is terminal (#1052), so
+        # the reset writer can only remove a key outside the population.
+        _leave_population(ns, key)
+        size = sibling.stat().st_size
+        write_rollout(sibling, conversation_records(1, session_id=_session(9),
+                                                    label="z"))
+        assert sibling.stat().st_size < size
+        _sync_both(ns)
+    assert _with_conv(ns, lambda c: c.execute(
+        "SELECT (SELECT COUNT(*) FROM codex_conversation_events "
+        "WHERE conversation_key=?) + (SELECT COUNT(*) FROM "
+        "codex_conversation_messages WHERE conversation_key=?)",
+        (key, key)).fetchone()[0]) == 0
+    assert _proof(ns) == proof, "the writer changed no retention evidence"
+    assert _state_of(ns, target) == ("unverified", "legacy-inequivalent")
+    calls = _rearm_spy(monkeypatch)
+    _assert_rearms_and_adopts(ns, entrance, calls, target, fp)
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+def test_retained_only_key_deletion_rearms(env, monkeypatch, entrance):
+    """#1090 T5 (§5.3 `keys`): a key the target path retains but the rollout
+    never derives blocks equivalence until it is deleted; its deletion
+    re-arms the row, which then adopts. Detects a record that names only
+    derived keys."""
+    ns, [path], [key] = _legacy_files(env, 1)
+    root = _root_key(ns, path)
+    stray = "codex:stray-retained-key"
+    _with_conv(ns, lambda c: c.execute(
+        "INSERT INTO codex_conversation_events (source_path, line_offset, "
+        "source_root_key, conversation_key, timestamp_utc, record_type, "
+        "payload_json) VALUES (?, 999999, ?, ?, '2026-07-20T10:00:00Z', "
+        "'event_msg', '{}')", (str(path), root, stray)))
+    _set_proof(ns, RETENTION_CUTOFF)
+    _drain(ns)
+    assert _state_of(ns, path) == ("unverified", "legacy-inequivalent")
+    record = _retry_record(ns, path)
+    assert record["keys"] == sorted([key, stray]), record
+    fp = _conv_cursor(ns, path)["pending_container_fingerprint"]
+    _retention_delete_key(stray)
+    calls = _rearm_spy(monkeypatch)
+    _assert_rearms_and_adopts(ns, entrance, calls, path, fp)
+    assert _conv_keys(ns, path) == [key], "the retained key is untouched"
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+@pytest.mark.parametrize("retention", ["on", "off"])
+def test_downgrade_rejection_is_rearmed_at_the_next_entrance(
+        env, monkeypatch, entrance, retention):
+    """#1090 T5 downgrade (§5.4 (a), no token): after the store has been
+    evaluated once, a recordless rejection written as an older binary writes
+    it is re-armed at the next entrance when proof exists — with retention on,
+    and with retention turned off and only its historical proof. Detects a
+    one-time marker or token that would hide a later rejection."""
+    ns, [path], [key] = _legacy_files(env, 1)
+    _prune_key(ns, key)
+    _set_proof(ns, RETENTION_CUTOFF)
+    cache = sys.modules["_cctally_cache"]
+    assert _with_conv(ns, cache._reevaluate_codex_legacy_rejections) == 0
+    _reject_directly(ns, path)
+    if retention == "off":
+        import _cctally_core
+        import _retention_fixtures as rfx
+        rfx.write_retention(pathlib.Path(_cctally_core.APP_DIR), 0)
+    fp = _conv_cursor(ns, path)["pending_container_fingerprint"]
+    calls = _rearm_spy(monkeypatch)
+    _assert_rearms_and_adopts(ns, entrance, calls, path, fp)
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+@pytest.mark.parametrize("permanent", [False, True],
+                         ids=["threshold", "permanent"])
+def test_threshold_crossing_rearms_and_permanent_never_does(
+        env, monkeypatch, entrance, permanent):
+    """#1090 T5 threshold (§5.4 (c)): an absent group whose newest stamp
+    equals the proof is rejected with that stamp as its threshold; once the
+    proof passes it, the row re-arms and adopts. A permanent record (here a
+    turn difference) whose threshold the proof has passed is never re-armed.
+    Detects a missed retry on cutoff advance, and an endless retry of a row
+    no retention transition can fix."""
+    ns, [path], [key] = _legacy_files(env, 1)
+    newest = _newest_stamp(ns, key)
+    _prune_key(ns, key)
+    _set_proof(ns, newest)
+    if permanent:
+        _with_conv(ns, lambda c: c.execute(
+            "UPDATE codex_conversation_source_files SET last_turn_id=? "
+            "WHERE path=?", ("different-turn", str(path))))
+    _drain(ns)
+    assert _state_of(ns, path) == ("unverified", "legacy-inequivalent")
+    record = _retry_record(ns, path)
+    assert record["threshold"] == newest and record["permanent"] is permanent
+    fp = _conv_cursor(ns, path)["pending_container_fingerprint"]
+    _set_proof(ns, RETENTION_CUTOFF)
+    calls = _rearm_spy(monkeypatch)
+    if not permanent:
+        _assert_rearms_and_adopts(ns, entrance, calls, path, fp)
+        return
+    _enter(ns, entrance)
+    assert calls and all(n == 0 and w == 0 for n, w, _rows in calls), calls
+    assert _state_of(ns, path) == ("unverified", "legacy-inequivalent")
+    assert _retry_record(ns, path) == record
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+def test_unchanged_state_writes_nothing(env, monkeypatch, entrance):
+    """#1090 T5 (§5.4 invariants): with a valid non-permanent record whose
+    dependency still has rows and no other trigger, the evaluator writes
+    nothing (`total_changes` unchanged) and the row stays rejected. Detects
+    a retry without relevant progress, or a write on every pass."""
+    ns, target, _sibling, _key = _sibling_dependency(env)
+    record = _retry_record(ns, target)
+    calls = _rearm_spy(monkeypatch)
+    _enter(ns, entrance)
+    assert calls and all(n == 0 and w == 0 for n, w, _rows in calls), calls
+    assert _state_of(ns, target) == ("unverified", "legacy-inequivalent")
+    assert _retry_record(ns, target) == record
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+def test_failed_rearm_transaction_rolls_back_and_retries(env, monkeypatch,
+                                                         entrance):
+    """#1090 T5 rollback (§5.4 writes): an error inside the evaluator's write
+    transaction leaves every row `unverified`, and the next entrance re-arms
+    them all. Detects a partial re-arm, or evaluator state that suppresses
+    the retry."""
+    ns, paths, keys = _legacy_files(env, 2)
+    for path, key in zip(paths, keys):
+        _prune_key(ns, key)
+        _reject_directly(ns, path)
+    _set_proof(ns, RETENTION_CUTOFF)
+    cache = sys.modules["_cctally_cache"]
+    raised = []
+
+    def fail(*args):
+        raised.append(args)
+        raise sqlite3.OperationalError("injected")
+
+    monkeypatch.setattr(cache, "_CODEX_LEGACY_REARM_PRECOMMIT_HOOK", fail,
+                        raising=False)
+    calls = _rearm_spy(monkeypatch)
+    _enter(ns, entrance)
+    assert raised, "the injected failure ran inside the write transaction"
+    assert calls and all(n == 0 for n, _w, _rows in calls), calls
+    for path in paths:
+        assert _state_of(ns, path) == ("unverified", "legacy-inequivalent")
+    monkeypatch.setattr(cache, "_CODEX_LEGACY_REARM_PRECOMMIT_HOOK", None)
+    calls.clear()
+    _enter(ns, entrance)
+    assert calls and calls[0][0] == 2, calls
+    if entrance == "pass":
+        _drain(ns)
+    for path in paths:
+        assert _state_of(ns, path) == ("accepted", None)
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+def test_cache_side_and_boundary_rows_are_never_rearmed(env, monkeypatch,
+                                                        entrance):
+    """#1090 T5 (Q4): with proof present and no record, a conversations
+    `legacy-boundary` row and a cache-side `unverified` row are left exactly
+    as they are. Detects a re-arm outside the reasons the record covers."""
+    ns, [boundary, cache_row], keys = _legacy_files(env, 2)
+    _prune_key(ns, keys[0])
+    _set_proof(ns, RETENTION_CUTOFF)
+    _reject_directly(ns, boundary, reason="legacy-boundary")
+    _drain(ns)        # the cache side settles; boundary stays as written
+    cache_conn = ns["open_cache_db"]()
+    try:
+        cache_conn.execute(
+            "UPDATE codex_session_files SET container_state='unverified', "
+            "container_state_reason='legacy-inequivalent', "
+            "pending_container_fingerprint='{}' WHERE path=?", (str(cache_row),))
+        cache_conn.commit()
+    finally:
+        cache_conn.close()
+    before_conv = _conv_cursor(ns, boundary)
+    before_cache = _cursor(ns, cache_row)
+    calls = _rearm_spy(monkeypatch)
+    _enter(ns, entrance)
+    assert calls and all(n == 0 for n, _w, _rows in calls), calls
+    assert _conv_cursor(ns, boundary) == before_conv
+    assert _cursor(ns, cache_row) == before_cache
+
+
+def test_pass_entrance_requests_the_drain_for_an_unwalked_rearmed_row(
+        env, monkeypatch):
+    """#1090 T5 (§5.4 entrance 1): the full pass's own re-arm requests the
+    verification drain even when its walk never meets the re-armed row (here
+    the file is left out of this pass's discovery, present on disk), so no
+    `verification-pending` skip asks for it. Detects a re-armed row left
+    `pending` with no drain run to verify it."""
+    ns, [path], [key] = _legacy_files(env, 1)
+    _prune_key(ns, key)
+    _set_proof(ns, RETENTION_CUTOFF)
+    _reject_directly(ns, path)
+    cache = sys.modules["_cctally_cache"]
+    real = cache._discover_codex_files_with_roots
+
+    def discover(*args, **kwargs):
+        return [f for f in real(*args, **kwargs)
+                if str(f.source_path) != str(path)]
+
+    monkeypatch.setattr(cache, "_discover_codex_files_with_roots", discover)
+    result = _enter(ns, "pass")
+    assert _state_of(ns, path) == ("pending", "legacy-reverify")
+    assert not result.container_skipped.get("verification-pending")
+    assert not result.container_pending
+    assert "_codex-replay-drain" in result.drain_requested, result
+
+
+def test_pass_keeps_a_prune_drain_request_beside_pending_verification(env):
+    """#1090 F3: a full pass that records prune debt (a retained file is gone)
+    and also skips a file as `verification-pending` requests both drains, the
+    request order stable. Detects the verification request overwriting the
+    prune drain's, which leaves the orphan rows undeleted for a pass."""
+    ns, [pending, gone], _keys = _legacy_files(env, 2)
+    gone.with_name(gone.name + ".zst").unlink()
+    result = _enter(ns, "pass")
+    assert result.container_skipped.get("verification-pending") or (
+        result.container_pending), result
+    assert result.prune_debt_pending, result
+    assert result.drain_requested == tuple(sorted(
+        {"_codex-replay-drain", "_codex-prune-drain"})), result
+    assert _state_of(ns, pending)[0] == "pending"
+
+
+# ── #1090 T5: the cache-held gate (§5.2, revision 3) ───────────────────────
+
+#: An equal-length accounting mutation the cache side's legacy check rejects
+#: (it compares output tokens); the conversations side's exempt group hides
+#: it, so only the cache cursor ends `unverified`.
+CACHE_MUTATION = (b'"output_tokens":40', b'"output_tokens":41')
+TORN = b'{"timestamp":"2026-07-20T10:00:30.000Z","type":"event_msg"'
+
+
+def _lines(records):
+    return b"".join(json.dumps(r, separators=(",", ":")).encode() + b"\n"
+                    for r in records)
+
+
+def _replace_zst(zpath, data):
+    """A new container at the same name with a new inode."""
+    tmp = zpath.with_name("replacement.tmp")
+    tmp.write_bytes(zstd_bytes(data))
+    os.replace(tmp, zpath)
+
+
+def _sync_cache(ns):
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+
+
+def _held_compressed(env, *, suffix, cache_rejects, torn_tail=b""):
+    """A legacy conversations cursor whose only key retention removed (proof
+    set), moved into a compressed container of ``prefix + suffix``; the
+    cache side rejects the prefix when ``cache_rejects``. ``torn_tail`` is a
+    torn final line the original plain file ended in (the cursor's
+    `size_bytes` then lies past its `last_byte_offset`)."""
+    ns, _provider, day = env
+    path = day / _name(1)
+    records = conversation_records(3, session_id=_session(1), label="g")
+    write_rollout(path, records[:-4])
+    good = path.read_bytes()
+    if torn_tail:
+        with path.open("ab") as fh:
+            fh.write(torn_tail)
+    _sync_both(ns)
+    _drop_anchors(ns)
+    [key] = _conv_keys(ns, path)
+    _prune_key(ns, key)
+    _set_proof(ns, RETENTION_CUTOFF)
+    extra = {"lines": _lines(records[-4:]), "torn": TORN,
+             "none": b""}[suffix] if isinstance(suffix, str) else suffix
+    prefix = good.replace(*CACHE_MUTATION, 1) if cache_rejects else good
+    zpath = path.with_name(path.name + ".zst")
+    zpath.write_bytes(zstd_bytes(prefix + extra))
+    path.unlink()
+    _sync_both(ns)
+    assert _state_of(ns, path)[0] == "pending"
+    return ns, path, zpath, key, good, extra
+
+
+def _cache_state(ns, path):
+    row = _cursor(ns, path)
+    return row["container_state"]
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+@pytest.mark.parametrize("suffix", ["lines", "torn"])
+def test_compressed_adoption_is_held_until_its_cache_cursor_is_accepted(
+        env, monkeypatch, suffix, entrance):
+    """#1090 T5 gate (§5.2 R1-P1-1, R2-P1-1): a compressed legacy container
+    that adopts only by the new rules and still has unread bytes (complete
+    lines, or a growing torn-only suffix) is held as `legacy-cache-held`
+    while its cache cursor is `unverified`; once the cache cursor is
+    `accepted`, the next entrance re-arms it by (d) and it adopts. Detects
+    the adoption whose deferral the barrier reports `uncovered` forever."""
+    ns, path, zpath, _key, good, extra = _held_compressed(
+        env, suffix=suffix, cache_rejects=True)
+    _drain(ns)
+    assert _cache_state(ns, path) == "unverified"
+    assert _state_of(ns, path) == ("unverified", "legacy-cache-held")
+    cursor = _conv_cursor(ns, path)
+    if suffix == "torn":
+        assert cursor["size_bytes"] == len(good)   # decoded length above it
+    record = _retry_record(ns, path)
+    assert record["cacheHeld"] is True, record
+    assert record["fp"] == cursor["pending_container_fingerprint"]
+    fp = cursor["pending_container_fingerprint"]
+    _drain(ns)                                    # still held: no progress
+    assert _state_of(ns, path) == ("unverified", "legacy-cache-held")
+    _replace_zst(zpath, good + extra)             # the cache side recovers
+    _sync_cache(ns)
+    cache = sys.modules["_cctally_cache"]
+    if entrance == "pass":
+        real = cache._reevaluate_codex_legacy_rejections
+        monkeypatch.setattr(cache, REARM, lambda conn: 0)
+        _drain(ns)                                # the cache side settles
+        monkeypatch.setattr(cache, REARM, real)
+    else:
+        calls = _rearm_spy(monkeypatch)
+    if entrance == "pass":
+        calls = _rearm_spy(monkeypatch)
+        result = _enter(ns, "pass")
+        assert "_codex-replay-drain" in result.drain_requested
+        assert _cache_state(ns, path) == "accepted"
+        _drain(ns)
+    else:
+        _drain(ns)
+        assert _cache_state(ns, path) == "accepted"
+    assert calls and calls[0][0] == 1 and calls[0][2][str(path)] == (
+        "pending", "legacy-reverify", fp), calls
+    assert _state_of(ns, path) == ("accepted", None)
+    assert _retry_record(ns, path) is None
+
+
+@pytest.mark.parametrize("case", ["accepted-cache", "reconcile-only"])
+def test_compressed_adoption_the_gate_leaves_alone(env, case):
+    """#1090 T5 gate controls: the same compressed file adopts directly when
+    its cache cursor is `accepted`, and a reconcile-only verdict (no unread
+    complete line, decoded length below the old scan target) adopts even
+    against an `unverified` cache cursor. Detects an over-broad hold."""
+    if case == "accepted-cache":
+        ns, path, _z, _k, _g, _e = _held_compressed(
+            env, suffix="lines", cache_rejects=False)
+    else:
+        ns, path, _z, _k, good, _e = _held_compressed(
+            env, suffix=TORN[:7], cache_rejects=True, torn_tail=TORN)
+        assert _conv_cursor(ns, path)["size_bytes"] == len(good) + len(TORN)
+    _drain(ns)
+    assert _cache_state(ns, path) == (
+        "accepted" if case == "accepted-cache" else "unverified")
+    assert _state_of(ns, path) == ("accepted", None)
+    assert _retry_record(ns, path) is None
+
+
+def _population(ns):
+    conn = ns["open_cache_db"]()
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT conversation_key FROM codex_barrier_population")}
+    finally:
+        conn.close()
+
+
+def _plain_with_suffix(env, *, suffix, cache_rejects):
+    """A legacy conversations cursor that last read a compressed container
+    and now finds the plain rollout with ``suffix`` appended (a kind change,
+    so verification runs); its only key retention removed (proof set)."""
+    ns, _provider, day = env
+    path = day / _name(1)
+    write_rollout(path, conversation_records(2, session_id=_session(1),
+                                             label="p"))
+    good = path.read_bytes()
+    _compress(path)
+    _sync_both(ns)
+    _drain(ns)
+    assert _state_of(ns, path) == ("accepted", None)
+    _drop_anchors(ns)
+    [key] = _conv_keys(ns, path)
+    _prune_key(ns, key)
+    _set_proof(ns, RETENTION_CUTOFF)
+    path.with_name(path.name + ".zst").unlink()
+    prefix = good.replace(*CACHE_MUTATION, 1) if cache_rejects else good
+    path.write_bytes(prefix + suffix)
+    _sync_both(ns)
+    assert _state_of(ns, path)[0] == "pending"
+    return ns, path, key, good
+
+
+def _other_population_key(ns, day):
+    """A key genuinely in the population: an unrelated compressed rollout."""
+    other = day / _name(5)
+    write_rollout(other, conversation_records(1, session_id=_session(5),
+                                              label="o"))
+    _compress(other)
+    _sync_both(ns)
+    _drain(ns)
+    [key] = _conv_keys(ns, other)
+    assert key in _population(ns)
+    return key
+
+
+def _set_population(ns, keep):
+    conn = ns["open_cache_db"]()
+    try:
+        marks = ",".join("?" * len(keep))
+        conn.execute("DELETE FROM codex_barrier_population" + (
+            f" WHERE conversation_key NOT IN ({marks})" if keep else ""),
+            tuple(keep))
+        conn.commit()
+    finally:
+        conn.close()
+    assert _population(ns) == set(keep)
+
+
+def _plain_positive_control(env, *, population="none"):
+    """The gate's positive control: a plain file with unread complete lines,
+    no population hit (none, or only an unrelated key) and no paired cache
+    cursor at all. Returns ``(ns, path, key, good)``."""
+    ns, _provider, day = env
+    other = _other_population_key(ns, day) if population == "unrelated" else None
+    records = conversation_records(3, session_id=_session(1), label="p")
+    ns, path, key, good = _plain_with_suffix(
+        env, suffix=_lines(records[-4:]), cache_rejects=False)
+    _set_population(ns, [] if other is None else [other])
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("DELETE FROM codex_session_files WHERE path=?", (str(path),))
+        conn.commit()
+    finally:
+        conn.close()
+    return ns, path, key, good
+
+
+def _assert_adopted_and_ingested(ns, path, key, good):
+    assert _state_of(ns, path) == ("accepted", None)
+    cursor = _conv_cursor(ns, path)
+    assert cursor["last_byte_offset"] == path.stat().st_size
+    assert _conv_keys(ns, path) == [key], "only the suffix's rows were written"
+    assert _with_conv(ns, lambda c: c.execute(
+        "SELECT MIN(line_offset) FROM codex_conversation_events "
+        "WHERE source_path=?", (str(path),)).fetchone()[0]) >= len(good)
+
+
+@pytest.mark.parametrize("population", ["none", "unrelated"])
+def test_plain_adoption_without_a_population_hit_ingests(env, population):
+    """#1090 T5 gate (R2-P2-1): a plain file with an unread suffix whose keys
+    the barrier population does not hold (no population, or only an
+    unrelated key) is never deferred, so it adopts and ingests even with no
+    paired cache cursor at all. Detects a gate that holds on the cache
+    cursor alone."""
+    ns, path, key, good = _plain_positive_control(env, population=population)
+    _drain(ns)
+    _assert_adopted_and_ingested(ns, path, key, good)
+
+
+#: #1090 R4-P1-1: the gate call (1 = preparation, 2 = application, in the
+#: first drain run) from which the gate's own inspection fails, and how.
+GATE_FAULTS = [
+    pytest.param(1, OSError(13, "Permission denied"), id="prepare-oserror"),
+    pytest.param(2, sqlite3.OperationalError("disk I/O error"),
+                 id="apply-sqlite"),
+]
+
+
+def _gate_fault(monkeypatch, *, start, error):
+    """Fail the gate's population read from gate call ``start`` on, only
+    inside the gate, while ``state["active"]``. The fingerprint, the file
+    and the (absent) cache cursor are untouched, as with a transient EACCES
+    or I/O error."""
+    cache = sys.modules["_cctally_cache"]
+    real_gate = cache._codex_legacy_cache_held
+    real_present = cache._codex_conversation_population_present
+    state = {"calls": 0, "inside": False, "active": True}
+
+    def gate(*args, **kwargs):
+        state["calls"] += 1
+        state["inside"] = True
+        try:
+            return real_gate(*args, **kwargs)
+        finally:
+            state["inside"] = False
+
+    def present(conn):
+        if state["active"] and state["inside"] and state["calls"] >= start:
+            raise error
+        return real_present(conn)
+
+    monkeypatch.setattr(cache, "_codex_legacy_cache_held", gate)
+    monkeypatch.setattr(cache, "_codex_conversation_population_present",
+                        present)
+    return state
+
+
+def _paired_cursor_absent(ns, path):
+    conn = ns["open_cache_db"]()
+    try:
+        return conn.execute("SELECT 1 FROM codex_session_files WHERE path=?",
+                            (str(path),)).fetchone() is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("entrance", ENTRANCES)
+@pytest.mark.parametrize("start,error", GATE_FAULTS)
+def test_undecidable_gate_leaves_the_adoption_pending(
+        env, monkeypatch, start, error, entrance):
+    """#1090 T5 gate (R4-P1-1): when the gate cannot decide (its inspection
+    raises at preparation, or first at application), the positive-control
+    adoption stays `pending` with no retry record, rather than committing a
+    `legacy-cache-held` that no trigger releases: the fingerprint is
+    unchanged and no cache cursor ever becomes `accepted`. Once the fault
+    clears, a later drain run adopts and ingests, directly or after a full
+    pass requests it. Detects a transient error turned into a permanent
+    hold."""
+    ns, path, key, good = _plain_positive_control(env)
+    stat = path.stat()
+    fault = _gate_fault(monkeypatch, start=start, error=error)
+    _drain(ns)
+    assert fault["calls"] >= start
+    assert _state_of(ns, path)[0] == "pending", _state_of(ns, path)
+    assert _retry_record(ns, path) is None
+    fault["active"] = False
+    assert _paired_cursor_absent(ns, path)
+    assert (path.stat().st_ino, path.stat().st_size) == (stat.st_ino,
+                                                         stat.st_size)
+    if entrance == "pass":
+        result = _enter(ns, "pass")
+        assert "_codex-replay-drain" in result.drain_requested
+        assert _paired_cursor_absent(ns, path)
+    _drain(ns)
+    _assert_adopted_and_ingested(ns, path, key, good)
+
+
+@pytest.mark.parametrize("start,error", GATE_FAULTS)
+def test_persistent_undecidable_gate_neither_holds_nor_burns_retries(
+        env, monkeypatch, start, error):
+    """#1090 T5 gate (R4-P1-1): a fault that persists across two drain runs
+    leaves the row `pending` after each, never held and never charged as a
+    `legacy-changed` revalidation retry, and each drain still completes.
+    Detects a persistent error that exhausts the retry bound as if the
+    state had changed."""
+    ns, path, _key, _good = _plain_positive_control(env)
+    _gate_fault(monkeypatch, start=start, error=error)
+    cache = sys.modules["_cctally_cache"]
+    real_apply = cache._apply_codex_verdict
+    outcomes = []
+
+    def apply(table, apply_path, *args, **kwargs):
+        outcome = real_apply(table, apply_path, *args, **kwargs)
+        if apply_path == str(path):
+            outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(cache, "_apply_codex_verdict", apply)
+    for _run in range(2):
+        result = _drain(ns)
+        assert result.outcome in ("drained", "yielded"), result
+        assert result.retried == 0, result
+        assert _state_of(ns, path)[0] == "pending", _state_of(ns, path)
+        assert _retry_record(ns, path) is None
+    assert outcomes and "legacy-changed" not in outcomes, outcomes
+
+
+@pytest.mark.parametrize("rule", ["before-read", "after-read"])
+def test_plain_adoption_the_barrier_would_defer_is_held(env, rule):
+    """#1090 T5 gate (R2-P1-1, R2-P2-1): a plain file with an unread suffix
+    and a present population is held as `legacy-cache-held` against an
+    `unverified` cache cursor when the targeted sync would defer it: its
+    membership keys hit the population (before read), or its unread suffix
+    names a population key while its membership keys do not (after read).
+    Detects a gate that copies only one of the two deferral rules."""
+    ns, _provider, day = env
+    if rule == "before-read":
+        records = conversation_records(3, session_id=_session(1), label="p")
+        ns, path, key, _good = _plain_with_suffix(
+            env, suffix=_lines(records[-4:]), cache_rejects=True)
+        assert key in _population(ns)
+    else:
+        other = _other_population_key(ns, day)
+        ns, path, key, _good = _plain_with_suffix(
+            env, suffix=_lines(conversation_records(
+                1, session_id=_session(5), label="x")), cache_rejects=True)
+        _set_population(ns, [other])
+    _drain(ns)
+    assert _cache_state(ns, path) == "unverified"
+    assert _state_of(ns, path) == ("unverified", "legacy-cache-held")
+    assert _retry_record(ns, path)["cacheHeld"] is True

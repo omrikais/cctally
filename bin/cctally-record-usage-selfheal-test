@@ -70,6 +70,7 @@ spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec)
 sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 assert str(mod.APP_DIR).startswith(os.environ["HOME"]), (
     f"APP_DIR {mod.APP_DIR} did not land under HOME={os.environ['HOME']!r}; "
@@ -311,6 +312,7 @@ loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
 spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 mod.APP_DIR.mkdir(parents=True, exist_ok=True)
 future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=3)).replace(
     minute=0, second=0, microsecond=0
@@ -373,6 +375,7 @@ loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
 spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 mod.APP_DIR.mkdir(parents=True, exist_ok=True)
 future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=3)).replace(
     minute=0, second=0, microsecond=0
@@ -419,6 +422,7 @@ loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
 spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 mod.APP_DIR.mkdir(parents=True, exist_ok=True)
 future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=3)).replace(
     minute=0, second=0, microsecond=0
@@ -486,6 +490,7 @@ loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
 spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 mod.APP_DIR.mkdir(parents=True, exist_ok=True)
 
 now = dt.datetime.now(dt.timezone.utc)
@@ -549,6 +554,7 @@ loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
 spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 mod.APP_DIR.mkdir(parents=True, exist_ok=True)
 import _lib_journal
 _real_make_obs = _lib_journal.make_obs

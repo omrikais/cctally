@@ -123,6 +123,12 @@ def _state(source, now, *, total_cost, daily_label=None, quota_histories=(),
 
 def _boot(ns, tmp_path, monkeypatch):
     redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # #787 / #861: the dashboard's startup owner creates its stores before
+    # any route serves; a share request no longer creates one.
+    core = ns["_cctally_core"]
+    with core.establish_authority("process"):
+        core.open_db().close()
+        ns["_cctally_cache"].open_cache_db().close()
     now = dt.datetime(2026, 7, 16, tzinfo=UTC)
     claude = _state("claude", now, total_cost=1.0)
     codex = _state("codex", now, total_cost=2.0)

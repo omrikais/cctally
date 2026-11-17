@@ -100,6 +100,61 @@ stores. The target requires explicit per-consumer watermarks and a consistent
 generation, with typed degradation when coherence cannot be proved. Never
 infer that guarantee from `generated_at`, a content hash or SSE connectivity.
 
+## Store authority services
+
+Every store access runs under an **authority** that names what it may do:
+`query` reads, `diagnostic` also reads metadata, `request_writer` also runs the
+restricted current-file ingest entries, and `process` holds everything (write,
+startup, maintenance, launch). Owner code calls `require_capability`; a refusal
+is recorded on the operation's violation latch and raised as
+`QueryAuthorityViolation`, a `BaseException`, so a broad `except Exception`
+cannot hide it, and publication (`check_publishable`) refuses a latched
+operation even when a handler swallowed the refusal. Readers open sessions
+through `bin/_cctally_store_access.py` (`QueryService.session`,
+`statement_reader`, `held_session`); a session lives for one read unit and
+never across computation, because a held stats.db session blocks every
+writer's commit.
+
+The dashboard applies this per request and per thread:
+
+| Surface | Ceiling | Notes |
+|---|---|---|
+| Ordinary GET/POST routes (detail, share, conversations, settings reads) | `query` | Sessions only; a not-ready store answers its typed degraded shape |
+| `/api/data`, `/api/events` | `query` | In-memory snapshot. The Doctor block is owner work (AD28): a snapshot without one renders the deferred placeholder and notifies the owner, never gathers |
+| `/api/debug/backend`, `/write-io`, `POST /api/alerts/test` | `diagnostic` | Diagnostic sessions; never create, migrate or recover |
+| `/api/conversation/events` (live-tail) | `request_writer` | Read phase narrows to `query`; growth runs the request ingest entries |
+| `/api/doctor` | `process` | The Doctor gather at `process`, its DB legs through diagnostic sessions, then an owner step |
+| `POST /api/sync`, `POST /api/settings` | `process` | Today's refresh and persistence |
+| Sync, conversation-sync, schema-wake, frozen-settle, update-check, obligation threads | `process` | Each pass in its own `operation_boundary`; a violation is logged and the pass's publication skipped |
+
+**The Doctor block (AD28).** Every caller gathers Doctor the same way: at `process`, with only its database legs narrowed to diagnostic sessions. The TUI and dashboard builds run their owner precomputes (Doctor and stats readiness) at `process` outside the build's narrowed reads, and every owner publication carries a Doctor block: the computed one, or a FAIL block when the gather fails (the memo is bypassed). The next build recomputes a FAIL block; under `--no-sync` the obligation thread does, replacing only `doctor_payload` and republishing, on its backoff.
+
+The ceiling is set inside a per-request `operation_boundary` in `_dispatch` and
+cleared on exit, so a keep-alive request starts clean; `send_response` and
+`_SnapshotRef`/`SSEHub` publication call `check_publishable`.
+
+**Owner attention.** A query that meets a state only an owner resolves calls
+`notify_owner(store, readiness)` (in memory, coalesced, a no-op outside the
+dashboard). `_dashboard_owner_attention` routes it: a cache or conversations
+store that is not readable wakes `_wake_schema_writer` (single-flight, on its
+own thread); a stats state or a readable-store obligation sets the
+owner-attention event, which starts the sync loop's next iteration early
+(never before its duty floor) or, under `--no-sync`, wakes the obligation
+thread. A request's Codex maintenance debt also wakes the conversations owner
+in sync mode; under `--no-sync` it is recorded and left pending, because
+draining it can ingest.
+
+**`--no-sync` obligation thread** (`_make_dashboard_obligation_thread`). It
+wakes on owner attention, or on a timer while an obligation it drains is
+outstanding. The timer starts at the sync interval (at least 5 s) and doubles
+after each timed pass that leaves an obligation outstanding, up to 300 s
+(`_OBLIGATION_BACKOFF_CAP_S`); owner attention, or a pass that drains
+everything, resets it to the sync interval. Each pass performs exactly the
+owner opens a `--no-sync` request
+thread performed before: owner `open_db()`, owner `open_cache_db()` and, for a
+conversations store that is not readable, `_wake_schema_writer(run_derivations=False)`.
+It never calls a `sync_*` or request entry and never starts a Codex worker.
+
 ## The session-entry cache (`cache.db`)
 
 Every JSONL-reading command goes through a delta cache:

@@ -1262,25 +1262,17 @@ def load_qualified_codex_entries(
     The S1 cache is the sole metadata source.  Unlike unqualified Codex
     accounting readers, this adapter deliberately has no direct-rollout fallback:
     without the relational conversation join it cannot safely attribute projects.
+
+    An owner function (#787 / #861 census): it may open the owner cache
+    connection and sync. A query caller uses `query_qualified_codex_entries`,
+    which shares the read kernel and never opens or syncs.
     """
-    if start.tzinfo is None or start.utcoffset() is None:
-        raise ValueError("start must be timezone-aware")
-    if end.tzinfo is None or end.utcoffset() is None:
-        raise ValueError("end must be timezone-aware")
-    if end <= start:
-        raise ValueError("end must be after start")
-
     if cache_conn is not None and sync:
+        _qualified_window_identities(start, end, source_identities)
         raise ValueError("cache_conn requires sync=False")
-
-    identities: tuple[tuple[str, str], ...] | None = None
-    if source_identities is not None:
-        identities = tuple(sorted({
-            (str(root), str(path)) for root, path in source_identities
-            if str(root) and str(path)
-        }))
-        if not identities:
-            return ()
+    identities = _qualified_window_identities(start, end, source_identities)
+    if identities == ():
+        return ()
 
     c = _cctally()
     owns_conn = cache_conn is None
@@ -1304,17 +1296,8 @@ def load_qualified_codex_entries(
                 raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable")
             if _on_sync is not None:
                 _on_sync(stats)
-        conn.row_factory = sqlite3.Row
-        rows = _load_qualified_codex_rows(conn, start, end, identities)
-        # §4.3: one inventory read per build. The caller supplies the build's
-        # own inventory when it has one; its alias leg is unbounded, which is a
-        # SUPERSET of the `paths=identities` leg this read would have loaded,
-        # and every lookup below is by identity, so the wider map answers each
-        # row identically.
-        inherited_metadata = (
-            load_codex_thread_metadata_inventory(conn, paths=identities)
-            if inventory is None else inventory
-        ).inherited_by_path
+        rows, inherited_metadata = _read_qualified_codex_rows(
+            conn, start, end, identities, inventory)
     except sqlite3.Error as exc:
         raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable") from exc
     finally:
@@ -1328,6 +1311,87 @@ def load_qualified_codex_entries(
         projects=_CodexProjectResolution(
             group, resolver_cache=project_resolver_cache),
     )
+
+
+def query_qualified_codex_entries(
+    start: dt.datetime,
+    end: dt.datetime,
+    *,
+    speed: str,
+    cache_conn: sqlite3.Connection | None = None,
+    sync: bool = False,
+    group: str = "git-root",
+    source_identities: Iterable[tuple[str, str]] | None = None,
+    inventory: "CodexThreadMetadataInventory | None" = None,
+    project_resolver_cache: "dict[object, object] | None" = None,
+) -> tuple[QualifiedCodexEntry, ...]:
+    """`load_qualified_codex_entries` for a query caller (#787 / #861 spec
+    5.11): the same bounded read and qualification over the caller's cache
+    query session (or, with no ``cache_conn``, one cache query session of its
+    own), with no owner open and no sync. ``sync`` is accepted for call-shape
+    parity and must be false."""
+    if sync:
+        raise ValueError("a query read never syncs")
+    identities = _qualified_window_identities(start, end, source_identities)
+    if identities == ():
+        return ()
+    owns_conn = cache_conn is None
+    if owns_conn:
+        import _cctally_store_access
+        try:
+            cache_conn = _cctally_store_access.held_session("cache")
+        except (OSError, sqlite3.Error) as exc:
+            raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable") from exc
+    previous_row_factory = cache_conn.row_factory
+    try:
+        rows, inherited_metadata = _read_qualified_codex_rows(
+            cache_conn, start, end, identities, inventory)
+    except sqlite3.Error as exc:
+        raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable") from exc
+    finally:
+        if owns_conn:
+            cache_conn.close()
+        else:
+            cache_conn.row_factory = previous_row_factory
+    return _qualify_codex_rows(
+        rows, inherited_metadata, speed=speed, group=group,
+        projects=_CodexProjectResolution(
+            group, resolver_cache=project_resolver_cache),
+    )
+
+
+def _qualified_window_identities(start, end, source_identities):
+    """Validate a qualified read's window; return its normalized source
+    identities (``None`` for every source, ``()`` for an empty set)."""
+    if start.tzinfo is None or start.utcoffset() is None:
+        raise ValueError("start must be timezone-aware")
+    if end.tzinfo is None or end.utcoffset() is None:
+        raise ValueError("end must be timezone-aware")
+    if end <= start:
+        raise ValueError("end must be after start")
+    if source_identities is None:
+        return None
+    return tuple(sorted({
+        (str(root), str(path)) for root, path in source_identities
+        if str(root) and str(path)
+    }))
+
+
+def _read_qualified_codex_rows(conn, start, end, identities, inventory):
+    """The qualified read kernel both entry points share: the bounded rows
+    and the inherited thread metadata, on ``conn`` (rows as `sqlite3.Row`)."""
+    conn.row_factory = sqlite3.Row
+    rows = _load_qualified_codex_rows(conn, start, end, identities)
+    # §4.3: one inventory read per build. The caller supplies the build's
+    # own inventory when it has one; its alias leg is unbounded, which is a
+    # SUPERSET of the `paths=identities` leg this read would have loaded,
+    # and every lookup below is by identity, so the wider map answers each
+    # row identically.
+    inherited_metadata = (
+        load_codex_thread_metadata_inventory(conn, paths=identities)
+        if inventory is None else inventory
+    ).inherited_by_path
+    return rows, inherited_metadata
 
 
 def _qualify_codex_rows(

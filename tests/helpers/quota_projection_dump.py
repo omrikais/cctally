@@ -412,6 +412,155 @@ def count_expanded_groups(quota):
         quota.load_codex_quota_observations = original
 
 
+class RawLoadRecord:
+    """What a reconcile ASKED the loader for, and which rows it got back.
+
+    ``count_expanded_groups`` observes interpreted results only, so it cannot
+    tell a pass that loaded a unit's complete population from one that loaded a
+    single stored spelling of it (#1071): both return observations of the same
+    interpreted windows. This records the raw request instead.
+    """
+
+    def __init__(self) -> None:
+        #: Every tuple passed in any call's ``physical_groups`` argument.
+        self.requested_groups: set[tuple] = set()
+        #: ``(source_path, line_offset)`` of every observation returned.
+        self.row_identities: set[tuple[str, int]] = set()
+        #: Calls made with ``physical_groups=None`` (a whole-history load).
+        self.unbounded_calls = 0
+
+
+@contextlib.contextmanager
+def raw_load_recorder(quota):
+    """Record the raw ``physical_groups`` requests and the loaded row identities
+    of every ``load_codex_quota_observations`` call made inside the block."""
+    record = RawLoadRecord()
+    original = quota.load_codex_quota_observations
+
+    def instrumented(*args, **kwargs):
+        groups = kwargs.get("physical_groups")
+        if groups is None:
+            record.unbounded_calls += 1
+        else:
+            groups = tuple(groups)
+            kwargs["physical_groups"] = groups
+            record.requested_groups.update(tuple(group) for group in groups)
+        result = original(*args, **kwargs)
+        record.row_identities.update(
+            (str(observation.source_path), int(observation.line_offset))
+            for observation in result)
+        return result
+
+    quota.load_codex_quota_observations = instrumented
+    try:
+        yield record
+    finally:
+        quota.load_codex_quota_observations = original
+
+
+@contextlib.contextmanager
+def scope_recorder(quota):
+    """Every ``_resolve_pass_scope`` result (the scope dict or ``None``) of the
+    passes run inside the block, with the keyword arguments it was given."""
+    calls: list[tuple[dict, object]] = []
+    original = quota._resolve_pass_scope
+
+    def recording(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append((kwargs, result[0]))
+        return result
+
+    quota._resolve_pass_scope = recording
+    try:
+        yield calls
+    finally:
+        quota._resolve_pass_scope = original
+
+
+# ── #1071 revision 6: interleaved windows of one identity ─────────────────
+#
+# One weekly identity whose windows (distinct canonical resets) are captured
+# inside each other's spans, the shape §4.2 M2 measured natively. Window ``n``
+# resets ten minutes earlier than window ``n - 1``, so a lower index sorts
+# LATER on an equal capture instant (`physical_order_key` breaks the tie on the
+# canonical reset). Captures are minutes after ``IL_BASE``, which every
+# window's nominal start precedes.
+
+IL_ROOT = "root-interleave"
+IL_SLOT = "secondary"
+IL_WEEK = 10_080
+IL_BASE = dt.datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
+IL_NOW = IL_BASE + dt.timedelta(days=2)
+IL_PATH = f"/codex/{IL_ROOT}/a.jsonl"
+IL_PATH_B = f"/codex/{IL_ROOT}/b.jsonl"
+IL_SPARK = "gpt-5.3-codex-spark"
+
+
+def interleave_reset(window: int) -> dt.datetime:
+    return IL_BASE + dt.timedelta(days=7) - dt.timedelta(minutes=10 * window)
+
+
+def interleave_capture(minute: float) -> dt.datetime:
+    return IL_BASE + dt.timedelta(minutes=minute)
+
+
+def interleave_key(*, slot: str = IL_SLOT, minutes: int = IL_WEEK,
+                   model: "str | None" = None) -> str:
+    return _lib_jsonl._codex_logical_limit_key(
+        IL_ROOT, "codex", slot, minutes, model)
+
+
+def seed_interleave_root(conn) -> None:
+    _fixture_builders.seed_codex_source_root(
+        conn, source_root_key=IL_ROOT,
+        canonical_root_path=f"/codex/{IL_ROOT}",
+        first_seen_utc=_iso(IL_BASE - dt.timedelta(days=1)),
+        last_seen_utc=_iso(IL_NOW))
+
+
+def seed_interleave_row(
+    conn, *, window: int, minute: float, percent: float, offset: int,
+    path: str = IL_PATH, captured_text: "str | None" = None,
+    slot: str = IL_SLOT, key: "str | None" = None, minutes: int = IL_WEEK,
+    model: "str | None" = None, account: "str | None" = None,
+) -> None:
+    """One physical row of window ``window`` captured ``minute`` minutes after
+    ``IL_BASE`` (``captured_text`` overrides its stored spelling)."""
+    reset = interleave_reset(window).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _fixture_builders.seed_codex_quota_snapshot(
+        conn, source_root_key=IL_ROOT, source_path=path, line_offset=offset,
+        captured_at_utc=(
+            captured_text if captured_text is not None
+            else interleave_capture(minute).isoformat().replace("+00:00", "Z")),
+        observed_slot=slot,
+        logical_limit_key=(
+            key if key is not None
+            else interleave_key(slot=slot, model=model)),
+        window_minutes=minutes, used_percent=percent, resets_at_utc=reset,
+        plan_type="pro", observed_model=model or "gpt-5",
+        account_key=account,
+    )
+
+
+def interleave_blocks(ns, window: int, *, slot: str = IL_SLOT) -> list[dict]:
+    """Every stored block of one window: its interpreted endpoint, its
+    orphan status and its pass provenance."""
+    conn = ns["open_db"]()
+    try:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(
+            "SELECT logical_limit_key, account_key, last_observed_at_utc, "
+            "       last_source_path, last_line_offset, "
+            "       orphaned_at IS NOT NULL AS orphaned, generation "
+            "  FROM quota_window_blocks "
+            " WHERE source='codex' AND source_root_key=? AND observed_slot=? "
+            "   AND unixepoch(resets_at_utc)=unixepoch(?) "
+            " ORDER BY logical_limit_key, account_key",
+            (IL_ROOT, slot, _iso(interleave_reset(window))))]
+    finally:
+        conn.close()
+
+
 def _iso(value: dt.datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 

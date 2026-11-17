@@ -70,6 +70,9 @@ def test_doctor_state_has_required_fields():
         "parse_health_claude", "parse_health_codex",
         "stats_db_quick_check", "cache_db_quick_check",
         "conversations_db_quick_check",
+        # #787 / #861 AD22: stores whose deep quick_check was refused.
+        "db_quick_check_unavailable",
+        "conversations_db_refused",
         "locks_held",
         # #297: read-only cache.db WAL-size backstop.
         "cache_db_wal_bytes",

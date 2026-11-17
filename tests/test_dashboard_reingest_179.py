@@ -1,5 +1,6 @@
 """#179 — resumable conversation-enrichment reingest + non-blocking dashboard sync."""
 import json
+import sys
 import types
 import os
 import sqlite3
@@ -10,7 +11,8 @@ from conftest import (  # type: ignore
     redirect_paths,
 )
 
-from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
+from tests._support_http import (PRESENCE_BACKSTOP_SECONDS,
+                                 inert_startup_heap_freeze, start, stop)
 
 
 def _asst_line(uuid, msg_id, req_id, text, *, ts="2026-06-01T00:00:00Z",
@@ -400,6 +402,7 @@ def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, mon
             self.server_close()                     # release the listening socket
             raise _BindReached
     monkeypatch.setattr(dash, "_QuietThreadingHTTPServer", _RecordingServer)
+    inert_startup_heap_freeze(monkeypatch, dash)
 
     args = argparse.Namespace(host="127.0.0.1", port=0, no_browser=True,
                               no_sync=False, sync_interval=1000, tz=None)
@@ -408,7 +411,10 @@ def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, mon
 
     def run_it():
         try:
-            rc["ret"] = dash.cmd_dashboard(args)
+            # #787 / #861 spec 5.1: `cmd_dashboard` runs on the CLI main
+            # thread at `process`; the test's thread establishes it.
+            with sys.modules["_cctally_core"].establish_authority("process"):
+                rc["ret"] = dash.cmd_dashboard(args)
         except _BindReached:
             rc["bind_reached"] = True
         except BaseException as exc:                # surface anything unexpected
@@ -425,6 +431,16 @@ def test_real_cmd_dashboard_binds_before_background_sync_completes(tmp_path, mon
     # complete (park_forever is never set) — bind is not gated on sync (#179).
     assert rc.get("bind_reached") is True, rc
     assert bound.get("port", 0) > 0, rc
+    # #787 / #861: a cmd_dashboard that stops before serving unregisters its
+    # owner-attention callback and restores the reader wake hook. A leaked
+    # callback outlives the run (the kernel is never reloaded), and a later
+    # reader that meets a behind store wakes a schema writer through this
+    # run's namespace, writing to whatever data directory is current then.
+    core = sys.modules["_cctally_core"]
+    assert dash._dashboard_owner_attention not in \
+        core._OWNER_ATTENTION_CALLBACKS, "owner-attention callback leaked"
+    assert sys.modules["_cctally_cache"].SCHEMA_WAKE_HOOK is None, (
+        "reader wake hook left installed")
     # Non-vacuity: the background sync seam was genuinely exercised and parked, so
     # the "blocked sync" premise is real (not a sync that was skipped entirely).
     assert sync_entered.wait(timeout=PRESENCE_BACKSTOP_SECONDS), "background sync seam was never exercised"

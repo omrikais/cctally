@@ -376,12 +376,33 @@ def _column(rendered: str, index: int) -> list:
     return cells
 
 
+def _serve_stats_reads(monkeypatch: pytest.MonkeyPatch, open_fixture) -> None:
+    """Serve the fixture store at the stats statement reader.
+
+    #787 / #861 AD21: `cmd_percent_breakdown` reads stats.db through a
+    query-session statement reader instead of `open_db`, and that reader opens
+    the data directory's own store (a seeded fixture there would be rebuilt
+    from the empty journal by the startup phase). The fixture is injected at
+    that seam; every other store still reads through the real one."""
+    import _cctally_store_access as access
+
+    real_reader = access.statement_reader
+
+    def statement_reader(primary, *args, **kwargs):
+        if primary == "stats":
+            return open_fixture()
+        return real_reader(primary, *args, **kwargs)
+
+    monkeypatch.setattr(access, "statement_reader", statement_reader)
+
+
 def _breakdown(ns, monkeypatch, opened_conns, gap_stats, capsys, *, as_json):
     import _cctally_core
     import _cctally_percent_breakdown as pb
 
     monkeypatch.setattr(pb, "open_db", opened_conns(gap_stats))
     monkeypatch.setattr(_cctally_core, "open_db", opened_conns(gap_stats))
+    _serve_stats_reads(monkeypatch, opened_conns(gap_stats))
     monkeypatch.setitem(ns, "load_config", lambda *a, **k: {})
     args = argparse.Namespace(
         week_start=None, week_start_name=None, json=as_json, tz="utc",

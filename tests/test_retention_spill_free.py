@@ -33,6 +33,7 @@ reports a missing deletion seam rather than failing on it.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import hashlib
 import importlib
@@ -42,6 +43,7 @@ import pathlib
 import random
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -238,37 +240,146 @@ class _Pinned:
         return False
 
 
-def _control(path, provider, *, unbounded, report=None):
-    conn = sqlite3.connect(path)
+#: #1078 #1091: the default and unbounded controls run in a fresh child
+#: process, one per control. The runners' SQLite shares one page cache across
+#: every connection of a process (`SQLITE_ENABLE_MEMORY_MANAGEMENT`), so an
+#: in-process default control's re-spills depended on whatever connections the
+#: process held: [claude] 17,972 frames beside this test's open builder
+#: connection, 32,099 with it closed, 9,814 beside one idle 64 MiB connection.
+#: In a child only the control's own connections share the cache, and it
+#: measured 32,099 / 7,904 ([codex] 152,181 / 54,298) in every trial, whatever
+#: the parent held open. The unbounded floor is the same either way. The
+#: child performs, in the same order, every statement and check `_Pinned` and
+#: the in-process control made: the checkpoint writer's attribution and
+#: `wal_checkpoint(TRUNCATE)`; the pinned reader's attribution,
+#: `BEGIN` and read; the measured interval's begin; the control writer's
+#: attribution, its cache configuration, the `page_size` read, `BEGIN
+#: IMMEDIATE`, the deletes, the commit and `SQLITE_DBSTATUS_CACHE_WRITE`; the
+#: settings observation after that frame snapshot; the interval's end; and the
+#: reader's rollback and close. It publishes each attribution as its own field,
+#: and the parent asserts all three. `run` takes its collaborators as keywords
+#: so `test_control_reporting_observes_effective_settings_after_frame_snapshot`
+#: can drive this exact program in-process with doubles.
+_CONTROL_CHILD = r"""
+import json
+import sqlite3
+import sys
+import time
+
+_SETTINGS = ("cache_size", "temp_store", "secure_delete", "journal_mode",
+             "cache_spill", "synchronous", "locking_mode")
+
+
+def cache_writes(conn):
+    # The same reading as the parent module's `_cache_writes`.
+    import ctypes
+    import _sqlite3
+
+    fn = ctypes.CDLL(_sqlite3.__file__).sqlite3_db_status
+    fn.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+                   ctypes.POINTER(ctypes.c_int), ctypes.c_int)
+    fn.restype = ctypes.c_int
+    handle = ctypes.c_void_p.from_address(
+        id(conn) + 2 * ctypes.sizeof(ctypes.c_void_p)).value
+    current, high = ctypes.c_int(), ctypes.c_int()
+    assert fn(ctypes.c_void_p(handle), 9, ctypes.byref(current),
+              ctypes.byref(high), 0) == 0
+    return int(current.value)
+
+
+def run(argv, *, sqlite3, acct, cache_writes):
+    _tests_dir, db_path, unbounded, report, deletes = argv
+    unbounded, report = unbounded == "1", report == "1"
+    attribution = {}
+    c = sqlite3.connect(db_path)
     try:
-        fx.require_attributed(conn, "control")
-        if unbounded:
-            conn.execute("PRAGMA cache_size = -1048576")
-            conn.execute("PRAGMA temp_store = MEMORY")
-        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-        conn.execute("BEGIN IMMEDIATE")
-        for sql in (_CLAUDE_DELETES if provider == "claude"
-                    else _CODEX_DELETES):
-            conn.execute(sql, ("expire-me",))
-        conn.commit()
-        frames = _cache_writes(conn)
-        # 968-MG04-V01: observe only AFTER the original commit and counter
-        # snapshot. Never scan schema/counts on this fresh measured writer.
-        if report is not None:
-            started = time.monotonic()
-            settings = {name: conn.execute("PRAGMA " + name).fetchone()[0]
-                        for name in ("cache_size", "temp_store", "secure_delete",
-                                     "journal_mode", "cache_spill", "synchronous",
-                                     "locking_mode")}
-            report["controls"]["unbounded" if unbounded else "default"] = {
-                "frames": frames, "pageSize": page_size,
-                "observationPoint": "deletion-connection-after-commit-and-frame-snapshot",
-                "effectiveSettings": settings}
-            report["observationSeconds"] = report.get("observationSeconds", 0) + (
-                time.monotonic() - started)
+        attribution["checkpointWriter"] = acct.is_attributed(c)
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
-        conn.close()
-    return frames, page_size
+        c.close()
+    reader = sqlite3.connect(db_path)
+    try:
+        attribution["pinnedReader"] = acct.is_attributed(reader)
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM cache_meta").fetchone()
+        interval = acct.measure(db_path).begin()
+        settings, observed = None, 0.0
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                attribution["control"] = acct.is_attributed(conn)
+                if unbounded:
+                    conn.execute("PRAGMA cache_size = -1048576")
+                    conn.execute("PRAGMA temp_store = MEMORY")
+                page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+                conn.execute("BEGIN IMMEDIATE")
+                for sql in json.loads(deletes):
+                    conn.execute(sql, ("expire-me",))
+                conn.commit()
+                frames = cache_writes(conn)
+                # 968-MG04-V01: observe only AFTER the original commit and
+                # counter snapshot. Never scan schema/counts on this fresh
+                # measured writer.
+                if report:
+                    started = time.monotonic()
+                    settings = {name: conn.execute("PRAGMA " + name).fetchone()[0]
+                                for name in _SETTINGS}
+                    observed = time.monotonic() - started
+            finally:
+                conn.close()
+        finally:
+            writes = interval.end()
+    finally:
+        reader.rollback()
+        reader.close()
+    acct.publish(writes, attributed=attribution["control"],
+                 attribution=attribution, frames=frames, pageSize=page_size,
+                 effectiveSettings=settings, observationSeconds=observed)
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, sys.argv[1])
+    import _sqlite_write_accounting as acct
+
+    acct.activate()
+    run(sys.argv[1:], sqlite3=sqlite3, acct=acct, cache_writes=cache_writes)
+"""
+
+
+@dataclasses.dataclass(frozen=True)
+class _ChildControl:
+    """One control measured in its own process: its frames, the page size read
+    before its deletion, and its interval's checked `Writes`."""
+
+    frames: int
+    page_size: int
+    writes: object
+
+
+def _child_control(path, provider, *, unbounded, report=None):
+    label = str(path)
+    deletes = _CLAUDE_DELETES if provider == "claude" else _CODEX_DELETES
+    child = subprocess.run(
+        [sys.executable, "-c", _CONTROL_CHILD, str(fx.TESTS_DIR), label,
+         "1" if unbounded else "0", "0" if report is None else "1",
+         json.dumps(deletes)],
+        capture_output=True, text=True, timeout=120)
+    record, writes = fx.child_writes(child.stdout, label, stderr=child.stderr)
+    assert child.returncode == 0, child.stderr
+    for key, name in (("checkpointWriter", "checkpoint writer"),
+                      ("pinnedReader", "pinned reader"), ("control", "control")):
+        assert record["attribution"][key] is True, (
+            name + ": the connection bypasses the write accounting VFS",
+            record["attribution"])
+    frames, page_size = record["frames"], record["pageSize"]
+    if report is not None:
+        report["controls"]["unbounded" if unbounded else "default"] = {
+            "frames": frames, "pageSize": page_size,
+            "observationPoint": "deletion-connection-after-commit-and-frame-snapshot",
+            "effectiveSettings": record["effectiveSettings"]}
+        report["observationSeconds"] = report.get("observationSeconds", 0) + (
+            record["observationSeconds"])
+    return _ChildControl(frames, page_size, writes)
 
 
 def _observe_control_start(conn, provider):
@@ -352,7 +463,7 @@ def _preserve_control_families(report, families):
 
 
 def _emit_control_report(report, default, unbounded, *, families=None):
-    """Only called after both `_Pinned.__exit__` operations completed.
+    """Only called after both child controls completed their intervals.
     Observation overhead is charged to the unchanged case runtime. The
     post-interval seconds include directories/copy/hashing/manifest work,
     excluding final JSON serialization, controls.json write and print.
@@ -469,12 +580,13 @@ def test_spill_free_deletion_writes_each_dirty_page_once(
     ns, conn, retention, db_path, copies = _build(tmp_path, monkeypatch,
                                                   provider, report=report)
     try:
-        with _Pinned(copies["default"]) as default:
-            default_frames, page_size = _control(copies["default"], provider,
-                                                 unbounded=False, report=report)
-        with _Pinned(copies["unbounded"]) as unbounded:
-            unbounded_frames, _ = _control(copies["unbounded"], provider,
-                                           unbounded=True, report=report)
+        # #1078 #1091: each control runs in a fresh child process, so its
+        # frames do not depend on what this process has cached.
+        default = _child_control(copies["default"], provider,
+                                 unbounded=False, report=report)
+        unbounded = _child_control(copies["unbounded"], provider,
+                                   unbounded=True, report=report)
+        default_frames, unbounded_frames = default.frames, unbounded.frames
         try:
             assert default_frames >= 2 * unbounded_frames, (
                 "validity: the group must make the default cache re-spill",
@@ -1166,11 +1278,10 @@ def test_control_reporting_preserves_intervals_failure_and_physical_families(
                 paths["product"], {k: paths[k] for k in ("default", "unbounded")})
 
     class Pinned:
+        # Only the product's interval is still in-process.
         def __init__(self, path):
             self.name = pathlib.Path(path).stem
             self.writes = fx.acct.Writes.empty(self.name)
-            if self.name == "default":
-                self.writes._temp = TEMP_SLACK + 1
 
         def __enter__(self):
             events.append(self.name + "-begin")
@@ -1179,12 +1290,20 @@ def test_control_reporting_preserves_intervals_failure_and_physical_families(
         def __exit__(self, *exc):
             events.append(self.name + "-end")
 
-    def control(path, provider, *, unbounded, **kwargs):
+    def child_control(path, provider, *, unbounded, **kwargs):
+        # #1078 #1091: a control is one child process, so its whole interval
+        # (begin and end) happens inside this one call.
+        name = pathlib.Path(path).stem
+        events.append(name + "-begin")
         frames = 5 if unbounded else (10 if valid else 9)
+        writes = fx.acct.Writes.empty(name)
+        if name == "default":
+            writes._temp = TEMP_SLACK + 1
         if kwargs.get("report") is not None:
             kwargs["report"]["controls"]["unbounded" if unbounded else "default"] = {
                 "frames": frames, "pageSize": 4096}
-        return frames, 4096
+        events.append(name + "-end")
+        return _ChildControl(frames, 4096, writes)
 
     def instrument(mp, retention, seen):
         seen.append({"frames": 5, "temp_store": 2, "cache_size": -262144,
@@ -1193,7 +1312,7 @@ def test_control_reporting_preserves_intervals_failure_and_physical_families(
 
     monkeypatch.setattr(sys.modules[__name__], "_build", build)
     monkeypatch.setattr(sys.modules[__name__], "_Pinned", Pinned)
-    monkeypatch.setattr(sys.modules[__name__], "_control", control)
+    monkeypatch.setattr(sys.modules[__name__], "_child_control", child_control)
     monkeypatch.setattr(sys.modules[__name__], "_instrument", instrument)
     real_print = print
 
@@ -1272,7 +1391,15 @@ def test_control_reporting_observes_effective_settings_after_frame_snapshot(
         tmp_path, monkeypatch):
     """A settings scan before deletion can warm the cache and invalidate the
     original control. The observer must use the actual deletion connection,
-    after commit and the existing frame snapshot, without resetting it."""
+    after commit and the existing frame snapshot, without resetting it.
+
+    #1078 #1091: the control is a child process, so its exact program
+    (`_CONTROL_CHILD`) runs here in-process with doubled collaborators, and its
+    published record goes through the parent's real evidence path."""
+    import contextlib
+    import io
+    import types
+
     events = []
 
     class Connection:
@@ -1288,24 +1415,54 @@ def test_control_reporting_observes_effective_settings_after_frame_snapshot(
         def commit(self):
             events.append("commit")
 
+        def rollback(self):
+            events.append("rollback")
+
         def close(self):
             events.append("close")
 
-    monkeypatch.setattr(sqlite3, "connect", lambda path: Connection())
-    monkeypatch.setattr(fx, "require_attributed", lambda *args: None)
+    class Interval:
+        def __init__(self, label):
+            self.label = label
+
+        def begin(self):
+            events.append("interval-begin")
+            return self
+
+        def end(self):
+            events.append("interval-end")
+            return fx.acct.Writes.empty(self.label)
 
     def frames(conn):
         events.append("frames")
         return 123
 
-    monkeypatch.setattr(sys.modules[__name__], "_cache_writes", frames)
+    acct = types.SimpleNamespace(is_attributed=lambda conn: True,
+                                 measure=Interval, publish=fx.acct.publish)
+
+    def run_child(argv, **kwargs):
+        assert argv[:2] == [sys.executable, "-c"], argv
+        program = {"__name__": "control_child"}
+        exec(argv[2], program)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            program["run"](argv[3:], sqlite3=types.SimpleNamespace(
+                connect=lambda path: Connection()), acct=acct, cache_writes=frames)
+        return subprocess.CompletedProcess(argv, 0, out.getvalue(), "")
+
+    monkeypatch.setattr(subprocess, "run", run_child)
     report = {"controls": {}}
-    assert _control(tmp_path / "default.db", "claude", unbounded=False,
-                    report=report) == (123, 4096)
-    assert events[:7] == ["PRAGMA page_size", "BEGIN IMMEDIATE",
-                          *_CLAUDE_DELETES, "commit"]
-    assert events[7] == "frames"
-    assert events[-1] == "close"
+    control = _child_control(tmp_path / "default.db", "claude", unbounded=False,
+                             report=report)
+    assert (control.frames, control.page_size) == (123, 4096)
+    settings = ["PRAGMA " + name for name in (
+        "cache_size", "temp_store", "secure_delete", "journal_mode",
+        "cache_spill", "synchronous", "locking_mode")]
+    assert events == [
+        "PRAGMA wal_checkpoint(TRUNCATE)", "close",
+        "BEGIN", "SELECT COUNT(*) FROM cache_meta", "interval-begin",
+        "PRAGMA page_size", "BEGIN IMMEDIATE", *_CLAUDE_DELETES, "commit",
+        "frames", *settings, "close", "interval-end", "rollback", "close"], events
     entry = report["controls"]["default"]
     assert entry["observationPoint"] == "deletion-connection-after-commit-and-frame-snapshot"
     assert entry["effectiveSettings"]["cache_size"] == -2000

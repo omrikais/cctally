@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib
+import json
 
 import pytest
 
 import _fixture_builders
 import _lib_jsonl
+import _lib_quota_ledger
 from conftest import load_script, redirect_paths
 
 
@@ -268,6 +270,184 @@ def test_the_returned_order_matches_an_unbounded_load(tmp_path, monkeypatch):
         conn.close()
 
     assert bounded == unbounded
+
+
+# ── #1071: the loading-unit closure ───────────────────────────────────────
+
+SPARK = "gpt-5.3-codex-spark"
+UNIT_RESET = BASE + dt.timedelta(days=7)
+
+
+def _week_key(minutes=WEEK, *, model=None, pool=None, root=ROOT, slot="primary"):
+    key = _lib_jsonl._codex_logical_limit_key(root, "codex", slot, minutes, model)
+    if pool is not None:
+        payload = json.loads(key)
+        payload["modelPool"] = pool
+        key = _lib_jsonl._codex_canonical_json(payload)
+    return key
+
+
+def _unit(root=ROOT, slot="primary", reset=UNIT_RESET):
+    return _lib_quota_ledger.loading_unit_from_raw(
+        (root, _week_key(root=root, slot=slot), slot, WEEK, _iso(reset)))
+
+
+#: Each case: the (key, column minutes) spellings the unit's rows are stored
+#: under. Every one of them is the same weekly window.
+_SPELLINGS = {
+    "spark_only": [(_week_key(model=SPARK), WEEK)],
+    "mixed": [(_week_key(), WEEK), (_week_key(model=SPARK), WEEK)],
+    "new_pool": [(_week_key(), WEEK), (_week_key(pool="future-pool"), WEEK)],
+    "minute_variants": [
+        (_week_key(WEEK + 1), WEEK),
+        (_week_key(WEEK), WEEK - 1),
+        (_week_key(WEEK - 1, model=SPARK), WEEK + 1),
+    ],
+}
+
+
+def _seed_unit_store(conn, spellings):
+    _fixture_builders.seed_codex_source_root(
+        conn, source_root_key=ROOT, canonical_root_path=f"/codex/{ROOT}")
+    _fixture_builders.seed_codex_source_root(
+        conn, source_root_key=OTHER_ROOT,
+        canonical_root_path=f"/codex/{OTHER_ROOT}")
+    offset = 0
+    for key, minutes in spellings:
+        for _ in range(2):
+            _seed(conn, minutes=minutes, limit_key=key, reset=UNIT_RESET,
+                  offset=offset)
+            offset += 1
+    unit_offsets = list(range(offset))
+    # Unrelated units, each differing from the unit on exactly one axis.
+    unrelated = [
+        dict(minutes=WEEK, limit_key=_week_key(model=SPARK),
+             reset=UNIT_RESET + dt.timedelta(days=7)),           # reset
+        dict(minutes=WEEK, slot="secondary",
+             limit_key=_week_key(model=SPARK, slot="secondary"),
+             reset=UNIT_RESET),                                   # slot
+        dict(minutes=FIVE_HOUR, reset=UNIT_RESET),                # length
+        dict(root=OTHER_ROOT, minutes=WEEK,
+             limit_key=_week_key(model=SPARK, root=OTHER_ROOT),
+             reset=UNIT_RESET),                                   # root
+    ]
+    for kwargs in unrelated:
+        _seed(conn, offset=offset, **kwargs)
+        offset += 1
+    conn.commit()
+    return unit_offsets
+
+
+@pytest.mark.parametrize("case", sorted(_SPELLINGS))
+def test_unit_closure_discovers_every_stored_spelling(
+    tmp_path, monkeypatch, case,
+):
+    """Detects #1071's partial load: the closure must reach every stored key
+    spelling of a loading unit — the ``modelPool`` form, a pool name no code
+    knows yet, and the minute jitter in the key and in the column — so loading
+    it hands the projector the unit's complete population."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    conn = ns["open_cache_db"]()
+    conn.row_factory = None
+    try:
+        unit_offsets = _seed_unit_store(conn, _SPELLINGS[case])
+        closure = quota.codex_unit_loading_closure(conn, {_unit()})
+        covered = {group[:4] for group in closure}
+        for key, minutes in _SPELLINGS[case]:
+            assert (ROOT, key, "primary", minutes) in covered, (key, minutes)
+        observations = quota.load_codex_quota_observations(
+            cache_conn=conn, physical_groups=closure)
+    finally:
+        conn.close()
+    assert _offsets(observations) == unit_offsets
+
+
+def test_unit_closure_excludes_unrelated_units(tmp_path, monkeypatch):
+    """Detects an over-wide closure: a window sharing the unit's key but not
+    its reset, slot, length or root must not be loaded with it."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    conn = ns["open_cache_db"]()
+    conn.row_factory = None
+    try:
+        unit_offsets = _seed_unit_store(conn, _SPELLINGS["mixed"])
+        closure = quota.codex_unit_loading_closure(conn, {_unit()})
+        assert {group[0] for group in closure} == {ROOT}
+        assert {group[2] for group in closure} == {"primary"}
+        observations = quota.load_codex_quota_observations(
+            cache_conn=conn, physical_groups=closure)
+    finally:
+        conn.close()
+    assert _offsets(observations) == unit_offsets
+
+
+def test_unit_closure_keeps_a_unit_with_no_stored_row(tmp_path, monkeypatch):
+    """A unit whose rows were all deleted still names its own key, so the
+    request is never empty for a unit the pass was told about."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    conn = ns["open_cache_db"]()
+    conn.row_factory = None
+    try:
+        _fixture_builders.seed_codex_source_root(
+            conn, source_root_key=ROOT, canonical_root_path=f"/codex/{ROOT}")
+        conn.commit()
+        closure = quota.codex_unit_loading_closure(conn, {_unit()})
+    finally:
+        conn.close()
+    assert (ROOT, _week_key(), "primary", WEEK) in {g[:4] for g in closure}
+
+
+def test_unit_closure_seeks_the_physical_group_index(tmp_path, monkeypatch):
+    """Detects key discovery that stops using ``idx_qws_physical_group``: a
+    read of the root's rows by any other path is a history-sized scan on the
+    hook, so every statement the closure runs over ``quota_window_snapshots``
+    must be planned on that index."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    conn = ns["open_cache_db"]()
+    conn.row_factory = None
+    try:
+        _seed_unit_store(conn, _SPELLINGS["minute_variants"])
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        try:
+            quota.codex_unit_loading_closure(
+                conn, {_unit(), _unit(reset=UNIT_RESET + dt.timedelta(days=7))})
+        finally:
+            conn.set_trace_callback(None)
+        reads = [sql for sql in statements
+                 if "quota_window_snapshots" in sql
+                 and "sqlite_master" not in sql]
+        assert reads, statements
+        for sql in reads:
+            plan = [str(row[-1]) for row in conn.execute(
+                "EXPLAIN QUERY PLAN " + sql)]
+            table_lines = [
+                line for line in plan if "quota_window_snapshots" in line]
+            assert table_lines and all(
+                "idx_qws_physical_group" in line for line in table_lines), (
+                sql, plan)
+    finally:
+        conn.close()
+
+
+def test_unit_closure_fallback_without_the_index_returns_the_same_set(
+    tmp_path, monkeypatch,
+):
+    """Detects an incomplete key list on a store missing the index: the
+    fallback must return exactly what the indexed discovery returns."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    conn = ns["open_cache_db"]()
+    conn.row_factory = None
+    try:
+        _seed_unit_store(conn, _SPELLINGS["minute_variants"]
+                         + _SPELLINGS["new_pool"])
+        units = {_unit(), _unit(slot="secondary"), _unit(root=OTHER_ROOT)}
+        indexed = quota.codex_unit_loading_closure(conn, units)
+        conn.execute("DROP INDEX idx_qws_physical_group")
+        conn.commit()
+        fallback = quota.codex_unit_loading_closure(conn, units)
+    finally:
+        conn.close()
+    assert fallback == indexed
 
 
 @pytest.mark.parametrize("kwargs", [

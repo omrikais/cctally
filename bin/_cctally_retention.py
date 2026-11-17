@@ -990,6 +990,8 @@ def reclaim_artifacts(
     A worker that cannot take the lock marks NOTHING: the hold is the only
     thing that keeps it off evidence mid-publication.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="reclaim_artifacts")
     root = _reclaim_root(root)
     records: "list[pathlib.Path]" = []
     errors: "dict[str, str]" = {}
@@ -1029,6 +1031,8 @@ def reclaim_artifacts(
 
 def resume_reclaim(*, root=None, timeout=None) -> ReclaimOutcome:
     """Finish every pending reclaim plan left by an interrupted worker."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="resume_reclaim")
     return reclaim_artifacts((), root=root, timeout=timeout, resume=True)
 
 
@@ -2040,6 +2044,8 @@ def run_retention_sweep(
     `tests/test_artifact_retention_lock_order.py` scans this module for
     exactly that.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="run_retention_sweep")
     root = _reclaim_root(root)
     resolution = (
         _kernel.PolicyResolution("valid", policy, None) if policy is not None

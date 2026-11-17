@@ -782,7 +782,8 @@ def test_reconcile_short_circuits_when_physically_unchanged(tmp_path, monkeypatc
         source_root_keys={"root-a"}, now=now
     )
     assert calls == [], "observation loader must NOT run on the short-circuit path"
-    assert result == quota.QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
+    assert result == quota.QuotaProjectionResult(
+        None, 0, 0, 0, 0, 0, 0, status="current")
 
 
 def test_reconcile_short_circuit_is_a_pure_no_op(tmp_path, monkeypatch):
@@ -1265,3 +1266,328 @@ def test_hook_lifecycle_line_carries_the_deferred_projection_token():
         blocks=0, milestones=0, alert_eligible_roots=0, quota_alerts=0,
         budget_alerts=0, dur_ms=1)
     assert "projection=" not in plain
+
+
+# ── #1069: completion rows for every reconciled root, and fenced finalization ──
+
+def _store_with_owed_work(tmp_path, monkeypatch, *, alerts=False):
+    """A reconciled store (helpers' builder) plus one ledgered mutation."""
+    from helpers.quota_projection_dump import (
+        append_one_observation_to_live_window, build_codex_quota_store,
+        enable_quota_alerts, store_as_of,
+    )
+    ns, quota = _load(tmp_path, monkeypatch)
+    build_codex_quota_store(ns, closed_windows=3, observations_per_window=10)
+    if alerts:
+        enable_quota_alerts(ns, actual=(2, 25))
+        now = store_as_of(ns, before_reset=dt.timedelta(minutes=20))
+    else:
+        now = store_as_of(ns)
+    from helpers.quota_projection_dump import ROOT_KEY
+    quota.reconcile_codex_quota_projection(
+        now=now,
+        alert_eligible_root_keys={ROOT_KEY} if alerts else ())
+    if not alerts:
+        append_one_observation_to_live_window(ns)
+    return ns, quota, now
+
+
+def _ledger_count(ns) -> int:
+    conn = ns["open_cache_db"]()
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM quota_window_change_log").fetchone()[0])
+    finally:
+        conn.close()
+
+
+def _cache_write(ns, fn):
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        fn(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _flocks_free(ns) -> bool:
+    import _cctally_core
+    from _lib_cache_writer_lock import (
+        acquire_ordered_flocks, release_cache_writer_flocks,
+    )
+    # The ordered primitive, not the wrapper a case may have replaced.
+    held = acquire_ordered_flocks(
+        [(_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
+         (_cctally_core.CACHE_LOCK_CODEX_PATH, fcntl.LOCK_EX)],
+        timeout=None)
+    if held is None:
+        return False
+    release_cache_writer_flocks(held)
+    return True
+
+
+def test_historic_roots_get_completion_rows(tmp_path, monkeypatch):
+    """Detects a publication the witness cannot see: a pass that reconciles a
+    historic (inactive) root must restamp its completion generation too, or a
+    historic-only publication changes nothing in ``quota_projection_state``.
+    Active-root readers (the signature match) keep their verdict."""
+    from helpers.quota_projection_dump import (
+        ROOT_KEY, build_codex_quota_store, store_as_of,
+    )
+    ns, quota = _load(tmp_path, monkeypatch)
+    build_codex_quota_store(ns, closed_windows=2, observations_per_window=5)
+    build_codex_quota_store(
+        ns, closed_windows=2, observations_per_window=5, root_key="root-gone")
+    now = store_as_of(ns)
+    quota.reconcile_codex_quota_projection(now=now)
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute(
+            "DELETE FROM codex_source_roots WHERE source_root_key='root-gone'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = quota.reconcile_codex_quota_projection(
+        now=now, alert_eligible_root_keys={ROOT_KEY})
+    assert result.status == "published", result
+    rows = {
+        (str(row["source_root_key"]), str(row["generation"]))
+        for row in _projection_rows(ns, "quota_projection_state")
+    }
+    assert rows == {(ROOT_KEY, result.generation),
+                    ("root-gone", result.generation)}, rows
+    cache = ns["open_cache_db"]()
+    stats = ns["open_db"]()
+    try:
+        certificate = quota.load_codex_quota_projection_certificate(cache)
+        assert certificate is not None
+        assert set(certificate[1]) == {ROOT_KEY}, "signatures stay active-only"
+        assert quota._stats_projection_signatures_match(
+            stats, {ROOT_KEY}, certificate[1])
+    finally:
+        cache.close()
+        stats.close()
+
+
+def _bump_attribution(conn):
+    import _cctally_cache
+    _cctally_cache.bump_codex_window_attribution_revision(conn)
+
+
+def _owe_models(conn):
+    import _cctally_cache
+    _cctally_cache.add_codex_finalization_debt(conn, model=True)
+
+
+def _advance_ledger_only(conn):
+    """A ledgered row with NO physical-sequence bump (migration 028's shape)."""
+    import _fixture_builders
+    from helpers.quota_projection_dump import (
+        ROOT_KEY, SOURCE_PATH, logical_limit_key,
+    )
+    _fixture_builders.seed_codex_quota_snapshot(
+        conn, source_root_key=ROOT_KEY, source_path=SOURCE_PATH,
+        line_offset=90_000, captured_at_utc="2026-07-01T00:01:00Z",
+        logical_limit_key=logical_limit_key(), window_minutes=300,
+        used_percent=1.0, resets_at_utc="2026-07-01T05:00:00Z",
+        plan_type="pro")
+
+
+@pytest.mark.parametrize("fence", [
+    "sequence", "attribution", "ledger_head", "model_debt"])
+def test_failed_fences_prune_nothing_and_delete_the_certificate(
+    tmp_path, monkeypatch, fence,
+):
+    """Detects a prune or certificate over a state the publication does not
+    describe: the cache moved after the stats commit (seam: the
+    ``_after_stats_commit`` hook, which runs before finalization), so the
+    committed publication keeps its rows but must prune nothing and delete the
+    stored certificate instead of leaving an older one standing."""
+    import _fixture_builders
+    ns, quota, now = _store_with_owed_work(tmp_path, monkeypatch)
+    assert _certificate_present(ns), "premise: an older certificate stands"
+    owed = _ledger_count(ns)
+    assert owed > 0, "premise: the pass has ledger entries to prune"
+    mutate = {
+        "sequence": _fixture_builders.bump_codex_physical_mutation_seq,
+        "attribution": _bump_attribution,
+        "ledger_head": _advance_ledger_only,
+        "model_debt": _owe_models,
+    }[fence]
+
+    result = quota.reconcile_codex_quota_projection(
+        now=now, _after_stats_commit=lambda: _cache_write(ns, mutate))
+    assert result.status == "published", result
+    assert _ledger_count(ns) == owed + (1 if fence == "ledger_head" else 0), (
+        f"the {fence} fence failed but the ledger was pruned")
+    assert not _certificate_present(ns), (
+        f"the {fence} fence failed but a certificate survived")
+
+
+@pytest.mark.parametrize("failure", [
+    "busy_flock", "flock_oserror", "cache_sqlite_error"])
+def test_a_finalization_failure_still_dispatches_the_committed_crossing(
+    tmp_path, monkeypatch, failure,
+):
+    """Detects a notification lost to a certificate failure: finalization runs
+    in ``post_commit``, before the cycle's alert dispatch, so it must never
+    raise. A busy flock, a flock I/O error and a cache transaction error each
+    skip finalization, keep the ledger, hold no flock afterwards, and the
+    cycle's committed crossing still reaches the dispatch sink."""
+    import fcntl as _fcntl
+    import os as _os
+
+    import _cctally_core
+    import _lib_cache_writer_lock
+    from helpers.quota_projection_dump import ROOT_KEY
+    ns, quota, now = _store_with_owed_work(tmp_path, monkeypatch, alerts=True)
+    jr = importlib.import_module("_cctally_journal")
+    dispatched: list = []
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
+    # A 30 % observation in the live window: a genuine 25 % crossing.
+    conn = ns["open_cache_db"]()
+    try:
+        row = conn.execute(
+            "SELECT logical_limit_key, resets_at_utc, "
+            "       COALESCE(canonical_resets_at_utc, resets_at_utc) "
+            "  FROM quota_window_snapshots WHERE source='codex' "
+            " ORDER BY 3 DESC LIMIT 1").fetchone()
+        import _fixture_builders
+        from helpers.quota_projection_dump import SOURCE_PATH
+        _fixture_builders.seed_codex_quota_snapshot(
+            conn, source_root_key=ROOT_KEY, source_path=SOURCE_PATH,
+            line_offset=10_000,
+            captured_at_utc=(now + dt.timedelta(minutes=1)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            logical_limit_key=str(row[0]), window_minutes=300,
+            used_percent=30.0, resets_at_utc=str(row[1]),
+            canonical_resets_at_utc=str(row[2]), plan_type="pro")
+        _fixture_builders.bump_codex_physical_mutation_seq(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    owed = _ledger_count(ns)
+    assert owed > 0
+    held_fd = None
+    after_commit = None
+    if failure == "busy_flock":
+        held_fd = _os.open(str(_cctally_core.CACHE_LOCK_PATH),
+                           _os.O_RDWR | _os.O_CREAT, 0o600)
+        _fcntl.flock(held_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    elif failure == "flock_oserror":
+        def _raise_oserror(*_a, **_k):
+            raise OSError("flock I/O error")
+        monkeypatch.setattr(
+            _lib_cache_writer_lock, "acquire_cache_writer_flocks",
+            _raise_oserror)
+    else:
+        def after_commit():
+            def _broken(_conn):
+                raise sqlite3.OperationalError("disk I/O error")
+            monkeypatch.setattr(quota, "codex_physical_mutation_seq", _broken)
+    try:
+        result = quota.reconcile_codex_quota_projection(
+            now=now + dt.timedelta(minutes=2),
+            alert_eligible_root_keys={ROOT_KEY},
+            _after_stats_commit=after_commit)
+    finally:
+        if held_fd is not None:
+            _fcntl.flock(held_fd, _fcntl.LOCK_UN)
+            _os.close(held_fd)
+    assert result.status == "published", result
+    assert [alert.get("threshold") for alert in dispatched] == [25], dispatched
+    assert _ledger_count(ns) == owed, "a failed finalization pruned the ledger"
+    assert _flocks_free(ns), "finalization left a cache writer flock held"
+
+
+def test_finalization_runs_after_the_commit_and_the_after_commit_seam(
+    tmp_path, monkeypatch,
+):
+    """Preservation: the order is commit, then ``_after_stats_commit``, then
+    the certificate finalization, then the alert dispatch; finalization sees
+    the committed stats rows."""
+    jr = importlib.import_module("_cctally_journal")
+    ns, quota, now = _store_with_owed_work(tmp_path, monkeypatch)
+    order: list = []
+    original = quota._finalize_codex_quota_publication
+
+    def finalize(prepared, **kwargs):
+        stats = ns["open_db"]()
+        try:
+            watermark = stats.execute(
+                "SELECT watermark_seq FROM quota_projection_ledger_state "
+                " WHERE source='codex'").fetchone()[0]
+        finally:
+            stats.close()
+        order.append(("finalize", watermark == prepared.watermark_target))
+        return original(prepared, **kwargs)
+
+    monkeypatch.setattr(quota, "_finalize_codex_quota_publication", finalize)
+    monkeypatch.setattr(
+        jr, "ALERT_DISPATCHER", lambda alerts: order.append(("dispatch",)))
+    result = quota.reconcile_codex_quota_projection(
+        now=now, _after_stats_commit=lambda: order.append(("after_commit",)))
+    assert result.status == "published", result
+    assert order[:2] == [("after_commit",), ("finalize", True)], order
+    assert _certificate_present(ns)
+    assert _ledger_count(ns) == 0
+
+
+def test_a_pre_commit_failure_finalizes_nothing(tmp_path, monkeypatch):
+    """Preservation: a raise before the stats commit rolls the publication
+    back, so nothing is pruned or certified."""
+    ns, quota, now = _store_with_owed_work(tmp_path, monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(
+        quota, "_finalize_codex_quota_publication",
+        lambda prepared, **kwargs: calls.append(1) or "stored")
+    owed = _ledger_count(ns)
+    state_before = _projection_rows(ns, "quota_projection_state")
+
+    with pytest.raises(RuntimeError, match="before commit"):
+        quota.reconcile_codex_quota_projection(
+            now=now,
+            _before_stats_commit=lambda: (_ for _ in ()).throw(
+                RuntimeError("before commit")))
+    assert calls == []
+    assert _ledger_count(ns) == owed
+    assert [tuple(r) for r in _projection_rows(
+        ns, "quota_projection_state")] == [tuple(r) for r in state_before]
+
+
+def test_a_nested_reconcile_returns_contended_before_any_work(
+    tmp_path, monkeypatch,
+):
+    """#1076 D4 (reconcile side, spec T5). Detects the self-wait coming back
+    through any nested caller: a reconcile inside a held stats ingest that
+    prepares a pass, opens stats.db or polls the ingest lock its own context
+    holds (10 s, then `contended`). Detects as well a nested alert-authorized
+    call silently accepted instead of refused."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    import _cctally_core
+    import _cctally_journal
+    import _cctally_store
+    calls: list = []
+    for module, name in ((quota, "_prepare_codex_quota_pass"),
+                         (_cctally_core, "open_db"),
+                         (_cctally_journal, "_acquire_ingest_lock")):
+        real = getattr(module, name)
+        monkeypatch.setattr(
+            module, name,
+            lambda *a, _n=name, _r=real, **k: calls.append(_n) or _r(*a, **k))
+    now = dt.datetime(2026, 7, 15, 12, tzinfo=UTC)
+    with _cctally_store.stats_write_scope("ingest", ingest_lock=True):
+        result = quota.reconcile_codex_quota_projection(now=now)
+        assert result.status == quota.PROJECTION_CONTENDED
+        assert result.alert_work_pending is False
+        assert result.alert_work_issue == ""
+        assert calls == [], calls
+        with pytest.raises(RuntimeError):
+            quota.reconcile_codex_quota_projection(
+                now=now, alert_eligible_root_keys={"r"})
+        with pytest.raises(RuntimeError):
+            quota.reconcile_codex_quota_projection(
+                now=now, _alert_activation_roots=frozenset())
+    assert calls == [], calls

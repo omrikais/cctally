@@ -189,7 +189,13 @@ def test_a_a_failing_marker_lookup_propagates_and_admits_nothing(
     seen = {"lookups": 0}
 
     def exists(self, *args, **kwargs):
-        if os.fspath(self) == target:
+        # Only the guarded opener's own lookups count. #787 / #861 (spec 5.1,
+        # AD5): the test thread holds `process`, so `open_cache_db` first
+        # classifies its branch, and that classifier looks up the same two
+        # records (reading an error as the MAINTENANCE branch). A one-shot
+        # fault it consumed would never reach the lookup this test is about.
+        if (os.fspath(self) == target
+                and sys._getframe(1).f_code.co_name == "_cache_open_guarded"):
             seen["lookups"] += 1
             if seen["lookups"] == nth:
                 raise OSError(code, os.strerror(code), target)

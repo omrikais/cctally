@@ -88,8 +88,11 @@ def _run_codex_stream(ns, monkeypatch, key, *, account=None, cycles=8,
     """The real qualified Codex live tail. Returns the handler and the
     ``only_paths`` of every transcript ingest after the connect ingest."""
     conv = _conversation_module(ns)
-    real = conv.sync_codex_conversations
-    real_accounting = conv.sync_codex_cache
+    # #787 / #861 spec 5.9: the stream ingests through the request entries,
+    # whose bodies call these full functions in the cache module.
+    cache = sys.modules["_cctally_cache"]
+    real = cache.sync_codex_conversations
+    real_accounting = cache.sync_codex_cache
     monkeypatch.setattr(conv, "_LIVE_TAIL_FILE_RESET_EVERY", reset_every)
     state = _script_cycles(conv, monkeypatch, cycles, actions or {})
     ingests: list = []
@@ -113,8 +116,8 @@ def _run_codex_stream(ns, monkeypatch, key, *, account=None, cycles=8,
                 before_accounting()
         return real_accounting(writer, **kwargs)
 
-    monkeypatch.setattr(conv, "sync_codex_cache", accounting)
-    monkeypatch.setattr(conv, "sync_codex_conversations", transcript)
+    monkeypatch.setattr(cache, "sync_codex_cache", accounting)
+    monkeypatch.setattr(cache, "sync_codex_conversations", transcript)
     handler = _StreamHandler()
     conv._qualified_conversation_events(handler, key, account)
     assert handler.errors == [], handler.errors
@@ -307,7 +310,9 @@ def test_a_stream_without_a_seam_keeps_the_integer_probe(env, monkeypatch,
         handler, None, passive=False, tail_data={"sessionId": "s1"},
         resolve=lambda: [str(path)], ingest=ingest,
         cached_sigs=lambda paths: {p: committed.get(p) for p in paths})
-    assert calls == [[str(path)], [str(path)]]   # the connect ingest + the growth
+    # #787 / #861 spec 5.9: the writer phase runs only on growth, so a
+    # connect whose committed cursor already matches ingests nothing.
+    assert calls == [[str(path)]]   # the growth only
     assert handler.frames("tail") == 1
 
 

@@ -5,16 +5,29 @@ A resource measurement, not a merge-path check: it times
 moves with the scheduler (a first occurrence under the full suite's load).
 It runs serially (`SERIAL` in bin/_lib_test_selection.py) in the full and
 broad runs and never in a quick gate (`BROAD_RUN_ONLY` in
-bin/_lib_quick_gate.py). The merge path keeps the deterministic detector of
-the same regression,
-`tests/test_retention_doctor_cost_496.py::test_the_planner_reads_the_reference_graph_linearly_in_the_root_count`,
-which counts reads instead of timing them.
+bin/_lib_quick_gate.py). It is the portable elapsed-time backstop: it runs
+wherever the full suite does, public CI's Ubuntu lane included, and it is
+parametrized over the age and count workloads, because the age workload never
+reaches the count phase (#964).
+
+The merge-path detector of the same regression is the instruction count,
+`tests/test_retention_doctor_cost_496.py::test_the_planner_executes_linearly_in_the_root_count`,
+which counts the CPU instructions the planner retires in a single-threaded
+child process, so load cannot move it; it needs macOS and skips elsewhere.
+Beside it, `test_the_planner_reads_the_reference_graph_linearly_in_the_root_count`
+counts the inverse-index reads. Neither measures elapsed time, which is what
+this backstop keeps: memory-access and allocation costs whose instruction
+count stays linear.
 """
 from __future__ import annotations
 
 import time
 
-from test_retention_doctor_cost_496 import _load, _synthetic_members
+import pytest
+
+from test_retention_doctor_cost_496 import (
+    _load, _synthetic_members, _workload_policy,
+)
 
 
 def _plan_seconds(kern, count, policy):
@@ -32,8 +45,9 @@ def _plan_seconds(kern, count, policy):
     return best
 
 
+@pytest.mark.parametrize("workload", ["age", "count"])
 def test_the_planner_does_not_scale_quadratically_in_the_root_count(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, workload,
 ):
     """Doubling the roots must not roughly quadruple the time.
 
@@ -47,10 +61,7 @@ def test_the_planner_does_not_scale_quadratically_in_the_root_count(
     serially, so it means the same thing on a fast and a slow runner.
     """
     _ns, _core, _doc, _ret, kern = _load(tmp_path, monkeypatch)
-    policy = kern.RetentionPolicy(
-        max_age_seconds=1, max_count_per_family=20,
-        max_total_bytes=1, min_free_bytes=None, max_shape_examples=8,
-    )
+    policy = _workload_policy(kern, workload)
     small = _plan_seconds(kern, 400, policy)
     large = _plan_seconds(kern, 1600, policy)
     ratio = large / small if small else float("inf")

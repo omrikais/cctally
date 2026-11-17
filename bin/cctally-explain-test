@@ -338,7 +338,9 @@ done
 # vector the transcript gate rejects), and a request under the
 # `dashboard.expose_transcripts` opt-in from a non-loopback bind. One store
 # with three served bodies is what makes those three cells RENDERED artifacts
-# rather than pytest legs over internal facts.
+# rather than pytest legs over internal facts. Each server runs under a
+# child-scope holder (issue #1087), which stops it while it holds it unreaped;
+# this harness never signals a process number.
 . "$REPO_ROOT/bin/_lib-kill-server.sh"
 
 # Put back whatever `config.json` the shared harness seeded. A leg that only
@@ -363,7 +365,7 @@ _restore_route_config() {
 serve_route_leg() {
     local name="$1" leg="$2" bind="$3" host_header="$4" expose="$5" query="$6"
     local as_of="$7"
-    local golden home log pid port status body_file actual config
+    local golden home log hold pid port status body_file actual config
     local config_backup
     home="$SCRATCH_DIR/$name"
     log="$SCRATCH_DIR/$name.$leg.dashboard.log"
@@ -402,10 +404,12 @@ serve_route_leg() {
  "dashboard": {"expose_transcripts": true, "lan_auth": false}}' > "$config"
     fi
 
-    env -u CODEX_HOME CCTALLY_AS_OF="$as_of" HOME="$home" TZ=Etc/UTC \
+    hold="$SCRATCH_DIR/$name.$leg.hold"
+    hold_start "$hold" child -- \
+        env -u CODEX_HOME CCTALLY_AS_OF="$as_of" HOME="$home" TZ=Etc/UTC \
         "$HARNESS_BIN" dashboard --port 0 --no-browser --no-sync \
-        --sync-interval 9999 --host "$bind" >"$log" 2>&1 &
-    pid=$!
+        --sync-interval 9999 --host "$bind" >"$log" 2>&1
+    pid=$HOLD_PID
 
     port=""
     tries=0
@@ -415,7 +419,7 @@ serve_route_leg() {
                    | head -1 | sed 's#.*:##')
             [ -n "$port" ] && break
         fi
-        kill -0 "$pid" 2>/dev/null || break
+        hold_alive "$pid" || break
         sleep 0.1
         tries=$((tries + 1))
     done
@@ -423,7 +427,7 @@ serve_route_leg() {
     if [ -z "$port" ]; then
         echo "FAIL $name/route-$leg: could not discover port (log: $log)"
         sed 's/^/    /' "$log" || true
-        kill_server_bounded "$pid"
+        stop_server_bounded "$hold"
         _restore_route_config "$config" "$config_backup" "$expose"
         fail_count=$((fail_count + 1))
         return 0
@@ -433,7 +437,7 @@ serve_route_leg() {
     status=$(curl -s -o "$body_file" -w '%{http_code}' --max-time 30 \
              -H "Host: ${host_header/PORT/$port}" \
              "http://127.0.0.1:$port/api/diagnosis?$query")
-    kill_server_bounded "$pid"
+    stop_server_bounded "$hold"
     _restore_route_config "$config" "$config_backup" "$expose"
 
     if [ "$status" != "200" ] && [ "$status" != "503" ]; then
@@ -496,10 +500,12 @@ for dir in "$HARNESS_FIXTURES_DIR"/*/; do
     # `env -u CODEX_HOME` is redundant here too, for the reason stated at the
     # oracle leg above. The dashboard does resolve Codex roots at boot, and the
     # shared harness environment has already unset the variable.
-    env -u CODEX_HOME CCTALLY_AS_OF="$AS_OF" HOME="$home" TZ=Etc/UTC \
+    hold="$SCRATCH_DIR/$name.hold"
+    hold_start "$hold" child -- \
+        env -u CODEX_HOME CCTALLY_AS_OF="$AS_OF" HOME="$home" TZ=Etc/UTC \
         "$HARNESS_BIN" dashboard --port 0 --no-browser --no-sync \
-        --sync-interval 9999 --host 127.0.0.1 >"$log" 2>&1 &
-    pid=$!
+        --sync-interval 9999 --host 127.0.0.1 >"$log" 2>&1
+    pid=$HOLD_PID
 
     port=""
     tries=0
@@ -509,7 +515,7 @@ for dir in "$HARNESS_FIXTURES_DIR"/*/; do
                    | head -1 | sed 's#.*:##')
             [ -n "$port" ] && break
         fi
-        kill -0 "$pid" 2>/dev/null || break
+        hold_alive "$pid" || break
         sleep 0.1
         tries=$((tries + 1))
     done
@@ -517,7 +523,7 @@ for dir in "$HARNESS_FIXTURES_DIR"/*/; do
     if [ -z "$port" ]; then
         echo "FAIL $name/route: could not discover port (log: $log)"
         sed 's/^/    /' "$log" || true
-        kill_server_bounded "$pid"
+        stop_server_bounded "$hold"
         fail_count=$((fail_count + 1))
         continue
     fi
@@ -528,7 +534,7 @@ for dir in "$HARNESS_FIXTURES_DIR"/*/; do
     body_file="$SCRATCH_DIR/$name.route.json"
     status=$(curl -s -o "$body_file" -w '%{http_code}' --max-time 30 \
              "http://127.0.0.1:$port/api/diagnosis?$ROUTE_QUERY")
-    kill_server_bounded "$pid"
+    stop_server_bounded "$hold"
 
     if [ "$status" != "200" ] && [ "$status" != "503" ]; then
         echo "FAIL $name/route: GET /api/diagnosis returned $status"

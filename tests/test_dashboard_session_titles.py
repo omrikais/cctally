@@ -24,6 +24,7 @@ BLOCK on the transcript store — rather than the feature it dropped:
 from __future__ import annotations
 
 import datetime as dt
+import os
 import pathlib
 import sqlite3
 import sys
@@ -167,6 +168,60 @@ def test_bounded_reader_never_uses_the_heavyweight_opener(tmp_path, monkeypatch)
 
     assert cache_mod.read_session_titles_bounded(["s-1"]) == {
         "s-1": "Fix the flaky test"}
+
+
+@pytest.mark.parametrize("state, expected", [
+    ("current", {"s-1": "Fix the flaky test"}),
+    ("schema_behind", {"s-1": "Fix the flaky test"}),
+    ("schema_ahead", {"s-1": "Fix the flaky test"}),
+    ("schema_behind_without_tables", {}),
+])
+def test_query_title_read_matches_base_across_schema_states(
+    tmp_path, monkeypatch, state, expected,
+):
+    """#787 / #861 F4 (R8): the narrowed snapshot build reads Sessions-panel
+    titles through a query session, which refuses a schema-behind or
+    schema-ahead conversations.db, so the panel lost every title in states
+    where base's raw ``mode=ro`` read showed them. The title session
+    tolerates the schema mismatch for its one plain SELECT, under admission
+    and the read-only authorizer, and an absent table is still the fail-soft
+    empty answer. Detects the panel rendering em-dashes on a store base
+    read. The tolerated store is still reported to its owner (N8), as the
+    refusal reported it, so the owner phase that migrates or heals it is
+    told; detects a tolerated mismatch that silently drops that call."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    core = ns["_cctally_core"]
+    os.chmod(core.APP_DIR, 0o700)
+    _seed_titles_on_disk(ns, rollup=[("s-1", "Fix the flaky test")])
+    cache_mod = ns["_load_sibling"]("_cctally_cache")
+    path = core.CONVERSATIONS_DB_PATH
+    head = len(db._CONVERSATIONS_MIGRATIONS)
+    if state != "current":
+        conn = sqlite3.connect(path)
+        try:
+            if state.endswith("without_tables"):
+                conn.execute("DROP TABLE conversation_ai_titles")
+                conn.execute("DROP TABLE conversation_sessions")
+            version = head + 1 if state == "schema_ahead" else head - 1
+            conn.execute(f"PRAGMA user_version = {version}")
+            conn.commit()
+        finally:
+            conn.close()
+    before = path.read_bytes()
+    notified: list = []
+    monkeypatch.setattr(core, "notify_owner",
+                        lambda store, readiness: notified.append(
+                            (store, readiness.reason)))
+    with core.authority_scope("query", policy="interactive"):
+        assert cache_mod.read_session_titles_bounded(["s-1"]) == expected
+    assert path.read_bytes() == before
+    if state == "current":
+        assert notified == []
+    else:
+        reason = ("schema_ahead" if state == "schema_ahead"
+                  else "schema_behind")
+        assert notified == [("conversations", reason)], notified
 
 
 def test_bounded_reader_returns_empty_when_the_store_is_missing(

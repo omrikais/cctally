@@ -20,6 +20,8 @@ import hashlib
 import itertools
 import os
 import pathlib
+import shutil
+import signal
 import json
 import sqlite3
 import subprocess
@@ -1269,6 +1271,1121 @@ def test_dashboard_soak_copies_operator_fixture_without_mutating_source(
     assert (unknown_log / "dashboard-soak.log").read_bytes() == prior_log.read_bytes()
 
 
+# ── #879: the surviving-foreign-corpus guard ──────────────────────────────
+
+def _operator_fixture(tmp_path, *, conversation_rows=(), marker=None,
+                      cache_rows=(), name="operator-fixture"):
+    """A minimal operator fixture: the shape `_prepare_fixture` requires, a
+    conversations.db with `conversation_source_files` rows naming
+    `conversation_rows` (no table when empty and `cache_rows` is empty too),
+    an optional cache.db whose accounting cursors name `cache_rows`, and an
+    optional marker document."""
+    source = tmp_path / name
+    (source / "data").mkdir(parents=True)
+    (source / "claude" / "projects").mkdir(parents=True)
+    (source / "codex-a" / "sessions").mkdir(parents=True)
+    conn = sqlite3.connect(source / "data" / "conversations.db")
+    conn.execute("CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT)")
+    if conversation_rows or cache_rows:
+        conn.execute("CREATE TABLE conversation_source_files (path TEXT "
+                     "PRIMARY KEY, size_bytes INTEGER, mtime_ns INTEGER, "
+                     "last_byte_offset INTEGER, last_ingested_at TEXT)")
+        conn.execute("CREATE TABLE codex_conversation_source_files (path TEXT "
+                     "PRIMARY KEY, size_bytes INTEGER)")
+        conn.executemany(
+            "INSERT INTO conversation_source_files VALUES (?, 1, 1, 1, 'x')",
+            [(str(p),) for p in conversation_rows])
+        # Codex conversation cursors are cleared by normalization whatever
+        # their files' state, so live ones must never count.
+        conn.executemany(
+            "INSERT INTO codex_conversation_source_files VALUES (?, 1)",
+            [(str(p),) for p in cache_rows])
+    conn.commit()
+    conn.close()
+    if cache_rows:
+        cache = sqlite3.connect(source / "data" / "cache.db")
+        for table in ("session_files", "codex_session_files"):
+            cache.execute(f"CREATE TABLE {table} (path TEXT PRIMARY KEY)")
+            cache.executemany(f"INSERT INTO {table} VALUES (?)",
+                              [(str(p),) for p in cache_rows])
+        cache.commit()
+        cache.close()
+    if marker is not None:
+        (source / ".cctally-soak-normalized.json").write_text(
+            json.dumps(marker, sort_keys=True) + "\n")
+    return source
+
+
+def _live_file(path: pathlib.Path) -> pathlib.Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n")
+    return path
+
+
+@pytest.mark.parametrize("case", [
+    "under-marker-root", "under-retained-prior-root", "outside-both",
+    "permission-error"])
+def test_prepare_fixture_refuses_surviving_transcript_rows(
+    tmp_path, monkeypatch, case,
+):
+    """#879 A1/A2: a copied fixture whose `conversation_source_files` still
+    names a transcript present on this host keeps that row through
+    normalization, and the run used to copy, rebuild for about 40 minutes and
+    only then refuse in `_prepared_source_cursor_evidence`. The guard must
+    refuse BEFORE the copy (the destination never exists), name the path,
+    say where it lies, and give the remedy. An `lstat` that fails with
+    anything but ENOENT/ENOTDIR is uncertain: the product keeps such a row,
+    so the guard must count it as surviving instead of letting it slip."""
+    soak = _load_dashboard_soak()
+    marker_root = (tmp_path / "marker-root").resolve()
+    prior_root = (tmp_path / "prior-root").resolve()
+    marker = {"schemaVersion": 1, "root": str(marker_root),
+              "fixtureSourceFingerprint": "a" * 64}
+    if case == "under-marker-root":
+        live = _live_file(marker_root / "claude" / "projects" / "p" / "a.jsonl")
+        where = "marker root"
+    elif case == "under-retained-prior-root":
+        live = _live_file(prior_root / "claude" / "projects" / "p" / "b.jsonl")
+        marker.update(retainedPriorSourceRoot=str(prior_root),
+                      retainedPriorSourceSha256="b" * 64)
+        where = "retained prior root"
+    elif case == "outside-both":
+        live = _live_file(tmp_path / "elsewhere" / "c.jsonl").resolve()
+        where = None
+    else:
+        live = (tmp_path / "unreadable" / "d.jsonl").resolve()
+        real_lstat = os.lstat
+
+        def lstat(target, *args, **kwargs):
+            if str(target) == str(live):
+                raise PermissionError(13, "Permission denied", str(target))
+            return real_lstat(target, *args, **kwargs)
+
+        monkeypatch.setattr(soak.os, "lstat", lstat)
+        where = None
+    absent = tmp_path / "gone" / "e.jsonl"
+    source = _operator_fixture(
+        tmp_path, conversation_rows=(absent, live), marker=marker)
+    destination = tmp_path / "measurement"
+    with pytest.raises(ValueError) as excinfo:
+        soak._prepare_fixture(destination, source, "small", 42)
+    message = str(excinfo.value)
+    assert not destination.exists()
+    assert str(live) in message
+    assert "preparation v2" in message
+    assert "1 transcript row" in message
+    if case == "permission-error":
+        assert "0 present, 1 unreadable" in message
+    else:
+        assert "1 present, 0 unreadable" in message
+    if where is not None:
+        assert where in message
+
+
+def test_prepare_fixture_guard_passes_safe_fixtures(tmp_path):
+    """#879 over-refusal guard: fixtures that normalize cleanly must still be
+    copied. F5's fixture has no cursor table at all; a fixture whose
+    accounting cursors (cache.db, and Codex conversation cursors) name live
+    files is safe because normalization clears those cursors whatever their
+    files' state, provided every Claude conversation row is absent; and the
+    five-field marker the regime staging writes is a valid marker shape."""
+    soak = _load_dashboard_soak()
+    no_rows = _operator_fixture(
+        tmp_path, name="f5", marker=None)
+    (no_rows / ".cctally-soak-normalized.json").write_text(json.dumps({
+        "schemaVersion": 1, "root": str(no_rows.resolve()),
+        "fixtureSourceFingerprint": "a" * 64}) + "\n")
+    live = _live_file(tmp_path / "live-root" / "rollout.jsonl").resolve()
+    accounting_only = _operator_fixture(
+        tmp_path, name="accounting-only", cache_rows=(live,),
+        conversation_rows=(tmp_path / "gone" / "t.jsonl",))
+    five_field = _operator_fixture(tmp_path, name="five-field", marker={
+        "schemaVersion": 1, "root": str((tmp_path / "x").resolve()),
+        "fixtureSourceFingerprint": "c" * 64,
+        "retainedPriorSourceRoot": str((tmp_path / "y").resolve()),
+        "retainedPriorSourceSha256": "d" * 64})
+    for index, source in enumerate((no_rows, accounting_only, five_field)):
+        destination = tmp_path / f"measurement-{index}"
+        assert soak._prepare_fixture(
+            destination, source, "small", 42) == "isolatedProductionCopy"
+        assert (destination / "data" / "conversations.db").is_file()
+
+
+@pytest.mark.parametrize("case", [
+    "schema-version", "relative-root", "symlinked-marker", "half-pair"])
+def test_prepare_fixture_guard_refuses_malformed_marker(tmp_path, case):
+    """#879 Q5: the marker is evidence of where a fixture came from, so a
+    corrupt one is refused (naming it) before the copy instead of being
+    trusted or ignored: a wrong schema version, a relative root, a marker
+    that is a symlink, or one half of the retained-prior pair."""
+    soak = _load_dashboard_soak()
+    marker = {"schemaVersion": 1, "root": str((tmp_path / "r").resolve()),
+              "fixtureSourceFingerprint": "a" * 64}
+    if case == "schema-version":
+        marker["schemaVersion"] = 2
+    elif case == "relative-root":
+        marker["root"] = "relative/root"
+    elif case == "half-pair":
+        marker["retainedPriorSourceRoot"] = str((tmp_path / "p").resolve())
+    source = _operator_fixture(
+        tmp_path, marker=None if case == "symlinked-marker" else marker)
+    if case == "symlinked-marker":
+        real = tmp_path / "real-marker.json"
+        real.write_text(json.dumps(marker) + "\n")
+        (source / ".cctally-soak-normalized.json").symlink_to(real)
+    destination = tmp_path / "measurement"
+    with pytest.raises(ValueError, match="marker"):
+        soak._prepare_fixture(destination, source, "small", 42)
+    assert not destination.exists()
+
+
+def test_dashboard_soak_main_refuses_live_fixture_before_copy(
+    tmp_path, monkeypatch,
+):
+    """#879 A1 at the entry point: `main()` with `--fixture-copy` on a fixture
+    with a live transcript row exits 2 through the existing ValueError path
+    and creates nothing under `--root`, so the guard cannot be bypassed on
+    the way in. The stubbed binary is never run: the step after the copy is
+    replaced by a stop, so without the guard the copy is what the test
+    observes."""
+    soak = _load_dashboard_soak()
+    live = _live_file(tmp_path / "corpus" / "claude" / "projects" / "a.jsonl")
+    source = _operator_fixture(tmp_path, conversation_rows=(live.resolve(),))
+    checkout = tmp_path / "checkout"
+    (checkout / "bin").mkdir(parents=True)
+    (checkout / "bin" / "cctally").write_text("#!/bin/sh\nexit 0\n")
+
+    def stop_after_copy(*_args, **_kwargs):
+        raise RuntimeError("stub binary: stop after the copy")
+
+    monkeypatch.setattr(soak, "_set_offline_config", stop_after_copy)
+    root = tmp_path / "measurement"
+    code = soak.main([
+        "--root", str(root), "--fixture-copy", str(source),
+        "--checkout", str(checkout), "--execute-regime", "claudeActive"])
+    assert code == 2
+    assert not root.exists()
+
+
+# ── #937: bench/soak_image.py (write-budget preparation v2) ────────────────
+
+HDIUTIL_FIXTURES = BIN.parent / "tests" / "fixtures" / "bench" / "hdiutil"
+
+
+def _load_soak_image():
+    path = BIN.parent / "bench" / "soak_image.py"
+    loader = importlib.machinery.SourceFileLoader("soak_image", str(path))
+    spec = importlib.util.spec_from_loader("soak_image", loader)
+    mod = importlib.util.module_from_spec(spec)
+    # dataclasses resolve their module through sys.modules
+    sys.modules["soak_image"] = mod
+    loader.exec_module(mod)
+    return mod
+
+
+def _equivalence_side(directory: pathlib.Path, canonical: str, *,
+                      normalized: bool) -> None:
+    """One side of a P0 comparison: the byte-derived families with the same
+    content on both sides, and the identity/clock columns the producer
+    regenerates differing between them, as a correct P0 leaves them."""
+    directory.mkdir(parents=True)
+    a = f"{canonical}/claude/projects/p/a.jsonl"
+    pruned = f"{canonical}/claude/projects/p/pruned.jsonl"
+    r = f"{canonical}/codex-a/sessions/r.jsonl"
+    s = f"{canonical}/codex-a/sessions/s.jsonl"
+    clock = "2026-11-08T00:00:00Z" if normalized else "2026-09-22T00:00:00Z"
+    inode = {a: 11, pruned: 12, r: 21, s: 22} if normalized else {
+        a: 911, pruned: 912, r: 921, s: 922}
+    cache = sqlite3.connect(directory / "cache.db")
+    cache.executescript("""
+        CREATE TABLE session_files (path TEXT PRIMARY KEY, size_bytes INTEGER,
+            mtime_ns INTEGER, last_byte_offset INTEGER, last_ingested_at TEXT,
+            session_id TEXT, project_path TEXT, account_key TEXT);
+        CREATE TABLE session_entries (id INTEGER PRIMARY KEY, source_path TEXT,
+            line_offset INTEGER, model TEXT, input_tokens INTEGER,
+            mutation_seq INTEGER, mutation_min_ts TEXT, account_key TEXT);
+        CREATE TABLE codex_session_files (path TEXT PRIMARY KEY,
+            size_bytes INTEGER, mtime_ns INTEGER, last_byte_offset INTEGER,
+            last_ingested_at TEXT, source_root_key TEXT, device_id INTEGER,
+            inode INTEGER, account_key TEXT);
+        CREATE TABLE codex_session_entries (id INTEGER PRIMARY KEY,
+            source_path TEXT, line_offset INTEGER, input_tokens INTEGER,
+            account_key TEXT);
+        CREATE TABLE codex_source_roots (source_root_key TEXT PRIMARY KEY,
+            canonical_root_path TEXT, first_seen_utc TEXT, last_seen_utc TEXT);
+        CREATE TABLE codex_file_incarnations (file_identity TEXT PRIMARY KEY,
+            incarnation INTEGER, updated_at_utc TEXT);
+        CREATE TABLE codex_file_accounts (file_identity TEXT,
+            incarnation INTEGER, from_offset INTEGER, root_scope TEXT,
+            account_key TEXT, decided_at_utc TEXT,
+            PRIMARY KEY (file_identity, incarnation, from_offset));
+        CREATE TABLE codex_conversation_threads (
+            conversation_key TEXT PRIMARY KEY, source_path TEXT, cwd TEXT,
+            first_seen_utc TEXT, last_seen_utc TEXT);
+        CREATE TABLE conversation_messages (id INTEGER PRIMARY KEY,
+            text TEXT);
+    """)
+    # A live cache.db table in the producer, with two ingest clocks; and an
+    # empty legacy conversation table, as on the full-size corpus.
+    cache.execute(
+        "INSERT INTO codex_conversation_threads VALUES (?,?,?,?,?)",
+        ("v1.rk.t1", f"{canonical}/codex-a/sessions/r.jsonl", "/w", clock,
+         clock))
+    cache.executemany("INSERT INTO session_files VALUES (?,?,?,?,?,?,?,?)", [
+        (a, 100, 1000, 100, clock, "sess-a", "/p", "acct"),
+        (pruned, 50, 1001, 50, clock, "sess-p", "/p", "acct")])
+    base = 100 if normalized else 1
+    cache.executemany(
+        "INSERT INTO session_entries VALUES (?,?,?,?,?,?,?,?)", [
+            (base, a, 0, "opus", 10, base, clock, "acct"),
+            (base + 1, a, 40, "opus", 20, base + 1, clock, "acct")])
+    cache.executemany(
+        "INSERT INTO codex_session_files VALUES (?,?,?,?,?,?,?,?,?)", [
+            (r, 200, 2000, 200, clock, "rk", 5 if normalized else 1, inode[r],
+             "acct"),
+            (s, 300, 2001, 300, clock, "rk", 5 if normalized else 1, inode[s],
+             "acct")])
+    cache.executemany("INSERT INTO codex_session_entries VALUES (?,?,?,?,?)", [
+        (base, r, 0, 7, "acct"), (base + 1, s, 0, 9, "acct")])
+    cache.execute("INSERT INTO codex_source_roots VALUES (?,?,?,?)",
+                  ("rk", f"{canonical}/codex-a/sessions", clock, clock))
+    # fk-r advances under the new device (the Codex counterpart of the
+    # Claude re-incarnation); fk-s keeps its incarnation and decisions.
+    cache.executemany("INSERT INTO codex_file_incarnations VALUES (?,?,?)", [
+        ("fk-r", 2 if normalized else 1, clock), ("fk-s", 1, clock)])
+    accounts = [("fk-r", 1, 0, "rk", "acct", clock),
+                ("fk-s", 1, 0, "rk", "acct", clock)]
+    if normalized:
+        accounts.append(("fk-r", 2, 0, "rk", None, clock))
+    cache.executemany("INSERT INTO codex_file_accounts VALUES (?,?,?,?,?,?)",
+                      accounts)
+    cache.commit()
+    cache.close()
+    conv = sqlite3.connect(directory / "conversations.db")
+    conv.executescript("""
+        CREATE TABLE conversation_source_files (path TEXT PRIMARY KEY,
+            size_bytes INTEGER, mtime_ns INTEGER, last_byte_offset INTEGER,
+            last_ingested_at TEXT, device_id INTEGER, inode INTEGER,
+            source_incarnation_id TEXT, committed_prefix_sha256 TEXT);
+        CREATE TABLE conversation_messages (id INTEGER PRIMARY KEY,
+            source_path TEXT, byte_offset INTEGER, text TEXT,
+            account_key TEXT);
+        CREATE TABLE codex_conversation_source_files (path TEXT PRIMARY KEY,
+            size_bytes INTEGER, mtime_ns INTEGER, last_byte_offset INTEGER,
+            last_ingested_at TEXT, source_root_key TEXT, device_id INTEGER,
+            inode INTEGER);
+        CREATE TABLE claude_conversation_account_stamps (
+            canonical_source_path TEXT, source_incarnation_id TEXT,
+            byte_offset INTEGER, record_sha256 TEXT, account_key TEXT);
+        CREATE TABLE conversation_sessions (session_id TEXT PRIMARY KEY,
+            msg_count INTEGER, render_revision INTEGER);
+    """)
+    incarnation = "inc-new" if normalized else "inc-old"
+    conv.executemany(
+        "INSERT INTO conversation_source_files VALUES (?,?,?,?,?,?,?,?,?)", [
+            (a, 100, 1000, 100, clock, 5 if normalized else 1, inode[a],
+             incarnation, "sha-a"),
+            # retention pruned this transcript's messages but kept its cursor
+            (pruned, 50, 1001, 50, clock, 5 if normalized else 1, inode[pruned],
+             incarnation, "sha-p")])
+    conv.executemany("INSERT INTO conversation_messages VALUES (?,?,?,?,?)", [
+        (base, a, 0, "Hello", "acct"), (base + 1, a, 40, "World", "acct")])
+    conv.executemany(
+        "INSERT INTO codex_conversation_source_files VALUES (?,?,?,?,?,?,?,?)", [
+            (r, 200, 2000, 200, clock, "rk", 5 if normalized else 1, inode[r]),
+            (s, 300, 2001, 300, clock, "rk", 5 if normalized else 1, inode[s])])
+    stamps = [(a, incarnation, 0, "rec-0", "acct"),
+              (a, incarnation, 40, "rec-40", None if normalized else "acct")]
+    if normalized:
+        # The producer's rebuild keeps the retained incarnation's stamps
+        # beside the new incarnation's (the full-size corpus, 2026-11-09).
+        stamps += [(a, "inc-old", 0, "rec-0", "acct"),
+                   (a, "inc-old", 40, "rec-40", "acct")]
+    conv.executemany(
+        "INSERT INTO claude_conversation_account_stamps VALUES (?,?,?,?,?)",
+        stamps)
+    conv.execute("INSERT INTO conversation_sessions VALUES (?,?,?)",
+                 ("sess-a", 2, 7 if normalized else 3))
+    conv.commit()
+    conv.close()
+
+
+def _equivalence_case(tmp_path):
+    canonical = str((tmp_path / "C").resolve())
+    retained, normalized = tmp_path / "retained", tmp_path / "normalized"
+    _equivalence_side(retained, canonical, normalized=False)
+    _equivalence_side(normalized, canonical, normalized=True)
+    inventory = {
+        "claude/projects/p/a.jsonl": [11, 100, 1000],
+        "claude/projects/p/pruned.jsonl": [12, 50, 1001],
+        "codex-a/sessions/r.jsonl": [21, 200, 2000],
+        "codex-a/sessions/s.jsonl": [22, 300, 2001],
+        "data/cache.db": [31, 4096, 3000],
+        "data/journal/.segment-summaries": [32, 10, 3001],
+    }
+    return canonical, retained, normalized, inventory
+
+
+def _sql(path, *statements):
+    conn = sqlite3.connect(path)
+    for statement in statements:
+        conn.execute(statement)
+    conn.commit()
+    conn.close()
+
+
+def test_store_equivalence_accepts_the_producers_transformation(tmp_path):
+    """Spec §5.3 steps 6-7 positive case: a correct P0 regenerates clocks,
+    surrogate ids and file identities, mints a new Claude incarnation whose
+    stamps keep every record_sha256, may advance a Codex incarnation (new
+    decisions only there), changes omitted aggregates, and keeps the cursor
+    of a transcript whose messages retention pruned. A comparator that
+    refuses any of these refuses a correct P0; an account_key-only
+    difference must be reported, not refused."""
+    si = _load_soak_image()
+    canonical, retained, normalized, inventory = _equivalence_case(tmp_path)
+    _sql(normalized / "cache.db",
+         "UPDATE session_entries SET account_key = 'acct-other' "
+         "WHERE line_offset = 40")
+    result = si.StoreEquivalence(
+        canonical_root=canonical, inventory=inventory,
+        file_key=lambda root_key, path: "fk-" + path.rsplit("/", 1)[1][0]
+    ).compare(retained, normalized)
+    assert result["problems"] == []
+    assert result["reported"]["cache.db.session_entries"]["differentKeys"] == 1
+    advances = result["reported"]["cache.db.codex_file_incarnations"]["advances"]
+    assert [(a["fileIdentity"], a["from"], a["to"]) for a in advances] == [
+        ("fk-r", 1, 2)]
+    # #937 F7: with the producer's file key an advance names its path.
+    assert advances[0]["path"] == f"{canonical}/codex-a/sessions/r.jsonl"
+    assert result["reported"][
+        "conversations.db.claude_conversation_account_stamps"][
+            "accountKeyDifferences"] == 1
+    assert "conversation_sessions" in result["omitted"]
+    assert result["tables"]["cursorPopulation"]["corpusFiles"] == 4
+
+
+@pytest.mark.parametrize("mutation, store, fragment", [
+    # same size and mtime, changed content: one byte of Claude message text
+    ("UPDATE conversation_messages SET text = 'Hellp' WHERE byte_offset = 0",
+     "conversations.db", "conversations.db.conversation_messages: 1 key(s) differ"),
+    # ... and one Codex token value
+    ("UPDATE codex_session_entries SET input_tokens = 8 WHERE input_tokens = 7",
+     "cache.db", "cache.db.codex_session_entries: 1 key(s) differ"),
+    ("DELETE FROM session_entries WHERE line_offset = 0", "cache.db",
+     "cache.db.session_entries: 1 key(s) missing"),
+    ("INSERT INTO session_entries VALUES (999, 'CANON/claude/projects/p/a.jsonl', "
+     "80, 'opus', 1, 1, 'x', 'acct')", "cache.db",
+     "cache.db.session_entries: 1 key(s) extra"),
+    ("UPDATE claude_conversation_account_stamps SET record_sha256 = 'forged' "
+     "WHERE byte_offset = 0 AND source_incarnation_id = 'inc-new'",
+     "conversations.db", "without exactly one new stamp"),
+    ("INSERT INTO claude_conversation_account_stamps VALUES "
+     "('CANON/claude/projects/p/a.jsonl', 'inc-third', 0, 'rec-0', 'acct')",
+     "conversations.db", "without exactly one new stamp"),
+    ("UPDATE claude_conversation_account_stamps SET record_sha256 = 'forged' "
+     "WHERE byte_offset = 0 AND source_incarnation_id = 'inc-old'",
+     "conversations.db", "carried retained stamp changed"),
+    ("UPDATE codex_file_incarnations SET incarnation = 0 "
+     "WHERE file_identity = 'fk-s'", "cache.db", "incarnation lowered"),
+    # the live threads table is compared; a legacy table must stay empty
+    ("UPDATE codex_conversation_threads SET cwd = '/elsewhere'", "cache.db",
+     "cache.db.codex_conversation_threads: 1 key(s) differ"),
+    ("INSERT INTO conversation_messages VALUES (1, 'x')", "cache.db",
+     "the legacy conversation tables must be empty"),
+    ("UPDATE codex_file_accounts SET account_key = 'other' "
+     "WHERE file_identity = 'fk-s'", "cache.db",
+     "decision(s) of a retained incarnation changed"),
+    ("DELETE FROM codex_conversation_source_files "
+     "WHERE path LIKE '%/s.jsonl'", "conversations.db",
+     "corpus file(s) without a cursor row"),
+    ("INSERT INTO session_files VALUES ('/elsewhere/x.jsonl', 1, 1, 1, 'x', "
+     "'s', '/p', 'acct')", "cache.db", "outside the corpus"),
+])
+def test_store_equivalence_refuses(tmp_path, mutation, store, fragment):
+    """Spec §5.3 steps 6-7 negatives, one per table row class: a compared
+    byte-derived difference (content changed under the same size and mtime),
+    a missing or extra natural key, a broken carrier invariant (a new stamp
+    whose record_sha256 changed, a second new stamp for one key, a carried
+    retained stamp that changed, a lowered Codex incarnation, a changed
+    decision on a retained incarnation), and a cursor population that lost a corpus file
+    or gained a foreign path. A comparator that accepts any of these accepts
+    a P0 whose bytes no longer derive the retained state."""
+    si = _load_soak_image()
+    canonical, retained, normalized, inventory = _equivalence_case(tmp_path)
+    _sql(normalized / store, mutation.replace("CANON", canonical))
+    result = si.StoreEquivalence(
+        canonical_root=canonical, inventory=inventory).compare(
+            retained, normalized)
+    assert any(fragment in p for p in result["problems"]), result["problems"]
+
+
+@pytest.mark.parametrize("store, table", [
+    ("cache.db", "session_files"),
+    ("cache.db", "codex_file_accounts"),
+    ("conversations.db", "claude_conversation_account_stamps"),
+])
+def test_store_equivalence_refuses_an_unclassified_column(tmp_path, store,
+                                                          table):
+    """#937 F10: the comparator reads each family's and carrier's real
+    columns (PRAGMA table_info). A column it does not classify (a family
+    with an explicit compared list, or a carrier) was silently skipped, so
+    a P0 that changed it sealed as equivalent; it now refuses by name."""
+    si = _load_soak_image()
+    canonical, retained, normalized, inventory = _equivalence_case(tmp_path)
+    for side in (retained, normalized):
+        _sql(side / store, f"ALTER TABLE {table} ADD COLUMN surprise TEXT")
+    result = si.StoreEquivalence(
+        canonical_root=canonical, inventory=inventory).compare(
+            retained, normalized)
+    assert any(table in p and "surprise" in p and "not classified" in p
+               for p in result["problems"]), result["problems"]
+
+
+def test_store_equivalence_reports_a_stamp_for_a_new_key(tmp_path):
+    """#937 F10, spec §5.3 step 7: every RETAINED stamp key needs exactly
+    one new stamp with its record_sha256; a normalized stamp for a key the
+    retained store lacks is outside that invariant and is reported with
+    its key, not refused (refusing it would refuse a correct P0)."""
+    si = _load_soak_image()
+    canonical, retained, normalized, inventory = _equivalence_case(tmp_path)
+    _sql(normalized / "conversations.db",
+         "INSERT INTO claude_conversation_account_stamps VALUES "
+         f"('{canonical}/claude/projects/p/a.jsonl', 'inc-new', 80, "
+         "'rec-80', 'acct')")
+    result = si.StoreEquivalence(
+        canonical_root=canonical, inventory=inventory).compare(
+            retained, normalized)
+    assert result["problems"] == []
+    stamps = result["reported"][
+        "conversations.db.claude_conversation_account_stamps"]
+    assert stamps["extraKeys"] == 1
+    assert stamps["firstExtraKeys"] == [
+        [f"{canonical}/claude/projects/p/a.jsonl", 80]]
+
+
+def test_store_equivalence_ignores_omitted_families(tmp_path):
+    """An omitted family (an aggregate re-derived from compared rows) that
+    differs must not refuse: comparing it would refuse every correct P0."""
+    si = _load_soak_image()
+    canonical, retained, normalized, inventory = _equivalence_case(tmp_path)
+    _sql(normalized / "conversations.db",
+         "UPDATE conversation_sessions SET msg_count = 99")
+    result = si.StoreEquivalence(
+        canonical_root=canonical, inventory=inventory).compare(
+            retained, normalized)
+    assert result["problems"] == []
+
+
+def _fake_bundle(path: pathlib.Path, bands=(("0", 10), ("1", 20))):
+    (path / "bands").mkdir(parents=True)
+    for name, size in bands:
+        (path / "bands" / name).write_bytes(b"b" * size)
+    for name in ("Info.plist", "Info.bckup", "token"):
+        (path / name).write_bytes(name.encode())
+    return path
+
+
+def test_clonefile_bundle_raises_without_fallback(tmp_path, monkeypatch):
+    """v1's `_clone_tree` fell back silently to a byte copy, so a run could
+    measure a copied (new-inode, internal-temp) tree believing it was a
+    clone. A failed clonefile(2) must raise with no copy made, and a clone
+    whose band listing differs from the source's must raise too."""
+    si = _load_soak_image()
+    src = _fake_bundle(tmp_path / "p.sparsebundle")
+    dst = tmp_path / "c.sparsebundle"
+    calls = []
+
+    def failing(source, destination, flags):
+        calls.append((source, destination, flags))
+        return -1
+
+    monkeypatch.setattr(si, "_libc", lambda: types.SimpleNamespace(clonefile=failing))
+    with pytest.raises(OSError, match="no copy fallback"):
+        si.clonefile_bundle(src, dst)
+    assert calls == [(os.fsencode(str(src)), os.fsencode(str(dst)), 0)]
+    assert not dst.exists()
+
+    def partial(source, destination, flags):
+        _fake_bundle(pathlib.Path(os.fsdecode(destination)), bands=(("0", 10),))
+        return 0
+
+    monkeypatch.setattr(si, "_libc", lambda: types.SimpleNamespace(clonefile=partial))
+    with pytest.raises(RuntimeError, match="other bands"):
+        si.clonefile_bundle(src, dst)
+
+
+def test_bundle_seal_binds_band_metadata(tmp_path):
+    """A P1/P2 clone is verified against the recorded seal by band names,
+    sizes, inodes and mtime_ns; a band rewritten in place must show."""
+    si = _load_soak_image()
+    bundle = _fake_bundle(tmp_path / "p.sparsebundle")
+    seal = si.bundle_seal(bundle, content=True)
+    assert seal["sealSha256"] == si.bundle_seal(bundle, content=True)["sealSha256"]
+    assert si.seal_metadata_problems(seal, bundle) == []
+    band = bundle / "bands" / "1"
+    os.utime(band, ns=(band.stat().st_atime_ns, band.stat().st_mtime_ns + 10**9))
+    assert any("band 1 changed" in p
+               for p in si.seal_metadata_problems(seal, bundle))
+
+
+class _RecordedHdiutil:
+    """`run` for ImageLifecycle built from the real recorded outputs
+    (tests/fixtures/bench/hdiutil), with the recording's placeholders filled
+    for this test. Attaching mounts nothing: detaching empties the
+    mountpoint, as the real unmount reveals the empty directory."""
+
+    def __init__(self, working_root, mountpoint, bundle, *, holder_pid=None,
+                 on_detach=None, info_code=None, detach_code=None):
+        self.mountpoint = pathlib.Path(mountpoint)
+        self.subs = {
+            "@BUNDLE@": str(bundle), "@WORKING_ROOT@": str(working_root),
+            "@MOUNTPOINT@": str(mountpoint), "@BACKING_VOLUME@": "/Volumes/Backing",
+            "@BACKING_VOLUME_NAME@": "Backing", "@VOLUME_SLICE@": "disk901s1",
+            "@VOLUME_WHOLE@": "disk901", "@IMAGE_SLICE@": "disk900s1",
+            "@IMAGE_WHOLE@": "disk900", "@BACKING_DEVICE@": "disk907s1",
+            "@BACKING_CONTAINER@": "disk907", "@PHYSICAL_STORE@": "disk906s1",
+            "@PHYSICAL_DISK@": "disk906", "@USER@": "runner",
+            "@UID@": str(os.getuid()), "@HDID_PID@": "4242",
+            "@HOLDER_PID@": str(holder_pid or 0), "@MEDIA_MODEL@": "Generic",
+            "@VOLUME_LABEL@": "cctally-soak"}
+        self.holder_pid = holder_pid
+        self.on_detach = on_detach
+        self.info_code = info_code
+        self.detach_code = detach_code
+        self.attached = False
+        self.calls = []
+
+    def text(self, name):
+        data = (HDIUTIL_FIXTURES / name).read_text()
+        for key, value in self.subs.items():
+            data = data.replace(key, value)
+        return data
+
+    def __call__(self, argv, **_kwargs):
+        argv = list(argv)
+        self.calls.append(argv)
+
+        def done(code, out="", err=""):
+            return subprocess.CompletedProcess(argv, code, out.encode(),
+                                               err.encode())
+
+        if argv[:2] == ["hdiutil", "create"]:
+            pathlib.Path(argv[-1]).mkdir()
+            return done(0, self.text("create.plist"), self.text("create.stderr.txt"))
+        if argv[:2] == ["hdiutil", "attach"]:
+            self.attached = True
+            return done(0, self.text("attach.plist"), self.text("attach.stderr.txt"))
+        if argv[:2] == ["hdiutil", "info"]:
+            if self.info_code is not None:
+                return done(self.info_code, "", "hdiutil: info failed\n")
+            return done(0, self.text("info.plist" if self.attached
+                                     else "info-after.plist"))
+        if argv == ["mount"]:
+            lines = self.text("mount.txt").splitlines()
+            if not self.attached:
+                lines = [l for l in lines if str(self.mountpoint) not in l]
+            return done(0, "\n".join(lines) + "\n")
+        if argv[0] == "lsof":
+            if self.holder_pid and self.attached:
+                return done(0, self.text("lsof-busy.txt"))
+            return done(1)
+        if argv[:2] == ["hdiutil", "detach"]:
+            if self.on_detach is not None:
+                self.on_detach()
+            if self.detach_code is not None:
+                return done(self.detach_code, "",
+                            "hdiutil: detach failed - Resource busy\n")
+            if self.holder_pid and "-force" not in argv:
+                return done(16, "", self.text("detach-busy.stderr.txt"))
+            self.attached = False
+            for child in list(self.mountpoint.iterdir()):
+                if child.is_dir():
+                    import shutil
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            return done(0, self.text("detach.stdout.txt"),
+                        self.text("detach.stderr.txt"))
+        raise AssertionError(f"unexpected tool call {argv}")
+
+
+def _lifecycle(si, tmp_path, *, owner_kwargs=None, **stub_kwargs):
+    working = (tmp_path / "W").resolve()
+    working.mkdir()
+    canonical = (tmp_path / "canonical").resolve()
+    bundle = working / "p0.sparsebundle"
+    stub = _RecordedHdiutil(working, canonical, bundle, **stub_kwargs)
+    kills = []
+    kwargs = {"kill": lambda pid, sig: kills.append((pid, sig)),
+              **(owner_kwargs or {})}
+    owner = si.ImageLifecycle(
+        working_root=working, canonical_root=canonical, run=stub,
+        env={"TMPDIR": str(working) + "/", "PYTHONDONTWRITEBYTECODE": "1"},
+        **kwargs)
+    return owner, stub, bundle, canonical, kills
+
+
+def test_image_lifecycle_refuses_an_existing_canonical_root(tmp_path):
+    """A stale mount or a leftover directory at the canonical root is
+    reported with the operator's command and never acted on: no attach and,
+    above all, no detach of whatever is there."""
+    si = _load_soak_image()
+    owner, stub, bundle, canonical, _kills = _lifecycle(si, tmp_path)
+    owner.create(bundle, size_gib=2)
+    canonical.mkdir()
+    with pytest.raises(si.ImageRefusal) as excinfo:
+        owner.attach(bundle)
+    assert "rmdir" in excinfo.value.remedy and "hdiutil detach" in excinfo.value.remedy
+    assert not any(call[:2] in (["hdiutil", "attach"], ["hdiutil", "detach"])
+                   for call in stub.calls)
+    assert canonical.is_dir()
+
+
+def test_image_lifecycle_detaches_only_the_owned_device(tmp_path):
+    """The owner records what the real `hdiutil attach -plist` names (the
+    volume's device, mount options, owner uid) and its teardown detaches
+    exactly that device, removes the mountpoint it created and verifies the
+    canonical root is absent; a leaked mount or a removed foreign directory
+    are the failures."""
+    si = _load_soak_image()
+    owner, stub, bundle, canonical, kills = _lifecycle(si, tmp_path)
+    owner.create(bundle, size_gib=2)
+    record = owner.attach(bundle)
+    assert record.device_node == "/dev/disk901s1"
+    assert "nobrowse" in record.mount_options
+    assert record.owner_uid == os.getuid()
+    assert (canonical / ".fseventsd" / "no_log").exists()
+    teardown = owner.close()
+    assert teardown.problems == [] and teardown.detached
+    assert teardown.canonical_absent and not canonical.exists()
+    assert [c for c in stub.calls if c[:2] == ["hdiutil", "detach"]] == [
+        ["hdiutil", "detach", "/dev/disk901s1"]]
+    assert kills == []
+    assert owner.close() is teardown
+
+
+def test_image_lifecycle_never_signals_an_unknown_holder(tmp_path):
+    """A process the owner did not start that holds a file on the volume
+    (lsof's real field output) makes the attempt INVALID: it is reported,
+    never signalled, and the busy volume is not force-detached."""
+    si = _load_soak_image()
+    owner, stub, bundle, canonical, kills = _lifecycle(si, tmp_path,
+                                                       holder_pid=999_999)
+    owner.create(bundle, size_gib=2)
+    owner.attach(bundle)
+    teardown = owner.close()
+    assert any("unknown holder pid 999999" in p for p in teardown.problems)
+    assert not teardown.detached and not teardown.canonical_absent
+    assert kills == []
+    assert not any("-force" in call for call in stub.calls)
+    assert [h["pid"] for h in teardown.holders] == [999_999]
+
+
+def test_image_lifecycle_repeated_signal_does_not_interrupt_cleanup(tmp_path):
+    """SIGTERM while the image is owned unwinds the run to its teardown;
+    a second SIGTERM arriving during that teardown is recorded and ignored,
+    so the detach still completes and the mount is not leaked."""
+    si = _load_soak_image()
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def second_signal():
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.05)
+
+    owner, stub, bundle, canonical, _kills = _lifecycle(
+        si, tmp_path, on_detach=second_signal)
+    owner.create(bundle, size_gib=2)
+    owner.attach(bundle)
+    owner.install_signal_handlers()
+    try:
+        with pytest.raises(si.ImageInterrupted):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(1)
+        teardown = owner.close()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert teardown.detached and teardown.canonical_absent
+    assert teardown.signals == [signal.SIGTERM, signal.SIGTERM]
+    assert owner.interrupted
+
+
+def test_image_lifecycle_dead_appender_invalidates_the_run(tmp_path):
+    """The workload appender's failure is never swallowed: teardown still
+    completes, and the record carries the failure as a problem."""
+    si = _load_soak_image()
+    owner, _stub, bundle, _canonical, _kills = _lifecycle(si, tmp_path)
+    owner.create(bundle, size_gib=2)
+    owner.attach(bundle)
+
+    def dead_appender():
+        raise RuntimeError("appender thread died")
+
+    owner.set_appender(dead_appender)
+    teardown = owner.close()
+    assert teardown.detached
+    assert any("appender" in p for p in teardown.problems)
+    assert "appender thread died" in teardown.appender_error
+
+
+@pytest.mark.parametrize("case", ["detach-fails", "root-left"])
+def test_image_lifecycle_reports_a_failed_attach_abort(tmp_path, case):
+    """#937 F3: an attach that fails after the device is attached detaches
+    that device; a failed abort detach leaves our image attached at C and
+    must be a teardown problem with the operator's command, not a silent
+    `detached`. With nothing attached, a canonical root still present after
+    teardown is a problem with its remedy too."""
+    si = _load_soak_image()
+    owner, stub, bundle, canonical, kills = _lifecycle(
+        si, tmp_path, info_code=1,
+        detach_code=1 if case == "detach-fails" else None)
+    owner.create(bundle, size_gib=2)
+    with pytest.raises(si.ImageRefusal, match="hdiutil info"):
+        owner.attach(bundle)
+    assert ["hdiutil", "detach", "/dev/disk901s1"] in stub.calls
+    if case == "root-left":
+        canonical.mkdir()
+    teardown = owner.close()
+    assert teardown.problems, teardown.as_dict()
+    if case == "detach-fails":
+        assert teardown.detached is False
+        assert any("hdiutil detach /dev/disk901s1" in p and "remedy" in p
+                   for p in teardown.problems), teardown.problems
+    else:
+        assert any(str(canonical) in p and "rmdir" in p
+                   for p in teardown.problems), teardown.problems
+        assert canonical.is_dir()
+    assert kills == []
+
+
+_HOLDING_GRANDCHILD = r"""
+import pathlib, sys, time
+held = open(sys.argv[1], "a")
+pathlib.Path(sys.argv[2]).write_text("ready")
+time.sleep(120)
+"""
+
+_DETACHING_CHILD = r"""
+import subprocess, sys
+grandchild = subprocess.Popen(
+    [sys.executable, "-c", sys.argv[1], sys.argv[2], sys.argv[3]],
+    start_new_session=True, stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print(grandchild.pid, flush=True)
+"""
+
+
+def _wait_for(predicate, seconds=20.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+@pytest.mark.parametrize("stranger", [False, True])
+def test_image_lifecycle_reaps_owned_detached_workers_only(tmp_path,
+                                                           stranger):
+    """#937 SD7, with real processes: a recorded child starts a worker in its
+    own session that holds a file on the volume, then exits (as the
+    product's detached stats and Codex workers do). Carrying this job's
+    owner token, the worker is classified owned from its own environment,
+    reaped and gone, and the teardown is clean; before SD7 it was an unknown
+    holder that made every v2 attempt INVALID. A holder without the token
+    is still an unknown holder: reported, the attempt INVALID, and never
+    signalled (it is alive afterwards)."""
+    si = _load_soak_image()
+    if not (si.process_environment(os.getpid()) or {}).get("PATH"):
+        pytest.skip("no process-environment reader on this platform")
+    token = "owner-" + os.urandom(8).hex()
+    holders = {}
+
+    def lsof(_root):
+        return [{"pid": pid, "command": command,
+                 "files": [{"fd": "3", "name": str(held)}]}
+                for pid, command in sorted(holders.items())
+                if si.process_start_identity(pid) is not None]
+
+    owner, _stub, bundle, canonical, _kills = _lifecycle(
+        si, tmp_path, owner_kwargs={
+            "lsof": lsof, "kill": os.kill, "owner_token": token,
+            "grace_s": 10.0, "kill_wait_s": 5.0,
+            "worker_records": lambda: {}})
+    owner.create(bundle, size_gib=2)
+    owner.attach(bundle)
+    held = canonical / "held.jsonl"
+    ready = tmp_path / "ready"
+    env = {key: value for key, value in os.environ.items()
+           if key != si.OWNER_TOKEN_ENV}
+    other = None
+    grandchild = None
+    try:
+        child = subprocess.Popen(
+            [sys.executable, "-c", _DETACHING_CHILD, _HOLDING_GRANDCHILD,
+             str(held), str(ready)],
+            env={**env, si.OWNER_TOKEN_ENV: token}, stdout=subprocess.PIPE,
+            text=True)
+        owner.register_process(child.pid)
+        out, _ = child.communicate(timeout=60)
+        grandchild = int(out.split()[0])
+        assert _wait_for(ready.exists)
+        holders[grandchild] = "python3"
+        if stranger:
+            other = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(120)"],
+                env=env, start_new_session=True)
+            holders[other.pid] = "stranger"
+            assert _wait_for(lambda: (si.process_environment(other.pid)
+                                      or {}).get("PATH"))
+        teardown = owner.close()
+        assert _wait_for(lambda: si.process_start_identity(grandchild)
+                         is None)
+        [worker] = teardown.owned_workers
+        assert worker["pid"] == grandchild
+        assert worker["proof"] == {"envToken": True, "productRecord": None}
+        assert worker["outcome"] == "reaped-term"
+        assert worker["startIdentity"]
+        record = teardown.as_dict()
+        assert record["ownedWorkers"] == teardown.owned_workers
+        if stranger:
+            assert any(f"unknown holder pid {other.pid}" in p
+                       for p in teardown.problems), teardown.problems
+            assert other.poll() is None
+        else:
+            assert teardown.problems == [], teardown.problems
+            assert teardown.detached and teardown.canonical_absent
+    finally:
+        if grandchild and si.process_start_identity(grandchild):
+            os.kill(grandchild, signal.SIGKILL)
+        if other is not None:
+            other.kill()
+            other.wait()
+
+
+def test_image_lifecycle_never_signals_a_pid_whose_identity_changed(
+        tmp_path):
+    """#937 SD7/F4: ownership is classified with the holder's start identity
+    and re-checked before every signal. A worker that exited after it was
+    classified, its pid reused by a process without the token, is never
+    signalled; the reused pid is then an unknown holder, reported only."""
+    si = _load_soak_image()
+    token = "owner-token"
+    identities = iter(["lstart:worker"])
+    environments = iter([{si.OWNER_TOKEN_ENV: token}])
+    owner, _stub, bundle, _canonical, kills = _lifecycle(
+        si, tmp_path, owner_kwargs={
+            "lsof": lambda _root: [{"pid": 4243, "command": "w",
+                                    "files": []}],
+            "owner_token": token,
+            "read_environment": lambda pid: next(environments, {}),
+            "start_identity": lambda pid: next(identities, "lstart:reused"),
+            "worker_records": lambda: {}})
+    owner.create(bundle, size_gib=2)
+    owner.attach(bundle)
+    teardown = owner.close()
+    assert kills == []
+    assert [w["outcome"] for w in teardown.owned_workers] == ["exited"]
+    assert any("unknown holder pid 4243" in p for p in teardown.problems)
+
+
+def test_acquire_host_lock_bounded_wait_and_missing_inode(tmp_path):
+    """A full-size run must never start beside another runner job: a held
+    lock is retried every retry_s and refused after at most wait_s, and a
+    missing lock inode refuses at once without being created (the runner's
+    own opener)."""
+    si = _load_soak_image()
+    sleeps = []
+    with pytest.raises(si.ImageRefusal, match="still held"):
+        si.acquire_host_lock(wait_s=90, retry_s=30, opener=lambda: None,
+                             sleep=sleeps.append)
+    assert sleeps == [30, 30, 30]
+    answers = iter([None, None, 7])
+    assert si.acquire_host_lock(wait_s=90, retry_s=30,
+                                opener=lambda: next(answers),
+                                sleep=lambda _s: None) == 7
+    absent = tmp_path / "absent-host.lock"
+    with pytest.raises(si.ImageRefusal, match="lock inode missing"):
+        si.acquire_host_lock(opener=si.host_lock_opener(absent),
+                             sleep=lambda _s: None)
+    assert not absent.exists()
+
+
+def _watchdog(si, tmp_path, kind, *, meter, free=None, clock=None,
+              stops=None, deadline_s=10 ** 6):
+    stops = [] if stops is None else stops
+    return si.BudgetWatchdog(
+        kind=kind, ledger=tmp_path / "budget.json", meter=meter,
+        free_bytes=free or (lambda: 10 ** 15), deadline_s=deadline_s,
+        on_stop=stops.append, clock=clock or (lambda: 0.0))
+
+
+@pytest.mark.parametrize("kind", ["full", "oracle"])
+def test_budget_watchdog_runs_and_stops_within_budget(tmp_path, kind):
+    """Spec §5.2/§7.4 per job kind: a zero-consumption job runs (a margin
+    that stopped it would block every job); readings crossing budget - m
+    stop it once; and the worst case - writing at RHO through one sample
+    interval and the termination grace, then the cleanup reserve - still
+    ends within the budget. Falling allocation never resets the budget."""
+    si = _load_soak_image()
+    p, rho = si.BudgetWatchdog.KINDS[kind], si.BudgetWatchdog.RHO
+    margin = rho * (p["i"] + p["g"]) + p["r"]
+    now = [0.0]
+    idle = _watchdog(si, tmp_path, kind, meter=lambda: 5_000,
+                     clock=lambda: now[0])
+    idle.start(thread=False)
+    for _ in range(5):
+        now[0] += p["i"]
+        assert idle.sample() is None
+    result = idle.stop()
+    assert result["stopReason"] is None and result["jobBytes"] == 0
+    assert result["margin"] == margin
+    assert margin < p["budget"] / 2  # else the kind refuses every job
+    assert not (tmp_path / "budget.json.lock").exists()
+    (tmp_path / "budget.json").unlink()
+
+    now[0] = 0.0
+    free = [10 ** 13]
+    stops = []
+
+    def free_bytes():
+        free[0] += 10 ** 9  # allocation falls: free space keeps rising
+        return free[0]
+
+    worst = _watchdog(si, tmp_path, kind, meter=lambda: int(rho * now[0]),
+                      clock=lambda: now[0], free=free_bytes, stops=stops)
+    worst.start(thread=False)
+    while not stops:
+        now[0] += p["i"]
+        worst.sample()
+    assert len(stops) == 1 and "stop margin" in stops[0]
+    now[0] += p["g"]  # SIGTERM -> SIGKILL grace at the ceiling rate
+    assert rho * now[0] + p["r"] <= p["budget"]
+    final = worst.stop()
+    assert final["overshootBytes"] == 0
+    ledger = json.loads((tmp_path / "budget.json").read_text())
+    assert ledger["consumedBytes"] == final["consumedBytes"] > 0
+
+
+@pytest.mark.parametrize("kind", ["full", "oracle"])
+def test_budget_watchdog_refuses_or_stops_when_unenforceable(tmp_path, kind):
+    """A write cap that cannot be enforced must not run: a margin of at least
+    half the budget refuses at start, as do an unreadable meter and a ledger
+    already at its cap; mid-job, an unreadable or decreasing meter stops the
+    job."""
+    si = _load_soak_image()
+    p = si.BudgetWatchdog.KINDS[kind]
+    bad = _watchdog(si, tmp_path, kind, meter=lambda: 0)
+    bad.KINDS = {kind: {**p, "budget": 2 * bad.margin()}}
+    with pytest.raises(si.ImageRefusal, match="configuration error"):
+        bad.start(thread=False)
+    assert not (tmp_path / "budget.json.lock").exists()
+
+    def unreadable():
+        raise RuntimeError("ioreg failed")
+
+    with pytest.raises(si.ImageRefusal, match="unreadable at start"):
+        _watchdog(si, tmp_path, kind, meter=unreadable).start(thread=False)
+
+    (tmp_path / "budget.json").write_text(json.dumps({
+        "schemaVersion": 1, "kind": kind, "consumedBytes": int(p["budget"]),
+        "consumedSeconds": 0, "jobs": []}))
+    with pytest.raises(si.ImageRefusal, match="at its cap"):
+        _watchdog(si, tmp_path, kind, meter=lambda: 0).start(thread=False)
+    (tmp_path / "budget.json").unlink()
+
+    for readings, fragment in (([100, None], "unreadable mid-job"),
+                               ([100, 50], "counter reset")):
+        values = iter(readings)
+
+        def meter():
+            value = next(values)
+            if value is None:
+                raise RuntimeError("ioreg failed")
+            return value
+
+        stops = []
+        job = _watchdog(si, tmp_path, kind, meter=meter, stops=stops)
+        job.start(thread=False)
+        assert fragment in job.sample()
+        assert len(stops) == 1
+        job.meter = lambda: 100
+        job.stop()
+        (tmp_path / "budget.json").unlink()
+
+
+def test_budget_watchdog_disk_write_meter_reads_the_backing_disk(tmp_path):
+    """The meter is the backing physical disk's cumulative IOBlockStorage
+    Bytes (Write) (F21), resolved through the volume's APFS physical store in
+    the real `diskutil info -plist` and read from the real `ioreg` text; a
+    wrong disk would meter another device and the cap would mean nothing."""
+    si = _load_soak_image()
+    stub = _RecordedHdiutil(tmp_path, tmp_path / "m", tmp_path / "b")
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(list(argv))
+        name = "diskutil-info.plist" if argv[0] == "diskutil" else "ioreg.txt"
+        return subprocess.CompletedProcess(argv, 0, stub.text(name).encode(), b"")
+
+    meter = si.disk_write_meter(pathlib.Path("/Volumes/Backing"), run=run)
+    assert meter.disk == "disk906"
+    assert meter() == 5952809230336
+    assert calls[0] == ["diskutil", "info", "-plist", "/Volumes/Backing"]
+
+
+def _load_catchup_tool():
+    path = BIN.parent / "bench" / "write-attribution" / "catchup.py"
+    spec = importlib.util.spec_from_file_location("bench_catchup", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_identity_equality_refuses_device_or_inode_change(tmp_path):
+    """Spec §5.5 step 2 (D1, D2): a P2 attach must present the P1 seal's
+    device and every file's (st_ino, size, mtime_ns), or device-sensitive
+    carriers (quota index, segment summaries) reach the arm. A different
+    st_dev is flagged first so the arm refuses before any product process;
+    an inode change and a changed journal sidecar are problems; a passing
+    check writes the manifest and receipt catchup's image mode accepts."""
+    si = _load_soak_image()
+    canonical = str((tmp_path / "C").resolve())
+    inventory = {
+        "claude/projects/p/a.jsonl": [11, 100, 1000],
+        "codex-a/sessions/r.jsonl": [21, 200, 2000],
+        "data/cache.db": [31, 4096, 3000],
+        "data/journal/.segment-summaries": [32, 10, 3001],
+    }
+    p1 = {"sourceInventory": {"stDev": 77, "files": inventory}}
+
+    def attached(st_dev):
+        return si.AttachRecord(
+            device_node="/dev/disk901s1", st_dev=st_dev, mount_options=[],
+            owner_uid=os.getuid(), case_sensitive=False, mountpoint=canonical,
+            bundle="arm.sparsebundle", image_path="arm.sparsebundle")
+
+    ok = si.identity_equality(attached(77), inventory, p1)
+    assert ok["passed"] and ok["problems"] == [] and not ok["deviceMismatch"]
+    assert sorted(e["logical"] for e in ok["manifest"]["entries"]) == [
+        f"{canonical}/claude/projects/p/a.jsonl",
+        f"{canonical}/codex-a/sessions/r.jsonl"]
+    moved = si.identity_equality(attached(78), inventory, p1)
+    assert not moved["passed"] and moved["deviceMismatch"]
+    assert moved["problems"][0].startswith("device mismatch")
+    assert "detach it and retry" in moved["problems"][0]
+    relinked = {**inventory, "codex-a/sessions/r.jsonl": [99, 200, 2000],
+                "data/journal/.segment-summaries": [33, 10, 3001]}
+    changed = si.identity_equality(attached(77), relinked, p1)
+    assert not changed["passed"] and not changed["deviceMismatch"]
+    assert any("codex-a/sessions/r.jsonl" in p for p in changed["problems"])
+    assert any("carrier data/journal/.segment-summaries" in p
+               for p in changed["problems"])
+    manifest = si.write_admission_inputs(tmp_path / "evidence" / "arm", ok)
+    inputs = _load_catchup_tool().image_admission_inputs(manifest)
+    assert inputs["problems"] == []
+    assert inputs["manifestSha256"] == ok["manifestSha256"]
+
 def test_dashboard_soak_normalization_rebuilds_a_copied_stats_epoch_first(
     tmp_path, monkeypatch,
 ):
@@ -1334,7 +2451,9 @@ def test_dashboard_soak_refuses_symlinks_in_operator_fixture(tmp_path):
     (source / "data").mkdir(parents=True)
     (source / "claude" / "projects").mkdir(parents=True)
     (source / "codex-a" / "sessions").mkdir(parents=True)
-    (source / "data" / "conversations.db").write_bytes(b"copy")
+    # A real (empty) store: #879's guard reads it before the symlink walk.
+    sqlite3.connect(source / "data" / "conversations.db").execute(
+        "CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT)").connection.close()
     (source / "claude" / "projects" / "live.jsonl").symlink_to(
         source / "data" / "conversations.db")
     prepare = getattr(soak, "_prepare_fixture", lambda *_args: None)
@@ -5298,6 +6417,27 @@ def test_write_budget_backlog_pacing_needs_every_operation_record():
     assert any("op_seq advanced 5, 4" in p for p in problems), problems
     assert soak._maintenance_completeness(ops, None, good) == [
         "no record snapshots bracket the window (op_seq)"]
+    # #937 SD10: one reclaim visit commits two chunks and then skips one,
+    # and the skip carries the op_id of the chunk committed before it. Each
+    # poll returns the ring so far. The collector keeps every ring record,
+    # so both committed chunks and their charges reach the bracket check.
+    # This detects the full-size backlog arm judged INVALID (records "lost")
+    # while the ring lost nothing.
+    window = _wb_window()
+    visit = [dict(_maintenance_op("reclaim", 1, 60, 16), seq=1),
+             dict(_maintenance_op("reclaim", 2, 60, 16), seq=2),
+             dict(_maintenance_op("reclaim", 2, 60, 0), seq=3,
+                  outcome="skipped", charged_bytes=0)]
+    for n, diag in enumerate(window["diagnostics"]):
+        diag["tick"]["maintenance"] = visit[:min(n, 3)]
+    window.update(apiLatenciesMs=[1.0], rss=[{"t": 0.0, "rssBytes": 1}],
+                  appendedEvents=0)
+    seen = soak._write_budget_metrics(window)["operations"]
+    assert [(o["op_id"], o["outcome"]) for o in seen] == [
+        (1, "ok"), (2, "ok"), (2, "skipped")]
+    charged = visit[0]["charged_bytes"] + visit[1]["charged_bytes"]
+    end = {"t": start + 1800, "opSeq": 12, "charged": 1000 + charged}
+    assert soak._maintenance_completeness(seen, begin, end) == []
 
 
 def test_write_budget_drain_and_warm_admission_share_one_deadline(tmp_path):
@@ -5345,12 +6485,20 @@ def test_write_budget_idle_not_applicable_needs_both_window_edges():
     assert any("last poll" in p for p in out["problems"])
 
 
-def test_write_budget_leg_requires_a_fixture_copy(tmp_path, capsys):
+def test_write_budget_leg_requires_a_fixture_image(tmp_path, capsys):
+    """Preparation v2 (spec §5.6): the leg measures a clone of a sealed P1
+    tree image, so it needs --fixture-image and --image-receipt, and a v1
+    --fixture-copy (which re-derives under a new device) is refused with the
+    v2 flag names. Detects a leg that silently measures a v1 copy."""
     soak = _load_dashboard_soak()
-    with pytest.raises(SystemExit) as caught:
-        soak.main(["--root", str(tmp_path / "root"), "--write-budget-leg"])
-    assert caught.value.code == 2
-    assert "--write-budget-leg requires --fixture-copy" in capsys.readouterr().err
+    for extra in ([], ["--fixture-copy", str(tmp_path / "fixture")]):
+        with pytest.raises(SystemExit) as caught:
+            soak.main(["--root", str(tmp_path / "root"), "--write-budget-leg",
+                       *extra])
+        assert caught.value.code == 2
+        err = capsys.readouterr().err
+        assert "--fixture-image" in err and "--image-receipt" in err
+    assert not (tmp_path / "root").exists()
 
 
 class _FakeLive:
@@ -5468,7 +6616,8 @@ def _wb_diagnostics(full_ms, *, idle=0, start=1_000.0, step=20.0):
 
 def _wb_qualification():
     return {
-        "fixture": {"fingerprint": "f" * 64, "preparation": {"version": 1}},
+        "fixture": {"p0Seal": "a" * 64, "p0ReceiptSha256": "b" * 64,
+                    "preparation": {"version": 2}},
         "host": {"hostname": "studio", "machine": "arm64",
                  "model": "Mac15,14", "cpuCount": 24, "memoryBytes": 1 << 36},
         "runtime": {"os": "Darwin", "osRelease": "27.0.0",
@@ -5476,7 +6625,7 @@ def _wb_qualification():
                     "pythonExecutable": "/opt/homebrew/bin/python3.14",
                     "sqlite": "3.53.4"},
         "storage": {"class": "external", "mountPoint": "/Volumes/X",
-                    "fsType": "apfs"},
+                    "fsType": "apfs", "image": {"type": "SPARSEBUNDLE"}},
         "instrumentation": {"collector": "warm-in-window/1",
                             "percentile": "nearest-rank", "sampleSeconds": 15,
                             "writeCounter": "proc_pid_rusage"},
@@ -5487,31 +6636,72 @@ def _wb_qualification():
     }
 
 
-def _wb_fake_arm(soak, calls, arms_ms, *, invalid=None):
-    """A synthetic `_run_write_budget_arm`: no clone, no dashboard."""
-    def run(args, name, checkout, *, capture=False):
+def _wb_fake_arm(soak, calls, arms_ms, *, invalid=None, idle=None,
+                 late_end=0.0):
+    """A synthetic `_run_write_budget_arm`: no clone, no dashboard. The
+    window's end is read `late_end` seconds after its last poll, as a real
+    window's is."""
+    def run(args, name, *, checkout, capture=False, **kwargs):
         calls.append((name, capture, pathlib.Path(checkout).name))
         if invalid and name in invalid:
             return {"arm": name, "invalid": invalid[name]}
-        diags, start, end = _wb_diagnostics(arms_ms[name])
-        full = soak._warm_full_builds(diags, start, end)
+        diags, start, end = _wb_diagnostics(arms_ms[name],
+                                            idle=(idle or {}).get(name, 0))
+        polled, end = [end], end + late_end
+        full = soak._warm_full_builds(diags, start, end, polled_at=polled)
         return {"arm": name, "mode": "reference" if capture else "candidate",
                 "window": {"start": start, "end": end},
-                "metrics": {"fullBuild": full,
+                "metrics": {"fullBuild": full, "start": start, "end": end,
                             "fullBuildP50Ms": full["p50Ms"],
                             "fullBuildP95Ms": full["p95Ms"]},
-                "teardown": {"survivors": []}, "diagnostics": diags}
+                "teardown": {"survivors": []}, "diagnostics": diags,
+                "polledAt": polled}
     return run
 
 
+def _wb_p1(soak, tmp_path, name, *, tree, p0_seal="a" * 64):
+    """A sealed (fake) P1 bundle and its passing receipt on P0 `p0_seal`."""
+    si = soak._soak_image()
+    bundle = _fake_bundle(tmp_path / f"{name}.sparsebundle")
+    receipt = {"schemaVersion": 1, "kind": soak.P1_RECEIPT_KIND,
+               "passed": True, "treeSha": tree, "bundle": str(bundle),
+               "canonicalRoot": str(tmp_path / f"{name}-canonical"),
+               "p0": {"seal": p0_seal, "sha256": "b" * 64,
+                      "retentionDays": 30},
+               "seal": si.bundle_seal(bundle, content=True),
+               "sourceInventory": {"stDev": 1, "files": {}}}
+    path = tmp_path / f"{name}-receipt.json"
+    path.write_text(json.dumps(receipt))
+    return bundle, path, receipt
+
+
+class _WbFakeJob:
+    """A `_V2Job` stand-in for the capture and leg flows: no host lock,
+    watchdog or attach."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.records = {"fake": True}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def _wb_capture(soak, tmp_path, monkeypatch, arms_ms, *, invalid=None,
-                output=None, storage="external"):
+                output=None, storage="external", idle=None, late_end=0.0):
     calls, materialized = [], []
     root = tmp_path / "ref-root"
     monkeypatch.setattr(soak, "_run_write_budget_arm",
-                        _wb_fake_arm(soak, calls, arms_ms, invalid=invalid))
+                        _wb_fake_arm(soak, calls, arms_ms, invalid=invalid,
+                                     idle=idle, late_end=late_end))
+    monkeypatch.setattr(soak, "_V2Job", _WbFakeJob)
+    bundle, receipt, _r = _wb_p1(soak, tmp_path, "ref-p1",
+                                 tree=soak.WRITE_BUDGET_BASELINE_SHA)
 
-    def materialize(ref, destination):
+    def materialize(ref, destination, **kwargs):
         materialized.append(ref)
         pathlib.Path(destination).mkdir(parents=True)
         return pathlib.Path(destination)
@@ -5523,8 +6713,9 @@ def _wb_capture(soak, tmp_path, monkeypatch, arms_ms, *, invalid=None,
     monkeypatch.setattr(soak, "_write_budget_qualification",
                         lambda args: _wb_qualification())
     args = types.SimpleNamespace(
-        root=str(root), fixture_copy=str(tmp_path / "fixture"),
-        output=str(output or root / "reference.json"), sync_interval=5.0)
+        root=str(root), fixture_image=str(bundle), image_receipt=str(receipt),
+        canonical_root=None, output=str(output or root / "reference.json"),
+        sync_interval=5.0)
     reference, code = soak.capture_write_budget_reference(args, "c" * 40)
     return reference, code, calls, materialized, pathlib.Path(args.output)
 
@@ -5701,7 +6892,7 @@ def test_write_budget_capture_refuses_before_any_work(
 
 
 @pytest.mark.parametrize("path", [
-    ("fixture", "fingerprint"), ("fixture", "preparation", "version"),
+    ("fixture", "p0Seal"), ("fixture", "preparation", "version"),
     ("host", "hostname"), ("host", "model"), ("host", "memoryBytes"),
     ("runtime", "os"), ("runtime", "python"), ("runtime", "sqlite"),
     ("storage", "class"), ("instrumentation", "collector"),
@@ -5832,6 +7023,163 @@ def test_write_budget_reference_artifacts_are_digest_bound(
     assert loaded["valid"] is False
 
 
+def test_write_budget_reference_recompute_uses_the_recorded_poll_times(
+        tmp_path, monkeypatch):
+    """#937 SD8: a window's end is read after its last poll, so the loader
+    recomputes completeness at the poll times the capture recorded, as the
+    capture judged it. Detects a genuine reference refused because its last
+    tick was published within the end-read gap of the longest period."""
+    soak = _load_dashboard_soak()
+    _ref, code, _c, _m, output = _wb_capture(
+        soak, tmp_path, monkeypatch, {"append": [10.0, 20.0], "backlog": [5.0]},
+        late_end=15.0)
+    assert code == 0
+    loaded = soak.load_write_budget_reference(output, _wb_qualification())
+    assert loaded["valid"] is True and loaded["usable"] is True, \
+        loaded["problems"]
+    arm = json.loads(output.read_text())["arms"]["append"]
+    raw = json.loads((output.parent / arm["artifacts"]["diagnostics"][
+        "path"]).read_text())
+    assert soak._warm_full_builds(raw["diagnostics"], arm["window"]["start"],
+                                  arm["window"]["end"])["complete"] is False
+
+
+def _wb_empty_backlog_capture(soak, tmp_path, monkeypatch, *, idle=90):
+    """A capture whose backlog took the idle decision on every tick: append
+    has warm builds, backlog none (complete evidence only with idle ticks;
+    90 ticks of 20 s span the backlog arm's 1,800 s)."""
+    return _wb_capture(soak, tmp_path, monkeypatch,
+                       {"append": [10.0, 20.0], "backlog": []},
+                       idle={"backlog": idle})
+
+
+def test_write_budget_empty_backlog_reference_is_adjudicated_per_arm(
+        tmp_path, monkeypatch):
+    """#937 (Codex 01a1c114 Q1-Q3): a capture whose sole defect is a
+    demonstrated empty backlog population qualifies append only. The loader
+    never rewrites the capture, the leg runs every arm, gates append against
+    append, keeps backlog's full-build comparison INVALID with zero or
+    positive candidate samples while still judging its write budget, and the
+    leg stays INVALID. Detects a vacuous backlog PASS on an empty reference,
+    and a leg that refuses the write-budget arms it can still judge."""
+    soak = _load_dashboard_soak()
+    reference, code, _c, _m, output = _wb_empty_backlog_capture(
+        soak, tmp_path, monkeypatch)
+    assert code == 2 and reference["valid"] is False
+    assert reference["problems"] == ["backlog: empty warm full-build population"]
+    raw = output.read_bytes()
+    loaded = soak.load_write_budget_reference(output, _wb_qualification())
+    assert output.read_bytes() == raw
+    assert loaded["valid"] is False and loaded["usable"] is True
+    assert loaded["problems"] == [f"backlog: {soak.WRITE_BUDGET_UNCERTIFIED}"]
+    assert loaded["arms"]["append"]["qualified"] is True
+    assert loaded["arms"]["backlog"]["population"] == "empty"
+    adjudication = loaded["adjudication"]
+    assert adjudication["policy"] == soak.WRITE_BUDGET_REFERENCE_POLICY
+    assert adjudication["referenceSha256"] == hashlib.sha256(raw).hexdigest()
+    assert (adjudication["captureValid"], adjudication["qualifiedArms"],
+            adjudication["uncertifiedArms"]) == (False, ["append"], ["backlog"])
+    for backlog_samples in ([], [1000.0, 3000.0]):
+        leg = _write_budget_leg(soak)
+        leg["baselineReference"] = loaded
+        leg["arms"]["append"]["metrics"].update(fullBuildP50Ms=10.0,
+                                                fullBuildP95Ms=20.0)
+        backlog = leg["arms"]["backlog"]["metrics"]
+        backlog["fullBuild"].update(samplesMs=backlog_samples,
+                                    n=len(backlog_samples))
+        backlog["worstBytesPerMinute"] = 16 * MIB_901 + 1
+        gates = soak.full_build_gate(leg)
+        assert gates["append"]["valid"] is True
+        assert gates["append"]["failures"] == []
+        assert gates["backlog"]["valid"] is False
+        assert gates["backlog"]["uncertified"] is True
+        assert soak.WRITE_BUDGET_UNCERTIFIED in gates["backlog"]["problems"]
+        reasons = soak.write_budget_invalid_reasons(leg)
+        assert any(r.startswith("baselineReference:") for r in reasons)
+        assert any(r.startswith("backlog: full build:") for r in reasons)
+        problems = soak.evaluate_write_budget_leg(leg)
+        assert any(p.startswith("backlog: INVALID: full build:")
+                   for p in problems), problems
+        assert any(p.startswith("backlog: ") and "B/min over" in p
+                   for p in problems), problems
+        assert not any(p.startswith("append: ") for p in problems), problems
+    calls = []
+    monkeypatch.setattr(soak, "_run_write_budget_arm",
+                        lambda args, name, **kwargs: calls.append(name)
+                        or _write_budget_leg(soak)["arms"][name])
+    if str(BIN) not in sys.path:
+        sys.path.insert(0, str(BIN))
+    import importlib as _importlib
+    monkeypatch.setattr(soak, "_candidate_module", lambda checkout, name:
+                        _importlib.import_module(name))
+    bundle, receipt, _r = _wb_p1(soak, tmp_path, "cand-p1", tree="d" * 40)
+    leg = soak.run_write_budget_leg(types.SimpleNamespace(
+        checkout=str(BIN.parent), write_budget_arms="idle,append,backlog",
+        baseline_reference=str(output), root=str(tmp_path / "leg-root"),
+        fixture_image=str(bundle), image_receipt=str(receipt),
+        canonical_root=None), "d" * 40)
+    assert leg["imageAttestation"]["problems"] == []
+    assert calls == ["idle", "append", "backlog"]
+    assert leg["fullBuildGate"]["backlog"]["uncertified"] is True
+    assert {"baselineReference", "backlog"} <= set(leg["invalid"])
+
+
+@pytest.mark.parametrize("case, fragment", [
+    ("incomplete", "incomplete tick evidence"),
+    ("append-empty", "append: empty warm full-build population"),
+    ("job-problem", "the reference capture was not valid"),
+    ("forged-complete", "recomputed from the raw diagnostics is incomplete"),
+    ("digest", "digest"),
+    ("ticks", "tick and exclusion counts"),
+    ("valid-flipped", "valid flag"),
+    ("teardown", "teardown recorded"),
+    ("window-edited", "measured window differs"),
+    ("short-window", "shorter than"),
+])
+def test_write_budget_empty_population_exception_is_narrow(
+        tmp_path, monkeypatch, case, fragment):
+    """#937 (01a1c114 Q2): only a demonstrated empty BACKLOG population is
+    recognized. Incomplete evidence, an empty append, any other capture
+    problem, a recorded completeness the raw diagnostics do not recompute,
+    and a changed artifact each leave the reference unusable, so no arm
+    runs. So do recorded tick counts, a capture verdict or job record that
+    disagrees with that defect, and a window shorter than the arm or not
+    the artifact's. Detects a reference whose missing evidence would
+    qualify it."""
+    soak = _load_dashboard_soak()
+    _ref, _code, _c, _m, output = _wb_empty_backlog_capture(
+        soak, tmp_path, monkeypatch,
+        idle={"incomplete": 0, "forged-complete": 0,
+              "short-window": 6}.get(case, 90))
+    reference = json.loads(output.read_text())
+    arms = reference["arms"]
+    if case == "append-empty":
+        arms["append"], arms["backlog"] = arms["backlog"], arms["append"]
+        reference["problems"] = ["append: empty warm full-build population"]
+    elif case == "job-problem":
+        reference["problems"].insert(0, "job: teardown: an other holder")
+    elif case == "forged-complete":
+        arms["backlog"]["fullBuild"].update(complete=True, problems=[])
+        arms["backlog"]["problems"] = ["empty warm full-build population"]
+        reference["problems"] = ["backlog: empty warm full-build population"]
+    elif case == "digest":
+        artifact = output.parent / arms["backlog"]["artifacts"][
+            "diagnostics"]["path"]
+        artifact.write_bytes(artifact.read_bytes() + b" ")
+    elif case == "ticks":
+        arms["backlog"]["fullBuild"]["ticks"] += 1
+    elif case == "valid-flipped":
+        reference["valid"] = True
+    elif case == "teardown":
+        reference["job"] = {"teardown": {"problems": ["an other holder"]}}
+    elif case == "window-edited":
+        arms["backlog"]["window"]["end"] -= 1.0
+    output.write_text(json.dumps(reference))
+    loaded = soak.load_write_budget_reference(output, _wb_qualification())
+    assert loaded["valid"] is False and loaded["usable"] is False
+    assert any(fragment in p for p in loaded["problems"]), loaded["problems"]
+
+
 _FAMILY_CHILD = r"""
 import subprocess, sys
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -5955,3 +7303,1532 @@ def test_write_budget_dashboard_teardown_reaps_the_group(tmp_path):
             break
         time.sleep(0.01)
     assert _wb_gone(int(marker.read_text()))
+
+
+# ── #937 T4: preparation v2's P0 and P1 flows ──────────────────────────────
+
+def _v2_storage(kind):
+    return lambda path: {"class": kind, "mountPoint": "/Volumes/Backing",
+                         "fsType": "apfs"}
+
+
+def test_v2_children_env_is_external(tmp_path, monkeypatch):
+    """Spec §5.2 environment (Global Constraint 7): every v2 child, product
+    or tool, gets TMPDIR under W/tmp/<step>/ and PYTHONDONTWRITEBYTECODE=1,
+    and a product child gets its data, Claude, Codex and HOME roots under the
+    canonical root; a working root on internal storage refuses. Detects
+    product temp files and bytecode landing on the host's internal disk (the
+    inherited TMPDIR), and a v2 child reading a live root."""
+    soak = _load_dashboard_soak()
+    working = tmp_path / "W"
+    working.mkdir()
+    canonical = tmp_path / "C"
+    (canonical / "codex-a").mkdir(parents=True)
+    monkeypatch.setenv("TMPDIR", "/internal/tmp/")
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    monkeypatch.setattr(soak, "_storage_identity", _v2_storage("external"))
+    env = soak._v2_env(soak._V2Step("p1-migrate", working, canonical))
+    assert env["TMPDIR"] == str(working / "tmp" / "p1-migrate") + os.sep
+    assert (working / "tmp" / "p1-migrate").is_dir()
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert env["CCTALLY_DATA_DIR"] == str(canonical / "data")
+    assert env["HOME"] == str(canonical / "home")
+    assert env["CLAUDE_CONFIG_DIR"] == str(canonical / "claude")
+    assert env["CODEX_HOME"] == str(canonical / "codex-a")
+    tool = soak._v2_env(soak._V2Step("image", working, None))
+    assert tool["TMPDIR"] == str(working / "tmp" / "image") + os.sep
+    assert tool["PYTHONDONTWRITEBYTECODE"] == "1"
+    monkeypatch.setattr(soak, "_storage_identity", _v2_storage("internal"))
+    with pytest.raises(soak._soak_image().ImageRefusal, match="external"):
+        soak._v2_env(soak._V2Step("p0", working, canonical))
+
+
+_RETENTION_STORE = r"""
+import importlib.machinery, importlib.util, sys
+sys.path.insert(0, sys.argv[1])
+loader = importlib.machinery.SourceFileLoader("cctally", sys.argv[1] + "/cctally")
+spec = importlib.util.spec_from_loader("cctally", loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules["cctally"] = module
+loader.exec_module(module)
+sys.modules["_cctally_core"].establish_script_owner()
+module._load_sibling("_cctally_cache").open_conversations_db().close()
+"""
+
+
+def _insert_filled(conn, table, values):
+    """One row with `values`, every other NOT NULL column filled neutrally."""
+    row = dict(values)
+    for _cid, name, kind, notnull, default, pk in conn.execute(
+            f"PRAGMA table_info({table})"):
+        if name in row or pk or not notnull or default is not None:
+            continue
+        row[name] = 0 if "INT" in (kind or "").upper() else ""
+    columns = ", ".join(row)
+    conn.execute(f"INSERT INTO {table} ({columns}) VALUES "
+                 f"({', '.join('?' for _ in row)})", tuple(row.values()))
+
+
+def test_pinned_prune_contract(tmp_path, monkeypatch):
+    """Spec §5.3 step 5 (F17): P0's prune runs in a separate process against
+    the producer's modules only (here the current tree stands in for it),
+    on the fixture's recorded clock: of two conversations on either side of
+    the pinned 30-day cutoff it removes exactly the older one, and a call on
+    the wall clock (which would prune the whole November population) or a
+    naive clock is refused before anything runs. Detects a clock-dependent
+    population and a prune that imports the harness tree's retention."""
+    soak = _load_dashboard_soak()
+    # Production isolates every tree child with -I; under pytest the
+    # isolation detector refuses -I children, and the child's own prelude
+    # still binds sys.path to the tree's bin/ plus the standard library.
+    assert "-I" in soak._TREE_CHILD_FLAGS
+    monkeypatch.setattr(soak, "_TREE_CHILD_FLAGS", ())
+    data = tmp_path / "data"
+    data.mkdir()
+    env = {**os.environ, "CCTALLY_DATA_DIR": str(data),
+           "HOME": str(tmp_path / "home"),
+           "CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),
+           "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+           "CCTALLY_DISABLE_TELEMETRY": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+    env.pop("CCTALLY_AS_OF", None)
+    subprocess.run([sys.executable, "-c", _RETENTION_STORE, str(BIN)],
+                   env=env, check=True, capture_output=True)
+    conn = sqlite3.connect(data / "conversations.db")
+    for session, stamp in (("older", "2026-08-01T00:00:00Z"),
+                           ("newer", "2026-09-10T00:00:00Z")):
+        _insert_filled(conn, "conversation_messages", {
+            "session_id": session, "timestamp_utc": stamp,
+            "source_path": f"/c/{session}.jsonl", "byte_offset": 0})
+    conn.commit()
+    conn.close()
+
+    def sessions():
+        with contextlib.closing(sqlite3.connect(data / "conversations.db")) as c:
+            return sorted(r[0] for r in c.execute(
+                "SELECT DISTINCT session_id FROM conversation_messages"))
+
+    for clock in (dt.datetime.now(dt.timezone.utc),
+                  soak.P0_PRUNE_NOW_UTC.replace(tzinfo=None)):
+        with pytest.raises(ValueError):
+            soak._pinned_retention_prune(BIN.parent, env, now_utc=clock,
+                                         retention_days=30)
+    assert sessions() == ["newer", "older"]
+    result = soak._pinned_retention_prune(
+        BIN.parent, env, now_utc=soak.P0_PRUNE_NOW_UTC, retention_days=30)
+    assert result["result"] is not None
+    assert result["result"]["claude_sessions"] == 1
+    assert sessions() == ["newer"]
+    assert pathlib.Path(result["sysPath"][0]) == BIN.resolve()
+    assert not any("site-packages" in p for p in result["sysPath"])
+    assert pathlib.Path(result["modules"]["_lib_conversation_retention"]
+                        ).resolve().parent == BIN.resolve()
+
+
+def _segment_summary_lib():
+    if str(BIN) not in sys.path:
+        sys.path.insert(0, str(BIN))
+    return importlib.import_module("_lib_segment_summary")
+
+
+def test_segment_summary_identity_check_recovers_once_then_refuses(tmp_path,
+                                                                  monkeypatch):
+    """Spec §5.4 step 4 (round 2, R5): a summary the stats rebuild carried
+    forward with the producer host's identity would reach P2 under a stale
+    (st_dev, st_ino). Decoded through the tree's own reader, a stale summary
+    triggers exactly one removal of the sidecar and one more rebuild; a
+    summary still stale after it refuses the step and names the segment; a
+    current one needs no recovery."""
+    soak = _load_dashboard_soak()
+    monkeypatch.setattr(soak, "_TREE_CHILD_FLAGS", ())
+    lss = _segment_summary_lib()
+    journal = tmp_path / "data" / "journal"
+    journal.mkdir(parents=True)
+    segment = journal / "observations-0001.jsonl"
+    segment.write_bytes(b"{}\n")
+    st = segment.stat()
+    sidecar = journal / lss.SIDECAR_NAME
+
+    def write(dev):
+        lss.write_sidecar(sidecar, [lss.SegmentSummary(
+            segment_name=segment.name, st_dev=dev, st_ino=st.st_ino,
+            summarized_size=3, complete_line_covered_offset=3)])
+
+    write(st.st_dev + 1)
+    problems = soak._segment_summary_identity_problems(BIN.parent, journal)
+    assert problems and segment.name in problems[0]
+    rebuilds = []
+    record = soak._settle_segment_summaries(
+        BIN.parent, journal,
+        lambda: rebuilds.append(sidecar.exists()) or write(st.st_dev))
+    assert rebuilds == [False]
+    assert record["recovered"] is True and record["problems"] == []
+    rebuilds.clear()
+    write(st.st_dev + 1)
+    with pytest.raises(RuntimeError, match=segment.name):
+        soak._settle_segment_summaries(
+            BIN.parent, journal,
+            lambda: rebuilds.append(sidecar.exists()) or write(st.st_dev + 1))
+    assert rebuilds == [False]
+    rebuilds.clear()
+    write(st.st_dev)
+    record = soak._settle_segment_summaries(
+        BIN.parent, journal, lambda: rebuilds.append(True))
+    assert rebuilds == [] and record["recovered"] is False
+    # #937 F5: a journal segment the sidecar does not summarize is a problem,
+    # not a pass (a segment the rebuild skipped would reach P2 unchecked).
+    second = journal / "observations-0002.jsonl"
+    second.write_bytes(b"{}\n")
+    problems = soak._segment_summary_identity_problems(BIN.parent, journal)
+    assert len(problems) == 1 and second.name in problems[0]
+    assert segment.name not in problems[0]
+
+
+def test_p1_replay_attribution_refuses_unattributed():
+    """Spec §5.4 step 7: P1's input differs from the producer's sealed state
+    only in the tree (and perhaps the device, which the product never
+    decides on), so a cursor family that replays (a reset, a new
+    incarnation, a vanished or new cursor) must be accounted for by a
+    pending key a migration set for that family. A replay with no such key,
+    or with a key naming another family, refuses as unattributed."""
+    soak = _load_dashboard_soak()
+    claude = {"table": "conversation_source_files", "path": "/C/a.jsonl",
+              "last_byte_offset": 100, "inode": 5, "source_incarnation_id": "i1"}
+    codex = {"table": "codex_session_files", "path": "/C/r.jsonl",
+             "last_byte_offset": 50, "inode": 7}
+    before = {"rows": {"conversation_source_files\t/C/a.jsonl": claude,
+                       "codex_session_files\t/C/r.jsonl": codex},
+              "incarnations": {"fk-r": 1}}
+    same = soak._p1_replay_attribution(before, before, {})
+    assert same["replayed"] == {} and same["unattributed"] == []
+    after = {"rows": {"conversation_source_files\t/C/a.jsonl": {
+                 **claude, "source_incarnation_id": "i2"},
+                 "codex_session_files\t/C/r.jsonl": codex},
+             "incarnations": {"fk-r": 1}}
+    attributed = soak._p1_replay_attribution(
+        before, after,
+        {"conversation_source_files": ["conversation_reingest_pending"]})
+    assert list(attributed["replayed"]) == ["conversation_source_files"]
+    assert attributed["unattributed"] == []
+    for keys in ({}, {"codex_session_files": ["codex_replay_from_zero_pending"]}):
+        with pytest.raises(RuntimeError, match="unattributed"):
+            soak._p1_replay_attribution(before, after, keys)
+    reset = {"rows": {**before["rows"], "codex_session_files\t/C/r.jsonl": {
+        **codex, "last_byte_offset": 0}}, "incarnations": {"fk-r": 2}}
+    with pytest.raises(RuntimeError, match="codex_session_files"):
+        soak._p1_replay_attribution(before, reset, {})
+
+
+
+def test_p1_pending_keys_classify_by_exact_registry_name():
+    """#937 F12: P1 attributes a replay to the cursor family a pending key
+    names. A substring guess filed `conversation_rebuild_codex_pending` under
+    the Claude family and accepted keys no tree registers. Classification is
+    by exact name from the tested tree's maintenance registry; a key the
+    registry lacks, or the harness table lacks, refuses and names the key;
+    a derived-only key re-reads no cursor family. The table also covers every
+    key the tree in this checkout registers."""
+    soak = _load_dashboard_soak()
+    if str(BIN) not in sys.path:
+        sys.path.insert(0, str(BIN))
+    frontier = importlib.import_module("_lib_ingest_frontier")
+    registry = (set(frontier._PENDING_META_KEYS)
+                | set(frontier._CONVERSATION_PENDING_META_KEYS))
+    assert registry <= set(soak.P1_PENDING_KEY_FAMILIES)
+    mapped = soak._pending_keys_by_family(
+        ["conversation_reingest_pending", "codex_replay_from_zero_pending",
+         "conversation_rebuild_codex_pending", "ai_titles_backfill_pending"],
+        sorted(registry))
+    assert mapped == {
+        "conversation_source_files": ["conversation_reingest_pending"],
+        "codex_session_files": ["codex_replay_from_zero_pending"],
+        "codex_conversation_source_files": [
+            "conversation_rebuild_codex_pending"]}
+    with pytest.raises(RuntimeError, match="conversation_reingest_pending"):
+        soak._pending_keys_by_family(["conversation_reingest_pending"],
+                                     ["codex_replay_from_zero_pending"])
+    with pytest.raises(RuntimeError, match="widget_rebuild_pending"):
+        soak._pending_keys_by_family(["widget_rebuild_pending"],
+                                     ["widget_rebuild_pending"])
+
+
+# ── #937 T5: the P2 arm, the two roots, qualification v2 ────────────────────
+
+@pytest.mark.parametrize("case", ["cross-tree", "v1-reference", "other-p0",
+                                  "wrong-tree", "seal-mismatch"])
+def test_write_budget_qualification_shared_keys_and_p1_attestation(
+        tmp_path, monkeypatch, case):
+    """Spec §5.6 test 11: reference (tree A) and candidate (tree B) P1s on
+    the same P0 qualify on the shared keys and each attests on its own; a v1
+    reference, another P0's seal, a P1 of another tree and a P1 whose seal no
+    longer matches its bundle each refuse. Detects a stale reference that
+    qualifies, and every valid cross-tree reference being refused."""
+    soak = _load_dashboard_soak()
+    monkeypatch.setattr(soak, "_storage_identity",
+                        lambda path: {"class": "external", "mountPoint": "/V",
+                                      "fsType": "apfs"})
+    ref_bundle, ref_path, ref_receipt = _wb_p1(
+        soak, tmp_path, "ref", tree=soak.WRITE_BUDGET_BASELINE_SHA)
+    cand_bundle, cand_path, cand_receipt = _wb_p1(
+        soak, tmp_path, "cand", tree="b" * 40,
+        p0_seal="c" * 64 if case == "other-p0" else "a" * 64)
+
+    def qualification(path, bundle):
+        return soak._write_budget_qualification(types.SimpleNamespace(
+            root=str(tmp_path), image_receipt=str(path),
+            fixture_image=str(bundle), sync_interval=5.0))
+
+    reference = qualification(ref_path, ref_bundle)
+    run = qualification(cand_path, cand_bundle)
+    if case == "v1-reference":
+        reference["fixture"]["preparation"] = {
+            **reference["fixture"]["preparation"], "version": 1}
+    if case == "seal-mismatch":
+        (cand_bundle / "bands" / "0").write_bytes(b"x" * 11)
+    mismatches = soak._qualification_mismatches(reference, run)
+    attestation = soak._p1_attestation_problems(
+        cand_receipt, expected_tree="d" * 40 if case == "wrong-tree"
+        else "b" * 40, p0_seal=reference["fixture"]["p0Seal"],
+        bundle=cand_bundle)
+    assert soak._p1_attestation_problems(
+        ref_receipt, expected_tree=soak.WRITE_BUDGET_BASELINE_SHA,
+        p0_seal=reference["fixture"]["p0Seal"], bundle=ref_bundle) == []
+    if case == "cross-tree":
+        assert mismatches == [] and attestation == []
+        assert reference["fixture"]["p0Seal"] == "a" * 64
+        assert reference["fixture"]["preparation"]["version"] == 2
+        assert reference["workload"]["retentionDays"] == 30
+        assert reference["workload"]["backlogRetentionDays"] == 29
+        assert "fingerprint" not in reference["fixture"]
+    elif case == "v1-reference":
+        assert any("fixture.preparation.version" in m for m in mismatches)
+    elif case == "other-p0":
+        assert any("fixture.p0Seal" in m for m in mismatches)
+        assert any("P0" in p for p in attestation), attestation
+    elif case == "wrong-tree":
+        assert mismatches == []
+        assert any("tree" in p for p in attestation), attestation
+    else:
+        assert mismatches == [] and attestation, attestation
+
+
+class _WbArmJob:
+    """A `_V2Job` stand-in for one arm: the image is a directory created at
+    the canonical root on attach and removed on detach; product processes,
+    the drain and the dashboard are recorded, never run."""
+
+    def __init__(self, soak, tmp_path, p1_receipt, *, device_offset=0):
+        self.si = soak._soak_image()
+        self.working_root = tmp_path / "W"
+        self.working_root.mkdir()
+        self.canonical_root = tmp_path / "C"
+        self.p1_receipt = p1_receipt
+        self.device_offset = device_offset
+        self.calls = []
+        self.lifecycle = self
+        self.stop_reason = None
+        self.detached_files = None
+        #: (owned-worker records, problems) the teardown's reap reports, and
+        #: the holders left after it (#937 SD7).
+        self.owned_report = ([], [])
+        self.holder_list = []
+
+    def attach(self, bundle):
+        self.calls.append("attach")
+        c = self.canonical_root
+        (c / "data").mkdir(parents=True)
+        (c / "data" / "cache.db").write_bytes(b"store")
+        (c / "data" / "config.json").write_text(
+            json.dumps({"conversation": {"retention_days": 30}}))
+        (c / "claude" / "projects" / "p").mkdir(parents=True)
+        (c / "claude" / "projects" / "p" / "s.jsonl").write_text("{}\n")
+        (c / "codex-a" / "sessions").mkdir(parents=True)
+        (c / "codex-a" / "sessions" / "r.jsonl").write_text("{}\n")
+        sealed = self.si.inventory_record(c)
+        self.p1_receipt["sourceInventory"] = {
+            "stDev": sealed["stDev"] + self.device_offset,
+            "files": sealed["files"]}
+        return types.SimpleNamespace(
+            st_dev=sealed["stDev"], mountpoint=str(c),
+            device_node="/dev/disk99s1",
+            as_dict=lambda: {"stDev": sealed["stDev"]})
+
+    def holders(self):
+        self.calls.append("holders")
+        return list(self.holder_list)
+
+    def reap_owned_workers(self):
+        return self.owned_report
+
+    def detach(self, record):
+        self.calls.append("detach")
+        self.detached_files = sorted(
+            p.relative_to(self.canonical_root).as_posix()
+            for p in self.canonical_root.rglob("*") if p.is_file())
+        shutil.rmtree(self.canonical_root)
+        return types.SimpleNamespace(
+            problems=[], as_dict=lambda: {"problems": [], "detached": True})
+
+    def register_process(self, pid):
+        pass
+
+    def register(self, pid):
+        pass
+
+    def check(self):
+        pass
+
+    def remaining(self):
+        return 3600.0
+
+    def run(self, log_dir):
+        job = self
+
+        class Runner:
+            records = []
+
+            def __call__(self, cmd, **kwargs):
+                job.calls.append("product:" + " ".join(map(str, cmd[1:4])))
+                return types.SimpleNamespace(returncode=0, stdout="",
+                                             stderr="")
+        return Runner()
+
+
+def _wb_arm(soak, tmp_path, monkeypatch, *, device_offset=0, on_drain=None,
+            configure=None):
+    """Run `_run_write_budget_arm` (append, capture mode) against an
+    `_WbArmJob`, every product step stubbed to record its call."""
+    import contextlib as _contextlib
+    si = soak._soak_image()
+    monkeypatch.setattr(soak, "_storage_identity",
+                        lambda path: {"class": "external", "mountPoint": "/V",
+                                      "fsType": "apfs"})
+    monkeypatch.setattr(si, "clonefile_bundle",
+                        lambda src, dst: shutil.copytree(src, dst))
+    p1_bundle, _path, receipt = _wb_p1(soak, tmp_path, "p1", tree="b" * 40)
+    job = _WbArmJob(soak, tmp_path, receipt, device_offset=device_offset)
+    if configure is not None:
+        configure(job)
+    drains = []
+
+    def drain(checkout, env, root, *, run=None, deadline_s=0,
+              image_manifest=None):
+        job.calls.append("drain")
+        if on_drain is not None:
+            on_drain(job)
+        drains.append({"env": env.get("WRITE_ATTRIBUTION_INPUTS"),
+                       "root": root, "manifest": image_manifest})
+        (root / "catchup.json").write_text(json.dumps({"admitted": True}))
+        return {"admitted": True, "problems": []}, None
+
+    @_contextlib.contextmanager
+    def dashboard(root, binary, env, sync_interval, *, log_path=None,
+                  on_spawn=None, **kwargs):
+        job.calls.append("dashboard")
+        log_path.write_text("dashboard log\n")
+        yield types.SimpleNamespace(
+            port=0, proc=types.SimpleNamespace(pid=os.getpid()),
+            teardown={"group": {"pgid": 1, "survivors": []}})
+
+    monkeypatch.setattr(soak, "_drain_before_admission", drain)
+    monkeypatch.setattr(soak, "_live_regime_dashboard", dashboard)
+    monkeypatch.setattr(soak, "_await_warm_publication",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(soak, "_compact_reclaim_backlog",
+                        lambda *a, **k: job.calls.append("compaction") or {})
+    monkeypatch.setattr(soak, "_set_retention_stamp",
+                        lambda *a, **k: job.calls.append("stamp"))
+    monkeypatch.setattr(soak, "_measure_write_window", lambda *a, **k: {
+        "start": 1.0, "end": 2.0, "samples": [], "diagnostics": [],
+        "rss": [], "apiLatenciesMs": [], "midway": None})
+    monkeypatch.setattr(soak, "_write_budget_metrics", lambda window: {
+        "operations": [], "fullBuild": None})
+    evidence = job.working_root / "evidence" / "reference-append"
+    record = soak._run_write_budget_arm(
+        types.SimpleNamespace(sync_interval=5.0, root=str(job.working_root)),
+        "append", p1_bundle=p1_bundle, p1_receipt=receipt,
+        data_root=job.canonical_root, evidence_root=evidence,
+        checkout=BIN.parent, job=job, capture=True)
+    return record, job, evidence, drains
+
+
+def test_write_budget_arm_evidence_outside_data_root(tmp_path, monkeypatch):
+    """Spec §5.2 two roots, test 13: the arm's logs, catchup receipt,
+    admission inputs and dashboard log go to the evidence root on the
+    backing volume, nothing of the harness's lands under the data root C,
+    and after detach every file the reference packager reads still exists
+    (the arm's bundle, session data, is removed). Also: admission runs in
+    catchup's image mode. Detects evidence deleted with the arm's image."""
+    soak = _load_dashboard_soak()
+    record, job, evidence, drains = _wb_arm(soak, tmp_path, monkeypatch)
+    assert not record.get("invalid"), record.get("invalid")
+    assert record["evidenceRoot"] == str(evidence)
+    assert not job.canonical_root.exists()
+    assert job.detached_files == ["claude/projects/p/s.jsonl",
+                                  "codex-a/sessions/r.jsonl",
+                                  "data/cache.db", "data/config.json"]
+    manifest = evidence / "admission" / "p2-manifest.json"
+    assert manifest.is_file()
+    assert (evidence / "admission" / "identity-receipt.json").is_file()
+    assert drains == [{"env": None, "root": evidence, "manifest": manifest}]
+    assert (evidence / "catchup.json").is_file()
+    arm = soak._reference_arm(record, tmp_path / "ref.evidence", tmp_path)
+    assert (tmp_path / arm["artifacts"]["dashboardLog"]["path"]).is_file()
+    assert record["identity"]["passed"] is True
+    assert not list(job.working_root.glob("arm-*"))
+
+
+def test_write_budget_arm_refuses_a_device_mismatch_before_any_product(
+        tmp_path, monkeypatch):
+    """Spec §5.5 step 2 (D1): a P2 volume whose st_dev differs from the P1
+    seal refuses, with the device remedy, before the offline config, the
+    retention setup, the drain or the dashboard runs; the image is then
+    detached. Detects a device refusal after a product process has already
+    written to the arm."""
+    soak = _load_dashboard_soak()
+    record, job, _evidence, drains = _wb_arm(soak, tmp_path, monkeypatch,
+                                             device_offset=1)
+    assert "device" in record["invalid"]
+    assert record["identity"]["deviceMismatch"] is True
+    assert drains == []
+    assert job.calls[0] == "attach" and job.calls[-1] == "detach"
+    assert not [c for c in job.calls
+                if c not in ("attach", "holders", "detach")], job.calls
+
+
+def test_write_budget_arm_watchdog_stop_invalidates_the_arm(tmp_path,
+                                                            monkeypatch):
+    """#937 F1: a watchdog stop that fires while the arm works in-process
+    (here during the admission drain, with no `job.check()` after it) makes
+    the arm INVALID with the stop named; before F1 the arm's record stayed
+    valid and its window was measured as if the job had not been stopped."""
+    soak = _load_dashboard_soak()
+
+    def stop(job):
+        job.stop_reason = "disk-write budget exhausted"
+
+    record, _job, _evidence, _drains = _wb_arm(soak, tmp_path, monkeypatch,
+                                               on_drain=stop)
+    assert "watchdog stopped the job: disk-write budget exhausted" in \
+        str(record.get("invalid")), record.get("invalid")
+
+
+def test_write_budget_arm_teardown_reaps_owned_workers_reports_others(
+        tmp_path, monkeypatch):
+    """#937 SD7 in the arm's teardown: this job's owned detached workers are
+    reaped first and recorded; a holder that is neither recorded nor owned
+    is the only `otherHolders` entry and invalidates the arm, never
+    signalled; an owned worker that could not be reaped invalidates too."""
+    soak = _load_dashboard_soak()
+    worker = {"pid": 11, "command": "python3", "startIdentity": "lstart:w",
+              "proof": {"envToken": True, "productRecord": None},
+              "outcome": "reaped-term"}
+
+    def configure(job):
+        job.owned_report = ([worker], [])
+        job.holder_list = [{"pid": 12, "command": "stranger",
+                            "recorded": False, "owned": False}]
+
+    record, _job, _evidence, _drains = _wb_arm(soak, tmp_path, monkeypatch,
+                                               configure=configure)
+    holders = record["teardown"]["holders"]
+    assert holders["ownedWorkers"] == [worker]
+    assert holders["otherHolders"] == [{"pid": 12, "command": "stranger"}]
+    assert "did not start" in str(record.get("invalid"))
+
+    def unreapable(job):
+        job.owned_report = ([dict(worker, outcome="unreapable")],
+                            ["owned detached worker 11 could not be reaped"])
+
+    (tmp_path / "second").mkdir()
+    record, _job, _evidence, _drains = _wb_arm(
+        soak, tmp_path / "second", monkeypatch, configure=unreapable)
+    assert record["teardown"]["holders"]["otherHolders"] == []
+    assert "could not be reaped" in str(record.get("invalid"))
+
+
+def test_oracle_control_records_its_identity_equality(tmp_path):
+    """#937 F11: the oracle's control clone is held to the same P2
+    `identity_equality` the image cases use, and its measured result is
+    recorded; a failing or unrunnable check is a control problem, never a
+    skipped one (the control could otherwise pass on another device)."""
+    soak = _load_dashboard_soak()
+
+    def fake_si(result):
+        def identity_equality(attached, inventory, sealed):
+            if isinstance(result, Exception):
+                raise result
+            return {"manifestSha256": "m", "deviceMismatch": False,
+                    **result}
+        return types.SimpleNamespace(
+            identity_equality=identity_equality,
+            source_inventory=lambda root: {},
+            write_admission_inputs=lambda directory, equality:
+            directory / "p2-manifest.json")
+
+    passed = soak._control_identity(fake_si({"passed": True, "problems": []}),
+                                    None, tmp_path, {}, tmp_path / "a")
+    assert passed["passed"] is True and passed["problems"] == []
+    failed = soak._control_identity(
+        fake_si({"passed": False, "problems": ["st_dev 5 is not 4"],
+                 "deviceMismatch": True}), None, tmp_path, {}, tmp_path / "b")
+    assert failed["passed"] is False and failed["deviceMismatch"] is True
+    assert failed["problems"] == ["st_dev 5 is not 4"]
+    broken = soak._control_identity(fake_si(OSError("unreadable")), None,
+                                    tmp_path, {}, tmp_path / "c")
+    assert broken["passed"] is False and "unreadable" in broken["problems"][0]
+
+
+_SESS19 = "/C/claude/projects/-bench-alpha-web/sess-19.jsonl"
+
+
+def _not_drained(path=_SESS19, reason="not consumed", extra=()):
+    problem = f"round 1: 1 unconsumed frontier entry (e.g. {path}: {reason})"
+    return {"invalid": f"the fixture's backlog was not drained: {problem}",
+            "problems": [problem, *extra],
+            "unconsumed": [{"logical": path, "provider": "claude",
+                            "reason": reason, "cursor": {"offset": 86498}}]}
+
+
+@pytest.mark.parametrize("case, expected", [
+    ("same-size stimulus", True),
+    ("another file", False),
+    ("another reason", False),
+    ("another problem", False),
+    ("two entries", False),
+])
+def test_oracle_classifies_only_the_same_size_stimulus_as_expected(
+        case, expected):
+    """#937 extra 1: the oracle's replacement and append cases see catch-up
+    report "not drained" because the same-size Claude replacement stimulus
+    (`sess-19.jsonl`) is observed only, never detected. Exactly that cause
+    is `expectedNotDrained`, with its evidence; any other not-drained cause
+    (another file, another reason, a second entry) or any other catch-up
+    problem is a failure, so it cannot hide behind the stimulus."""
+    soak = _load_dashboard_soak()
+    catchup = {
+        "same-size stimulus": _not_drained(),
+        "another file": _not_drained(path="/C/claude/projects/p/x.jsonl"),
+        "another reason": _not_drained(reason="cursor past the prefix"),
+        "another problem": _not_drained(extra=["stats epoch moved"]),
+        "two entries": dict(_not_drained(), unconsumed=[
+            *_not_drained()["unconsumed"],
+            *_not_drained(path="/C/codex-a/r.jsonl")["unconsumed"]]),
+    }[case]
+    record, problems = soak._expected_not_drained(catchup, _SESS19)
+    if expected:
+        assert problems == []
+        assert record["path"] == _SESS19 and record["reason"] == "not consumed"
+        assert record["evidence"]["cursor"] == {"offset": 86498}
+    else:
+        assert record is None
+        assert problems and problems[0].startswith("catchup: ")
+    assert soak._expected_not_drained({"invalid": None}, _SESS19) == (None, [])
+
+
+def test_oracle_catchup_carries_the_final_rounds_unconsumed_entries(
+        tmp_path, monkeypatch):
+    """The oracle's catch-up summary carries the final round's unconsumed
+    frontier entries (path, reason, cursor) from the D6 stability receipt,
+    which is the evidence `expectedNotDrained` is judged on; without it
+    every not-drained cause looked alike."""
+    soak = _load_dashboard_soak()
+    entry = {"logical": _SESS19, "provider": "claude", "reason": "not consumed",
+             "cursor": {"offset": 1}, "completeEnd": 1, "generation": "plain:1",
+             "consumption": {"ignored": True}}
+    receipt = {"admitted": False, "problems": ["p"], "elapsedS": 1.0,
+               "stability": {"receipts": [{"unconsumed": []},
+                                          {"unconsumed": [entry]}]}}
+    monkeypatch.setattr(soak, "_drain_before_admission",
+                        lambda *a, **k: (receipt, "not drained"))
+    job = types.SimpleNamespace(remaining=lambda: 60.0)
+    summary = soak._oracle_catchup(BIN.parent, {}, tmp_path / "w", None, job)
+    assert summary["unconsumed"] == [{
+        key: entry[key] for key in ("logical", "provider", "reason", "cursor",
+                                    "completeEnd", "generation")}]
+    assert summary["invalid"] == "not drained"
+
+
+# ── #937 T6: the relocation oracle's store evidence and the v2 CLI ──────────
+
+def _replay_store(directory, rows, *, cursor, inode=7, incarnation="inc-1"):
+    """A conversations.db with one Claude cursor and its derived rows."""
+    directory.mkdir(parents=True)
+    with contextlib.closing(sqlite3.connect(directory / "conversations.db")) as c:
+        c.execute("CREATE TABLE conversation_source_files (path TEXT PRIMARY "
+                  "KEY, last_byte_offset INTEGER, size_bytes INTEGER, inode "
+                  "INTEGER, source_incarnation_id TEXT)")
+        c.execute("CREATE TABLE conversation_messages (id INTEGER PRIMARY KEY "
+                  "AUTOINCREMENT, source_path TEXT NOT NULL, byte_offset "
+                  "INTEGER NOT NULL, content TEXT, UNIQUE(source_path, "
+                  "byte_offset))")
+        c.execute("INSERT INTO conversation_source_files VALUES (?,?,?,?,?)",
+                  ("/c/a.jsonl", cursor, cursor, inode, incarnation))
+        c.executemany("INSERT INTO conversation_messages (id, source_path, "
+                      "byte_offset, content) VALUES (?, '/c/a.jsonl', ?, ?)",
+                      rows)
+        c.commit()
+    return directory
+
+
+@pytest.mark.parametrize("case", ["identical", "identical-reinsert",
+                                  "consumed", "content-rewrite", "reset",
+                                  "new-incarnation"])
+def test_store_replay_evidence_detects_identical_reinsert(tmp_path, case):
+    """Spec §6.2: a replay that deletes and reinserts byte-identical rows
+    below the pre-drain cursor is visible only by the rows' surrogate ids,
+    so the oracle's store evidence must call it a replay; so are a content
+    rewrite below the cursor, a reset offset and a new incarnation, while
+    rows added at or past the pre-drain cursor are consumed input. Detects
+    an oracle whose GREEN case passes over a silent re-ingest."""
+    soak = _load_dashboard_soak()
+    rows = [(1, 0, "a"), (2, 10, "b")]
+    before = _replay_store(tmp_path / "before", rows, cursor=20)
+    after_rows, cursor, inode, incarnation = rows, 20, 7, "inc-1"
+    if case == "identical-reinsert":
+        after_rows = [(3, 0, "a"), (4, 10, "b")]
+    elif case == "consumed":
+        after_rows, cursor = rows + [(3, 20, "c")], 30
+    elif case == "content-rewrite":
+        after_rows = [(1, 0, "A"), (2, 10, "b")]
+    elif case == "reset":
+        cursor = 10
+    elif case == "new-incarnation":
+        incarnation = "inc-2"
+    after = _replay_store(tmp_path / "after", after_rows, cursor=cursor,
+                          inode=inode, incarnation=incarnation)
+    evidence = soak._store_replay_evidence(before, after)
+    kinds = {r["kind"] for r in evidence["replays"]}
+    if case in ("identical", "consumed"):
+        assert evidence["replayed"] is False, evidence["replays"]
+    else:
+        assert evidence["replayed"] is True
+    expected = {"identical-reinsert": "surrogate id changed",
+                "content-rewrite": "content changed", "reset": "reset",
+                "new-incarnation": "new incarnation"}.get(case)
+    if expected:
+        assert expected in kinds, kinds
+    consumed = evidence["consumed"]["conversation_messages"]
+    assert consumed == ({"/c/a.jsonl": [20]} if case == "consumed" else {})
+    assert evidence["cursors"]["conversation_source_files"]["/c/a.jsonl"][
+        "after"]["last_byte_offset"] == cursor
+
+
+def test_cli_v2_flags_parse_and_refuse_fixture_copy(tmp_path, monkeypatch,
+                                                    capsys):
+    """Spec §5.6 CLI: --prepare-fixture-image, --prepare-tree-image and
+    --relocation-oracle reach their flows with the parsed v2 arguments and
+    exit 2 on a failing receipt; each refuses --fixture-copy, and a missing
+    required input or two modes at once is a usage error before anything
+    runs. Detects a v2 step started on a v1 copy or with a missing input."""
+    soak = _load_dashboard_soak()
+    seen, outcome = {}, {"passed": True}
+    for name in ("prepare_fixture_image", "prepare_tree_image",
+                 "run_relocation_oracle"):
+        monkeypatch.setattr(soak, name, lambda args, name=name: (
+            seen.__setitem__(name, args) or dict(outcome)))
+    root = tmp_path / "W"
+    modes = {
+        "prepare_fixture_image": [
+            "--prepare-fixture-image", "--output", str(root / "p0.json"),
+            "--source-fingerprint", "a" * 64, "--source-digest", "b" * 64],
+        "prepare_tree_image": [
+            "--prepare-tree-image", "--p0-receipt", str(root / "p0.json"),
+            "--tree", "abc", "--output", str(root / "p1.json"),
+            "--canonical-root", str(tmp_path / "C")],
+        "run_relocation_oracle": ["--relocation-oracle", "--tree", "abc"],
+    }
+    for name, argv in modes.items():
+        assert soak.main(["--root", str(root), *argv]) == 0
+        assert pathlib.Path(seen[name].root) == root
+    assert seen["prepare_fixture_image"].source_digest == "b" * 64
+    assert pathlib.Path(seen["prepare_tree_image"].canonical_root) == \
+        tmp_path / "C"
+    assert seen["prepare_tree_image"].tree == "abc"
+    assert pathlib.Path(seen["prepare_tree_image"].p0_receipt) == \
+        root / "p0.json"
+    assert seen["run_relocation_oracle"].canonical_root is None
+    assert seen["prepare_fixture_image"].extract_only is False
+    assert seen["prepare_fixture_image"].resume_from is None
+    # #937 I4: --extract-only keeps the stdin inputs; --resume-from takes
+    # them from the checkpoint, so neither pre-pass value is required.
+    assert soak.main(["--root", str(root), *modes["prepare_fixture_image"],
+                      "--extract-only"]) == 0
+    assert seen["prepare_fixture_image"].extract_only is True
+    checkpoint = root / "p0-checkpoint-extracted.json"
+    assert soak.main(["--root", str(root), "--prepare-fixture-image",
+                      "--output", str(root / "p0-r.json"),
+                      "--resume-from", str(checkpoint)]) == 0
+    assert pathlib.Path(seen["prepare_fixture_image"].resume_from) == \
+        checkpoint
+    assert seen["prepare_fixture_image"].source_fingerprint is None
+    seen.clear()
+    outcome["passed"] = False
+    assert soak.main(["--root", str(root),
+                      *modes["run_relocation_oracle"]]) == 2
+    seen.clear()
+    refused = [argv + ["--fixture-copy", str(tmp_path / "fixture")]
+               for argv in modes.values()]
+    refused += [modes["run_relocation_oracle"] + ["--prepare-fixture-image"],
+                ["--prepare-tree-image", "--tree", "abc", "--output",
+                 str(root / "p1.json")],
+                ["--relocation-oracle"],
+                ["--prepare-fixture-image", "--output", str(root / "p0.json"),
+                 "--extract-only"],
+                ["--prepare-fixture-image", "--output", str(root / "p0.json"),
+                 "--resume-from", str(root / "c.json"), "--extract-only"],
+                ["--prepare-fixture-image", "--output", str(root / "p0.json"),
+                 "--resume-from", str(root / "c.json"),
+                 "--source-digest", "b" * 64],
+                ["--prepare-tree-image", "--p0-receipt", str(root / "p0.json"),
+                 "--tree", "abc", "--output", str(root / "p1.json"),
+                 "--extract-only"]]
+    for argv in refused:
+        with pytest.raises(SystemExit) as caught:
+            soak.main(["--root", str(root), *argv])
+        assert caught.value.code == 2
+    err = capsys.readouterr().err
+    assert "--fixture-copy" in err
+    assert seen == {} and not root.exists()
+
+
+def test_v2_meter_resolves_the_working_roots_mount_point(tmp_path,
+                                                         monkeypatch):
+    """`diskutil info` resolves a volume only by its mount point (a
+    subdirectory exits 1), so the budget watchdog's meter must be built from
+    the mount point that holds the working root, never the working root
+    itself. Detects every v2 job refusing at start with an unreadable meter
+    (observed on the first lan oracle run)."""
+    soak = _load_dashboard_soak()
+    si = soak._soak_image()
+    working = tmp_path / "W"
+    working.mkdir()
+    monkeypatch.setattr(soak, "_storage_identity",
+                        lambda path: {"class": "external", "mountPoint": "/V",
+                                      "fsType": "apfs"})
+    seen = []
+    monkeypatch.setattr(si, "disk_write_meter",
+                        lambda volume, run=None: seen.append(volume) or "meter")
+    assert soak._v2_meter(working) == "meter"
+    volume = pathlib.Path(seen[0])
+    assert os.path.ismount(volume) and volume != working
+    assert volume == working or volume in working.resolve().parents
+
+
+# ── #937 I4: P0's sealed checkpoints, --extract-only and --resume-from ─────
+
+class _P0Job:
+    """A `_V2Job` stand-in for P0: a bundle is a directory holding bands/,
+    the three meta files and vol/ (the volume's content); attach renames
+    vol/ to the canonical root and detach renames it back, appending to the
+    band as an image written through its volume would change. Product steps
+    are recorded, never run; the rebuild adds a row to data/cache.db."""
+
+    def __init__(self, state, *, working_root, canonical_root, kind,
+                 deadline_s, ledger):
+        self.state = state
+        self.si = state["si"]
+        self.working_root = pathlib.Path(working_root)
+        self.canonical_root = pathlib.Path(canonical_root)
+        self.kind = kind
+        self.records = {}
+        self.stop_reason = None
+        self.interrupted = False
+        self.lifecycle = self
+        self._attached = None
+        state["jobs"].append(kind)
+        state["job"] = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self._attached is not None:
+            self.detach(None)
+        self.records["teardown"] = {"problems": []}
+        return False
+
+    def create(self, bundle):
+        bundle = pathlib.Path(bundle)
+        (bundle / "bands").mkdir(parents=True)
+        (bundle / "bands" / "0").write_bytes(b"band")
+        for name in self.si.BUNDLE_META_FILES:
+            (bundle / name).write_bytes(name.encode())
+        (bundle / "vol").mkdir()
+
+    def attach(self, bundle):
+        bundle = pathlib.Path(bundle)
+        self.state["calls"].append(("attach", bundle))
+        os.rename(bundle / "vol", self.canonical_root)
+        self._attached = bundle
+        st_dev = os.stat(self.canonical_root).st_dev
+        return types.SimpleNamespace(
+            st_dev=st_dev, device_node="/dev/disk9s1",
+            as_dict=lambda: {"bundle": str(bundle), "stDev": st_dev})
+
+    def detach(self, record):
+        bundle = self._attached
+        self.state["calls"].append(("detach", bundle))
+        os.rename(self.canonical_root, bundle / "vol")
+        with open(bundle / "bands" / "0", "ab") as fh:
+            fh.write(b"w")
+        self._attached = None
+        return types.SimpleNamespace(
+            problems=[], as_dict=lambda: {"problems": [], "detached": True})
+
+    def holders(self):
+        return []
+
+    def reap_owned_workers(self):
+        return [], []
+
+    def register_process(self, pid):
+        pass
+
+    def register(self, pid):
+        pass
+
+    def check(self):
+        pass
+
+    def remaining(self):
+        return 3600.0
+
+    def run(self, log_dir):
+        job = self
+
+        class Runner:
+            #: One recorded child with its write counter (#937 F8).
+            records = [{"label": "product", "writeBytes": 4096,
+                        "writeStatus": "measured", "durationS": 0.5,
+                        "returncode": 0, "argv": ["not", "copied"]}]
+
+            def __call__(self, cmd, **kwargs):
+                text = " ".join(map(str, cmd))
+                job.state["calls"].append(("product", text))
+                if "--rebuild" in cmd:
+                    job.state["calls"].append("rebuild")
+                    with contextlib.closing(sqlite3.connect(
+                            job.canonical_root / "data" / "cache.db")) as conn:
+                        conn.execute("INSERT INTO t VALUES ('rebuilt')")
+                        conn.commit()
+                return types.SimpleNamespace(returncode=0, stdout="",
+                                             stderr="")
+        return Runner()
+
+
+def _p0_world(soak, tmp_path, monkeypatch, *, prune_fails=False,
+              stamp=None, prune_hook=None):
+    """A small source fixture, its pre-pass values, and every P0 step stubbed
+    to a `_P0Job`. Clones are copies with mtimes kept; the inventory maps
+    every inode to 0, as a clone of a bundle keeps its volume's inodes."""
+    si = soak._soak_image()
+    src = tmp_path / "src"
+    (src / "claude" / "projects" / "p").mkdir(parents=True)
+    (src / "claude" / "projects" / "p" / "s.jsonl").write_text('{"a": 1}\n')
+    (src / "codex-a" / "sessions" / "2026").mkdir(parents=True)
+    (src / "codex-a" / "sessions" / "2026" / "r.jsonl").write_text('{"b": 2}\n')
+    data = src / "data"
+    data.mkdir()
+    (data / "config.json").write_text(
+        json.dumps({"conversation": {"retention_days": 30}}))
+    with contextlib.closing(sqlite3.connect(data / "conversations.db")) as c:
+        c.execute("CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT)")
+        c.executemany("INSERT INTO cache_meta VALUES (?, ?)", [
+            ("conversation_retention_last_prune_at",
+             soak.P0_LAST_PRUNE_AT if stamp is None else stamp),
+            ("conversation_schema_version", "2"),
+            ("codex_find_projection_generation", "226541")])
+        c.commit()
+    with contextlib.closing(sqlite3.connect(data / "cache.db")) as c:
+        c.execute("CREATE TABLE t (v TEXT)")
+        c.execute("CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT)")
+        c.execute("INSERT INTO cache_meta VALUES "
+                  "('claude_ingest_walk_complete', '2026-09-22T16:06:01Z')")
+        c.commit()
+    (data / "stats.db").write_bytes(b"stats")
+    working = tmp_path / "W"
+    working.mkdir()
+    canonical = tmp_path / "C"
+    state = {"si": si, "calls": [], "jobs": [], "clones": []}
+    real_inventory = si.source_inventory
+    stamps = iter(range(10 ** 6))
+    monkeypatch.setattr(soak, "_utc_stamp",
+                        lambda: f"20261109T{next(stamps):06d}Z")
+
+    def clone(a, b):
+        state["clones"].append((pathlib.Path(a), pathlib.Path(b)))
+        shutil.copytree(a, b, copy_function=shutil.copy2)
+
+    def extract(job, step, target, log_dir, *, stdin=None):
+        state["calls"].append("extract")
+        shutil.copytree(src, target, dirs_exist_ok=True,
+                        copy_function=shutil.copy2)
+        return {"exitCode": 0}
+
+    def prune(producer, env, **kwargs):
+        state["calls"].append("prune")
+        if prune_fails:
+            raise soak._V2Refusal("the pinned prune failed")
+        if prune_hook is not None:
+            prune_hook(canonical / "data")
+        return {"result": 1}
+
+    class Equivalence:
+        def __init__(self, **kwargs):
+            state["equivalenceKwargs"] = kwargs
+
+        def compare(self, retained, normalized):
+            state["calls"].append("compare")
+            if state.get("on_compare"):
+                state["on_compare"]()
+            for store, rows in ((retained, 0), (normalized, 1)):
+                with contextlib.closing(sqlite3.connect(
+                        store / "cache.db")) as conn:
+                    assert conn.execute(
+                        "SELECT COUNT(*) FROM t").fetchone()[0] == rows
+            return {"problems": []}
+
+    monkeypatch.setattr(soak, "P0_SOURCE_FILES", len(real_inventory(src)))
+    monkeypatch.setattr(soak, "_storage_identity", _v2_storage("external"))
+    monkeypatch.setattr(soak, "_V2Job", lambda **kw: _P0Job(state, **kw))
+    monkeypatch.setattr(soak, "_extract_stream", extract)
+    monkeypatch.setattr(soak, "_clonefile", shutil.copy2)
+    def materialize(sha, dest, env=None):
+        # The producer's stdlib-only source identity (#937 F7).
+        (pathlib.Path(dest) / "bin").mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(dest) / "bin" / "_lib_source_identity.py").write_text(
+            "def codex_file_key(root_key, path):\n"
+            "    return 'fk:' + str(root_key) + ':' + str(path)\n")
+        return dest
+
+    monkeypatch.setattr(soak, "materialize_checkout_ref", materialize)
+    monkeypatch.setattr(soak, "_user_version",
+                        lambda _p: soak.P0_STATS_USER_VERSION)
+    monkeypatch.setattr(soak, "_pinned_retention_prune", prune)
+    monkeypatch.setattr(soak, "_checkpoint_stores", lambda _d: {})
+    monkeypatch.setattr(si, "clonefile_bundle", clone)
+    monkeypatch.setattr(si, "StoreEquivalence", Equivalence)
+    monkeypatch.setattr(si, "source_inventory", lambda root: {
+        rel: [0, *values[1:]] for rel, values in real_inventory(root).items()})
+    prepass = {"fingerprint": soak._fixture_source_fingerprint(src),
+               "digest": si.content_digest(src)}
+    return state, working, canonical, prepass
+
+
+def _p0_args(working, canonical, output, prepass=None, **extra):
+    fields = {"root": str(working), "canonical_root": str(canonical),
+              "output": str(output),
+              "source_fingerprint": (prepass or {}).get("fingerprint"),
+              "source_digest": (prepass or {}).get("digest"),
+              "extract_only": False, "resume_from": None}
+    fields.update(extra)
+    return types.SimpleNamespace(**fields)
+
+
+def _p0_extract_only(soak, state, working, canonical, prepass):
+    output = working / "p0-checkpoint-extracted.json"
+    receipt = soak.prepare_fixture_image(_p0_args(
+        working, canonical, output, prepass, extract_only=True))
+    return receipt, output
+
+
+def test_p0_extract_only_writes_a_sealed_checkpoint_and_never_normalizes(
+        tmp_path, monkeypatch):
+    """Correction 2: `--extract-only` verifies the stream (census,
+    fingerprint, digest), clones the detached working bundle into a sealed
+    `extracted` checkpoint whose JSON is --output, and stops: no producer
+    step runs. Detects an extract-only P0 that normalizes, or that leaves no
+    resumable checkpoint (a later failure would re-stream for hours)."""
+    soak = _load_dashboard_soak()
+    si = soak._soak_image()
+    state, working, canonical, prepass = _p0_world(soak, tmp_path, monkeypatch)
+    receipt, output = _p0_extract_only(soak, state, working, canonical,
+                                       prepass)
+    assert receipt["passed"] is True, receipt["problems"]
+    assert "rebuild" not in state["calls"] and "prune" not in state["calls"]
+    assert not [c for c in state["calls"] if c[0] == "product"]
+    checkpoint = json.loads(output.read_text())
+    assert checkpoint["stage"] == "extracted"
+    bundle = pathlib.Path(checkpoint["bundle"])
+    assert bundle.parent == working and bundle.is_dir()
+    assert si.seal_metadata_problems(checkpoint["seal"], bundle) == []
+    assert checkpoint["prePass"] == {"fingerprint": prepass["fingerprint"],
+                                     "digest": prepass["digest"]}
+    assert checkpoint["sourceInventory"]["files"]
+    assert receipt["checkpoints"] == [{
+        "stage": "extracted", "path": str(output),
+        "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "seal": checkpoint["seal"]["sealSha256"]}]
+    assert state["jobs"] == ["full"]
+    assert not canonical.exists()
+
+
+@pytest.mark.parametrize("case", ["clean", "inventory", "digest", "seal"])
+def test_p0_resume_from_extracted_clones_and_reverifies_before_normalizing(
+        tmp_path, monkeypatch, case):
+    """Correction 2: `--resume-from` an `extracted` checkpoint never attaches
+    or mutates the checkpoint bundle; it attaches a fresh clone, requires the
+    checkpoint's exact inventory, re-runs the fingerprint and the content
+    digest against the pre-pass, then rebuilds, checkpoints `rebuilt` and
+    seals. A changed inventory entry, a digest mismatch (same metadata,
+    other bytes) and a checkpoint bundle off its seal each refuse before any
+    producer step. Detects a resumed P0 that normalizes an unverified clone,
+    or writes into the checkpoint it resumes from."""
+    soak = _load_dashboard_soak()
+    si = soak._soak_image()
+    state, working, canonical, prepass = _p0_world(soak, tmp_path, monkeypatch)
+    _receipt, checkpoint_path = _p0_extract_only(soak, state, working,
+                                                 canonical, prepass)
+    checkpoint = json.loads(checkpoint_path.read_text())
+    bundle = pathlib.Path(checkpoint["bundle"])
+    if case == "inventory":
+        victim = bundle / "vol" / "claude" / "projects" / "p" / "s.jsonl"
+        victim.write_text('{"a": 1, "changed": true}\n')
+    elif case == "digest":
+        victim = bundle / "vol" / "codex-a" / "sessions" / "2026" / "r.jsonl"
+        st = victim.stat()
+        victim.write_text('{"b": 3}\n')
+        os.utime(victim, ns=(st.st_atime_ns, st.st_mtime_ns))
+    elif case == "seal":
+        with open(bundle / "bands" / "0", "ab") as fh:
+            fh.write(b"x")
+    if case in ("inventory", "digest"):
+        # Re-seal so only the volume check can catch the change.
+        checkpoint["seal"] = si.bundle_seal(bundle, content=False)
+        checkpoint_path.write_text(json.dumps(checkpoint))
+    state["calls"].clear()
+    seal_before = si.bundle_seal(bundle, content=False)
+    output = working / "p0-receipt.json"
+    args = _p0_args(working, canonical, output, None,
+                    resume_from=str(checkpoint_path))
+    if case == "seal":
+        with pytest.raises(ValueError, match="seal") as caught:
+            soak.prepare_fixture_image(args)
+        assert "remedy" in str(caught.value).lower()
+        assert state["calls"] == [] and not output.exists()
+        return
+    receipt = soak.prepare_fixture_image(args)
+    attached = [c[1] for c in state["calls"] if c[0] == "attach"]
+    assert bundle not in attached
+    assert si.bundle_seal(bundle, content=False)["sealSha256"] == \
+        seal_before["sealSha256"]
+    assert "extract" not in state["calls"]
+    if case != "clean":
+        assert receipt["passed"] is False
+        assert "rebuild" not in state["calls"]
+        assert not [c for c in state["calls"] if c[0] == "product"]
+        fragment = "inventory" if case == "inventory" else "digest"
+        assert any(fragment in p for p in receipt["problems"]), \
+            receipt["problems"]
+        return
+    assert receipt["passed"] is True, receipt["problems"]
+    assert state["calls"].index("rebuild") < state["calls"].index("prune")
+    assert receipt["resumedFrom"]["stage"] == "extracted"
+    assert receipt["resumedFrom"]["path"] == str(checkpoint_path)
+    assert [c["stage"] for c in receipt["checkpoints"]] == ["rebuilt"]
+    rebuilt = json.loads(pathlib.Path(
+        receipt["checkpoints"][0]["path"]).read_text())
+    assert rebuilt["stage"] == "rebuilt"
+    assert rebuilt["normalization"]["originalStamp"] == soak.P0_LAST_PRUNE_AT
+    assert receipt["fingerprints"]["image"] == prepass["fingerprint"]
+    assert "seal" in receipt and pathlib.Path(receipt["bundle"]) != bundle
+
+
+def test_p0_resume_from_rebuilt_skips_the_rebuild(tmp_path, monkeypatch):
+    """Correction 2: the one-shot form checkpoints `extracted` and `rebuilt`;
+    after a failure past the rebuild (here the pinned prune), resuming from
+    `rebuilt` runs the prune, the comparison and the seal on a verified
+    clone, and never the multi-hour rebuild, with the original config bytes
+    restored from the retained copy. Detects a resumed P0 that re-runs the
+    rebuild, or loses the original configuration."""
+    soak = _load_dashboard_soak()
+    state, working, canonical, prepass = _p0_world(soak, tmp_path, monkeypatch,
+                                                   prune_fails=True)
+    first = soak.prepare_fixture_image(_p0_args(
+        working, canonical, working / "p0-first.json", prepass))
+    assert first["passed"] is False
+    assert [c["stage"] for c in first["checkpoints"]] == ["extracted",
+                                                         "rebuilt"]
+    rebuilt_path = pathlib.Path(first["checkpoints"][1]["path"])
+    monkeypatch.setattr(soak, "_pinned_retention_prune",
+                        lambda producer, env, **kw: state["calls"].append(
+                            "prune") or {"result": 1})
+    state["calls"].clear()
+    receipt = soak.prepare_fixture_image(_p0_args(
+        working, canonical, working / "p0-receipt.json", None,
+        resume_from=str(rebuilt_path)))
+    assert receipt["passed"] is True, receipt["problems"]
+    assert "rebuild" not in state["calls"] and "extract" not in state["calls"]
+    assert state["calls"].index("prune") < state["calls"].index("compare")
+    assert receipt["resumedFrom"]["stage"] == "rebuilt"
+    assert receipt["checkpoints"] == []
+    sealed = pathlib.Path(receipt["bundle"]) / "vol" / "data" / "config.json"
+    assert json.loads(sealed.read_text()) == {
+        "conversation": {"retention_days": 30}}
+
+
+_P0_WRITES = [{"label": "product", "writeBytes": 4096,
+               "writeStatus": "measured", "durationS": 0.5, "returncode": 0}]
+
+
+def test_p0_records_the_producer_file_key_and_process_writes(tmp_path,
+                                                             monkeypatch):
+    """#937 F7/F8: P0's equivalence gets the producer's own
+    `codex_file_key`, so an advanced Codex incarnation names its path
+    instead of an opaque identity; and the P0 receipt carries each recorded
+    child's write counter in P1's `processWrites` shape, so the write
+    budget's P0 share is measured, not inferred."""
+    soak = _load_dashboard_soak()
+    state, working, canonical, prepass = _p0_world(soak, tmp_path, monkeypatch)
+    receipt = soak.prepare_fixture_image(_p0_args(
+        working, canonical, working / "p0-receipt.json", prepass))
+    assert receipt["passed"] is True, receipt["problems"]
+    file_key = state["equivalenceKwargs"]["file_key"]
+    assert file_key("rk", "/C/codex-a/r.jsonl") == "fk:rk:/C/codex-a/r.jsonl"
+    assert receipt["equivalenceFileKey"]["loaded"] is True
+    assert receipt["processWrites"] == _P0_WRITES
+    assert receipt["metaComparison"]["problems"] == []
+
+
+@pytest.mark.parametrize("store, change, key", [
+    ("conversations.db", "extra", "conversation_title_fts_backfill_pending"),
+    ("conversations.db", "changed", "conversation_schema_version"),
+    ("conversations.db", "missing", "conversation_schema_version"),
+    ("cache.db", "missing", "claude_ingest_walk_complete"),
+    ("conversations.db", "regenerated", "codex_find_projection_generation"),
+    ("cache.db", "producer-ok", "conversation_sessions_pricing_fp"),
+    ("conversations.db", "producer-bad", "conversation_sessions_pricing_fp"),
+    ("conversations.db", "stamp", "conversation_retention_last_prune_at")])
+def test_p0_meta_restore_compares_every_key_and_refuses_another_stamp(
+        tmp_path, monkeypatch, store, change, key):
+    """#937 F6: P0 checked two cache_meta keys only, so a normalized store
+    that gained a pending flag, lost or changed a contract key, or lost the
+    rebuild's walk-complete marker sealed as equivalent (and a key the
+    producer stamps with its own constant, the rollup pricing date, must
+    hold that constant); and a corpus whose
+    own retention stamp is not the pinned constant was rewritten to it
+    instead of refused. Every key is now held to P0's per-key expectation (a
+    key the producer's rebuild regenerates is recorded, not compared, so a
+    correct normalization still passes), and a corpus stamp other than
+    `P0_LAST_PRUNE_AT` refuses before the prune."""
+    soak = _load_dashboard_soak()
+
+    def hook(data):
+        statement = {
+            "extra": f"INSERT INTO cache_meta VALUES ('{key}', '1')",
+            "changed": f"UPDATE cache_meta SET value = '5' WHERE key = '{key}'",
+            "regenerated":
+                f"UPDATE cache_meta SET value = '7' WHERE key = '{key}'",
+            "producer-ok": "INSERT OR REPLACE INTO cache_meta VALUES "
+                           f"('{key}', '{soak.P0_PRODUCER_PRICING_FP}')",
+            "producer-bad": "INSERT OR REPLACE INTO cache_meta VALUES "
+                            f"('{key}', '2026-09-05')",
+            "missing": f"DELETE FROM cache_meta WHERE key = '{key}'"}[change]
+        _sql(data / store, statement)
+
+    state, working, canonical, prepass = _p0_world(
+        soak, tmp_path, monkeypatch,
+        stamp="2026-01-01T00:00:00+00:00" if change == "stamp" else None,
+        prune_hook=None if change == "stamp" else hook)
+    receipt = soak.prepare_fixture_image(_p0_args(
+        working, canonical, working / "p0-receipt.json", prepass))
+    entry = (receipt.get("metaComparison") or {}).get("stores", {}).get(store)
+    if change == "regenerated":
+        assert receipt["passed"] is True, receipt["problems"]
+        assert entry["regenerated"][key] == {"retained": "226541",
+                                             "normalized": "7"}
+        return
+    if change == "producer-ok":
+        # The producer stamps its own pricing date; the corpus's older one
+        # is recorded, never compared (the full-size P0, 2026-11-09).
+        assert receipt["passed"] is True, receipt["problems"]
+        assert entry["producer"][key]["equal"] is True
+        return
+    assert receipt["passed"] is False and "seal" not in receipt
+    assert any(key in p for p in receipt["problems"]), receipt["problems"]
+    if change == "stamp":
+        assert "prune" not in state["calls"]
+        return
+    assert "compare" in state["calls"]
+    if change == "producer-bad":
+        assert entry["producer"][key]["equal"] is False
+        return
+    kind = "unclassified" if change == "extra" else change
+    assert entry[kind] == [key]
+
+
+@pytest.mark.parametrize("mode", ["one-shot", "extract-only"])
+def test_p0_watchdog_stop_in_process_invalidates_the_receipt(
+        tmp_path, monkeypatch, mode):
+    """#937 F1: the watchdog's `on_stop` can fire while P0 runs in-process
+    work no `job.check()` follows (the equivalence pass, the extraction's
+    checkpoint). The receipt must not pass and must name the stop, and the
+    one-shot P0 must not seal: before F1 it sealed a stopped job."""
+    soak = _load_dashboard_soak()
+    real_check = soak._V2Job.check
+    state, working, canonical, prepass = _p0_world(soak, tmp_path, monkeypatch)
+
+    def stop():
+        state["job"].stop_reason = "disk-write budget exhausted"
+
+    if mode == "one-shot":
+        monkeypatch.setattr(_P0Job, "check", real_check)
+        state["on_compare"] = stop
+        receipt = soak.prepare_fixture_image(_p0_args(
+            working, canonical, working / "p0-receipt.json", prepass))
+        assert "seal" not in receipt
+    else:
+        real_extract = soak._extract_stream
+
+        def extract(*args, **kwargs):
+            done = real_extract(*args, **kwargs)
+            stop()
+            return done
+        monkeypatch.setattr(soak, "_extract_stream", extract)
+        receipt, _output = _p0_extract_only(soak, state, working, canonical,
+                                            prepass)
+    assert receipt["passed"] is False
+    assert any("watchdog stopped the job: disk-write budget exhausted" in p
+               for p in receipt["problems"]), receipt["problems"]
+
+
+def _p1_world(soak, tmp_path, monkeypatch, *, probe, quota, on_quota=None):
+    """A passing P0 receipt and bundle built by hand on `_p0_world`'s fakes,
+    and every P1 tree child, sync and drain stubbed; the stats rebuild and
+    the replay attribution run on empty states."""
+    si = soak._soak_image()
+    state, working, canonical, _prepass = _p0_world(soak, tmp_path,
+                                                    monkeypatch)
+    p0_bundle = working / "p0-fixture.sparsebundle"
+    (p0_bundle / "bands").mkdir(parents=True)
+    (p0_bundle / "bands" / "0").write_bytes(b"band")
+    for name in si.BUNDLE_META_FILES:
+        (p0_bundle / name).write_bytes(name.encode())
+    shutil.copytree(tmp_path / "src", p0_bundle / "vol",
+                    copy_function=shutil.copy2)
+    p0 = {"schemaVersion": 1, "kind": soak.P0_RECEIPT_KIND, "passed": True,
+          "bundle": str(p0_bundle), "canonicalRoot": str(canonical),
+          "seal": si.bundle_seal(p0_bundle, content=False),
+          "retentionDays": 30,
+          "sourceInventory": {
+              "stDev": os.stat(p0_bundle / "vol").st_dev,
+              "files": si.source_inventory(p0_bundle / "vol")}}
+    p0_path = working / "p0-receipt.json"
+    p0_path.write_text(json.dumps(p0))
+
+    def tree_child(checkout, body, argv, env, *, run=None, timeout=None):
+        if body == soak._MIGRATE_BODY:
+            return {"opened": ["cache.db", "conversations.db"],
+                    "registries": {"maintenanceKeys": [], "migrations": {}}}
+        if body == getattr(soak, "_QUOTA_INDEX_PROBE_BODY", None):
+            return dict(probe)
+        if body == soak._QUOTA_INDEX_BODY:
+            if on_quota is not None:
+                on_quota(state)
+            return dict(quota)
+        raise AssertionError("unexpected tree child")
+
+    monkeypatch.setattr(soak, "_resolve_commit", lambda ref: "c" * 40)
+    monkeypatch.setattr(soak, "_defer_retention", lambda data: {
+        "retentionDays": 30, "configSha256": "x", "stamp": "s"})
+    monkeypatch.setattr(soak, "_restore_retention", lambda data, saved: None)
+    monkeypatch.setattr(soak, "_catchup_module", lambda: types.SimpleNamespace(
+        retained_state=lambda data: {"rows": {}, "incarnations": {}}))
+    monkeypatch.setattr(soak, "_tree_child", tree_child)
+    monkeypatch.setattr(soak, "_settle_segment_summaries",
+                        lambda *a, **k: {"checked": True})
+    monkeypatch.setattr(
+        soak, "_drain_before_admission",
+        lambda checkout, env, root, *, run=None, deadline_s=0,
+        image_manifest=None: ({"admitted": True, "problems": [],
+                               "pendingState": {"stats": 3}}, None))
+    args = types.SimpleNamespace(root=str(working), tree="HEAD",
+                                 output=str(working / "p1-receipt.json"),
+                                 p0_receipt=str(p0_path), canonical_root=None)
+    return state, args
+
+
+@pytest.mark.parametrize("case", ["rebuilt-by-drain", "ensured", "undefined"])
+def test_p1_receipt_records_the_quota_index_bearing(tmp_path, monkeypatch,
+                                                    case):
+    """#937 review R1 bearing: the P1 receipt says whether the tree's Codex
+    quota index was valid before and after the drain and whether it was
+    rebuilt (by the drain, or by the one `ensure_quota_index`); a tree that
+    lacks `quota_index_valid` (the 56e66f07a baseline) records null with the
+    reason instead of a guessed value. Also #937 F8: P1's `processWrites`
+    and P0's share one shape."""
+    soak = _load_dashboard_soak()
+    probe, quota = {
+        "rebuilt-by-drain": ({"defined": True, "valid": False},
+                             {"defined": True, "validBefore": True,
+                              "valid": True}),
+        "ensured": ({"defined": True, "valid": False},
+                    {"defined": True, "validBefore": False, "ensured": True,
+                     "valid": True}),
+        "undefined": ({"defined": False}, {"defined": False})}[case]
+    _state, args = _p1_world(soak, tmp_path, monkeypatch, probe=probe,
+                             quota=quota)
+    receipt = soak.prepare_tree_image(args)
+    assert receipt["passed"] is True, receipt["problems"]
+    bearing = {key: receipt["quotaIndex"][key] for key in
+               ("validBeforeDrain", "validAfterDrain", "rebuilt")}
+    assert bearing == {
+        "rebuilt-by-drain": {"validBeforeDrain": False,
+                             "validAfterDrain": True, "rebuilt": True},
+        "ensured": {"validBeforeDrain": False, "validAfterDrain": False,
+                    "rebuilt": True},
+        "undefined": {"validBeforeDrain": None, "validAfterDrain": None,
+                      "rebuilt": None}}[case]
+    assert (receipt["quotaIndex"]["reason"] is None) == (case != "undefined")
+    assert receipt["processWrites"] == _P0_WRITES
+
+
+@pytest.mark.parametrize("site", ["seal", "checkpoint"])
+def test_owned_workers_are_reaped_before_the_recorded_state(tmp_path,
+                                                            monkeypatch,
+                                                            site):
+    """#937 SD7: the seal and each P0 checkpoint recorded the WAL
+    checkpoint and the inventories before reaping this job's owned detached
+    workers, so a live worker could still write C/data after the state the
+    seal binds was recorded, and the seal and the recorded inventory could
+    disagree. The reap now comes first and is repeated after the records,
+    before the detach."""
+    soak = _load_dashboard_soak()
+    calls = []
+
+    class Lifecycle:
+        def reap_owned_workers(self):
+            calls.append("reap")
+            return [], []
+
+        def holders(self):
+            return []
+
+        def detach(self, attached):
+            calls.append("detach")
+            return types.SimpleNamespace(problems=["stop after the detach"],
+                                         as_dict=lambda: {})
+
+    si = types.SimpleNamespace(
+        inventory_record=lambda root: calls.append("inventory") or {},
+        source_inventory=lambda root: calls.append("inventory") or {})
+    job = types.SimpleNamespace(si=si, canonical_root=tmp_path / "C",
+                                working_root=tmp_path / "W",
+                                lifecycle=Lifecycle(), check=lambda: None)
+    monkeypatch.setattr(soak, "_checkpoint_stores",
+                        lambda data: calls.append("wal") or [])
+    monkeypatch.setattr(soak, "_journal_carriers",
+                        lambda data: calls.append("carriers") or {})
+    bundle = tmp_path / "b.sparsebundle"
+    with pytest.raises(soak._V2Refusal):
+        if site == "seal":
+            soak._detach_and_seal(job, None, bundle, {})
+        else:
+            soak._p0_checkpoint(job, None, bundle, {}, "rebuilt", "s",
+                                path=tmp_path / "cp.json", reattach=False,
+                                facts={})
+    recorded = [i for i, c in enumerate(calls)
+                if c in ("wal", "carriers", "inventory")]
+    assert recorded, calls
+    assert calls.index("reap") < min(recorded), calls
+    assert "reap" in calls[max(recorded):calls.index("detach")], calls
+
+
+def test_p1_watchdog_stop_in_process_refuses_the_seal(tmp_path, monkeypatch):
+    """#937 F1: a watchdog stop that fires after P1's last product step
+    (during the in-process replay attribution and restore) must refuse the
+    seal and fail the receipt with the stop named; before F1 the seal ran
+    and the receipt passed."""
+    soak = _load_dashboard_soak()
+    monkeypatch.setattr(_P0Job, "check", soak._V2Job.check)
+
+    def stop(state):
+        state["job"].stop_reason = "deadline"
+
+    _state, args = _p1_world(
+        soak, tmp_path, monkeypatch, probe={"defined": False},
+        quota={"defined": False}, on_quota=stop)
+    receipt = soak.prepare_tree_image(args)
+    assert receipt["passed"] is False and "seal" not in receipt
+    assert any("watchdog stopped the job: deadline" in p
+               for p in receipt["problems"]), receipt["problems"]
+
+
+def test_v2_job_stop_signals_only_processes_with_their_recorded_identity(
+        tmp_path, monkeypatch):
+    """#937 F4: the watchdog's stop sends SIGTERM, then SIGKILL, to the
+    groups of the job's active children. A child that exited (no recorded
+    identity) or whose pid was reused (another start identity) is pruned
+    and never signalled: before F4 a reused pid's group was killed."""
+    soak = _load_dashboard_soak()
+    job = soak._V2Job(working_root=tmp_path, canonical_root=tmp_path / "C",
+                      kind="oracle", deadline_s=60, ledger=tmp_path / "b.json")
+    recorded = {101: "lstart:a", 102: "lstart:b"}
+    now = {101: "lstart:a", 102: "lstart:other", 103: "lstart:c"}
+    job.lifecycle = types.SimpleNamespace(
+        recorded_identity=recorded.get, start_identity=now.get)
+    job._active = {101, 102, 103}
+    sent = []
+    monkeypatch.setattr(soak.os, "killpg", lambda pid, sig: sent.append(
+        (pid, sig)))
+
+    class Timer:
+        def __init__(self, _grace, function, args=()):
+            self.function, self.args = function, args
+            self.daemon = False
+
+        def start(self):
+            self.function(*self.args)
+
+    monkeypatch.setattr(soak.threading, "Timer", Timer)
+    job._on_stop("deadline")
+    assert sent == [(101, signal.SIGTERM), (101, signal.SIGKILL)]
+    assert job._active == {101} and job.stop_reason == "deadline"
+
+
+def test_v1_and_v2_child_environments_share_one_base(tmp_path, monkeypatch):
+    """#937 F13: the v1 arm (`_write_budget_env`) and every v2 child
+    (`_v2_env`) are built on one constructor, so their environments cannot
+    drift: for the same data root every key but TMPDIR is equal, an
+    inherited WRITE_ATTRIBUTION_INPUTS or owner token is dropped, and only
+    a v2 child inside a job carries that job's owner token (#937 SD7)."""
+    soak = _load_dashboard_soak()
+    si = soak._soak_image()
+    working = tmp_path / "W"
+    working.mkdir()
+    canonical = tmp_path / "C"
+    (canonical / "codex-a").mkdir(parents=True)
+    monkeypatch.setenv("WRITE_ATTRIBUTION_INPUTS", "frozen:/elsewhere")
+    monkeypatch.setenv(si.OWNER_TOKEN_ENV, "inherited")
+    monkeypatch.setattr(soak, "_storage_identity", _v2_storage("external"))
+    monkeypatch.setattr(soak, "_V2_OWNER_TOKEN", "job-token")
+    v1 = soak._write_budget_env(canonical)
+    v2 = soak._v2_env(soak._V2Step("arm", working, canonical))
+    assert v2.pop(si.OWNER_TOKEN_ENV) == "job-token"
+    assert si.OWNER_TOKEN_ENV not in v1
+    assert "WRITE_ATTRIBUTION_INPUTS" not in v1 | v2
+    assert set(v1) == set(v2)
+    assert {k: v for k, v in v1.items() if k != "TMPDIR"} == \
+        {k: v for k, v in v2.items() if k != "TMPDIR"}
+
+
+def test_soak_image_fingerprint_cli_matches_the_harness_fingerprint(
+        tmp_path, capsys):
+    """Correction 3: the source host's pre-pass `soak_image.py fingerprint
+    <dir>` computes exactly `_fixture_source_fingerprint` of a plain tree
+    with nested files. Detects a pre-pass whose value can never equal P0's
+    measured fingerprint, which refuses the extraction after hours of
+    streaming."""
+    soak = _load_dashboard_soak()
+    si = _load_soak_image()
+    tree = tmp_path / "fixture"
+    (tree / "a" / "b").mkdir(parents=True)
+    (tree / "a" / "b" / "deep.jsonl").write_text("x" * 10)
+    (tree / "a" / "z.txt").write_text("z")
+    (tree / "top").write_text("t")
+    (tree / "B").mkdir()
+    (tree / "B" / "c").write_text("c")
+    assert si.main(["fingerprint", str(tree)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["fingerprint"] == soak._fixture_source_fingerprint(tree)
+    assert si.main(["fingerprint", str(tmp_path / "missing")]) == 2

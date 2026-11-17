@@ -5,6 +5,8 @@
 // two headline panels; everything else hydrates over SSE). It replaces the
 // panel's definitive empty/"unavailable" copy so first paint doesn't flash a
 // broken-looking "No data" / "restart the dashboard" state that then fills in.
+// ProjectsPanel also shows it while a cache repair withholds its envelope
+// (#787 / #861 revision 35), for the same reason.
 //
 // Shimmer is aria-hidden and gated by prefers-reduced-motion in CSS (mirrors
 // the cold-start SkeletonGrid); a single sr-only status line conveys "loading"

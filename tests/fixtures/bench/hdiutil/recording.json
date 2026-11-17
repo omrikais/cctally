@@ -1,0 +1,113 @@
+{
+ "argv": {
+  "attach": [
+   "hdiutil",
+   "attach",
+   "-nobrowse",
+   "-noautoopen",
+   "-owners",
+   "on",
+   "-mountpoint",
+   "@MOUNTPOINT@",
+   "@BUNDLE@",
+   "-plist"
+  ],
+  "create": [
+   "hdiutil",
+   "create",
+   "-type",
+   "SPARSEBUNDLE",
+   "-fs",
+   "APFS",
+   "-size",
+   "2g",
+   "-volname",
+   "@VOLUME_LABEL@",
+   "-plist",
+   "@BUNDLE@"
+  ],
+  "detach": [
+   "hdiutil",
+   "detach",
+   "/dev/@VOLUME_SLICE@"
+  ],
+  "detach_busy": [
+   "hdiutil",
+   "detach",
+   "/dev/@VOLUME_SLICE@"
+  ],
+  "diskutil_info": [
+   "diskutil",
+   "info",
+   "-plist",
+   "@BACKING_VOLUME@"
+  ],
+  "info": [
+   "hdiutil",
+   "info",
+   "-plist"
+  ],
+  "info_after": [
+   "hdiutil",
+   "info",
+   "-plist"
+  ],
+  "ioreg": [
+   "ioreg",
+   "-c",
+   "IOBlockStorageDriver",
+   "-r",
+   "-w0",
+   "-l"
+  ],
+  "lsof_busy": [
+   "lsof",
+   "-n",
+   "-P",
+   "-F",
+   "pcfn",
+   "@MOUNTPOINT@"
+  ],
+  "lsof_clean": [
+   "lsof",
+   "-n",
+   "-P",
+   "-F",
+   "pcfn",
+   "@MOUNTPOINT@"
+  ],
+  "mount": [
+   "mount"
+  ]
+ },
+ "bandsAfterCreate": [
+  "0",
+  "1",
+  "7f",
+  "80",
+  "ff"
+ ],
+ "bundleTop": [
+  "Info.bckup",
+  "Info.plist",
+  "bands",
+  "lock",
+  "token"
+ ],
+ "mountpointAfterDetach": [],
+ "rc": {
+  "attach": 0,
+  "create": 0,
+  "detach": 0,
+  "detach_busy": 16,
+  "diskutil_info": 0,
+  "info": 0,
+  "info_after": 0,
+  "ioreg": 0,
+  "lsof_busy": 0,
+  "lsof_clean": 1,
+  "mount": 0
+ },
+ "source": "one real hdiutil create/attach/info/detach sequence, a detach refused by a busy holder, lsof scoped to the mount, diskutil info -plist of the backing volume and ioreg -c IOBlockStorageDriver -r -w0 -l, recorded on a runner (macOS 27.2); host-specific values are @PLACEHOLDERS@",
+ "volumeTopAtAttach": []
+}

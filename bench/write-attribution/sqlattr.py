@@ -257,6 +257,11 @@ try:
         module = importlib.util.module_from_spec(spec)
         sys.modules["cctally"] = module
         loader.exec_module(module)
+        # #787 / #861 spec 5.1: this tool's thread is a process owner
+        # (a tree that predates final enforcement has no helper).
+        _core = sys.modules.get("_cctally_core")
+        if _core is not None and hasattr(_core, "establish_script_owner"):
+            _core.establish_script_owner()
         sys.modules["_cctally_store"].WRITER_TEMP_STORE = CONTROL
         raise SystemExit(module.main())
     import runpy

@@ -66,6 +66,15 @@ fi
 # The contract library path is computed from the checked-out repository root.
 # shellcheck source=/dev/null
 source "$REPO_ROOT/bin/_lib-test-contract.sh"
+# The shell holder (#1087): the harness pool and each pytest leg run under it,
+# so this script never signals a process number. Sourcing defines functions
+# and exports the holder's path only.
+if [ ! -r "$REPO_ROOT/bin/_lib-hold.sh" ] || [ ! -r "$REPO_ROOT/bin/_lib_hold.py" ]; then
+    echo "cctally-test-all: the shell holder bin/_lib-hold.sh or bin/_lib_hold.py is missing or unreadable; refusing to run" >&2
+    exit 3
+fi
+# shellcheck source=bin/_lib-hold.sh
+source "$REPO_ROOT/bin/_lib-hold.sh"
 
 # ---- worker-budget resolution ------------------------------------------
 
@@ -1610,13 +1619,13 @@ fi
 # directory. TMPDIR itself is never changed. The template path is explicit
 # because macOS mktemp ignores TMPDIR without one.
 #
-# Every process group the run starts (the pool and each pytest leg) is reaped
-# right after its leader's `wait` returns: TERM, up to 5 s, KILL, up to 5 s,
-# while the group's number is still this run's. A group whose leader was never
-# waited (the run was interrupted) is reaped the same way at exit. The
+# Every process group the run starts (the pool and each pytest leg) is settled
+# by its holder (bin/_lib_hold.py) once its work exits, or when the run asks it
+# to stop: TERM, up to 5 s, KILL rounds, up to 5 s, while the holder still holds
+# the group's leader. The holders' control directories live here too. The
 # directory is then removed through bin/_lib_test_temp.py (no link following,
-# one device). A directory that cannot be removed, or whose groups survive
-# SIGKILL, is kept. Under the runner supervisor it lies inside the run
+# one device). A directory that cannot be removed, or whose group a holder
+# could not confirm empty, is kept. Under the runner supervisor it lies inside the run
 # directory, which the supervisor removes after its own reap; on hosted Linux
 # there is no supervisor, so it stays under TMPDIR until the ephemeral VM is
 # discarded.
@@ -1624,84 +1633,61 @@ SUITE_TEMP_LIB="$REPO_ROOT/bin/_lib_test_temp.py"
 SUITE_DIR=""
 SUITE_NAME=""
 SUITE_STATE=none
-SUITE_GROUPS=""
+SUITE_HOLDERS=""
 SUITE_GROUP_SURVIVED=0
 
-# A group whose leader this run has not yet waited. Its number cannot be
-# reused while the leader is an unwaited child, so it is safe to signal.
-_suite_record_group() {   # $1 group leader pid
+# The harness pool and each pytest leg run under a group-scope holder
+# (bin/_lib_hold.py, #1087), the work's parent and only reaper: it holds the
+# work's leader unreaped while it signals the leader's group, so the group's
+# number cannot have been handed to another process. This script therefore
+# never probes or signals a process number; it asks a holder to stop and reads
+# the settlement the holder publishes in $SUITE_DIR/hold.<role>/status. Each
+# entry here is `<holder pid>:<role>`, the role being `pool` or a leg's name.
+_suite_record_holder() {   # $1 holder pid, $2 role
     [ -n "$1" ] || return 0
-    SUITE_GROUPS="$SUITE_GROUPS $1"
+    SUITE_HOLDERS="$SUITE_HOLDERS $1:$2"
     return 0
 }
 
-_suite_forget_group() {   # $1 group id
-    local g kept=""
-    for g in $SUITE_GROUPS; do
-        [ "$g" = "$1" ] || kept="$kept $g"
+# Settle one holder and forget it: wait for it, or with $3 = stop ask it to
+# stop first. A settlement the holder could not confirm complete, or one it
+# never published, keeps the suite directory (SUITE_GROUP_SURVIVED). Leaves the
+# work's status in HOLD_RC.
+_suite_settle_holder() {   # $1 holder pid, $2 role, [$3 stop]
+    local pid=$1 role=$2 label=pool entry kept=""
+    [ -n "$pid" ] || return 0
+    [ "$role" = pool ] || label="pytest leg"
+    if [ "${3:-}" = stop ]; then
+        hold_stop "$pid" "$SUITE_DIR/hold.$role"
+    else
+        hold_wait "$pid" "$SUITE_DIR/hold.$role"
+    fi
+    if [ "$HOLD_PUBLISHED" != 1 ]; then
+        contract_note "suite directory $SUITE_NAME: the $label holder exited without publishing its settlement"
+        SUITE_GROUP_SURVIVED=1
+    elif [ "$HOLD_COMPLETE" != 1 ]; then
+        contract_note "suite directory $SUITE_NAME: the $label holder could not confirm its process group empty (survivors: ${HOLD_SURVIVORS:-none})"
+        SUITE_GROUP_SURVIVED=1
+    fi
+    for entry in $SUITE_HOLDERS; do
+        [ "$entry" = "$pid:$role" ] || kept="$kept $entry"
     done
-    SUITE_GROUPS=$kept
+    SUITE_HOLDERS=$kept
     return 0
 }
 
-# Status 0 while process group $1 has a member, 1 once it is gone. Only ESRCH
-# ("No such process") means gone: the group is empty and its number is free.
-# EPERM means the group exists but no member could be signalled; macOS answers
-# it for a group whose remaining members are all zombies (#1006), which Linux
-# reports as success instead. Either way the number is still that group's until
-# the zombies are reaped, so EPERM is present, and so is any failure the probe
-# cannot read: failing closed costs at most a report of a surviving group,
-# never a signal to a number this run no longer holds. LC_ALL=C pins the text
-# of the builtin's message.
-_suite_group_present() {   # $1 group id
-    local err
-    err=$(LC_ALL=C; kill -0 -"$1" 2>&1) && return 0
-    case "$err" in
-        *"No such process"*) return 1 ;;
-    esac
-    return 0
-}
-
-# Reap group $1 once and forget it. Called only while the number is this
-# run's: right after its leader's `wait` returned, or for a leader never
-# waited. TERM and KILL go only to a group a probe has just found present, and
-# a group a probe found gone is never addressed again. A group that outlives
-# SIGKILL by 5 s keeps the suite directory (SUITE_GROUP_SURVIVED).
-_suite_settle_group() {   # $1 group id
-    local pg=$1 sig waited
-    [ -n "$pg" ] || return 0
-    for sig in TERM KILL; do
-        _suite_group_present "$pg" || break
-        kill -"$sig" -"$pg" 2>/dev/null || true
-        waited=0
-        while _suite_group_present "$pg"; do
-            if [ "$waited" -ge 20 ]; then
-                if [ "$sig" = KILL ]; then
-                    contract_note "suite directory $SUITE_NAME: process group $pg survived SIGKILL"
-                    SUITE_GROUP_SURVIVED=1
-                fi
-                break
-            fi
-            sleep 0.25 2>/dev/null || sleep 1
-            waited=$((waited + 1))
-        done
-    done
-    _suite_forget_group "$pg"
-    return 0
-}
-
-# Reap every group whose leader was never waited (the cancellation path), and
-# report (status 1) when any group survived SIGKILL.
+# Stop every holder still recorded (the cancellation path), and report
+# (status 1) when any settlement was not complete.
 _suite_reap_groups() {
-    local pg
-    for pg in $SUITE_GROUPS; do
-        _suite_settle_group "$pg"
+    local entry
+    for entry in $SUITE_HOLDERS; do
+        _suite_settle_holder "${entry%%:*}" "${entry#*:}" stop
     done
     [ "$SUITE_GROUP_SURVIVED" = 0 ]
 }
 
-# Reap, then remove. Status 1 when a group survived or the removal was
-# refused; the directory then stays.
+# Settle, then remove. Status 1 when a holder's settlement was not complete or
+# the removal was refused; the directory then stays.
 _suite_remove() {
     [ "$SUITE_STATE" = created ] || return 0
     if ! _suite_reap_groups; then
@@ -1919,6 +1905,7 @@ contract_is_authoritative && PROGRESS_INTERVAL=$AUTHORITATIVE_PROGRESS_INTERVAL
 ALL_HARNESS_NAMES=${report_harnesses[*]+"${report_harnesses[*]}"}
 HARNESS_TOTAL=${#report_harnesses[@]}
 REPORTER_PID=""
+REPORTER_STOP=""
 POOL_PID=""
 PHASE_PID=""
 
@@ -1954,8 +1941,30 @@ _report_completion() {   # $1 harness, $2 index
     fi
 }
 
-_reporter_loop() {   # $1 parent pid
-    local parent=$1 last=$SECONDS last_phase="" done_n running queued names h phase elapsed
+# A private test seam (#1087, tests/test_suite_directory_lifecycle.py): with
+# CCTALLY_TEST_ALL_REPORTER_STALL_S set to whole seconds, the first reporter to
+# process a completion stalls once inside that processing and records any
+# signal it receives meanwhile, so a case can show the join's 10 s bound
+# signals nothing. Read only here, and never in an authoritative run; its
+# CCTALLY_TEST_ALL_ prefix makes it owner-only, so no harness or pytest leg
+# (and so no nested aggregator) inherits it. Status 1
+# when the run removed PROGRESS_DIR during the stall.
+_reporter_test_stall() {
+    local stall=${CCTALLY_TEST_ALL_REPORTER_STALL_S:-}
+    case "$stall" in ''|*[!0-9]*) return 0 ;; esac
+    contract_is_authoritative && return 0
+    # Once per run, not per reporter: the marker outlives this subshell.
+    [ ! -e "$PROGRESS_DIR/test-stalled" ] || return 0
+    : > "$PROGRESS_DIR/test-stalled" 2>/dev/null || return 0
+    trap 'echo "[cctally-test-all] progress reporter received SIGTERM" >&2' TERM
+    trap 'echo "[cctally-test-all] progress reporter received SIGINT" >&2' INT
+    trap 'echo "[cctally-test-all] progress reporter received SIGHUP" >&2' HUP
+    sleep "$stall"
+    [ -d "$PROGRESS_DIR" ]
+}
+
+_reporter_loop() {   # $1 parent pid, $2 this reporter's stop marker
+    local parent=$1 stop=$2 last=$SECONDS last_phase="" done_n running queued names h phase elapsed
     local final=0
     # Monotonic across ticks, and deliberately NOT the scan position. Counting
     # completions during the in-estate-order scan made the index go BACKWARDS
@@ -1972,7 +1981,7 @@ _reporter_loop() {   # $1 parent pid
         # or every harness that finished between the last tick and the join
         # would never get its completion line. A fast estate finishes the whole
         # pool inside one tick, so that is the ordinary case rather than a race.
-        [ -f "$PROGRESS_DIR/stop" ] && final=1
+        [ -f "$stop" ] && final=1
         done_n=0; running=0; queued=0; names=""
         for h in $ALL_HARNESS_NAMES; do
             if [ -f "$LOGDIR/${h}.done" ]; then
@@ -1980,6 +1989,7 @@ _reporter_loop() {   # $1 parent pid
                 if [ ! -f "$PROGRESS_DIR/${h}.reported" ]; then
                     : > "$PROGRESS_DIR/${h}.reported"
                     reported=$((reported + 1))
+                    _reporter_test_stall || return 0
                     _report_completion "$h" "$reported"
                 fi
             elif [ -f "$LOGDIR/${h}.started" ]; then
@@ -2010,10 +2020,14 @@ _reporter_loop() {   # $1 parent pid
     done
 }
 
+# Each reporter has its own stop marker, so a reporter its join left running
+# (see _reporter_join) cannot be revived by the next one's start.
+REPORTER_GEN=0
 _reporter_start() {   # $1 phase
     _phase_set "$1"
-    rm -f "$PROGRESS_DIR/stop" 2>/dev/null || true
-    _reporter_loop "$$" &
+    REPORTER_GEN=$((REPORTER_GEN + 1))
+    REPORTER_STOP="$PROGRESS_DIR/stop.$REPORTER_GEN"
+    _reporter_loop "$$" "$REPORTER_STOP" &
     REPORTER_PID=$!
     _reporter_wait_phase "$1"
 }
@@ -2024,7 +2038,7 @@ _reporter_start() {   # $1 phase
 _reporter_wait_phase() {   # $1 phase
     local phase=$1 waited=0
     while [ ! -f "$PROGRESS_DIR/phase-${phase}.reported" ]; do
-        kill -0 "$REPORTER_PID" 2>/dev/null || return 1
+        hold_alive "$REPORTER_PID" || return 1
         [ "$waited" -lt 50 ] || return 1
         sleep 0.1
         waited=$((waited + 1))
@@ -2032,48 +2046,26 @@ _reporter_wait_phase() {   # $1 phase
     return 0
 }
 
-# Bounded, so the wait can never hang the suite.
+# Bounded, so the wait can never hang the suite, and it never signals: the
+# reporter is a background job bash may already have reaped, so its number is
+# not this run's to signal (#1087). Liveness is read from the job table. A
+# reporter still running after 10 s is noted and left; it exits by itself at
+# its next loop, when PROGRESS_DIR is gone or this run has exited.
 _reporter_join() {
     local waited=0
     [ -n "$REPORTER_PID" ] || return 0
-    : > "$PROGRESS_DIR/stop" 2>/dev/null || true
-    while kill -0 "$REPORTER_PID" 2>/dev/null; do
+    { : > "$REPORTER_STOP"; } 2>/dev/null || true
+    while hold_alive "$REPORTER_PID"; do
         if [ "$waited" -ge 10 ]; then
-            kill -TERM "$REPORTER_PID" 2>/dev/null || true
-            break
+            contract_note "the progress reporter had not exited 10 s after its stop marker; left to exit on its own"
+            REPORTER_PID=""
+            return 0
         fi
         sleep 1
         waited=$((waited + 1))
     done
     wait "$REPORTER_PID" 2>/dev/null || true
     REPORTER_PID=""
-    return 0
-}
-
-# A negative pid signals the whole PROCESS GROUP. The pool and each pytest leg
-# are launched under `set -m` so they lead their own group, which is what makes
-# `xargs`, every `bash -c` worker and every harness descendant reachable here.
-# Signalling only the leader would leave harnesses running into a directory
-# teardown is about to remove.
-_reap_group() {   # $1 group leader pid
-    local pid=$1 waited=0
-    [ -n "$pid" ] || return 0
-    # The leader is an unwaited child here, so its number is still this run's.
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-        while kill -0 "$pid" 2>/dev/null; do
-            if [ "$waited" -ge 20 ]; then
-                kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-                break
-            fi
-            sleep 0.25 2>/dev/null || sleep 1
-            waited=$((waited + 1))
-        done
-    fi
-    wait "$pid" 2>/dev/null || true
-    # The leader is waited: reap what is left of its group now, while the
-    # number is still this run's, and never again.
-    _suite_settle_group "$pid"
     return 0
 }
 
@@ -2084,8 +2076,9 @@ _reap_group() {   # $1 group leader pid
 _cleanup_run() {
     local rc=$? state=completed
     _phase_set "done"
-    _reap_group "${POOL_PID:-}"
-    _reap_group "${PHASE_PID:-}"
+    # Stop the pool's and the legs' holders still running; each settles its
+    # group before it publishes.
+    _suite_reap_groups || true
     _reporter_join
     if [ -n "$EVIDENCE_DIR" ]; then
         # Marking an interrupted run `completed` would be false, and an
@@ -2107,7 +2100,7 @@ _cleanup_run() {
         rm -rf "$LOGDIR"
     fi
     # The suite directory, unless the run already removed it before the
-    # freeze: reap any group whose leader was never waited, then remove it.
+    # freeze: settle any holder still recorded, then remove it.
     _suite_remove || true
     return $rc
 }
@@ -2265,31 +2258,38 @@ export -f run_one
 export REPO_ROOT LOGDIR INNER
 
 # Shell-harness pool (reconcile included; no serial phase). xargs -I {} runs
-# one bash per harness; -P "$OUTER" bounds concurrency.
+# one bash per harness; -P "$OUTER" bounds concurrency. Its status is xargs';
+# each harness's own status is in its `.exit` file.
 #
-# The pipeline is wrapped in a subshell and backgrounded under `set -m` for two
-# reasons: `$!` then names a process-group LEADER that teardown can signal as a
-# group, and the parent waits with `wait`, which a trapped signal interrupts —
-# an ordinary foreground pipeline defers every trap until it finishes, so an
-# interrupted run would sit through the whole estate before tearing down.
+# The pipeline runs under a group-scope holder (#1087) for two reasons: its
+# work leads a process group the holder settles while it holds the leader, so
+# teardown reaches `xargs`, every `bash -c` worker and every harness
+# descendant without this script signalling a number; and the parent waits
+# with `wait`, which a trapped signal interrupts — an ordinary foreground
+# pipeline defers every trap until it finishes, so an interrupted run would sit
+# through the whole estate before tearing down.
+_pool_dispatch() {   # $1 outer width, then the harness names
+    local outer=$1
+    shift
+    # The emptiness test keeps `printf '%s\n'` with no arguments from emitting
+    # the single blank line it would otherwise print, which xargs
+    # implementations do not agree about.
+    { [ "$#" -eq 0 ] || printf '%s\n' "$@" ; } \
+        | xargs -P "$outer" -I {} bash -c 'run_one "$@"' _ {}
+}
+export -f _pool_dispatch
 pool_start=$SECONDS
 _reporter_start pool
-set -m
-# Two guards with two jobs. The `${a[@]+…}` form keeps bash 3.2 from erroring
-# on an empty array under `set -u`; the emptiness test keeps `printf '%s\n'`
-# with no arguments from emitting the single blank line it would otherwise
-# print, which xargs implementations do not agree about.
-{ { [ "$HARNESS_TOTAL" -eq 0 ] || printf '%s\n' ${dispatch_harnesses[@]+"${dispatch_harnesses[@]}"} ; } \
-    | xargs -P "$OUTER" -I {} bash -c 'run_one "$@"' _ {} ; } &
-POOL_PID=$!
-set +m
-_suite_record_group "$POOL_PID"
-wait "$POOL_PID"
-# Cleared BEFORE the reap: an interrupt during it must not hand the teardown a
-# leader this run has already waited.
-pool_leader=$POOL_PID
+# The `${a[@]+…}` form keeps bash 3.2 from erroring on an empty array under
+# `set -u`.
+hold_start "$SUITE_DIR/hold.pool" group -- "$BASH" -c '_pool_dispatch "$@"' _ "$OUTER" \
+    ${dispatch_harnesses[@]+"${dispatch_harnesses[@]}"}
+POOL_PID=$HOLD_PID
+_suite_record_holder "$POOL_PID" pool
+# HOLD_RC is xargs' status, which the run does not read: a harness's verdict
+# comes from its own `.exit` file, and one that never ran has none.
+_suite_settle_holder "$POOL_PID" pool
 POOL_PID=""
-_suite_settle_group "$pool_leader"
 pool_wall=$((SECONDS - pool_start))
 # The reporter is joined BEFORE the parent writes any multiline diagnostic. A
 # heartbeat landing inside a `---- … ----` block would split a diagnostic the
@@ -2415,26 +2415,23 @@ _read_leg() {   # <file>
     done < "$1"
 }
 
-# Runs one pytest leg as its own process group, for the reasons given at the
-# pool: `wait` is interruptible by a trapped signal and the group is reapable.
-# Sets leg_rc and leg_wall.
+# Runs one pytest leg under its own group-scope holder, for the reasons given
+# at the pool, with the repository root as its working directory. Sets leg_rc
+# (the holder's HOLD_RC: 128 + the signal for a leg killed by one, 137 for a
+# leg its holder could not reap, 3 or 4 for one it could not start) and
+# leg_wall.
 _run_pytest_leg() {   # <leg> <log> <durations-path> <args...>
-    local leg=$1 log=$2 durations=$3 start=$SECONDS leader
+    local leg=$1 log=$2 durations=$3 start=$SECONDS
     shift 3
-    set -m
-    { cd "$REPO_ROOT" \
-      && CCTALLY_DURATIONS_PATH="$durations" \
-         CCTALLY_DURATIONS_LEG="$leg" \
-         "${pytest_env_sanitize[@]}" python3 -m pytest "$@" ; } \
-        > "$log" 2>&1 &
-    PHASE_PID=$!
-    set +m
-    _suite_record_group "$PHASE_PID"
-    wait "$PHASE_PID"
-    leg_rc=$?
-    leader=$PHASE_PID
+    hold_start "$SUITE_DIR/hold.$leg" group -- "$BASH" -c 'cd "$1" && shift && exec "$@"' _ \
+        "$REPO_ROOT" "${pytest_env_sanitize[@]}" \
+        CCTALLY_DURATIONS_PATH="$durations" CCTALLY_DURATIONS_LEG="$leg" \
+        python3 -m pytest "$@" > "$log" 2>&1
+    PHASE_PID=$HOLD_PID
+    _suite_record_holder "$PHASE_PID" "$leg"
+    _suite_settle_holder "$PHASE_PID" "$leg"
+    leg_rc=$HOLD_RC
     PHASE_PID=""
-    _suite_settle_group "$leader"
     leg_wall=$((SECONDS - start))
 }
 
@@ -2591,7 +2588,7 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
         if [ "$durations_rc" -ne 0 ]; then
             contract_note "evidence: the per-test durations artifact was not published for run $RUN_ID"
         elif [[ "$durations_summary" == *INCOMPLETE* ]]; then
-            contract_note "evidence: the per-test durations artifact for run $RUN_ID is INCOMPLETE ($durations_summary) — a pytest leg did not finish, so the artifact covers fewer tests than the run executed"
+            contract_note "evidence: the per-test durations artifact for run $RUN_ID is INCOMPLETE ($durations_summary) — a pytest leg did not finish normally; complete coverage cannot be established from this artifact"
         fi
     fi
     pytest_wall=$((SECONDS - pytest_start))
@@ -2634,8 +2631,8 @@ slowest_lines=$(
 )
 # BEFORE the wall is frozen for the outcome's wallSeconds and normalized
 # metric: removal is part of the run's cost, and removing after the freeze
-# would hide it (B1). Every group was reaped when its leader was waited; one
-# that survived SIGKILL, or a refused removal, keeps the directory and
+# would hide it (B1). Every group was settled by its holder; a settlement that
+# was not complete, or a refused removal, keeps the directory and
 # fails the run as infrastructure. The reason's phase is `pytest`, one of the
 # record's closed phase set (U7: no new phase); the directory is the pytest
 # legs' temp.

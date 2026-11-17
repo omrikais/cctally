@@ -271,7 +271,7 @@
     "week_index": [
       {
         "block_count": 0,
-        "detail_stamp": "169c5df519d2b40f",
+        "detail_stamp": "7cf323a3a4d1f390",
         "end_at_utc": "2026-04-20T14:00:00Z",
         "has_observation_gap": false,
         "is_current": true,
@@ -1788,7 +1788,7 @@
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "169c5df519d2b40f",
+                "detail_stamp": "7cf323a3a4d1f390",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,
@@ -3626,7 +3626,7 @@
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "169c5df519d2b40f",
+                "detail_stamp": "7cf323a3a4d1f390",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,
@@ -4063,7 +4063,7 @@
               "cycle_index": [
                 {
                   "block_count": 0,
-                  "detail_stamp": "28ad34293fe92304",
+                  "detail_stamp": "53f08dc57ca614c1",
                   "end_at_utc": "2026-04-20T16:00:00Z",
                   "is_current": true,
                   "key": "milestone_cycle:496pTClWE6Q5AmIGuRhDqNdEldGBYRgVudFj9pPt8w8",
@@ -4422,7 +4422,7 @@
               "cycle_index": [
                 {
                   "block_count": 0,
-                  "detail_stamp": "377fd11ed15192d8",
+                  "detail_stamp": "cf29303dc8e69c37",
                   "end_at_utc": "2026-04-18T19:00:00Z",
                   "is_current": true,
                   "key": "milestone_cycle:_3tuPRGbLRluJr3xVsu879diMMEq4wOoiO9Am2Y6d7Q",

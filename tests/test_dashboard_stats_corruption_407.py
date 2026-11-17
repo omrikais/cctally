@@ -391,6 +391,9 @@ def test_every_stats_reporting_surface_is_classified(env):
         ("_cctally_tui.py", "_tui_build_snapshot_impl"): "heal",
         ("_cctally_tui.py", "_tui_build_snapshot_once"): "heal",
         ("_cctally_tui.py", "capture_failure"): "heal",
+        # #787 / #861 5.11: `capture_failure`'s twin for the precomputes a
+        # build refreshes after an owner-resolved refusal ends it.
+        ("_cctally_tui.py", "capture_late"): "heal",
         ("_cctally_tui.py", "_tui_capture_sync_failure"): "heal",
         ("_cctally_tui.py", "_tui_build_idle_snapshot"): "heal",
         ("_cctally_dashboard.py", "_dashboard_initial_snapshot"): "heal",

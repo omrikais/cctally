@@ -11,12 +11,17 @@ SQLite trigger can record and the INTERPRETED identity the read path produces.
 """
 from __future__ import annotations
 
+import datetime as dt
+import importlib
 import json
 
 import pytest
 
+import _fixture_builders
 import _lib_jsonl
 import _lib_quota_ledger as kernel
+from conftest import load_script, redirect_paths
+from helpers.quota_projection_dump import canonical_projection_dump
 
 
 ROOT = "root-kernel"
@@ -194,6 +199,50 @@ def test_a_model_scoped_identity_maps_back_to_its_raw_unit():
     assert from_raw == from_identity
 
 
+@pytest.mark.parametrize(
+    ("stored_pool", "key_minutes", "column_minutes", "reset", "observed_model"),
+    [
+        (None, 10080, 10080, RESET, "gpt-5"),
+        (None, 10079, 10080, "2026-07-31T15:00:00+00:00", SPARK),
+        (SPARK, 10080, 10080, RESET, SPARK),
+        (SPARK, 10079, 10080, RESET, SPARK),
+        (SPARK, 10080, 10079, "2026-07-31T15:00:00+00:00", SPARK),
+        (SPARK, 10079, 10079, "2026-07-31T17:00:00+02:00", SPARK),
+    ],
+    ids=["ordinary", "ordinary_key79_spark_model", "pool", "pool_key79",
+         "pool_col79_offset", "pool_both79_zone"],
+)
+def test_raw_and_interpreted_units_agree_across_pool_and_snap_spellings(
+    stored_pool, key_minutes, column_minutes, reset, observed_model,
+):
+    """Detects #1071's unit disagreement: a row STORED under the ``modelPool``
+    key named a different loading unit from raw coordinates than the block it
+    produced stamps, so a scoped pass loaded one pool, re-projected the unit
+    over it and orphaned the sibling pool's block.
+
+    Every stored spelling of one weekly window — with or without the pool
+    member, either minute spelling in the key and in the column, either reset
+    spelling — must name the unit its interpreted identity names.
+    """
+    stored_key = _lib_jsonl._codex_logical_limit_key(
+        ROOT, "codex", SLOT, key_minutes, stored_pool)
+    from_raw = kernel.loading_unit_from_raw(
+        (ROOT, stored_key, SLOT, column_minutes, reset))
+    # What the read path produces for that row: the key snapped, and the pool
+    # member present whenever the stored key or the observed model carries it.
+    interpreted_pool = (
+        SPARK if stored_pool is not None or observed_model == SPARK else None)
+    from_identity = kernel.loading_unit_from_identity(
+        source_root_key=ROOT,
+        logical_limit_key=_lib_jsonl._codex_logical_limit_key(
+            ROOT, "codex", SLOT, 10080, interpreted_pool),
+        observed_slot=SLOT,
+        window_minutes=10080,
+        canonical_reset_iso=RESET,
+    )
+    assert from_raw == from_identity
+
+
 def test_stripping_the_pool_preserves_every_other_member():
     stripped = kernel.strip_model_pool(SPARK_KEY)
     assert json.loads(stripped) == json.loads(WEEK_KEY)
@@ -332,3 +381,145 @@ def test_the_per_observation_signature_tuple_keeps_its_shape():
 
 if __name__ == "__main__":  # pragma: no cover - convenience
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ── through the scope and the sweep (#1071) ───────────────────────────────
+
+UTC = dt.timezone.utc
+STORE_ROOT = "root-kernel-store"
+STORE_PATH = f"/codex/{STORE_ROOT}/rollout.jsonl"
+STORE_BASE = dt.datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+
+
+def _store_key(minutes, model=None):
+    return _lib_jsonl._codex_logical_limit_key(
+        STORE_ROOT, "codex", SLOT, minutes, model)
+
+
+def _iso(value):
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    quota = importlib.import_module("_cctally_quota")
+    conn = ns["open_cache_db"]()
+    _fixture_builders.seed_codex_source_root(
+        conn, source_root_key=STORE_ROOT,
+        canonical_root_path=f"/codex/{STORE_ROOT}")
+    conn.commit()
+    try:
+        yield ns, quota, conn
+    finally:
+        conn.close()
+
+
+def _seed_store_row(conn, *, offset, reset, minutes=300, model=None,
+                    percent=5.0):
+    _fixture_builders.seed_codex_quota_snapshot(
+        conn, source_root_key=STORE_ROOT, source_path=STORE_PATH,
+        line_offset=offset,
+        captured_at_utc=_iso(reset - dt.timedelta(minutes=minutes // 2)),
+        observed_slot=SLOT, logical_limit_key=_store_key(minutes, model),
+        window_minutes=minutes, used_percent=percent, resets_at_utc=_iso(reset),
+        observed_model=model or "gpt-5",
+    )
+
+
+def test_two_spellings_of_one_unit_count_once_against_the_ceiling(store):
+    """Detects a spurious whole-history hand-off: one weekly window stored
+    under both its ordinary and its ``modelPool`` key is ONE unit, so a burst
+    exactly at the incremental ceiling must stay scoped rather than count that
+    unit twice and fall back to a full pass."""
+    ns, quota, conn = store
+    ceiling = quota._MAX_INCREMENTAL_UNITS
+    for index in range(ceiling - 1):
+        _seed_store_row(
+            conn, offset=index,
+            reset=STORE_BASE + dt.timedelta(hours=5 * (index + 1)))
+    week_reset = STORE_BASE + dt.timedelta(days=60)
+    _seed_store_row(conn, offset=ceiling, reset=week_reset, minutes=10080)
+    _seed_store_row(conn, offset=ceiling + 1, reset=week_reset, minutes=10080,
+                    model=SPARK)
+    conn.commit()
+    high = quota._ledger_max_seq(conn)
+    scope, target = quota._resolve_pass_scope(
+        conn, force_full=False,
+        ledger_state={
+            "interpretation_version": quota._CODEX_QUOTA_INTERPRETATION_VERSION,
+            "watermark": 0,
+        },
+        ledger_high=high, watermark=0, active_roots={STORE_ROOT},
+        stale_reverse_map=False,
+    )
+    assert scope is not None, (
+        f"{ceiling} distinct units were counted past the ceiling of {ceiling}: "
+        f"the two stored spellings of one weekly window counted twice")
+    assert len(scope["units"]) == ceiling
+    assert target == high
+
+
+def test_an_update_moving_rows_between_units_keeps_both_units_owed(store):
+    """Detects a stranded block: an UPDATE that moves a ``modelPool``-keyed row
+    from one weekly window to another must leave BOTH units in the scope and
+    sweep the vacated one, exactly as ``force_full`` does."""
+    ns, quota, conn = store
+    old_reset = STORE_BASE + dt.timedelta(days=7)
+    new_reset = STORE_BASE + dt.timedelta(days=14)
+    _seed_store_row(conn, offset=0, reset=old_reset, minutes=10080,
+                    model=SPARK, percent=10.0)
+    _seed_store_row(conn, offset=1, reset=new_reset, minutes=10080,
+                    model=SPARK, percent=20.0)
+    _fixture_builders.bump_codex_physical_mutation_seq(conn)
+    conn.commit()
+    now = STORE_BASE + dt.timedelta(days=13)
+    quota.reconcile_codex_quota_projection(now=now)  # prime, whole history
+
+    conn.execute(
+        "UPDATE quota_window_snapshots SET resets_at_utc=?, "
+        "       canonical_resets_at_utc=? "
+        " WHERE source_path=? AND line_offset=0",
+        (_iso(new_reset), _iso(new_reset), STORE_PATH))
+    _fixture_builders.bump_codex_physical_mutation_seq(conn)
+    conn.commit()
+
+    scopes = []
+    original = quota._resolve_pass_scope
+
+    def recording(*args, **kwargs):
+        result = original(*args, **kwargs)
+        scopes.append(result[0])
+        return result
+
+    quota._resolve_pass_scope = recording
+    try:
+        quota.reconcile_codex_quota_projection(now=now)  # the scoped pass
+    finally:
+        quota._resolve_pass_scope = original
+    assert scopes and scopes[0] is not None, "the pass was not scoped"
+    expected_units = {
+        kernel.physical_group_key_text(kernel.loading_unit_from_raw(
+            (STORE_ROOT, _store_key(10080, SPARK), SLOT, 10080, _iso(reset))))
+        for reset in (old_reset, new_reset)
+    }
+    assert expected_units <= set(scopes[0]["units"]), scopes[0]["units"]
+
+    stats = ns["open_db"]()
+    try:
+        scoped = canonical_projection_dump(stats)
+    finally:
+        stats.close()
+    quota.reconcile_codex_quota_projection(now=now, force_full=True)
+    stats = ns["open_db"]()
+    try:
+        oracle = canonical_projection_dump(stats)
+        vacated = [tuple(row) for row in stats.execute(
+            "SELECT orphaned_at IS NOT NULL FROM quota_window_blocks "
+            " WHERE source='codex' AND unixepoch(resets_at_utc)=unixepoch(?)",
+            (_iso(old_reset),))]
+    finally:
+        stats.close()
+    assert vacated == [(1,)], "oracle premise: the vacated window is orphaned"
+    assert scoped == oracle

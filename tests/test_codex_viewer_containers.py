@@ -289,7 +289,15 @@ def test_no_decoder_reaches_the_existing_dashboard_500_envelope(viewer, monkeypa
     monkeypatch.setattr(rc, "resolve_zstd_backend", lambda: rc.UNAVAILABLE)
     import _cctally_dashboard_conversation as dashboard_query
     conn = ns["open_conversations_db"]()
-    monkeypatch.setattr(dashboard_query, "_open_conversation_reader", lambda _label: conn)
+    import contextlib
+    import types
+
+    def opened(_account=None):
+        stack = contextlib.ExitStack()
+        stack.callback(conn.close)
+        return types.SimpleNamespace(conn=conn), stack
+
+    monkeypatch.setattr(dashboard_query, "_open_conversation_session", opened)
 
     class Handler:
         path = "/api/conversation/payload"

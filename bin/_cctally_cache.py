@@ -154,6 +154,9 @@ import _lib_codex_publication_barrier as _barrier
 # #1000 §5.2: the strict in-process clone for the transcript probe. A public
 # stdlib-only leaf, so it is circular-safe for the same reason.
 import _lib_clone_copy
+# #1094: the conversation FTS write guard (stdlib-only; imports only
+# _cctally_core at module top).
+import _lib_conversation_fts_integrity as _fts_integrity
 # #944 F1/F7: the one record-id rule, from the pure attribution kernel (a
 # stdlib-only leaf), so it is circular-safe for the same reason.
 from _lib_claude_attribution import keyed_ids as _keyed_ids
@@ -650,6 +653,18 @@ _codex_conversation_fts_full_clear = _cctally_db_sib._codex_conversation_fts_ful
 # cache_meta key/value upsert helper — reused by the resumable reingest cursor
 # writes (#179) so the ON CONFLICT idiom lives in one place. Caller commits.
 _set_cache_meta = _cctally_db_sib._set_cache_meta
+
+
+def _ensure_incarnation_id_committed(
+    conn: sqlite3.Connection, db_label: str,
+) -> None:
+    """#1068 D2: insert the store's incarnation id when absent and commit that
+    insert alone. A connection already inside a transaction is left to its
+    caller's commit."""
+    was_in_transaction = conn.in_transaction
+    _cctally_db_sib._ensure_store_incarnation_id(conn, db_label)
+    if not was_in_transaction and conn.in_transaction:
+        conn.commit()
 
 # Byte-zero Codex replay markers (spec
 # docs/superpowers/specs/2026-07-30-codex-thread-source-inference-design.md
@@ -3447,6 +3462,10 @@ class _PrefixFacts(NamedTuple):
     events: list
     messages: list       # normalized projection, _MESSAGE_PROJECTION order
     resume: tuple
+    #: #1090 §5.2: ``(conversation_key, timestamp_utc)`` per physical event,
+    #: in stream order (derived facts only; never compared). The compared
+    #: event tuple above is unchanged, and cache-side code ignores this.
+    stamps: "tuple | None" = None
 
 
 #: The normalized-projection columns legacy equivalence compares (#968 spec
@@ -3523,8 +3542,10 @@ def _codex_prefix_facts(selected, *, path_str: str, root_key: "str | None",
     )
     messages = [tuple(getattr(row, name) for name in _MESSAGE_PROJECTION)
                 for row in normalized.rows]
+    stamps = tuple((event.conversation_key, event.timestamp_utc)
+                   for event in physical)
     return _PrefixFacts(accounting, sorted(quotas), threads, events,
-                        sorted(messages), resume)
+                        sorted(messages), resume, stamps)
 
 
 def _retained_messages(conn, path: str) -> list:
@@ -3597,22 +3618,40 @@ def _retained_prefix_facts(conn, table: str, snap: _CursorSnapshot,
                         _retained_messages(conn, snap.path), resume)
 
 
+#: #1090 §5.2 (Q3): the conversations-side resume indices legacy equivalence
+#: compares — every field but ``last_total_tokens`` (index 2). The stored
+#: watermark is preserved at adoption and stays in generation revalidation.
+_CONVERSATIONS_RESUME_COMPARED = (0, 1, 3, 4, 5, 6, 7)
+
+
+def _conversations_resume_differs(derived: _PrefixFacts,
+                                  retained: _PrefixFacts) -> bool:
+    return any(derived.resume[i] != retained.resume[i]
+               for i in _CONVERSATIONS_RESUME_COMPARED)
+
+
 def _prefix_facts_equal(table: str, derived: _PrefixFacts,
-                        retained: _PrefixFacts) -> bool:
-    # The compact cache preserves an unused legacy turn column; only the
-    # conversations cursor reads it to resume normalization. Its no-token
-    # initial watermark is 0, whereas accounting preserves NULL.
-    resume = derived.resume
-    if table == "codex_conversation_source_files" and not derived.accounting:
-        resume = resume[:2] + (0,) + resume[3:]
-    width = 8 if table == "codex_conversation_source_files" else 7
-    if resume[:width] != retained.resume[:width]:
-        return False                      # 5.5: resume state is part of equivalence
+                        retained: _PrefixFacts, *,
+                        absent: frozenset = frozenset()) -> bool:
     if table == "codex_conversation_source_files":
+        # 5.5: resume state is part of equivalence, the turn included.
+        if _conversations_resume_differs(derived, retained):
+            return False
+        # #1090 §5.2: a derived group retention legitimately removed (absent
+        # everywhere and cutoff-proven, `_retention_absent_groups`) is dropped
+        # from the derived side only, keeping order and multiplicity. Retained
+        # rows are never filtered: a qualifying key has none by construction.
+        events, messages = derived.events, derived.messages
+        if absent:
+            events = [e for e in events if e[1] not in absent]
+            messages = [m for m in messages if m[1] not in absent]
         # The normalized projection too (review P3-4): equal raw events with a
         # differing projection are not equivalent.
-        return (derived.events == retained.events
-                and derived.messages == retained.messages)
+        return events == retained.events and messages == retained.messages
+    # The compact cache preserves an unused legacy turn column (index 7);
+    # only the conversations cursor reads it to resume normalization.
+    if derived.resume[:7] != retained.resume[:7]:
+        return False                      # 5.5: resume state is part of equivalence
     if derived.accounting != retained.accounting:
         return False
     if derived.quotas != retained.quotas or derived.threads != retained.threads:
@@ -3621,6 +3660,305 @@ def _prefix_facts_equal(table: str, derived: _PrefixFacts,
     if retained.events and derived.events != retained.events:
         return False
     return not retained.messages or derived.messages == retained.messages
+
+
+class _LegacyGroupFacts(NamedTuple):
+    """One derived conversation group (a key, or None for this path's
+    NULL-key events) as #1090 §5.2 classifies it."""
+    present: bool        # it still has a row somewhere (NULL: on this path)
+    qualifiable: bool    # it could ever qualify (dated, no NULL-key message)
+    newest: "str | None"  # `_sqlite_order` max of its dated derived stamps
+    exempt: bool         # absent, qualifiable and newest < proof
+
+
+def _codex_derived_group_facts(conn, path: str, derived: _PrefixFacts,
+                               proof: "str | None") -> dict:
+    """#1090 §5.2 (Q2): every derived group, with its absence probes (one
+    `LIMIT 1` index probe per store table) read on ``conn``'s snapshot."""
+    order = _load_lib("_lib_conversation_retention")._sqlite_order
+    event_stamps: dict = {}
+    for key, stamp in derived.stamps or ():
+        event_stamps.setdefault(key, [])
+        if stamp is not None:
+            event_stamps[key].append(stamp)
+    message_stamps: dict = {}
+    for row in derived.messages:
+        message_stamps.setdefault(row[1], [])
+        if row[2] is not None:
+            message_stamps[row[1]].append(row[2])
+    groups = {}
+    for key in sorted(set(event_stamps) | set(message_stamps),
+                      key=order):
+        dated = event_stamps.get(key, [])
+        if key is None:
+            # The NULL group is scoped to this path's NULL-key events; a
+            # derived NULL-key message (unexpected) never qualifies.
+            present = conn.execute(
+                "SELECT 1 FROM codex_conversation_events "
+                "WHERE conversation_key IS NULL AND source_path=? LIMIT 1",
+                (path,)).fetchone() is not None
+            qualifiable = bool(dated) and None not in message_stamps
+            stamps = dated
+        else:
+            present = (conn.execute(
+                "SELECT 1 FROM codex_conversation_events "
+                "WHERE conversation_key=? LIMIT 1", (key,)).fetchone() is not None
+                or conn.execute(
+                    "SELECT 1 FROM codex_conversation_messages "
+                    "WHERE conversation_key=? LIMIT 1", (key,)).fetchone()
+                is not None)
+            qualifiable = bool(dated)
+            stamps = dated + message_stamps.get(key, [])
+        newest = max(stamps, key=order) if stamps else None
+        exempt = (not present and qualifiable and proof is not None
+                  and order(newest) < order(proof))
+        groups[key] = _LegacyGroupFacts(present, qualifiable, newest, exempt)
+    return groups
+
+
+def _retention_absent_groups(groups: dict) -> frozenset:
+    """#1090 §5.2: the derived groups retention has legitimately removed,
+    read from the `_codex_derived_group_facts` mapping of one snapshot.
+
+    A member is a non-NULL key, or None for this path's NULL-key events. A
+    key K qualifies when it has a dated derived event, the `_sqlite_order`
+    maximum over its dated derived events and messages is strictly below the
+    proof, and no `codex_conversation_events` or `..._messages` row for K
+    exists on any path. The NULL group qualifies when a dated NULL-key
+    derived event exists, their maximum is below the proof, no derived
+    message has a NULL key, and this path retains no NULL-key event. With
+    no proof the set is empty (no group is ``exempt``)."""
+    return frozenset(key for key, facts in groups.items() if facts.exempt)
+
+
+class _LegacyComparison(NamedTuple):
+    """The database-dependent half of a legacy verdict (#1090 §5.2, §5.3)."""
+    equal: bool
+    groups: frozenset          # the exempt (retention-absent) groups
+    retained: _PrefixFacts
+    proof: "str | None"
+    relied_on_new_rules: bool  # exempt groups, or a watermark-only resume diff
+    permanent: bool            # no retention transition can make it equal
+    keys: tuple                # sorted non-NULL keys whose deletion matters
+    null_group: bool           # this path retains NULL-key events
+    threshold: "str | None"    # max newest stamp of absent unproven groups
+
+
+def _legacy_equivalent(conn, table: str, snap: _CursorSnapshot,
+                       derived: _PrefixFacts) -> _LegacyComparison:
+    """Legacy derived-content equivalence against the retained rows (#968
+    5.5), retention-aware on the conversations side (#1090 §5.2).
+
+    The conversations side reads the proof, the retained by-path rows and
+    the absence probes in one explicit read transaction (one snapshot); a
+    caller already inside a transaction supplies that snapshot itself. The
+    cache side keeps its current reads and never relies on the new rules."""
+    if table != "codex_conversation_source_files":
+        retained = _retained_prefix_facts(conn, table, snap, derived)
+        return _LegacyComparison(
+            _prefix_facts_equal(table, derived, retained), frozenset(),
+            retained, None, False, False, (), False, None)
+    retention = _load_lib("_lib_conversation_retention")
+    order = retention._sqlite_order
+    own = not conn.in_transaction
+    if own:
+        conn.execute("BEGIN")
+    try:
+        proof = retention.retention_cutoff_proof(conn)
+        retained = _retained_prefix_facts(conn, table, snap, derived)
+        groups = _codex_derived_group_facts(conn, snap.path, derived, proof)
+    finally:
+        if own and conn.in_transaction:
+            conn.execute("COMMIT")
+    exempt = _retention_absent_groups(groups)
+    equal = _prefix_facts_equal(table, derived, retained, absent=exempt)
+    resume_differs = _conversations_resume_differs(derived, retained)
+    # The pre-#1090 rule compared the watermark too, with a no-accounting
+    # derivation read as 0: a difference it already allowed is not new.
+    old_watermark = (derived.resume[2] if derived.accounting else 0)
+    watermark_only = (not resume_differs
+                      and old_watermark != retained.resume[2])
+    absent = [g for g in groups.values() if not g.present]
+    unproven = [g.newest for g in absent if g.qualifiable and not g.exempt]
+    keys = {k for k, g in groups.items() if k is not None and g.present}
+    keys |= {e[1] for e in retained.events if e[1] is not None}
+    keys |= {m[1] for m in retained.messages if m[1] is not None}
+    return _LegacyComparison(
+        equal=equal, groups=exempt, retained=retained, proof=proof,
+        relied_on_new_rules=bool(exempt) or watermark_only,
+        permanent=resume_differs or any(not g.qualifiable for g in absent),
+        keys=tuple(sorted(keys)),
+        null_group=any(e[1] is None for e in retained.events),
+        threshold=max(unproven, key=order) if unproven else None)
+
+
+#: #1090 §5.3: the conversations-side retry record of a legacy rejection,
+#: `cache_meta[CODEX_LEGACY_RETRY_PREFIX || path]`, read by its primary-key
+#: range `[CODEX_LEGACY_RETRY_PREFIX, CODEX_LEGACY_RETRY_RANGE_END)` (§5.4).
+CODEX_LEGACY_RETRY_PREFIX = "codex_legacy_retry:v1:"
+CODEX_LEGACY_RETRY_RANGE_END = "codex_legacy_retry:v1;"
+#: The reasons whose `unverified` application writes a retry record.
+_CODEX_LEGACY_RETRY_REASONS = ("legacy-inequivalent", "legacy-cache-held")
+#: #1090 §5.5: changed-result retries per identity per drain run; a further
+#: change leaves the row `pending` for the next run.
+CODEX_LEGACY_REVALIDATION_RETRIES = 2
+
+
+def _codex_legacy_retry_payload(comparison: _LegacyComparison, fp: str, *,
+                                cache_held: bool = False) -> str:
+    """The §5.3 record as deterministic JSON (sorted keys)."""
+    return json.dumps({
+        "fp": fp, "permanent": bool(comparison.permanent),
+        "cacheHeld": bool(cache_held), "keys": list(comparison.keys),
+        "nullGroup": bool(comparison.null_group),
+        "threshold": comparison.threshold,
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def _codex_verdict_reconcile_only(snap: _CursorSnapshot,
+                                  verdict: "ContainerVerdict") -> bool:
+    """The drain's metadata-only target reconciliation of an ``adopt-ingest``.
+
+    If validation found no unread complete line, target reconciliation is
+    metadata-only, even when part of the old torn suffix remains. The normal
+    writer would advance the sequence and timestamps with no new facts (I4).
+    """
+    return (verdict.outcome == "adopt-ingest"
+            and verdict.complete_line_end == snap.last_byte_offset
+            and verdict.decoded_length < snap.size_bytes)
+
+
+def _codex_resumed_thread(root_key, path_str, native, root, parent,
+                          conversation):
+    """The thread state a conversations cursor resumes the parser with."""
+    return _lib_jsonl.CodexThreadMetadata(
+        source_root_key=root_key,
+        source_path=path_str,
+        native_thread_id=native,
+        root_thread_id=root,
+        parent_thread_id=parent,
+        conversation_key=conversation,
+        cwd=None,
+        git_json=None,
+        source_kind=None,
+        thread_source_json=None,
+        model_provider=None,
+        context_window=None,
+    )
+
+
+def _codex_conversation_suffix_events(selected, snap: _CursorSnapshot,
+                                      end_offset: int) -> list:
+    """The events the targeted sync would parse next: the unread complete
+    suffix ``[last_byte_offset, end_offset)``, resumed from the cursor's
+    session and thread state exactly as the conversation walk resumes it."""
+    state = _CodexIterState(session_id=snap.last_session_id,
+                            model=snap.last_model,
+                            total_tokens=int(snap.last_total_tokens or 0))
+    if snap.last_native_thread_id and snap.last_root_thread_id:
+        state.thread = _codex_resumed_thread(
+            snap.root_key, snap.path, snap.last_native_thread_id,
+            snap.last_root_thread_id, snap.last_parent_thread_id,
+            snap.last_conversation_key)
+    events = []
+    with _rc.open_decoded(selected) as fh:
+        fh.seek(int(snap.last_byte_offset))
+        for emission in _iter_codex_fused_records_with_offsets(
+                fh, snap.path, initial_session_id=snap.last_session_id,
+                initial_model=snap.last_model,
+                initial_total_tokens=int(snap.last_total_tokens or 0),
+                source_root_key=snap.root_key, state=state,
+                stop_before=lambda off: off >= end_offset):
+            if emission.event is not None:
+                events.append(emission.event)
+    return events
+
+
+#: #1090 R4-P1-1: the cache-held gate's third outcome — its inspection could
+#: not read the state it decides on (cache store not attached, the path not
+#: qualified, a database error, an unreadable container). Truthy on purpose:
+#: a caller that only tests truth fails closed. Neither caller persists it;
+#: the row stays `pending` and its debt brings the next drain run.
+CODEX_CACHE_HELD_UNDECIDABLE = "undecidable"
+
+
+def _codex_legacy_cache_held(conn, snap: _CursorSnapshot,
+                             verdict: "ContainerVerdict",
+                             selected) -> "bool | str":
+    """#1090 §5.2 the cache-held gate: True (a proven hold) when this
+    would-be adoption (``verdict`` is an ``adopt``/``adopt-ingest`` carrying
+    ``legacy``) must stay `unverified/legacy-cache-held`, False when it
+    adopts, and ``CODEX_CACHE_HELD_UNDECIDABLE`` when the state it decides on
+    could not be read. Called at preparation and again at application (§5.5).
+
+    All three must hold (revision 3): (1) equivalence relied on #1090's
+    rules; (2) the drain would hand the identity to the per-identity targeted
+    sync (``adopt-ingest`` and not the metadata-only reconciliation); (3) that
+    sync would defer the file — by the walk's own before-read and after-read
+    rules, called here rather than copied — while the paired cache cursor is
+    absent or not `accepted`. Such a deferral could never be covered (a
+    suspended target records no scan target), so adopting would turn a quiet
+    terminal row into a perpetual `uncovered` retry. Unreadable state is
+    undecidable, never a hold: a hold is persisted with a retry record that
+    only a changed dependency releases, and a transient read error changes
+    none (the fingerprint and the paired cursor stay as they were)."""
+    if verdict.legacy is None or not verdict.legacy[1].relied_on_new_rules:
+        return False
+    if (verdict.outcome != "adopt-ingest"
+            or _codex_verdict_reconcile_only(snap, verdict)):
+        return False
+    try:
+        if not _codex_conversations_cache_attached(conn):
+            return CODEX_CACHE_HELD_UNDECIDABLE
+        paired = conn.execute(
+            "SELECT container_state FROM cache_db.codex_session_files "
+            "WHERE path=?", (snap.path,)).fetchone()
+        if paired is not None and paired[0] == "accepted":
+            return False
+        qualified = _qualify_codex_targets({snap.path})
+        if not qualified:
+            return CODEX_CACHE_HELD_UNDECIDABLE
+        present = _codex_conversation_population_present(conn)
+        zstd = selected.kind == _rc.ZSTD
+        # The drain's adoption path hands the sync no executor reset.
+        if _codex_conversation_before_read_hit(
+                conn, qualified[0], zstd=zstd, population_present=present,
+                cursor_key=snap.last_conversation_key,
+                reset_path=None) is not None:
+            return True
+        end = verdict.complete_line_end
+        if zstd or not present or end is None or end <= snap.last_byte_offset:
+            return False                  # a torn-only suffix has no line
+        return bool(_codex_conversation_after_read_hit(
+            conn, _codex_conversation_suffix_events(selected, snap, int(end)),
+            population_present=present))
+    except sqlite3.Error:
+        return CODEX_CACHE_HELD_UNDECIDABLE
+    except (_rc.ContainerError, OSError):
+        return CODEX_CACHE_HELD_UNDECIDABLE
+
+
+def _codex_legacy_result_class(comparison: _LegacyComparison,
+                               held: bool) -> str:
+    if not comparison.equal:
+        return "rejected"
+    return "held" if held else "equal"
+
+
+def _codex_legacy_prepared_class(verdict: "ContainerVerdict") -> str:
+    if verdict.reason == "legacy-inequivalent":
+        return "rejected"
+    return "held" if verdict.reason == "legacy-cache-held" else "equal"
+
+
+def _codex_legacy_adoption_verdict(snap: _CursorSnapshot,
+                                   verdict: "ContainerVerdict",
+                                   legacy) -> "ContainerVerdict":
+    """The adoption a held or adopting legacy verdict stands for."""
+    unchanged = (verdict.decoded_length == snap.size_bytes
+                 and int(snap.ingest_complete) == 1)
+    return verdict._replace(outcome="adopt" if unchanged else "adopt-ingest",
+                            reason=None, legacy=legacy)
 
 
 class ContainerVerdict(NamedTuple):
@@ -3632,6 +3970,9 @@ class ContainerVerdict(NamedTuple):
     anchor_offset: "int | None"
 
     complete_line_end: "int | None" = None
+    #: #1090 §5.5: ``(derived, comparison)`` for a conversations-table legacy
+    #: verdict, so application can revalidate; None otherwise.
+    legacy: "tuple | None" = None
 
 def _verify_codex_container(conn, table: str, snap: _CursorSnapshot,
                             selected) -> ContainerVerdict:
@@ -3683,20 +4024,33 @@ def _prepare_codex_container_verdict(conn, table: str, snap: _CursorSnapshot,
     derived = _codex_prefix_facts(selected, path_str=snap.path,
                                   root_key=snap.root_key,
                                   end_offset=int(snap.last_byte_offset))
-    retained = _retained_prefix_facts(conn, table, snap, derived)
-    if not _prefix_facts_equal(table, derived, retained):
+    comparison = _legacy_equivalent(conn, table, snap, derived)
+    legacy = ((derived, comparison)
+              if table == "codex_conversation_source_files" else None)
+    if not comparison.equal:
         return ContainerVerdict("unverified", "legacy-inequivalent", fp, length,
-                                None, None)
+                                None, None, legacy=legacy)
     with _rc.open_decoded(selected) as fh:
         chain, reached = _rc.anchor_over(
             fh, start_offset=0, start_anchor=_rc.anchor_seed(),
             end_offset=int(snap.last_byte_offset))
     if reached != snap.last_byte_offset:
         return ContainerVerdict("unverified", "legacy-boundary", fp, length,
-                                None, None)
+                                None, None, legacy=legacy)
     unchanged = (length == snap.size_bytes and int(snap.ingest_complete) == 1)
-    return ContainerVerdict("adopt" if unchanged else "adopt-ingest", None, fp,
-                            length, chain, reached, validation.complete_line_end)
+    adoption = ContainerVerdict(
+        "adopt" if unchanged else "adopt-ingest", None, fp, length, chain,
+        reached, validation.complete_line_end, legacy)
+    if legacy is not None:
+        held = _codex_legacy_cache_held(conn, snap, adoption, selected)
+        if held is CODEX_CACHE_HELD_UNDECIDABLE:
+            # #1090 R4-P1-1: as for an unreadable container; no retry record.
+            return ContainerVerdict("pending", "read-error", None, None, None,
+                                    None)
+        if held:
+            return adoption._replace(outcome="unverified",
+                                     reason="legacy-cache-held")
+    return adoption
 
 
 #: Private test seam: called before an adoption commit with (table, path).
@@ -3807,6 +4161,220 @@ def _conversation_drain_maintenance_lock():
         return None
 
 
+#: Private test seam: called inside the re-arm write transaction, before
+#: its commit (#1090 T5 rollback case).
+_CODEX_LEGACY_REARM_PRECOMMIT_HOOK: "Callable[[], None] | None" = None
+
+
+def _codex_legacy_retry_record(raw) -> "dict | None":
+    """One §5.3 record parsed and shape-checked; None when malformed (a
+    malformed record is stale, like any record that no longer matches)."""
+    try:
+        record = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if (not isinstance(record, dict) or not isinstance(record.get("fp"), str)
+            or any(not isinstance(record.get(name), bool)
+                   for name in ("permanent", "cacheHeld", "nullGroup"))):
+        return None
+    keys, threshold = record.get("keys"), record.get("threshold")
+    if (not isinstance(keys, list) or not all(isinstance(k, str) for k in keys)
+            or not (threshold is None or isinstance(threshold, str))):
+        return None
+    return record
+
+
+def _codex_legacy_record_matches(record: "dict | None", row) -> bool:
+    """§5.3 validity: the row is `unverified` with the reason the record
+    implies (``legacy-cache-held`` exactly when ``cacheHeld``) and its pending
+    fingerprint is the record's ``fp``. ``row`` is ``(reason, fingerprint)``
+    of an `unverified` row, or None."""
+    if record is None or row is None:
+        return False
+    reason = ("legacy-cache-held" if record["cacheHeld"]
+              else "legacy-inequivalent")
+    return row == (reason, record["fp"])
+
+
+def _codex_conversations_cache_attached(conn) -> bool:
+    return any(row[1] == "cache_db"
+               for row in conn.execute("PRAGMA database_list"))
+
+
+def _codex_legacy_dependency_gone(conn, path: str, record: dict) -> bool:
+    """§5.4 (b): a dependency key now has no event and no message anywhere,
+    or the path's NULL-key events are gone. One `LIMIT 1` index probe each."""
+    for key in record["keys"]:
+        if (conn.execute("SELECT 1 FROM codex_conversation_events "
+                         "WHERE conversation_key=? LIMIT 1", (key,)).fetchone()
+                is None
+                and conn.execute("SELECT 1 FROM codex_conversation_messages "
+                                 "WHERE conversation_key=? LIMIT 1",
+                                 (key,)).fetchone() is None):
+            return True
+    return record["nullGroup"] and conn.execute(
+        "SELECT 1 FROM codex_conversation_events "
+        "WHERE conversation_key IS NULL AND source_path=? LIMIT 1",
+        (path,)).fetchone() is None
+
+
+def _reevaluate_codex_legacy_rejections(conn) -> int:
+    """Re-arm the legacy rejections whose dependency changed (#1090 §5.4).
+
+    Conversations store only. The caller holds the Codex conversations
+    provider lock and has no open transaction; a caller inside one is left
+    alone (a later entrance evaluates again), so this never commits a
+    caller's rows. Returns the number of rows re-armed to
+    `pending/legacy-reverify`.
+
+    No token: every entrance reads current state. One read transaction takes
+    the proof, the retention history stamp, the `unverified`
+    `legacy-inequivalent`/`legacy-cache-held` rows, every retry record (one
+    primary-key range read) and, for valid non-permanent records only, the
+    dependency probes or the paired cache cursor. A row is re-armed when
+    (a) it has no valid record, and proof exists or the store has no
+    retention history (no `_RETENTION_LAST_PRUNE_KEY` row); (b) its record
+    is neither permanent nor held and a dependency key, or its NULL group,
+    has no rows left; (c) likewise, and its threshold is below the proof;
+    (d) its record is held and the paired cache cursor is now `accepted`. A
+    compressed candidate is not re-armed while no zstd decoder is available.
+    Writes happen only when a trigger fired or a stale record exists, in one
+    `BEGIN IMMEDIATE` that re-reads each row; an unchanged state writes
+    nothing. A database error rolls back, is reported, and leaves the next
+    entrance to evaluate again."""
+    if conn.in_transaction:
+        return 0
+    retention = _load_lib("_lib_conversation_retention")
+    order = retention._sqlite_order
+    marks = ",".join("?" * len(_CODEX_LEGACY_RETRY_REASONS))
+    try:
+        conn.execute("BEGIN")
+        try:
+            proof = retention.retention_cutoff_proof(conn)
+            # A store with no retention history never pruned, so it owes no
+            # rejection to retention and need not wait for proof (§5.4 (a)).
+            pruned = conn.execute(
+                "SELECT 1 FROM cache_meta WHERE key=?",
+                (retention._RETENTION_LAST_PRUNE_KEY,)).fetchone() is not None
+            rows = {path: (reason, fp) for path, reason, fp in conn.execute(
+                "SELECT path, container_state_reason, "
+                "pending_container_fingerprint "
+                "FROM codex_conversation_source_files "
+                "WHERE container_state='unverified' "
+                f"AND container_state_reason IN ({marks})",
+                _CODEX_LEGACY_RETRY_REASONS)}
+            raw_records = dict(conn.execute(
+                "SELECT key, value FROM cache_meta WHERE key >= ? AND key < ?",
+                (CODEX_LEGACY_RETRY_PREFIX, CODEX_LEGACY_RETRY_RANGE_END)))
+            valid: dict = {}
+            stale: dict = {}
+            for key, raw in raw_records.items():
+                path = key[len(CODEX_LEGACY_RETRY_PREFIX):]
+                record = _codex_legacy_retry_record(raw)
+                if _codex_legacy_record_matches(record, rows.get(path)):
+                    valid[path] = record
+                else:
+                    stale[path] = raw
+            attached = _codex_conversations_cache_attached(conn)
+            rearm: dict = {}
+            for path, row in sorted(rows.items()):
+                record = valid.get(path)
+                if record is None:
+                    if proof is not None or not pruned:         # (a)
+                        rearm[path] = row
+                elif record["permanent"]:
+                    continue
+                elif record["cacheHeld"]:
+                    paired = (conn.execute(
+                        "SELECT container_state FROM cache_db.codex_session_files "
+                        "WHERE path=?", (path,)).fetchone() if attached else None)
+                    if paired is not None and paired[0] == "accepted":  # (d)
+                        rearm[path] = row
+                elif ((record["threshold"] is not None and proof is not None
+                       and order(record["threshold"]) < order(proof))  # (c)
+                      or _codex_legacy_dependency_gone(conn, path, record)):  # (b)
+                    rearm[path] = row
+        finally:
+            if conn.in_transaction:
+                conn.execute("COMMIT")
+        if rearm and _rc.decoder_capability() == "unavailable":
+            # A compressed candidate cannot be verified without a decoder:
+            # re-armed now it would stay `pending`, debt every pass asks a
+            # drain for, where `main` keeps the row quiet. Its trigger still
+            # holds when the decoder returns, so a later entrance re-arms it.
+            rearm = {path: row for path, row in rearm.items()
+                     if getattr(_rc.ContainerFingerprint.from_json(row[1]),
+                                "kind", None) != _rc.ZSTD}
+        if not rearm and not stale:
+            return 0
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rearmed = 0
+            for path, (reason, fp) in sorted(rearm.items()):
+                cur = conn.execute(
+                    "UPDATE codex_conversation_source_files "
+                    "SET container_state='pending', "
+                    "container_state_reason='legacy-reverify' WHERE path=? "
+                    "AND container_state='unverified' "
+                    "AND container_state_reason=? "
+                    "AND pending_container_fingerprint IS ?",
+                    (path, reason, fp))
+                if cur.rowcount == 1:
+                    rearmed += 1
+                    conn.execute("DELETE FROM cache_meta WHERE key=?",
+                                 (CODEX_LEGACY_RETRY_PREFIX + path,))
+            for path, raw in sorted(stale.items()):
+                current = conn.execute(
+                    "SELECT container_state_reason, "
+                    "pending_container_fingerprint "
+                    "FROM codex_conversation_source_files WHERE path=? "
+                    "AND container_state='unverified'", (path,)).fetchone()
+                if not _codex_legacy_record_matches(
+                        _codex_legacy_retry_record(raw),
+                        None if current is None else tuple(current)):
+                    conn.execute("DELETE FROM cache_meta WHERE key=? AND value=?",
+                                 (CODEX_LEGACY_RETRY_PREFIX + path, raw))
+            if _CODEX_LEGACY_REARM_PRECOMMIT_HOOK is not None:
+                _CODEX_LEGACY_REARM_PRECOMMIT_HOOK()
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return rearmed
+    except sqlite3.Error as exc:
+        if conn.in_transaction:
+            conn.rollback()
+        eprint(f"[codex-conversations] legacy re-verification check failed: "
+               f"{exc}")
+        return 0
+
+
+def _codex_legacy_rearm_prelude(adm, counts, *, wait_for_requests: bool) -> str:
+    """The drain's conversations prelude (#1090 §5.4 entrance 2): open the
+    store BEFORE admission (S-P2b), admit through the global gate, evaluate,
+    finish. A refusal follows the per-identity rule: "yield-stop" when not
+    waiting for requests, otherwise a backoff and a retry."""
+    while True:
+        conn = open_conversations_db()
+        try:
+            admission = adm.admit(_cctally_core.APP_DIR,
+                                  _conversation_store_locks,
+                                  _release_conversation_store_locks)
+            if not admission.admitted:
+                counts["yielded"] += 1
+                if not wait_for_requests:
+                    return "yield-stop"
+                _drain_backoff(adm)
+                continue
+            try:
+                _reevaluate_codex_legacy_rejections(conn)
+            finally:
+                adm.finish(admission, _release_conversation_store_locks)
+        finally:
+            conn.close()
+        return "done"
+
+
 def run_codex_container_verification_drain(
         *, wait_for_requests: bool = True,
         max_identities: "int | None" = None) -> VerificationDrainResult:
@@ -3829,9 +4397,19 @@ def run_codex_container_verification_drain(
     # identity after a refused admission is counted in `retried`, never here,
     # so `max_identities` bounds identities, not attempts.
     processed: "set[tuple[str, str]]" = set()
+    # #1090 §5.5: changed-result retries per identity in this run, bounded by
+    # CODEX_LEGACY_REVALIDATION_RETRIES; a further change leaves the row
+    # `pending` (counted pending) so a churning writer never stalls the run.
+    legacy_changes: "dict[tuple[str, str], int]" = {}
     prune_discovery = _CodexPruneDiscoveryCache()
     try:
         for table in _VERIFY_TABLES:
+            if table == "codex_conversation_source_files" and (
+                    _codex_legacy_rearm_prelude(
+                        adm, counts, wait_for_requests=wait_for_requests)
+                    == "yield-stop"):
+                # #1090 §5.4 entrance 2: re-arm before the first selection.
+                return VerificationDrainResult("yielded", **counts)
             after = ""
             retry_path = None
             while True:
@@ -3871,6 +4449,14 @@ def run_codex_container_verification_drain(
                     table, path, snap, verdict, adm, counts,
                     wait_for_requests=wait_for_requests,
                     prune_discovery=prune_discovery)
+                if outcome == "legacy-changed":
+                    changes = legacy_changes.get((table, path), 0) + 1
+                    legacy_changes[(table, path)] = changes
+                    if changes > CODEX_LEGACY_REVALIDATION_RETRIES:
+                        counts["pending"] += 1
+                        outcome = "done"
+                    else:
+                        outcome = "retry"
                 if outcome == "yield-stop":
                     return VerificationDrainResult("yielded", **counts)
                 retry_path = path if outcome == "retry" else None
@@ -3882,7 +4468,9 @@ def run_codex_container_verification_drain(
 
 def _apply_codex_verdict(table, path, snap, verdict, adm, counts, *,
                          wait_for_requests: bool, prune_discovery=None) -> str:
-    """Admit and apply one verdict; returns "done", "retry" or "yield-stop"."""
+    """Admit and apply one verdict; returns "done", "retry", "yield-stop" or
+    "legacy-changed" (#1090 §5.5: the revalidated legacy result differs from
+    the prepared one and nothing was written; the drain bounds the retry)."""
     cache_side = table == "codex_session_files"
     if verdict.outcome == "pending":
         counts["pending"] += 1
@@ -3931,8 +4519,30 @@ def _apply_codex_verdict(table, path, snap, verdict, adm, counts, *,
                         or qualified[0].source_root_key != snap.root_key):
                     counts["pending"] += 1   # changed under us: verify again later
                     return "done"
+                comparison = None
+                if not cache_side and verdict.legacy is not None:
+                    # #1090 §5.5: the retention-dependent predicate, read
+                    # again under the admitted locks before any write. A
+                    # changed result writes nothing; the drain re-prepares.
+                    derived = verdict.legacy[0]
+                    comparison = _legacy_equivalent(conn, table, snap, derived)
+                    held = False
+                    if (comparison.equal
+                            and verdict.reason in (None, "legacy-cache-held")):
+                        held = _codex_legacy_cache_held(
+                            conn, snap, _codex_legacy_adoption_verdict(
+                                snap, verdict, (derived, comparison)), again)
+                        if held is CODEX_CACHE_HELD_UNDECIDABLE:
+                            # R4-P1-1: write nothing and leave the row
+                            # `pending` for a later run; not a changed
+                            # result, so no revalidation retry is charged.
+                            counts["pending"] += 1
+                            return "done"
+                    if (_codex_legacy_result_class(comparison, held)
+                            != _codex_legacy_prepared_class(verdict)):
+                        return "legacy-changed"
                 if verdict.outcome == "unverified":
-                    conn.execute(
+                    cur = conn.execute(
                         f"UPDATE {table} SET container_state='unverified', "
                         "container_state_reason=?, pending_container_fingerprint=? "
                         "WHERE path=? AND container_state='pending'",
@@ -3941,12 +4551,31 @@ def _apply_codex_verdict(table, path, snap, verdict, adm, counts, *,
                     if cache_side:
                         _codex_barrier_apply_holds(conn, [(path, snap.root_key,
                             "verification-unverified", verdict.fingerprint)])
+                    elif cur.rowcount == 1:
+                        # #1090 §5.3: the retry record commits with the
+                        # rejection; any other rejection leaves none.
+                        key = CODEX_LEGACY_RETRY_PREFIX + path
+                        if (comparison is not None
+                                and verdict.reason in _CODEX_LEGACY_RETRY_REASONS):
+                            conn.execute(
+                                "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
+                                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                (key, _codex_legacy_retry_payload(
+                                    comparison, verdict.fingerprint.to_json(),
+                                    cache_held=(verdict.reason
+                                                == "legacy-cache-held"))))
+                        else:
+                            conn.execute("DELETE FROM cache_meta WHERE key=?",
+                                         (key,))
                 elif snap.state != "accepted":
                     if not _adopt_codex_container(conn, table, snap, verdict):
                         counts["pending"] += 1
                         conn.rollback()
                         return "done"
                     counts["adopted"] += 1
+                    if not cache_side:
+                        conn.execute("DELETE FROM cache_meta WHERE key=?",
+                                     (CODEX_LEGACY_RETRY_PREFIX + path,))
                     if cache_side:
                         _codex_barrier_adopt(
                             conn, path=path, root_key=snap.root_key,
@@ -3980,12 +4609,7 @@ def _apply_codex_verdict(table, path, snap, verdict, adm, counts, *,
                 scope, path, snap.root_key, roots=verdict_roots) is not None:
             counts["pending"] += 1
             return "done"
-    # If validation found no unread complete line, target reconciliation is
-    # metadata-only, even when part of the old torn suffix remains. The normal
-    # writer would advance the sequence and timestamps with no new facts (I4).
-    reconcile_only = (verdict.outcome == "adopt-ingest"
-                      and verdict.complete_line_end == snap.last_byte_offset
-                      and verdict.decoded_length < snap.size_bytes)
+    reconcile_only = _codex_verdict_reconcile_only(snap, verdict)
     conn = opener()                       # before admission (S-P2b)
     try:
         # The sync takes its own provider locks. For conversations, retain
@@ -7090,6 +7714,38 @@ class PruneDrainResult(NamedTuple):
     # executor settled (prune identities stay in the counts above).
     finalization_units: int = 0
     owed_units: int = 0
+    # #1034 §5.5: the drain's own settlement of its deletions and the exit
+    # re-check. The defaults mean "not applicable" or "not inspected". The
+    # settlement fields keep them on every run that did not settle;
+    # `work_remaining` and `ledger_retained` are filled on every run that
+    # inspected its exit, so only the `busy` return, the conversations drain
+    # and an unreadable diagnostic read keep `None`/`-1` there.
+    settlement: str = "none"            # the aggregate settlement token
+    settle_projection: str = ""         # the reconcile's own status, when run
+    settle_reason: str = ""             # decline reason, or the error detail
+    settle_counts: "SettlementCounts | None" = None
+    settle_held_ms: int = 0             # lifecycle-lock occupancy
+    work_remaining: "bool | None" = None
+    ledger_retained: int = -1           # diagnostic only, never currentness
+
+
+class SettlementCounts(NamedTuple):
+    """The settlement core's reconcile counts (#1034 §5.5)."""
+    blocks: int
+    milestones: int
+    eligible_roots: int
+    quota_alerts: int
+    budget_alerts: int
+    budget_completed: bool
+
+
+class SettlementReport(NamedTuple):
+    """What ``_settle_codex_quota_after_prune`` did (#1034 §5.2)."""
+    token: str
+    core: Any            # CodexLifecycleCoreOutcome | None
+    reason: str
+    held_seconds: float
+    eligible_roots: int = 0
 
 
 #: Private test seam: called inside each identity transaction, before commit.
@@ -7667,8 +8323,394 @@ def _codex_drain_presence(path: str, root_key: "str | None",
     return _codex_stable_absence(path, root, roots=roots)
 
 
+#: #1034 Q3: complete lifecycle-lock acquisition is attempted this many times,
+#: this far apart, holding nothing between attempts (at most 10 s of sleep).
+_SETTLEMENT_LOCK_ATTEMPTS = 21
+_SETTLEMENT_LOCK_RETRY_SECONDS = 0.5
+
+
+def _settlement_token(core) -> str:
+    """Map a settlement core outcome to its aggregate token (#1034 §5.5).
+
+    The first matching rule wins. ``reconciled`` is the phase discriminator:
+    the hook's classification returns ``noop`` both for declines before the
+    reconcile and for post-reconcile outcomes, and only the former is
+    ``not_ready``."""
+    if core.result == "error":
+        return "error"
+    if not core.reconciled:
+        return "not_ready"
+    status = getattr(core.projection, "status", None) or "published"
+    if status in ("published", "current"):
+        if not core.budget_completed:
+            return "budget_deferred"
+        if getattr(core.projection, "alert_work_pending", False):
+            return "alert_pending"
+    return status
+
+
+def _settlement_hooks_enabled(roots) -> bool:
+    from _lib_codex_hooks import (
+        codex_hook_roots_all_enabled, codex_hooks_feature_enabled)
+    return codex_hooks_feature_enabled() and codex_hook_roots_all_enabled(roots)
+
+
+def _settle_codex_quota_after_prune() -> SettlementReport:
+    """Settle this drain's committed deletions through the hook core (#1034).
+
+    Run by the drain worker once its executor loop and root cleanup ended:
+    every cache connection is closed and no store lock or admission is held,
+    only the worker single-flight lock. In order (spec §5.2): a pending epoch
+    rebuild, the configured roots, the all-roots-enabled population gate, an
+    early read-only readiness probe, complete lifecycle-lock acquisition (21
+    non-blocking attempts 0.5 s apart, a partial set released before each
+    sleep), a root-drift recheck under the locks, then the shared core with
+    ``kind="settlement"``. The locks are released in ``finally`` before any
+    verify request. Never stamps lifecycle success, writes no lifecycle line
+    and records no hook activity. Any exception becomes ``error``; nothing
+    propagates into the drain, whose committed prune work stands."""
+    import _cctally_record as record
+    from _lib_codex_hooks import (
+        acquire_due_lifecycle_locks, release_lifecycle_locks)
+    locks: list = []
+    acquired_at: "float | None" = None
+    held = 0.0
+    core = None
+    # A decline taken under the complete set: reported after the release, so
+    # its occupancy is measured (§5.5).
+    drift_reason = ""
+    try:
+        try:
+            if record._stats_epoch_rebuild_pending():
+                record._defer_stats_epoch_rebuild()
+                return SettlementReport("not_ready", None, "epoch_pending", 0.0)
+            try:
+                roots = record._codex_lifecycle_roots()
+            except OSError:
+                return SettlementReport(
+                    "unavailable", None, "roots_unreadable", 0.0)
+            if not roots:
+                return SettlementReport("no_roots", None, "", 0.0)
+            if not _settlement_hooks_enabled(roots):
+                return SettlementReport("hooks_disabled", None, "", 0.0)
+            # An optimization only: the core's own declines stay authoritative.
+            try:
+                probe = _hook_snapshot_connect(_cctally_core.CACHE_DB_PATH)
+                try:
+                    probe.execute("BEGIN")
+                    refill = _codex_replay_refill_unlocked(probe)
+                    inventory_ready = codex_identity_inventory_ready(probe)
+                finally:
+                    probe.close()
+            except (sqlite3.Error, OSError):
+                return SettlementReport(
+                    "unavailable", None, "cache_unavailable", 0.0)
+            if refill:
+                return SettlementReport("not_ready", None, "replay_pending", 0.0)
+            if not inventory_ready:
+                return SettlementReport(
+                    "not_ready", None, "inventory_pending", 0.0)
+            keys = tuple(root.source_root_key for root in roots)
+            for attempt in range(_SETTLEMENT_LOCK_ATTEMPTS):
+                locks = acquire_due_lifecycle_locks(
+                    _cctally_core.APP_DIR, roots, now=time.time(),
+                    throttle_seconds=0)
+                if len(locks) == len(roots):
+                    acquired_at = time.monotonic()
+                    break
+                release_lifecycle_locks(locks)
+                locks = []
+                if attempt + 1 < _SETTLEMENT_LOCK_ATTEMPTS:
+                    time.sleep(_SETTLEMENT_LOCK_RETRY_SECONDS)
+            if acquired_at is None:
+                return SettlementReport("locks_busy", None, "", 0.0)
+            drifted = record._codex_lifecycle_roots()
+            if (tuple(root.source_root_key for root in drifted) != keys
+                    or not _settlement_hooks_enabled(drifted)):
+                drift_reason = "root_drift"
+            else:
+                core = record._run_codex_lifecycle_core(
+                    locks, roots, transcript_path="", kind="settlement")
+        finally:
+            if locks:
+                release_lifecycle_locks(locks)
+                if acquired_at is not None:
+                    held = time.monotonic() - acquired_at
+            if core is not None and core.request_verify:
+                try:
+                    import _cctally_quota
+                    _cctally_quota._defer_codex_quota_verification()
+                except Exception:  # noqa: BLE001 - the drain stays quiet
+                    pass
+    except Exception as exc:  # noqa: BLE001 - never escapes the drain
+        return SettlementReport(
+            "error", core, record._hook_log_error_detail(exc), held,
+            len(locks))
+    if drift_reason:
+        return SettlementReport("not_ready", None, drift_reason, held)
+    token = _settlement_token(core)
+    reason = core.error if token == "error" else core.reason
+    return SettlementReport(token, core, reason, held, len(locks))
+
+
+def _apply_settlement(result: PruneDrainResult,
+                      report: "SettlementReport | None") -> PruneDrainResult:
+    """Carry a settlement report into the drain result (#1034 §5.5)."""
+    if report is None:
+        return result
+    core = report.core
+    projection = getattr(core, "projection", None)
+    reconciled = bool(getattr(core, "reconciled", False))
+    counts = None
+    status = ""
+    if reconciled:
+        status = str(getattr(projection, "status", None) or "published")
+        counts = SettlementCounts(
+            blocks=int(getattr(projection, "blocks_upserted", 0) or 0),
+            milestones=int(getattr(projection, "milestones_upserted", 0) or 0),
+            eligible_roots=int(report.eligible_roots),
+            quota_alerts=int(getattr(projection, "alerts_dispatched", 0) or 0),
+            budget_alerts=int(getattr(core, "budget_alerts", 0) or 0),
+            budget_completed=bool(getattr(core, "budget_completed", False)),
+        )
+    return result._replace(
+        settlement=report.token, settle_projection=status,
+        settle_reason=str(report.reason or ""), settle_counts=counts,
+        settle_held_ms=max(0, int(report.held_seconds * 1000)))
+
+
+class _CodexPruneRunState:
+    """One drain invocation's shared executor state (#1034 §5.4): the blocked
+    kinds, the evidence units' attempts, the WAL-attempt count and every
+    counter, against one cumulative ``max_identities``. A continuation phase
+    shares it, so it neither resets the budget nor retries a blocked kind."""
+
+    __slots__ = ("deleted", "dropped", "yielded", "finalization_units",
+                 "owed_units", "wal_attempts", "blocked", "evidence_budget")
+
+    def __init__(self) -> None:
+        self.deleted = self.dropped = self.yielded = 0
+        self.finalization_units = self.owed_units = self.wal_attempts = 0
+        self.blocked: "set[str]" = set()
+        # #1033 §5.3: the evidence units' attempts per kind for this run.
+        self.evidence_budget: "dict[str, int]" = {}
+
+
+def _run_codex_prune_drain_phase(
+    state: _CodexPruneRunState, adm, *, wait_for_requests: bool,
+    max_identities: "int | None",
+) -> None:
+    """One executor phase of ``run_codex_prune_drain`` (#1034 §5.4).
+
+    The executor loop, unchanged: it runs while prune debt, finalization debt
+    or owed maintenance remains and is neither blocked nor capped. Each phase
+    takes its own pass discovery and restarts the prune keyset cursor; every
+    other piece of state is the run's."""
+    discovery = _CodexPruneDiscoveryCache()     # one discovery per pass (N10)
+    # #970 spec 5.6: an identity whose absence is unknown keeps its debt and
+    # is passed over for the rest of this run (keyset past it).
+    after: "tuple[str, str] | None" = None
+    while max_identities is None or state.deleted + state.dropped < max_identities:
+        # Prepare without locks: the identity and its #485 scope, computed
+        # for THIS identity from the pass's discovery. Opening the store
+        # happens BEFORE admission takes the store locks (the HEAD writer
+        # order; review S-P2b), and the connection is kept for the
+        # identity.
+        conn = open_cache_db()
+        try:
+            # #980 D5: the loop runs while prune debt, finalization debt
+            # or owed maintenance exists. Finalization goes first, so a
+            # projection refused over an unresolved model is unblocked
+            # before a long prune backlog; every unit has its own
+            # admission, re-reads its state under the gate and commits.
+            unit = _codex_executor_next_unit(conn, state.blocked)
+            conn.rollback()
+            if unit == CODEX_EVIDENCE_BOOTSTRAP_UNIT:
+                # #1033 §5.3: like the catch-up, special-cased ahead of
+                # prune rows; its scan runs before its own admission.
+                outcome = _run_codex_reset_anchor_evidence_unit(
+                    conn, adm, unit, budget=state.evidence_budget)
+                if outcome == "yielded":
+                    state.yielded += 1
+                    if not wait_for_requests:
+                        break
+                    _drain_backoff(adm)
+                elif outcome == "published":
+                    state.owed_units += 1
+                elif outcome == "blocked":
+                    state.blocked.add(unit)
+                continue
+            if unit == "ingest_catch_up":
+                # #980 F4: its sync owns the locks and its own admission.
+                caught = _run_codex_ingest_catch_up_unit(conn, adm)
+                if caught == "yielded":
+                    state.yielded += 1
+                    if not wait_for_requests:
+                        break
+                    _drain_backoff(adm)
+                elif caught == "done":
+                    state.owed_units += 1
+                else:
+                    state.blocked.add("ingest_catch_up")
+                continue
+            row = None
+            if unit != "finalization":
+                row = _next_codex_debt_row(conn, "codex_prune_debt", after)
+                conn.rollback()
+            if row is None and unit is None:
+                break
+            if row is None and unit == CODEX_EVIDENCE_REPAIR_UNIT:
+                # #1033 §5.3: after pruning; prepare runs unadmitted, so
+                # it never goes through the admitted-only executor body.
+                outcome = _run_codex_reset_anchor_evidence_unit(
+                    conn, adm, unit, budget=state.evidence_budget)
+                if outcome == "yielded":
+                    state.yielded += 1
+                    if not wait_for_requests:
+                        break
+                    _drain_backoff(adm)
+                elif outcome == "published":
+                    state.owed_units += 1
+                elif outcome == "blocked":
+                    state.blocked.add(unit)
+                continue
+            if row is None:
+                admission = adm.admit(_cctally_core.APP_DIR,
+                                      _cache_store_locks,
+                                      _release_cache_store_locks)
+                if not admission.admitted:
+                    state.yielded += 1
+                    if not wait_for_requests:
+                        break
+                    _drain_backoff(adm)
+                    continue
+                model_cleared = False
+                try:
+                    unit = _codex_executor_next_unit(conn, state.blocked)
+                    conn.rollback()
+                    if unit is None or unit in (
+                            "ingest_catch_up",
+                            CODEX_EVIDENCE_BOOTSTRAP_UNIT,
+                            CODEX_EVIDENCE_REPAIR_UNIT):
+                        # #981 R2: a catch-up a hook recorded since the
+                        # unlocked read runs through its own path (its sync
+                        # owns the locks): release this admission and let
+                        # the next pass dispatch it. The #1033 evidence
+                        # units likewise run through their own path.
+                        continue
+                    ok, model_cleared = _run_codex_executor_unit(conn, unit)
+                except BaseException:
+                    conn.rollback()
+                    raise
+                finally:
+                    adm.finish(admission, _release_cache_store_locks)
+                if model_cleared:
+                    # D5: republish the projection a publisher refused
+                    # while the flag was set; outside every store lock.
+                    try:
+                        from _cctally_quota import (
+                            _defer_codex_quota_verification)
+                        _defer_codex_quota_verification()
+                    except Exception:
+                        pass
+                if unit == "finalization":
+                    state.finalization_units += int(ok)
+                    if not ok:
+                        state.blocked.add("finalization")
+                elif ok:
+                    state.owed_units += 1
+                elif unit == "change_log_prune":
+                    state.blocked.add("change_log_prune")
+                elif unit == "wal_truncate":
+                    state.wal_attempts += 1
+                    if state.wal_attempts >= _CODEX_OWED_WAL_ATTEMPTS:
+                        state.blocked.add("wal_truncate")
+                    else:
+                        adm._sleep(adm.POLL_SECONDS)
+                continue
+            roots, scope = discovery.prepare()
+            admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
+                                  _release_cache_store_locks)
+            if not admission.admitted:
+                state.yielded += 1
+                if not wait_for_requests:
+                    break
+                _drain_backoff(adm)
+                continue
+            try:
+                if ([r.source_root_key for r in _codex_provider_roots()]
+                        != [r.source_root_key for r in roots]):
+                    continue          # roots changed while admitting: re-prepare
+                path, stored_root = row[0], (row[1] or None)
+                # #970 spec 5.6 (A4/A5): inside its discovery scope an
+                # identity is deleted only on STABLE proved absence, and
+                # its deletion witness follows its accepted location; a
+                # scope exit keeps today's rule (not present).
+                presence = _codex_drain_presence(path, stored_root, roots)
+                if presence == "unknown":
+                    after = (row[0], row[1])
+                    conn.rollback()
+                    continue
+                present = presence == "present"
+                eligible, _refused, _ok_roots, _refused_roots = (
+                    _partition_codex_prune_candidates(
+                        scope, [(path, stored_root)], set(),
+                        refusal=lambda p, k: scope.refusal_reason(
+                            p, k, witness=_codex_deletion_witness(
+                                conn, "codex_session_files", p,
+                                _codex_scope_root(p, k, roots)))))
+                # #927 B5: debt planned from a stale inventory row names
+                # an identity no family carries, which the legacy scans
+                # could never have planned: delete nothing for it.
+                stale = not _codex_identity_has_rows(conn, path, stored_root)
+                if present or not eligible or stale:
+                    conn.execute(
+                        "DELETE FROM codex_prune_debt WHERE source_path=? "
+                        "AND source_root_key=?", (path, row[1]))
+                    # #927 B5: debt planned from a stale inventory row
+                    # deletes nothing, but the row itself goes, so the
+                    # next plan does not record the same debt again.
+                    _forget_codex_retained_identities(
+                        conn, path, stored_root)
+                    conn.commit()
+                    state.dropped += 1
+                    continue
+                keys = {r[0] for r in conn.execute(
+                    "SELECT DISTINCT conversation_key FROM "
+                    "codex_conversation_messages WHERE source_path=?",
+                    (path,)) if r[0]}
+                if stored_root is not None:
+                    # A NULL-root identity has no durable file key (the
+                    # key needs a root), so it never held a barrier
+                    # membership; computing one raised and stopped the
+                    # drain on its first NULL-root debt.
+                    _codex_barrier_forget_identity(
+                        conn, codex_file_key_for_entry_path(stored_root, path))
+                _delete_codex_file_derived_rows(
+                    conn, path, source_root_key=stored_root,
+                    match_source_root=True)
+                _recompute_codex_rollups(conn, keys)
+                _bump_codex_physical_mutation_seq(conn)
+                conn.execute(
+                    "DELETE FROM codex_prune_debt WHERE source_path=? "
+                    "AND source_root_key=?", (path, row[1]))
+                _set_cache_meta(conn, CODEX_PRUNE_ROOT_CLEANUP_KEY, "1")
+                if _CODEX_PRUNE_PRECOMMIT_HOOK is not None:
+                    _CODEX_PRUNE_PRECOMMIT_HOOK(path, row[1])
+                conn.commit()
+                state.deleted += 1
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                adm.finish(admission, _release_cache_store_locks)
+        finally:
+            conn.close()
+
+
 def run_codex_prune_drain(*, wait_for_requests: bool = True,
-                          max_identities: "int | None" = None) -> PruneDrainResult:
+                          max_identities: "int | None" = None,
+                          settle_projection: bool = False) -> PruneDrainResult:
     """Drain cache.db prune debt one logical identity per transaction (#968 5.7).
 
     Single-flight through ``codex-prune-drain.lock``. Every identity is admitted
@@ -7682,229 +8724,120 @@ def run_codex_prune_drain(*, wait_for_requests: bool = True,
     worker = _worker_lock(CODEX_PRUNE_DRAIN_LOCK_NAME)
     if worker is None:
         return PruneDrainResult("busy", 0, 0, 0, -1)
-    deleted = dropped = yielded = 0
-    finalization_units = owed_units = wal_attempts = 0
-    blocked: "set[str]" = set()
-    # #1033 §5.3: the evidence units' attempts per kind for this run.
-    evidence_budget: "dict[str, int]" = {}
-    discovery = _CodexPruneDiscoveryCache()     # one discovery per pass (N10)
-    # #970 spec 5.6: an identity whose absence is unknown keeps its debt and
-    # is passed over for the rest of this run (keyset past it).
-    after: "tuple[str, str] | None" = None
+    state = _CodexPruneRunState()
     try:
-        while max_identities is None or deleted + dropped < max_identities:
-            # Prepare without locks: the identity and its #485 scope, computed
-            # for THIS identity from the pass's discovery. Opening the store
-            # happens BEFORE admission takes the store locks (the HEAD writer
-            # order; review S-P2b), and the connection is kept for the
-            # identity.
-            conn = open_cache_db()
-            try:
-                # #980 D5: the loop runs while prune debt, finalization debt
-                # or owed maintenance exists. Finalization goes first, so a
-                # projection refused over an unresolved model is unblocked
-                # before a long prune backlog; every unit has its own
-                # admission, re-reads its state under the gate and commits.
-                unit = _codex_executor_next_unit(conn, blocked)
-                conn.rollback()
-                if unit == CODEX_EVIDENCE_BOOTSTRAP_UNIT:
-                    # #1033 §5.3: like the catch-up, special-cased ahead of
-                    # prune rows; its scan runs before its own admission.
-                    outcome = _run_codex_reset_anchor_evidence_unit(
-                        conn, adm, unit, budget=evidence_budget)
-                    if outcome == "yielded":
-                        yielded += 1
-                        if not wait_for_requests:
-                            break
-                        _drain_backoff(adm)
-                    elif outcome == "published":
-                        owed_units += 1
-                    elif outcome == "blocked":
-                        blocked.add(unit)
-                    continue
-                if unit == "ingest_catch_up":
-                    # #980 F4: its sync owns the locks and its own admission.
-                    caught = _run_codex_ingest_catch_up_unit(conn, adm)
-                    if caught == "yielded":
-                        yielded += 1
-                        if not wait_for_requests:
-                            break
-                        _drain_backoff(adm)
-                    elif caught == "done":
-                        owed_units += 1
-                    else:
-                        blocked.add("ingest_catch_up")
-                    continue
-                row = None
-                if unit != "finalization":
-                    row = _next_codex_debt_row(conn, "codex_prune_debt", after)
-                    conn.rollback()
-                if row is None and unit is None:
-                    break
-                if row is None and unit == CODEX_EVIDENCE_REPAIR_UNIT:
-                    # #1033 §5.3: after pruning; prepare runs unadmitted, so
-                    # it never goes through the admitted-only executor body.
-                    outcome = _run_codex_reset_anchor_evidence_unit(
-                        conn, adm, unit, budget=evidence_budget)
-                    if outcome == "yielded":
-                        yielded += 1
-                        if not wait_for_requests:
-                            break
-                        _drain_backoff(adm)
-                    elif outcome == "published":
-                        owed_units += 1
-                    elif outcome == "blocked":
-                        blocked.add(unit)
-                    continue
-                if row is None:
-                    admission = adm.admit(_cctally_core.APP_DIR,
-                                          _cache_store_locks,
-                                          _release_cache_store_locks)
-                    if not admission.admitted:
-                        yielded += 1
-                        if not wait_for_requests:
-                            break
-                        _drain_backoff(adm)
-                        continue
-                    model_cleared = False
-                    try:
-                        unit = _codex_executor_next_unit(conn, blocked)
-                        conn.rollback()
-                        if unit is None or unit in (
-                                "ingest_catch_up",
-                                CODEX_EVIDENCE_BOOTSTRAP_UNIT,
-                                CODEX_EVIDENCE_REPAIR_UNIT):
-                            # #981 R2: a catch-up a hook recorded since the
-                            # unlocked read runs through its own path (its sync
-                            # owns the locks): release this admission and let
-                            # the next pass dispatch it. The #1033 evidence
-                            # units likewise run through their own path.
-                            continue
-                        ok, model_cleared = _run_codex_executor_unit(conn, unit)
-                    except BaseException:
-                        conn.rollback()
-                        raise
-                    finally:
-                        adm.finish(admission, _release_cache_store_locks)
-                    if model_cleared:
-                        # D5: republish the projection a publisher refused
-                        # while the flag was set; outside every store lock.
-                        try:
-                            from _cctally_quota import (
-                                _defer_codex_quota_verification)
-                            _defer_codex_quota_verification()
-                        except Exception:
-                            pass
-                    if unit == "finalization":
-                        finalization_units += int(ok)
-                        if not ok:
-                            blocked.add("finalization")
-                    elif ok:
-                        owed_units += 1
-                    elif unit == "change_log_prune":
-                        blocked.add("change_log_prune")
-                    elif unit == "wal_truncate":
-                        wal_attempts += 1
-                        if wal_attempts >= _CODEX_OWED_WAL_ATTEMPTS:
-                            blocked.add("wal_truncate")
-                        else:
-                            adm._sleep(adm.POLL_SECONDS)
-                    continue
-                roots, scope = discovery.prepare()
-                admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
-                                      _release_cache_store_locks)
-                if not admission.admitted:
-                    yielded += 1
-                    if not wait_for_requests:
-                        break
-                    _drain_backoff(adm)
-                    continue
-                try:
-                    if ([r.source_root_key for r in _codex_provider_roots()]
-                            != [r.source_root_key for r in roots]):
-                        continue          # roots changed while admitting: re-prepare
-                    path, stored_root = row[0], (row[1] or None)
-                    # #970 spec 5.6 (A4/A5): inside its discovery scope an
-                    # identity is deleted only on STABLE proved absence, and
-                    # its deletion witness follows its accepted location; a
-                    # scope exit keeps today's rule (not present).
-                    presence = _codex_drain_presence(path, stored_root, roots)
-                    if presence == "unknown":
-                        after = (row[0], row[1])
-                        conn.rollback()
-                        continue
-                    present = presence == "present"
-                    eligible, _refused, _ok_roots, _refused_roots = (
-                        _partition_codex_prune_candidates(
-                            scope, [(path, stored_root)], set(),
-                            refusal=lambda p, k: scope.refusal_reason(
-                                p, k, witness=_codex_deletion_witness(
-                                    conn, "codex_session_files", p,
-                                    _codex_scope_root(p, k, roots)))))
-                    # #927 B5: debt planned from a stale inventory row names
-                    # an identity no family carries, which the legacy scans
-                    # could never have planned: delete nothing for it.
-                    stale = not _codex_identity_has_rows(conn, path, stored_root)
-                    if present or not eligible or stale:
-                        conn.execute(
-                            "DELETE FROM codex_prune_debt WHERE source_path=? "
-                            "AND source_root_key=?", (path, row[1]))
-                        # #927 B5: debt planned from a stale inventory row
-                        # deletes nothing, but the row itself goes, so the
-                        # next plan does not record the same debt again.
-                        _forget_codex_retained_identities(
-                            conn, path, stored_root)
-                        conn.commit()
-                        dropped += 1
-                        continue
-                    keys = {r[0] for r in conn.execute(
-                        "SELECT DISTINCT conversation_key FROM "
-                        "codex_conversation_messages WHERE source_path=?",
-                        (path,)) if r[0]}
-                    if stored_root is not None:
-                        # A NULL-root identity has no durable file key (the
-                        # key needs a root), so it never held a barrier
-                        # membership; computing one raised and stopped the
-                        # drain on its first NULL-root debt.
-                        _codex_barrier_forget_identity(
-                            conn, codex_file_key_for_entry_path(stored_root, path))
-                    _delete_codex_file_derived_rows(
-                        conn, path, source_root_key=stored_root,
-                        match_source_root=True)
-                    _recompute_codex_rollups(conn, keys)
-                    _bump_codex_physical_mutation_seq(conn)
-                    conn.execute(
-                        "DELETE FROM codex_prune_debt WHERE source_path=? "
-                        "AND source_root_key=?", (path, row[1]))
-                    _set_cache_meta(conn, CODEX_PRUNE_ROOT_CLEANUP_KEY, "1")
-                    if _CODEX_PRUNE_PRECOMMIT_HOOK is not None:
-                        _CODEX_PRUNE_PRECOMMIT_HOOK(path, row[1])
-                    conn.commit()
-                    deleted += 1
-                except BaseException:
-                    conn.rollback()
-                    raise
-                finally:
-                    adm.finish(admission, _release_cache_store_locks)
-            finally:
-                conn.close()
-        conn = open_cache_db()
-        try:
-            remaining = int(conn.execute(
-                "SELECT COUNT(*) FROM codex_prune_debt").fetchone()[0])
-            cleanup_due = conn.execute(
-                "SELECT 1 FROM cache_meta WHERE key=?",
-                (CODEX_PRUNE_ROOT_CLEANUP_KEY,)).fetchone() is not None
-            if remaining == 0 and cleanup_due:
-                _codex_prune_root_cleanup(conn, adm)
-        finally:
-            conn.close()
+        _run_codex_prune_drain_phase(
+            state, adm, wait_for_requests=wait_for_requests,
+            max_identities=max_identities)
+        settling = settle_projection and state.deleted > 0
+        remaining, work_remaining, ledger_retained = _codex_prune_drain_exit(
+            adm, inspect=not settling)
+        report = None
+        if settling:
+            # #1034 §5.2: settle this run's committed deletions while the
+            # worker single-flight lock is still held and nothing else is.
+            report = _settle_codex_quota_after_prune()
+            # §5.4 (J3): durable work the settlement attempt left — debt its
+            # own sync or reconcile recorded, or work the first phase could
+            # not reach — is consumed here by ONE continuation phase, never
+            # behind the attempt marker the spawn of this drain stamped. A
+            # failed or declined settlement does not skip the check.
+            # Diagnostic: an unreadable re-check reports `unknown` and runs
+            # no continuation, never discarding the committed work's report.
+            work_remaining, ledger_retained = _codex_prune_drain_recheck()
+            if work_remaining:
+                _run_codex_prune_drain_phase(
+                    state, adm, wait_for_requests=wait_for_requests,
+                    max_identities=max_identities)
+                remaining, work_remaining, ledger_retained = (
+                    _codex_prune_drain_exit(adm, inspect=True))
+        # R-a: `outcome` keeps its prune-row meaning, after the continuation.
         outcome = "drained" if remaining == 0 else (
-            "yielded" if yielded else "partial")
-        return PruneDrainResult(outcome, deleted, dropped, yielded, remaining,
-                                finalization_units, owed_units)
+            "yielded" if state.yielded else "partial")
+        return _apply_settlement(
+            PruneDrainResult(outcome, state.deleted, state.dropped,
+                             state.yielded, remaining,
+                             state.finalization_units, state.owed_units,
+                             work_remaining=work_remaining,
+                             ledger_retained=ledger_retained),
+            report)
     finally:
         _release_worker_lock(worker)
+
+
+def _codex_durable_work_remaining(conn: sqlite3.Connection) -> bool:
+    """Any executor work class left (#1034 §5.4): finalization debt, owed
+    maintenance (the #1033 evidence work included), prune debt, or a pending
+    root cleanup."""
+    if not load_codex_finalization_debt(conn).empty:
+        return True
+    if _codex_owed_anything(conn):
+        return True
+    if conn.execute("SELECT 1 FROM codex_prune_debt LIMIT 1").fetchone():
+        return True
+    return conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key=?",
+        (CODEX_PRUNE_ROOT_CLEANUP_KEY,)).fetchone() is not None
+
+
+def _codex_ledger_retained(conn: sqlite3.Connection) -> int:
+    """``COUNT(*)`` of the quota change ledger, a diagnostic only (#1034
+    §5.5): retained rows are neither unconsumed work nor a currentness
+    signal. ``-1`` when unreadable."""
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM quota_window_change_log").fetchone()[0])
+    except Exception:  # noqa: BLE001 - a diagnostic never fails the drain
+        return -1
+
+
+def _codex_prune_drain_inspect(
+        conn: sqlite3.Connection) -> "tuple[bool | None, int]":
+    """The exit's diagnostic re-check (#1034 §5.5): any failure degrades to
+    ``None``/``-1``, because the prune and settlement work it reports on is
+    already committed and its report must still reach the drain line."""
+    try:
+        work = _codex_durable_work_remaining(conn)
+    except Exception:  # noqa: BLE001 - a diagnostic never fails the drain
+        work = None
+    return work, _codex_ledger_retained(conn)
+
+
+def _codex_prune_drain_exit(
+        adm, *, inspect: bool) -> "tuple[int, bool | None, int]":
+    """The end of an executor phase: count the prune rows, run the root
+    cleanup when it is due, and (``inspect``) re-check every work class."""
+    conn = open_cache_db()
+    try:
+        remaining = int(conn.execute(
+            "SELECT COUNT(*) FROM codex_prune_debt").fetchone()[0])
+        cleanup_due = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?",
+            (CODEX_PRUNE_ROOT_CLEANUP_KEY,)).fetchone() is not None
+        if remaining == 0 and cleanup_due:
+            _codex_prune_root_cleanup(conn, adm)
+        if not inspect:
+            return remaining, None, -1
+        work, ledger = _codex_prune_drain_inspect(conn)
+        return remaining, work, ledger
+    finally:
+        conn.close()
+
+
+def _codex_prune_drain_recheck() -> "tuple[bool | None, int]":
+    """The continuation's trigger, in one fresh connection (#1034 §5.4).
+
+    A connection that cannot be opened reports ``(None, -1)``: the trigger
+    is unknown, so no continuation runs, and the committed prune and
+    settlement work keeps its report."""
+    try:
+        conn = open_cache_db()
+    except Exception:  # noqa: BLE001 - a diagnostic never fails the drain
+        return None, -1
+    try:
+        return _codex_prune_drain_inspect(conn)
+    finally:
+        conn.close()
 
 
 CODEX_CONVERSATION_PRUNE_DRAIN_LOCK_NAME = "codex-conversation-prune-drain.lock"
@@ -8204,7 +9137,9 @@ def _cmd_codex_prune_drain_body(args) -> int:
         _hook_tick_log_rotate_if_needed()
 
     try:
-        result = run_codex_prune_drain(wait_for_requests=True)
+        # #1034: only the worker settles its own deletions.
+        result = run_codex_prune_drain(wait_for_requests=True,
+                                       settle_projection=True)
         conv_result = run_codex_conversation_prune_drain(wait_for_requests=True)
     except Exception as exc:
         _log("error", error=_hook_log_error_detail(exc))
@@ -8216,8 +9151,39 @@ def _cmd_codex_prune_drain_body(args) -> int:
          f"owed_units={result.owed_units} "
          f"conv_deleted={conv_result.identities_deleted} "
          f"conv_dropped={conv_result.identities_dropped} "
-         f"conv_remaining={conv_result.remaining}")
+         f"conv_remaining={conv_result.remaining} "
+         + _prune_drain_settle_detail(result, _hook_log_safe_free_text))
     return 0
+
+
+def _prune_drain_settle_detail(result: PruneDrainResult, safe_text) -> str:
+    """The #1034 §5.5 keys of the ``op=prune-drain`` line, from the cache
+    drain's result only. ``settle_reason`` is last and sanitized; the
+    ``ledger_retained`` count is a diagnostic, never a currentness claim."""
+    parts = [f"settle={result.settlement}"]
+    if result.settle_projection:
+        parts.append(f"settle_projection={result.settle_projection}")
+    counts = result.settle_counts
+    if counts is not None:
+        parts.extend([
+            f"settle_blocks={counts.blocks}",
+            f"settle_milestones={counts.milestones}",
+            f"settle_eligible_roots={counts.eligible_roots}",
+            f"settle_quota_alerts={counts.quota_alerts}",
+            f"settle_budget_alerts={counts.budget_alerts}",
+            f"settle_budget={int(counts.budget_completed)}",
+        ])
+    parts.append(f"settle_held_ms={max(0, int(result.settle_held_ms))}")
+    parts.append("work_remaining=" + (
+        "unknown" if result.work_remaining is None
+        else str(int(result.work_remaining))))
+    parts.append("ledger_retained=" + (
+        "unknown" if result.ledger_retained < 0
+        else str(int(result.ledger_retained))))
+    reason = safe_text(result.settle_reason) if result.settle_reason else ""
+    if reason:
+        parts.append(f"settle_reason={reason}")
+    return " ".join(parts)
 
 
 
@@ -8336,6 +9302,8 @@ def request_codex_inventory_bootstrap() -> bool:
     so the next request retries at once; the inline fallback is never taken
     here (``cache-sync`` runs the executor itself).
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("LAUNCH", entry="request_codex_inventory_bootstrap")
     marker = _cctally_core.APP_DIR / CODEX_INVENTORY_BOOTSTRAP_MARKER_NAME
     try:
         age = time.time() - marker.stat().st_mtime
@@ -8591,6 +9559,15 @@ def _append_codex_file_account_decision(
 #: alone. The hook's budgeted path keeps its per-file commits.
 CODEX_ACCOUNTING_BATCH_FILES = 64
 CODEX_ACCOUNTING_BATCH_BYTES = 4 * 1024 * 1024
+#: #1042 D1: the Claude accounting walk of ``sync_cache`` commits once per
+#: batch of files, each file in its own savepoint. A batch holds at most this
+#: many files that wrote anything (identity-only backfills included) and this
+#: many bytes of JSONL input (a file's frozen size minus its start offset,
+#: known before it is read). A file is admitted only if the batch stays within
+#: the byte bound, else the batch commits first; a file whose own input
+#: exceeds the bound is a batch of its own.
+CLAUDE_ACCOUNTING_BATCH_FILES = 512
+CLAUDE_ACCOUNTING_BATCH_BYTES = 256 * 1024 * 1024
 #: Test seam: False keeps an unbudgeted call on the pre-W11 per-file commits,
 #: the per-file control G10 (l) compares against.
 _CODEX_W11_ENABLED = True
@@ -9144,9 +10121,23 @@ class PruneResult:
     attribution_deferred: bool = False
 
 
+#: ``_progress_stderr``'s cadence, in processed files.
+_PROGRESS_STDERR_EVERY = 200
+
+
 def _progress_stderr(stats: IngestStats, *, force: bool = False) -> None:
-    """Default stderr progress callback. Every 200 files or when forced."""
-    if not force and stats.files_processed % 200 != 0:
+    """Default stderr progress callback. Every 200 files or when forced.
+
+    #1042: ``files_processed`` now advances a batch at a time, so the line
+    prints once each time the count crosses a multiple of 200 since this
+    callback last saw it (the first call at 0 counts as a crossing, as the
+    equality rule it replaces printed there)."""
+    done = stats.files_processed
+    seen = getattr(stats, "_progress_stderr_seen", None)
+    stats._progress_stderr_seen = done
+    floor = seen if seen is not None else (-1 if done == 0 else 0)
+    every = _PROGRESS_STDERR_EVERY
+    if not force and done // every <= floor // every:
         return
     eprint(
         f"[cache-sync] {stats.files_processed}/{stats.files_total} files, "
@@ -9154,7 +10145,27 @@ def _progress_stderr(stats: IngestStats, *, force: bool = False) -> None:
     )
 
 
-def _ensure_session_files_row(conn: sqlite3.Connection, source_path: str) -> None:
+def _session_files_identity_missing(conn: sqlite3.Connection,
+                                    source_path: str) -> bool:
+    """Whether ``_ensure_session_files_row`` would write for this path."""
+    existing = conn.execute(
+        "SELECT session_id, project_path FROM session_files WHERE path = ?",
+        (source_path,),
+    ).fetchone()
+    return existing is None or existing[0] is None or existing[1] is None
+
+
+#: #1042 spec 6.2: each file of a Claude accounting batch writes inside this
+#: savepoint, which only ever runs inside the batch's open transaction (an
+#: outermost savepoint would begin a transaction itself, and its RELEASE
+#: would commit).
+_CLAUDE_ACCOUNTING_SAVEPOINT = "SAVEPOINT claude_accounting_file"
+_CLAUDE_ACCOUNTING_RELEASE = "RELEASE SAVEPOINT claude_accounting_file"
+_CLAUDE_ACCOUNTING_ROLLBACK_TO = "ROLLBACK TO SAVEPOINT claude_accounting_file"
+
+
+def _ensure_session_files_row(conn: sqlite3.Connection, source_path: str,
+                              *, commit: bool = True) -> None:
     """Populate session_files.session_id and .project_path for this JSONL.
 
     Idempotent and safe to call every sync: uses UPSERT with COALESCE on the
@@ -9256,8 +10267,11 @@ def _ensure_session_files_row(conn: sqlite3.Connection, source_path: str) -> Non
     # subsequent JSONL read+parse. Leaving the implicit transaction open
     # across the per-file loop would both hold a writer lock across reads
     # and risk losing updates if a file-loop iteration `continue`s without
-    # hitting the caller's own commit.
-    conn.commit()
+    # hitting the caller's own commit. #1042: the accounting walk passes
+    # ``commit=False`` and writes the row inside the file's savepoint, so it
+    # commits (or rolls back) with the file's entries and cursor.
+    if commit:
+        conn.commit()
 
 
 # How long `cache-sync --rebuild` (and the --prune-orphans path) waits on the
@@ -9423,12 +10437,15 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
     in a second transaction. The ordering is deliberately failure-safe: an
     interruption may leave re-derivable transcript rows absent, but cannot
     delete accounting evidence while its conversation coverage is still the
-    only proof that the orphan is safe. Recomputes conversation_sessions for
-    exactly the pruned session_ids. Does NOT write the walk-complete marker:
+    only proof that the orphan is safe. Then re-derives conversation_sessions
+    for every session the deletions affected and acknowledges its own
+    accounting-generation rotation (#1072 §4.8). Does NOT write the walk-complete marker:
     the next full sync_cache re-establishes it on a clean walk. Acquires both
     provider flocks itself; contention returns a `contended` result without
     mutating.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="_prune_orphaned_cache_entries")
     result = PruneResult()
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _cctally_core.CACHE_LOCK_PATH.touch()
@@ -9457,7 +10474,6 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
             return result
 
         safe_paths = []
-        pruned_sids = set()
         for path, sid in orphan_cands:
             if sid is None or sid in surviving_sids:          # Gate A
                 result.residual_paths.append(path)
@@ -9485,7 +10501,6 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
                 result.residual_paths.append(path)
                 continue
             safe_paths.append(path)
-            pruned_sids.add(sid)
 
         if not safe_paths:
             return result
@@ -9511,13 +10526,48 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
 
         # No IN(...) chunking: safe_paths is bounded by the orphan count (a
         # handful of removed files), well under SQLite's variable limit;
-        # _recompute_conversation_sessions chunks its own session-id list.
+        # the step-4 re-derive chunks its own session-id list.
         ph = ",".join("?" * len(safe_paths))
+        safe_set = set(safe_paths)
+        # #1072 §4.8 step 1: from the cache connection already held, the
+        # current accounting generation and the safe paths' turn keys.
+        generation_before = _read_claude_accounting_generation(conn)
+        safe_keys = list(dict.fromkeys(
+            (mid, rid) for mid, rid in conn.execute(
+                f"SELECT msg_id, req_id FROM session_entries "
+                f"WHERE source_path IN ({ph}) "
+                f"AND msg_id IS NOT NULL AND req_id IS NOT NULL",
+                safe_paths)))
         result.pruned_messages = conv.execute(
             f"SELECT count(*) FROM conversation_messages WHERE source_path IN ({ph})",
             safe_paths).fetchone()[0]
-        conv.execute("BEGIN")
+        # IMMEDIATE, not deferred: this transaction reads (the affected set,
+        # the key holders, the pending set) before its first write, and a
+        # deferred one that did so would fail its first write at once with
+        # SQLITE_BUSY_SNAPSHOT, which no busy timeout retries, whenever the
+        # Codex conversation writer committed in between (the same reason as
+        # `_begin_claude_conversation_batch`). The reads stay inside it, so
+        # the affected set is atomic with the deletes it describes.
+        conv.execute("BEGIN IMMEDIATE")
         try:
+            # #1072 §4.8 step 2: every session losing messages here, plus every
+            # session that prices one of the deleted keys under a path outside
+            # the safe set (a residual sibling holding the same turn), is
+            # recorded in the pending set in this same transaction. A
+            # `session_files.session_id` names one session per file, which is
+            # why the recompute this replaces missed both kinds.
+            affected = {
+                sid for (sid,) in conv.execute(
+                    f"SELECT session_id FROM conversation_messages "
+                    f"WHERE source_path IN ({ph})", safe_paths)
+                if sid is not None
+            }
+            for mid, rid in safe_keys:
+                affected.update(
+                    sid for sid, source_path
+                    in _sessions_holding_turn_key(conv, mid, rid)
+                    if sid is not None and source_path not in safe_set)
+            _merge_rollup_pending(conv, affected)
             conv.execute(
                 f"DELETE FROM conversation_file_touches WHERE message_id IN "
                 f"(SELECT id FROM conversation_messages WHERE source_path IN ({ph}))",
@@ -9526,34 +10576,25 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
                 f"DELETE FROM conversation_messages WHERE source_path IN ({ph})", safe_paths)
             conv.execute(
                 f"DELETE FROM conversation_ai_titles WHERE source_path IN ({ph})", safe_paths)
-            # #729: this return was discarded. A refused re-derive still
-            # commits — the three DELETEs above are done, and the refusal ARMS
-            # `conversation_sessions_backfill_pending` and latches its record
-            # inside this same BEGIN, so rolling back would discard the very
-            # signal that tells the next authorized process to finish the job.
-            # What must not happen is reporting the outcome as clean.
-            refusal_state: "list[str]" = []
-            if not _recompute_conversation_sessions(
-                conv, list(pruned_sids), refusal_out=refusal_state
-            ):
-                result.prune_refused = True
-                result.prune_refused_files = len(safe_paths)
-                result.prune_refused_state = (
-                    refusal_state[0] if refusal_state else None)
             conv.commit()
         except BaseException:
             conv.rollback()
             raise
         conn.execute("BEGIN")
         try:
-            result.pruned_entries = conn.execute(
-                f"DELETE FROM session_entries WHERE source_path IN ({ph})", safe_paths).rowcount
+            # #1072 §4.8 step 3: the delete rotates the generation.
+            result.pruned_entries = _delete_claude_session_entries(
+                conn, f"source_path IN ({ph})", tuple(safe_paths))
             result.pruned_files = conn.execute(
                 f"DELETE FROM session_files WHERE path IN ({ph})", safe_paths).rowcount
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
+        _prune_rederive_affected_sessions(
+            conv, sorted(affected), generation_before,
+            _read_claude_accounting_generation(conn), result,
+            refused_files=len(safe_paths))
         return result
     finally:
         if conv is not None:
@@ -9599,6 +10640,154 @@ def _bump_mutation_seq(conn: sqlite3.Connection) -> int:
     return int(row[0])
 
 
+# ── #1072 §4.1: the accounting version of `session_entries` ─────────────────
+#: cache.db ``cache_meta`` key holding a random 32-hex token. Together with
+#: ``session_entries_mutation_seq`` it versions the table: every runtime insert
+#: or in-place update stamps a newly bumped sequence number, and every runtime
+#: delete rotates this token in the same transaction. The conversations-side
+#: rollup records the version it consumed (``conversation_sessions_input_
+#: watermark``), so a changed token means "rows may have been deleted; the
+#: rollup cannot tell which sessions lost them" and forces a full re-derive.
+#: Not ``cache_incarnation_id``: that one rotates on every migration run.
+CLAUDE_ACCOUNTING_GENERATION_KEY = "claude_accounting_generation"
+
+#: The cache migrations that change ``session_entries`` without stamping or
+#: rotating (§4.2). The sorted names of the ones marked applied form the
+#: watermark's migration digest, so a migration that runs later (``db unskip``,
+#: version-ahead recovery) forces one full re-derive. A future migration of
+#: that kind joins this tuple (the §4.9 rule).
+_CLAUDE_ACCOUNTING_MIGRATIONS = (
+    "001_dedup_highest_wins",
+    "008_session_entries_speed_backfill",
+    "020_session_entries_physical_unique",
+)
+
+
+def _delete_claude_session_entries(
+    conn: sqlite3.Connection, where_sql: "str | None" = None,
+    params: tuple = (),
+) -> int:
+    """Delete all or the selected ``session_entries`` rows and rotate the
+    accounting generation in the SAME transaction (#1072 §4.1). Returns the
+    deleted row count. NEVER commits: every caller owns its transaction, and
+    the rotation must commit or roll back with the rows it describes.
+
+    Every runtime delete of ``session_entries`` goes through here (the rebuild
+    and truncation-escalation wipes, the per-file re-ingest delete, the orphan
+    prune). A delete that removed nothing (``rowcount == 0``) changed no
+    version and does not rotate, so a no-op delete costs no full re-derive."""
+    sql = "DELETE FROM session_entries"
+    if where_sql:
+        sql += f" WHERE {where_sql}"
+    deleted = conn.execute(sql, params).rowcount
+    if deleted != 0:
+        _set_cache_meta(conn, CLAUDE_ACCOUNTING_GENERATION_KEY, uuid.uuid4().hex)
+    return deleted
+
+
+def _ensure_claude_accounting_generation(conn: sqlite3.Connection) -> "str | None":
+    """Mint the accounting generation when absent and return the stored value
+    (#1072 §4.1); None when ``cache_meta`` cannot be read or written. NEVER
+    commits. Reads first, so a store that already carries the token opens no
+    write transaction (the key only ever goes from absent to present outside
+    `_delete_claude_session_entries`, so ``INSERT OR IGNORE`` is safe without
+    the cache flock)."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
+            (CLAUDE_ACCOUNTING_GENERATION_KEY,)).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO cache_meta(key, value) VALUES(?, ?)",
+                (CLAUDE_ACCOUNTING_GENERATION_KEY, uuid.uuid4().hex))
+            row = conn.execute(
+                "SELECT value FROM cache_meta WHERE key=?",
+                (CLAUDE_ACCOUNTING_GENERATION_KEY,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return None if row is None or row[0] is None else str(row[0])
+
+
+def _ensure_claude_accounting_generation_committed(
+    conn: sqlite3.Connection,
+) -> None:
+    """`_ensure_claude_accounting_generation`, committing the mint alone, with
+    the same guard as `_ensure_incarnation_id_committed`: a connection already
+    inside a transaction is left to its caller's commit."""
+    was_in_transaction = conn.in_transaction
+    _ensure_claude_accounting_generation(conn)
+    if not was_in_transaction and conn.in_transaction:
+        conn.commit()
+
+
+def _read_claude_accounting_generation(conn: sqlite3.Connection) -> "str | None":
+    """The stored accounting generation of a cache.db connection, read only."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
+            (CLAUDE_ACCOUNTING_GENERATION_KEY,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return None if row is None or row[0] is None else str(row[0])
+
+
+def _prune_rederive_affected_sessions(
+    conv: sqlite3.Connection, affected: "list[str]",
+    generation_before: "str | None", generation_after: "str | None",
+    result: "PruneResult", *, refused_files: int,
+) -> None:
+    """#1072 §4.8 step 4 of the orphan prune: re-derive the affected sessions
+    against the post-delete accounting, then acknowledge the prune's own
+    generation rotation.
+
+    cache.db is attached read-only with a direct ``ATTACH`` (no opener, no
+    admission, no flock: the caller still holds both flocks and its open cache
+    connection already passed ``open_cache_db``). Each chunk removes its ids
+    from the pending set in its own transaction; the last one also rewrites
+    ``generation_before`` to ``generation_after`` in the watermark and in a
+    cursor's target. A refusal (#705, reported on ``result`` as before) or any
+    failure here leaves the pending set and the old generation, so the next
+    steady pass runs a traversal, and never fails the prune."""
+    uri = (pathlib.Path(_cctally_core.CACHE_DB_PATH).resolve().as_uri()
+           + "?mode=ro")
+    try:
+        conv.execute("ATTACH DATABASE ? AS cache_db", (uri,))
+    except sqlite3.Error as exc:
+        eprint(f"[cache] prune rollup re-derive deferred: {exc}")
+        return
+    try:
+        chunks = _split_by_volume(conv, affected) or [[]]
+        for index, chunk in enumerate(chunks):
+            refusal_state: "list[str]" = []
+            if chunk and not _recompute_conversation_sessions(
+                    conv, chunk, refusal_out=refusal_state):
+                # #729: the refusal record and the armed flag commit; the
+                # outcome is reported rather than looking clean.
+                conv.commit()
+                result.prune_refused = True
+                result.prune_refused_files = refused_files
+                result.prune_refused_state = (
+                    refusal_state[0] if refusal_state else None)
+                return
+            _remove_rollup_pending(conv, chunk)
+            if index == len(chunks) - 1 and generation_before is not None \
+                    and generation_after is not None:
+                _acknowledge_generation_rotation(
+                    conv, generation_before, generation_after)
+            conv.commit()
+    except Exception as exc:  # noqa: BLE001 — the next pass converges
+        eprint(f"[cache] prune rollup re-derive deferred: {exc!r}")
+        try:
+            conv.rollback()
+        except sqlite3.Error:
+            pass
+    finally:
+        try:
+            conv.execute("DETACH DATABASE cache_db")
+        except sqlite3.Error:
+            pass
+
+
 def _force_retention_prune_after_replay(
     conn: "sqlite3.Connection | None" = None,
 ) -> None:
@@ -9609,6 +10798,8 @@ def _force_retention_prune_after_replay(
     break a sync. The caller invokes this only after the sync released its
     provider flock, so the orchestrator can re-acquire it. No-op when retention
     is disabled (``conversation.retention_days`` 0)."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="_force_retention_prune_after_replay")
     try:
         import _lib_conversation_retention as retention
         from _cctally_config import resolve_prune_retention_days
@@ -9775,6 +10966,10 @@ class _ClaudeAttributionRun:
     journal_hw: tuple
     memo: dict = field(default_factory=dict)
     deferral_pending: bool = False
+    # #1042 spec 6.3: the ``(payload, segment, offset)`` of every op the
+    # current file appended, so a rollback that discards its decision rows
+    # can restore them. The walk empties it at the start of each file.
+    file_ops: list = field(default_factory=list)
 
 
 def _attribute_claude_rows(conn, run: _ClaudeAttributionRun, path_str: str,
@@ -9852,7 +11047,7 @@ def _attribute_claude_rows(conn, run: _ClaudeAttributionRun, path_str: str,
             [(ident, decision, ts, list(evidence))
              for _key, ident, decision, ts, evidence in pending],
             journal_hw=run.journal_hw, closing_capture=run.capture,
-            evidence=[])
+            evidence=[], appended=run.file_ops)
         for (record_key, ident, _d, _ts, _e), decision in zip(
                 pending, stored):
             resolved[record_key] = decision
@@ -9903,6 +11098,9 @@ def sync_cache(
     populating. If the lock is contended on a rebuild, the cache is left
     untouched and the caller sees `lock_contended=True`.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability(
+        _cctally_core.sync_capability("sync_cache"), entry="sync_cache")
     stats = IngestStats()
     c = _cctally()
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -9938,6 +11136,11 @@ def sync_cache(
             return stats
         # #901 §5.3c (W9): a sync writer owns its checkpoints.
         _wal_checkpoint.arm(conn)
+        # #1068 D2: the cache incarnation id, inserted once under the cache
+        # flock at the start of the write.
+        _ensure_incarnation_id_committed(conn, "cache.db")
+        # #1072 §4.1: the accounting generation, minted once beside it.
+        _ensure_claude_accounting_generation_committed(conn)
 
         targeted = only_paths is not None
         if targeted:
@@ -10104,7 +11307,8 @@ def sync_cache(
             # leaving the user with empty state. Done before the existing
             # SELECT so the subsequent delta-detection logic sees an
             # empty baseline.
-            conn.execute("DELETE FROM session_entries")
+            # #1072 §4.1: the wipe rotates the accounting generation.
+            _delete_claude_session_entries(conn)
             conn.execute("DELETE FROM session_files")
             # Plan 1: conversation_messages shares the cost path's lifecycle.
             # A rebuild re-derives the whole cache from on-disk JSONL, so the
@@ -10417,8 +11621,9 @@ def sync_cache(
         # This SELECT does NOT open an implicit transaction (Python's
         # sqlite3 module only BEGINs on DML). Do NOT add any INSERT/
         # UPDATE/DELETE/REPLACE statement between here and the per-file
-        # loop below — the read+parse inside that loop must run with
-        # zero cache.db write lock held.
+        # loop below that is not committed before it — the walk opens each
+        # batch with an explicit BEGIN IMMEDIATE (#1042), which an implicit
+        # transaction left open would refuse.
         existing = {
             row[0]: (row[1], row[2], row[3])
             for row in conn.execute(
@@ -10592,7 +11797,8 @@ def sync_cache(
                     conn.rollback()
                     return _defer_claude_sync(
                         conn, stats, CLAUDE_ATTRIBUTION_DEFERRAL)
-            conn.execute("DELETE FROM session_entries")
+            # #1072 §4.1: the escalation wipe rotates the accounting generation.
+            _delete_claude_session_entries(conn)
             # Plan 1: truncation escalates to a full re-ingest of EVERY file,
             # so conversation_messages is wiped here (parallel to the
             # session_entries full-reset) and the per-file fused walk
@@ -10652,8 +11858,8 @@ def sync_cache(
         # conversation_messages this walk touched, so the post-walk recompute can
         # scope its DELETE+INSERT re-derive to just those sessions (steady
         # state). Pure Python —
-        # updated only AFTER each per-file conn.commit() below, never inside the
-        # zero-write-lock read/parse region, so it adds no DML there.
+        # updated only AFTER each batch's COMMIT below (#1042), so it never
+        # names a session whose rows did not commit.
         touched_sessions: set = set()
 
         # #276 perf: bracket the fused per-file ingest loop as ONE coarse
@@ -10679,58 +11885,258 @@ def sync_cache(
         ).fetchone() is not None
         _p_walk = _perf.phase("walk")
         _p_walk.__enter__()
-        for jp in paths:
+        # #1042 D1 (spec 6.1-6.4): the walk commits once per batch of files.
+        # A batch is one write transaction, opened by an explicit BEGIN
+        # IMMEDIATE at its first write; each file's writes (its identity row
+        # included) run inside SAVEPOINT claude_accounting_file. A released
+        # file's counts stay pending until its batch commits, and the
+        # ``progress`` callback runs only after a commit, never inside a batch
+        # (the TUI and dashboard callback takes the stats maintenance flock,
+        # which the lock-order law forbids under a SQLite write transaction).
+        batch = {"files": 0, "bytes": 0, "report": False}
+        # Per released ingest file: (rows_changed, truncated, sessions).
+        batch_pending: list = []
+        # Per released file: the journal ops its decisions came from, plus
+        # every op a restore re-applied inside the open batch (6.3).
+        batch_ops: list = []
+
+        def _reset_batch() -> None:
+            batch.update(files=0, bytes=0)
+            batch_pending.clear()
+            batch_ops.clear()
+
+        def _batch_has_work() -> bool:
+            # Pending files, or decisions restored inside the open batch.
+            return bool(batch_pending) or any(batch_ops)
+
+        def _reread_deferral() -> None:
+            # A rollback may have restored a deferral record that an earlier
+            # append had cleared (spec 6.3).
+            if attr_run is not None:
+                attr_run.deferral_pending = _attr.deferral_recorded(conn)
+
+        def _restore_ops(ops) -> bool:
+            """Re-apply journal-backed decisions a rollback discarded, before
+            any later file is attributed (spec 6.3): in the open transaction
+            after a savepoint rollback, else in a transaction of their own
+            committed at once. False when the restore failed."""
+            if not ops:
+                return True
+            own = not conn.in_transaction
+            try:
+                if own:
+                    conn.execute("BEGIN IMMEDIATE")
+                _attr.restore_decision_ops(conn, ops)
+                if own:
+                    conn.commit()
+            except sqlite3.DatabaseError as exc:
+                if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                    _rollback_claude_batch(conn)
+                    raise
+                eprint(f"[cache] could not restore journaled decisions: {exc}")
+                if own:
+                    _rollback_claude_batch(conn)
+                return False
+            if own:
+                _wal_checkpoint.after_commit(conn)
+            else:
+                # Re-applied inside the open batch: a later loss of the same
+                # batch discards them again, so they join its records and
+                # ``_batch_lost`` restores them once more (first-wins makes
+                # the repeat harmless).
+                batch_ops.append(list(ops))
+            return True
+
+        def _batch_lost(extra_ops=()) -> bool:
+            """The open batch's transaction is gone: an error ended it, or its
+            COMMIT failed. Every pending file fails once, and the decisions
+            the loss discarded are restored. False when the restore failed."""
+            nonlocal walk_clean
+            _rollback_claude_batch(conn)
+            if batch_pending:
+                walk_clean = False
+                stats.files_failed += len(batch_pending)
+            ops = [op for file_ops in batch_ops for op in file_ops]
+            ops.extend(extra_ops)
+            _reset_batch()
+            restored = _restore_ops(ops)
+            _reread_deferral()
+            return restored
+
+        def _commit_batch() -> bool:
+            """Commit the open batch and publish its files' counts. False when
+            the COMMIT failed and the decisions it lost could not be restored
+            (the walk then stops as a failed walk)."""
+            if not conn.in_transaction:
+                return _batch_lost() if _batch_has_work() else True
+            try:
+                _cache_storm_test_pause("claude_precommit")
+                conn.commit()
+            except sqlite3.DatabaseError as exc:
+                if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                    _rollback_claude_batch(conn)
+                    raise
+                eprint(f"[cache] batch commit failed: {exc}")
+                return _batch_lost()
+            _wal_checkpoint.after_commit(conn)
+            for rows_changed, was_truncated, sessions in batch_pending:
+                stats.files_processed += 1
+                stats.rows_changed += rows_changed
+                if was_truncated:
+                    stats.files_reset_truncated += 1
+                # Browse-rail rollup: the session_ids this batch committed, so
+                # the post-walk recompute can scope its re-derive to them.
+                touched_sessions.update(sessions)
+            _reset_batch()
+            batch["report"] = True
+            return True
+
+        def _report_progress() -> None:
+            # Outside the per-file guard, so a failing callback is never
+            # mistaken for a file's failure, and never inside a batch.
+            if batch["report"]:
+                batch["report"] = False
+                if progress is not None:
+                    progress(stats)
+
+        def _walk_stops() -> None:
+            """A failed restore stops the walk as a failed walk (spec 6.3,
+            revision 4): no further file is walked, the end of the walk
+            commits the files released before the failure if the transaction
+            is intact, and the post-walk contract runs uncertified. No
+            attribution deferral is recorded, because the journal was
+            written; the next sync's replay restores its decisions before it
+            decides anything."""
+            nonlocal walk_clean
+            walk_clean = False
+
+        def _rollback_file(frame: dict) -> bool:
+            """Undo the current file. True when only the file was undone (its
+            savepoint rolled back, or it had none and the batch is intact);
+            False when the batch's transaction is lost."""
+            if frame["open"]:
+                frame["open"] = False
+                if conn.in_transaction:
+                    try:
+                        conn.execute(_CLAUDE_ACCOUNTING_ROLLBACK_TO)
+                        conn.execute(_CLAUDE_ACCOUNTING_RELEASE)
+                        return True
+                    except sqlite3.DatabaseError:
+                        pass
+                return False
+            return conn.in_transaction or not _batch_has_work()
+
+        def _release_file(frame: dict, file_bytes: int) -> None:
+            conn.execute(_CLAUDE_ACCOUNTING_RELEASE)
+            frame["open"] = False
+            # The file bound counts every file that wrote anything, an
+            # identity-only backfill included (spec 6.1).
+            if conn.total_changes != frame["changes"]:
+                batch["files"] += 1
+                batch["bytes"] += file_bytes
+
+        def _plan_claude_file(jp, _frame: dict) -> "tuple | None":
+            """The first phase of one file, before it joins a batch: what the
+            walk will write for it. None when it writes nothing (skipped, or
+            failed before any write)."""
+            nonlocal walk_clean
             path_str = str(jp)
-            # Backfill session_id/project_path for A2 `session` subcommand.
-            # Idempotent upsert that preserves delta-resume columns.
-            # Placed at the top so unchanged files (early-continue below) are
-            # still covered. The downstream INSERT for session_files preserves
-            # the two new columns via an explicit column list so this backfill
-            # is not clobbered by delta-resume writes.
-            _ensure_session_files_row(conn, path_str)
             st = frozen.get(path_str)
-            if st is None or isinstance(st, OSError):
+            stat_ok = not (st is None or isinstance(st, OSError))
+            prev = existing.get(path_str)
+            start_offset = 0
+            truncated = False
+            unchanged = False
+            size = mtime_ns = 0
+            if stat_ok:
+                size = st.st_size
+                mtime_ns = st.st_mtime_ns
+                if prev is not None:
+                    # mtime_ns is stored in session_files for diagnostics but
+                    # intentionally NOT consulted for delta detection — size
+                    # is the only signal (Claude Code's JSONL sessions are
+                    # strictly append-only, so a size change is sufficient
+                    # and mtime is prone to clock-skew false-positives).
+                    prev_size, _, prev_offset = prev
+                    if size == prev_size:
+                        unchanged = True
+                    elif size > prev_size:
+                        start_offset = prev_offset
+                    else:
+                        truncated = True
+                        start_offset = 0
+            ingest = stat_ok and not unchanged
+            # Backfill session_id/project_path for A2 `session` subcommand.
+            # Idempotent upsert that preserves delta-resume columns, run for
+            # unchanged files too. The downstream INSERT for session_files
+            # preserves the two columns via an explicit column list so this
+            # backfill is not clobbered by delta-resume writes. #1042: a file
+            # that needs neither the backfill nor ingest writes nothing and
+            # opens no transaction.
+            needs_identity = _session_files_identity_missing(conn, path_str)
+            if not stat_ok and not needs_identity:
                 exc = st if st is not None else FileNotFoundError(path_str)
                 eprint(f"[cache] stat failed for {jp}: {exc}")
                 walk_clean = False  # skipped a file without ingesting (D5a)
                 stats.files_failed += 1
-                continue
+                return None
+            if unchanged and not needs_identity:
+                stats.files_skipped_unchanged += 1
+                return None
+            # A file's bytes are the JSONL bytes the walk will read from it,
+            # known before it is read (spec 6.1).
+            file_bytes = max(0, size - start_offset) if ingest else 0
+            # Defensive: a file needs ingest that the up-front change check
+            # did not see, so attribution starts before it is read.
+            restart = bool(ingest and attribution and attr_run is None)
+            return (path_str, st, stat_ok, prev, start_offset, truncated,
+                    unchanged, size, mtime_ns, needs_identity, file_bytes,
+                    restart)
 
-            size = st.st_size
-            mtime_ns = st.st_mtime_ns
-            prev = existing.get(path_str)
-            start_offset = 0
-            truncated = False
-            if prev is not None:
-                # mtime_ns is stored in session_files for diagnostics but
-                # intentionally NOT consulted for delta detection — size
-                # is the only signal (Claude Code's JSONL sessions are
-                # strictly append-only, so a size change is sufficient
-                # and mtime is prone to clock-skew false-positives).
-                prev_size, _, prev_offset = prev
-                if size == prev_size:
-                    stats.files_skipped_unchanged += 1
-                    continue
-                if size > prev_size:
-                    start_offset = prev_offset
-                else:
-                    truncated = True
-                    start_offset = 0
+        def _write_claude_file(jp, frame: dict, plan: tuple) -> None:
+            """The second phase of one file: its writes, in its savepoint of
+            the open batch."""
+            nonlocal walk_clean
+            (path_str, st, stat_ok, prev, start_offset, truncated, unchanged,
+             size, mtime_ns, needs_identity, file_bytes, _restart) = plan
+            if attr_run is not None:
+                attr_run.file_ops = []
+            frame["changes"] = conn.total_changes
+            if not conn.in_transaction:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.DatabaseError as exc:
+                    if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                        raise
+                    # Nothing of the file was written: it stays retryable.
+                    eprint(f"[cache] could not begin a batch for {jp}: {exc}")
+                    walk_clean = False
+                    stats.files_failed += 1
+                    return None
+            conn.execute(_CLAUDE_ACCOUNTING_SAVEPOINT)
+            frame["open"] = True
+            if needs_identity:
+                _ensure_session_files_row(conn, path_str, commit=False)
+            if not stat_ok:
+                _release_file(frame, 0)
+                exc = st if st is not None else FileNotFoundError(path_str)
+                eprint(f"[cache] stat failed for {jp}: {exc}")
+                walk_clean = False  # skipped a file without ingesting (D5a)
+                stats.files_failed += 1
+                return None
+            if unchanged:
+                _release_file(frame, 0)
+                stats.files_skipped_unchanged += 1
+                return None
 
-            # Read + parse is a pure read; do it OUTSIDE the write transaction
-            # so a slow JSONL doesn't hold a SQLite lock.
+            # Read + parse is a pure read. #1042: it runs inside the open
+            # batch, which changes I/O, not the lock order (O7).
             rows: list[tuple[Any, ...]] = []
             # #944: (raw record bytes, timestamp as written) per cost row.
             metas: list[tuple[Any, Any]] = []
             conv_rows: list[tuple[Any, ...]] = []
             ai_rows: list[tuple[Any, ...]] = []   # #193: ai-title upserts
             final_offset = start_offset
-            if attribution and attr_run is None:
-                # Defensive: a file needs ingest that the up-front change
-                # check did not see; start attribution before reading it.
-                reason = _start_attribution(False)
-                if reason is not None:
-                    return _defer_claude_sync(conn, stats, reason)
             replaced = False
             try:
                 with contextlib.ExitStack() as _fh_stack:
@@ -10822,203 +12228,290 @@ def sync_cache(
                     # cursor-consistency invariant).
                     final_offset = fh.tell()
             except OSError as exc:
+                _release_file(frame, 0)
                 eprint(f"[cache] could not read {jp}: {exc}")
                 walk_clean = False  # skipped a file without ingesting (D5a)
                 stats.files_failed += 1
-                continue
+                return None
             if replaced:
                 # Replaced between the stat and the open: retried next sync,
                 # not an error, but this walk does not mirror the disk.
+                _release_file(frame, 0)
                 stats.files_skipped_replaced += 1
                 walk_clean = False
-                continue
+                return None
 
-            # Python's sqlite3 module starts an implicit transaction on the
-            # first DML statement and commits on conn.commit(). We do NOT
-            # call "BEGIN IMMEDIATE" ourselves — that would error with
-            # "cannot start a transaction within a transaction" if a prior
-            # statement already opened one. DELETE + INSERTs + UPDATE happen
-            # atomically in a single commit.
+            # The file's DELETE + INSERTs + UPDATE run in its savepoint and
+            # commit with its batch (#1042 D1).
+            if truncated:
+                if attr_run is not None:
+                    # #944 spec 5.6: link the path's rows before deleting.
+                    _attr.preserve_unlinked_rows(
+                        conn, journal_hw=attr_run.journal_hw,
+                        source_paths=[path_str],
+                        appended=attr_run.file_ops)
+                # #1072 §4.1: rotates the accounting generation.
+                _delete_claude_session_entries(
+                    conn, "source_path = ?", (path_str,))
+            attribution_binds = None
+            rows_changed = 0
+            if rows and attr_run is not None:
+                # #944 spec 5.5 steps 5-6: decide, append (fsync), and
+                # only then write the accounting rows.
+                attribution_binds = _attribute_claude_rows(
+                    conn, attr_run, path_str, rows, metas)
+            if rows:
+                # #270: bump the per-file mutation counter BEFORE capturing
+                # `before`, so this cache_meta write stays OUTSIDE the
+                # [before, after] total_changes window and never inflates
+                # `stats.rows_changed` (byte-identity). Per file (not once
+                # per sync) for rollback-safety: the counter write is atomic
+                # with the row stamps in this file's write transaction, so a
+                # file that rolls back reverts both together (spec §6). Each
+                # row built for this file is stamped mutation_seq = this
+                # file's `sync_seq` and mutation_min_ts = its own
+                # timestamp_utc (== the event time on insert).
+                sync_seq = _bump_mutation_seq(conn)
+                # #341: append the active account (resolved once per sync) as
+                # the trailing column. First-stamp-wins — account_key is
+                # DELIBERATELY OMITTED from the ON CONFLICT DO UPDATE SET below
+                # (spec §2 cache.db: a resumed session replaying identical
+                # bytes under a different account is the SAME message and keeps
+                # the first observed stamp). ``file_account_key`` is None when
+                # stably-absent (stamped NULL == unattributed on read).
+                if attribution_binds is not None:
+                    stamped_rows = [
+                        r + (sync_seq, r[2], account, decision_key)
+                        for r, (account, decision_key)
+                        in zip(rows, attribution_binds)]
+                else:
+                    stamped_rows = [
+                        r + (sync_seq, r[2], file_account_key)
+                        for r in rows]
+                before = conn.total_changes
+                # ccusage-parity ON CONFLICT DO UPDATE: higher-token total
+                # wins on conflict; speed-set breaks ties. The partial
+                # UNIQUE index `idx_entries_dedup` restricts the conflict
+                # target to (msg_id IS NOT NULL AND req_id IS NOT NULL),
+                # so the WHERE clause on the conflict target MUST repeat
+                # that predicate verbatim — bare `ON CONFLICT(msg_id,
+                # req_id)` raises OperationalError. NULL-keyed rows fall
+                # through to a plain INSERT, unchanged.
+                #
+                # `source_path` is INTENTIONALLY OMITTED from the DO
+                # UPDATE SET clause: it stays pinned to whichever JSONL
+                # FIRST INSERTed the (msg_id, req_id) row. The
+                # downstream `LEFT JOIN session_files ON sf.path =
+                # se.source_path` uses source_path to attribute tokens
+                # to a `project_path`. If a later UPSERT from a
+                # different file flipped source_path, the row's
+                # project attribution would move with the winner —
+                # `cctally project` would mis-aggregate. Sticky
+                # source_path matches pre-dedup INSERT OR IGNORE
+                # behavior and the operator's mental model.
+                # (`line_offset` is similarly sticky for the same
+                # reason — the offset only makes sense within the
+                # file that originally wrote the row.)
+                # #195: while the re-walk is armed, rows are NOT wiped
+                # first, so a row the partial dedup index does not cover
+                # collides on idx_entries_physical and would roll back the
+                # whole per-file transaction. Steady state keeps the
+                # single-target SQL and its LOUD physical-key backstop.
+                #
+                # #916: the obligation is also carried per file. Migration
+                # 030 is the only producer of a negative ``size_bytes``,
+                # so a ``-1`` cursor is a file not yet re-walked since the
+                # reset, still owed the chained clause even after a
+                # residual-only walk retired the global flag (an orphan
+                # whose transcript reappears). Read from THIS file's own
+                # ``prev`` row: the ``prev_size`` local is unbound for a
+                # new file and stale for a file after a ``-1`` one.
+                use_rewalk = rewalk_armed or (
+                    prev is not None and prev[0] < 0)
+                if attribution_binds is not None:
+                    _sql = (SESSION_ENTRY_UPSERT_SQL_REWALK_LINKED
+                            if use_rewalk
+                            else SESSION_ENTRY_UPSERT_SQL_LINKED)
+                else:
+                    _sql = (SESSION_ENTRY_UPSERT_SQL_REWALK
+                            if use_rewalk else SESSION_ENTRY_UPSERT_SQL)
+                conn.executemany(_sql, stamped_rows)
+                rows_changed = conn.total_changes - before
+            # Conversation message ingest (Plan 1). Lands in the SAME
+            # per-file write transaction as session_entries so the cost
+            # rows and message rows for a file commit atomically.
+            # INSERT OR IGNORE on UNIQUE(source_path, byte_offset): a
+            # resume-replayed line re-walked from a delta offset that
+            # already landed is a silent no-op, and the same physical line
+            # in two files (resume across JSONL) keeps BOTH rows. No
+            # per-file DELETE here — the only conversation_messages resets
+            # are the rebuild + truncation-escalation full-clears above
+            # (parallel to the cost path's lifecycle).
+            if conv_rows:
+                conn.executemany(_CONV_INSERT_SQL, conv_rows)
+                # #217 S2 / I-3: derive this tick's file touches, scoped to the
+                # just-ingested rows' PHYSICAL keys (cr[3]=source_path,
+                # cr[4]=byte_offset per _conv_row_tuple). Cheap (proportional to
+                # new bytes); decoupled from the INSERT OR IGNORE rowcount —
+                # _fill_file_touches reads conversation_messages by physical key,
+                # so an already-present (rowcount-0) row still gets its touches.
+                # Lands in the SAME per-file write transaction as the message
+                # rows, so they commit atomically.
+                _fill_file_touches(
+                    conn, scope=[(cr[3], cr[4]) for cr in conv_rows])
+            # #193: ai-title upserts for this file, in file order (last wins).
+            # Committed atomically with the session_files cursor below.
+            if ai_rows:
+                conn.executemany(_AI_TITLE_UPSERT_SQL, ai_rows)
+            # UPSERT preserves session_id / project_path columns populated
+            # by _ensure_session_files_row at the top of this loop. A plain
+            # INSERT OR REPLACE would wipe them on every changed-file sync.
+            # #341: session_files.account_key is a "last observed" diagnostic
+            # only (spec §2 — entry rows are authoritative for attribution; no
+            # aggregation reads file rows). Stamp the active account resolved
+            # once per sync; None (stably-absent) writes NULL.
+            conn.execute(
+                """INSERT INTO session_files
+                   (path, size_bytes, mtime_ns, last_byte_offset,
+                    last_ingested_at, account_key)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(path) DO UPDATE SET
+                       size_bytes       = excluded.size_bytes,
+                       mtime_ns         = excluded.mtime_ns,
+                       last_byte_offset = excluded.last_byte_offset,
+                       last_ingested_at = excluded.last_ingested_at,
+                       account_key      = excluded.account_key""",
+                (
+                    path_str, size, mtime_ns, final_offset,
+                    dt.datetime.now(dt.timezone.utc).isoformat(),
+                    file_account_key,
+                ),
+            )
+            _release_file(frame, file_bytes)
+            batch_pending.append((
+                rows_changed, truncated,
+                {cr[0] for cr in conv_rows if cr[0] is not None}))
+            batch_ops.append(list(attr_run.file_ops)
+                             if attr_run is not None else [])
+
+        def _guarded(step, jp, frame: dict, *args) -> "tuple[str, Any]":
+            """Run one phase of a file under the outer guard (spec 6.3);
+            recovery depends on the phase the failure arrives in. Returns
+            ("ok", the step's value), ("failed", None) when the file failed
+            and the walk continues, or ("stop", None) when the restore of its
+            decisions failed and the walk stops."""
+            nonlocal walk_clean
             try:
-                if truncated:
-                    if attr_run is not None:
-                        # #944 spec 5.6: link the path's rows before deleting.
-                        _attr.preserve_unlinked_rows(
-                            conn, journal_hw=attr_run.journal_hw,
-                            source_paths=[path_str])
-                    conn.execute(
-                        "DELETE FROM session_entries WHERE source_path = ?",
-                        (path_str,),
-                    )
-                    stats.files_reset_truncated += 1
-                attribution_binds = None
-                if rows and attr_run is not None:
-                    # #944 spec 5.5 steps 5-6: decide, append (fsync), and
-                    # only then write the accounting rows.
-                    attribution_binds = _attribute_claude_rows(
-                        conn, attr_run, path_str, rows, metas)
-                if rows:
-                    # #270: bump the per-file mutation counter BEFORE capturing
-                    # `before`, so this cache_meta write stays OUTSIDE the
-                    # [before, after] total_changes window and never inflates
-                    # `stats.rows_changed` (byte-identity). Per file (not once
-                    # per sync) for rollback-safety: the counter write is atomic
-                    # with the row stamps in this file's write transaction, so a
-                    # file that rolls back reverts both together (spec §6). Each
-                    # row built for this file is stamped mutation_seq = this
-                    # file's `sync_seq` and mutation_min_ts = its own
-                    # timestamp_utc (== the event time on insert).
-                    sync_seq = _bump_mutation_seq(conn)
-                    # #341: append the active account (resolved once per sync) as
-                    # the trailing column. First-stamp-wins — account_key is
-                    # DELIBERATELY OMITTED from the ON CONFLICT DO UPDATE SET below
-                    # (spec §2 cache.db: a resumed session replaying identical
-                    # bytes under a different account is the SAME message and keeps
-                    # the first observed stamp). ``file_account_key`` is None when
-                    # stably-absent (stamped NULL == unattributed on read).
-                    if attribution_binds is not None:
-                        stamped_rows = [
-                            r + (sync_seq, r[2], account, decision_key)
-                            for r, (account, decision_key)
-                            in zip(rows, attribution_binds)]
-                    else:
-                        stamped_rows = [
-                            r + (sync_seq, r[2], file_account_key)
-                            for r in rows]
-                    before = conn.total_changes
-                    # ccusage-parity ON CONFLICT DO UPDATE: higher-token total
-                    # wins on conflict; speed-set breaks ties. The partial
-                    # UNIQUE index `idx_entries_dedup` restricts the conflict
-                    # target to (msg_id IS NOT NULL AND req_id IS NOT NULL),
-                    # so the WHERE clause on the conflict target MUST repeat
-                    # that predicate verbatim — bare `ON CONFLICT(msg_id,
-                    # req_id)` raises OperationalError. NULL-keyed rows fall
-                    # through to a plain INSERT, unchanged.
-                    #
-                    # `source_path` is INTENTIONALLY OMITTED from the DO
-                    # UPDATE SET clause: it stays pinned to whichever JSONL
-                    # FIRST INSERTed the (msg_id, req_id) row. The
-                    # downstream `LEFT JOIN session_files ON sf.path =
-                    # se.source_path` uses source_path to attribute tokens
-                    # to a `project_path`. If a later UPSERT from a
-                    # different file flipped source_path, the row's
-                    # project attribution would move with the winner —
-                    # `cctally project` would mis-aggregate. Sticky
-                    # source_path matches pre-dedup INSERT OR IGNORE
-                    # behavior and the operator's mental model.
-                    # (`line_offset` is similarly sticky for the same
-                    # reason — the offset only makes sense within the
-                    # file that originally wrote the row.)
-                    # #195: while the re-walk is armed, rows are NOT wiped
-                    # first, so a row the partial dedup index does not cover
-                    # collides on idx_entries_physical and would roll back the
-                    # whole per-file transaction. Steady state keeps the
-                    # single-target SQL and its LOUD physical-key backstop.
-                    #
-                    # #916: the obligation is also carried per file. Migration
-                    # 030 is the only producer of a negative ``size_bytes``,
-                    # so a ``-1`` cursor is a file not yet re-walked since the
-                    # reset, still owed the chained clause even after a
-                    # residual-only walk retired the global flag (an orphan
-                    # whose transcript reappears). Read from THIS file's own
-                    # ``prev`` row: the ``prev_size`` local is unbound for a
-                    # new file and stale for a file after a ``-1`` one.
-                    use_rewalk = rewalk_armed or (
-                        prev is not None and prev[0] < 0)
-                    if attribution_binds is not None:
-                        _sql = (SESSION_ENTRY_UPSERT_SQL_REWALK_LINKED
-                                if use_rewalk
-                                else SESSION_ENTRY_UPSERT_SQL_LINKED)
-                    else:
-                        _sql = (SESSION_ENTRY_UPSERT_SQL_REWALK
-                                if use_rewalk else SESSION_ENTRY_UPSERT_SQL)
-                    conn.executemany(_sql, stamped_rows)
-                    stats.rows_changed += conn.total_changes - before
-                # Conversation message ingest (Plan 1). Lands in the SAME
-                # per-file write transaction as session_entries so the cost
-                # rows and message rows for a file commit atomically.
-                # INSERT OR IGNORE on UNIQUE(source_path, byte_offset): a
-                # resume-replayed line re-walked from a delta offset that
-                # already landed is a silent no-op, and the same physical line
-                # in two files (resume across JSONL) keeps BOTH rows. No
-                # per-file DELETE here — the only conversation_messages resets
-                # are the rebuild + truncation-escalation full-clears above
-                # (parallel to the cost path's lifecycle).
-                if conv_rows:
-                    conn.executemany(_CONV_INSERT_SQL, conv_rows)
-                    # #217 S2 / I-3: derive this tick's file touches, scoped to the
-                    # just-ingested rows' PHYSICAL keys (cr[3]=source_path,
-                    # cr[4]=byte_offset per _conv_row_tuple). Cheap (proportional to
-                    # new bytes); decoupled from the INSERT OR IGNORE rowcount —
-                    # _fill_file_touches reads conversation_messages by physical key,
-                    # so an already-present (rowcount-0) row still gets its touches.
-                    # Lands in the SAME per-file write transaction as the message
-                    # rows, so they commit atomically.
-                    _fill_file_touches(
-                        conn, scope=[(cr[3], cr[4]) for cr in conv_rows])
-                # #193: ai-title upserts for this file, in file order (last wins).
-                # Committed atomically with the session_files cursor below.
-                if ai_rows:
-                    conn.executemany(_AI_TITLE_UPSERT_SQL, ai_rows)
-                # UPSERT preserves session_id / project_path columns populated
-                # by _ensure_session_files_row at the top of this loop. A plain
-                # INSERT OR REPLACE would wipe them on every changed-file sync.
-                # #341: session_files.account_key is a "last observed" diagnostic
-                # only (spec §2 — entry rows are authoritative for attribution; no
-                # aggregation reads file rows). Stamp the active account resolved
-                # once per sync; None (stably-absent) writes NULL.
-                conn.execute(
-                    """INSERT INTO session_files
-                       (path, size_bytes, mtime_ns, last_byte_offset,
-                        last_ingested_at, account_key)
-                       VALUES (?,?,?,?,?,?)
-                       ON CONFLICT(path) DO UPDATE SET
-                           size_bytes       = excluded.size_bytes,
-                           mtime_ns         = excluded.mtime_ns,
-                           last_byte_offset = excluded.last_byte_offset,
-                           last_ingested_at = excluded.last_ingested_at,
-                           account_key      = excluded.account_key""",
-                    (
-                        path_str, size, mtime_ns, final_offset,
-                        dt.datetime.now(dt.timezone.utc).isoformat(),
-                        file_account_key,
-                    ),
-                )
-                _cache_storm_test_pause("claude_precommit")
-                conn.commit()
-                _wal_checkpoint.after_commit(conn)
-                stats.files_processed += 1
-                # Browse-rail rollup: record the session_ids this file just
-                # committed so the post-walk recompute can scope its DELETE+INSERT
-                # re-derive to them. cr[0] is session_id per _conv_row_tuple's
-                # column order. Lands
-                # AFTER the commit (pure Python; no DML, no extra write lock).
-                touched_sessions.update(cr[0] for cr in conv_rows if cr[0] is not None)
+                return "ok", step(jp, frame, *args)
             except _attr.AttributionJournalUnavailable:
                 # #944 spec 5.5: the decisions could not be made durable, so
                 # this file stays uncommitted and retryable. Reported once, by
                 # the caller (the `cache-sync` ladder; hooks stay silent).
-                conn.rollback()
+                # Counted now and never withdrawn (spec 6.4), and not in
+                # files_failed: the CLI sums the two.
                 stats.deferred_reason = CLAUDE_ATTRIBUTION_DEFERRAL
                 stats.attribution_files_deferred += 1
                 walk_clean = False
-                continue
+                file_ops = attr_run.file_ops if attr_run is not None else []
+                if _rollback_file(frame):
+                    restored = _restore_ops(file_ops)
+                    _reread_deferral()
+                else:
+                    restored = _batch_lost(file_ops)
+                return ("failed" if restored else "stop"), None
             except sqlite3.DatabaseError as exc:
                 eprint(f"[cache] db error on {jp}: {exc}")
-                conn.rollback()
                 if _cctally_db_sib._is_sqlite_corruption_error(exc):
                     # Corruption is a database-family failure, not a bad input
                     # file.  The recovery plan must see it immediately so it can
                     # close this handle, quarantine once, and restart the full
                     # requested provider plan on a fresh family.
+                    _rollback_claude_batch(conn)
                     raise
                 walk_clean = False  # rolled back this file without ingesting (D5a)
                 stats.files_failed += 1
+                file_ops = attr_run.file_ops if attr_run is not None else []
+                if _rollback_file(frame):
+                    restored = _restore_ops(file_ops)
+                    _reread_deferral()
+                else:
+                    restored = _batch_lost(file_ops)
+                return ("failed" if restored else "stop"), None
+            except Exception:
+                # The files released before this one commit; the walk ends,
+                # so no later file is attributed and the next sync's replay
+                # restores any decision this file appended (O3).
+                if _rollback_file(frame):
+                    _commit_batch()
+                else:
+                    _rollback_claude_batch(conn)
+                    if batch_pending:
+                        stats.files_failed += len(batch_pending)
+                    _reset_batch()
+                raise
+            except BaseException:
+                # The same outcome as a crash, which O3 covers.
+                _rollback_claude_batch(conn)
+                raise
+
+        def _restart_attribution(_jp, _frame: dict) -> "str | None":
+            return _start_attribution(False)
+
+        for jp in paths:
+            frame = {"open": False, "changes": 0}
+            status, plan = _guarded(_plan_claude_file, jp, frame)
+            if status == "stop":
+                _walk_stops()
+                break
+            if status == "failed" or plan is None:
                 continue
+            *_, file_bytes, restart = plan
+            # Before the file joins (spec 6.1): the defensive restart and the
+            # admission commit run here, outside the per-file guard, and each
+            # commit is followed by its progress report before the next batch
+            # opens, so a failing callback is never taken for a file's
+            # failure and never runs inside a batch.
+            if restart:
+                if not _commit_batch():
+                    _walk_stops()
+                    break
+                _report_progress()
+                status, reason = _guarded(_restart_attribution, jp, frame)
+                if status == "stop":
+                    _walk_stops()
+                    break
+                if status == "failed":
+                    continue
+                if reason is not None:
+                    return _defer_claude_sync(conn, stats, reason)
+            # Admission: the batch commits first when it is full, or when
+            # this file's bytes would take it past the byte bound.
+            if batch["files"] and (
+                    batch["files"] >= CLAUDE_ACCOUNTING_BATCH_FILES
+                    or batch["bytes"] + file_bytes
+                    > CLAUDE_ACCOUNTING_BATCH_BYTES):
+                if not _commit_batch():
+                    _walk_stops()
+                    break
+                _report_progress()
+            status, _ = _guarded(_write_claude_file, jp, frame, plan)
+            if status == "stop":
+                _walk_stops()
+                break
+            if status == "failed":
+                continue
+            # A file whose own bytes exceed the byte bound is a batch of its
+            # own; a full batch commits at once (spec 6.1).
+            if (batch["files"] >= CLAUDE_ACCOUNTING_BATCH_FILES
+                    or batch["bytes"] >= CLAUDE_ACCOUNTING_BATCH_BYTES):
+                if not _commit_batch():
+                    _walk_stops()
+                    break
+                _report_progress()
 
-            if progress is not None:
-                progress(stats)
-
+        if not _commit_batch():
+            walk_clean = False
+        batch["report"] = False
         if progress is not None:
             progress(stats)
         _p_walk.__exit__(None, None, None)
@@ -11454,7 +12947,12 @@ def _resumable_reingest_conversation_messages(
             conn.rollback()
             raise
 
-    # 3. Completion: clear flags + cursor + gen atomically.
+    # 3. Completion: clear flags + cursor + gen atomically, and arm the rollup
+    # backfill in the SAME commit (#1072). The replay deleted and re-inserted
+    # every file's rows without recording the sessions it removed, so only a
+    # backfill traversal can drop the row of a session that lost every message;
+    # arming it in a later commit left a window where a death cleared the
+    # reingest flags with no backfill armed, and that ghost row stayed.
     conn.execute(
         "DELETE FROM cache_meta WHERE key IN "
         "('conversation_reingest_pending',"
@@ -11466,6 +12964,7 @@ def _resumable_reingest_conversation_messages(
         " 'conversation_background_mcp_reingest_pending',"
         " 'conversation_reingest_cursor',"
         " 'conversation_reingest_cursor_gen')")
+    _arm_rollup_backfill_restarting_traversal(conn)
     conn.commit()
 
 
@@ -12067,6 +13566,1050 @@ def _recompute_conversation_sessions(
     return True
 
 
+# --------------------------------------------------------------------------
+# #1068 D2/D8: the rollup row's input fingerprint
+# --------------------------------------------------------------------------
+
+#: Bump whenever the derivation of ANY conversation_sessions column changes
+#: (alongside arming the rollup backfill, which the unscoped Viewer already
+#: needs): the epoch pins it, so a bump retires every stored fingerprint and a
+#: reused row can never carry the old derivation.
+_CONVERSATION_ROLLUP_DERIVATION_VERSION = 1
+
+#: The fingerprint text format (``<epoch>:<max_id>:<entries>:<max_seq>:<seal>``).
+_CONVERSATION_FINGERPRINT_FORMAT_VERSION = 1
+
+#: The stored content columns the seal covers, in this order (D2).
+_ROLLUP_SEAL_COLUMNS = (
+    "msg_count", "started_utc", "last_activity_utc", "project_label",
+    "cost_usd", "cache_rebuild_count", "git_branch", "models_json", "title",
+)
+
+#: Sessions the steady pass re-derives per pass to bring them to a current
+#: fingerprint (D8).
+_CONVERSATION_FINGERPRINT_REFRESH_LIMIT = 100
+
+#: The refresh runs inside the steady pass's rollup write transaction, so it
+#: re-derives in batches and starts no further batch once this much wall-clock
+#: time has passed: the write lock is held about this long plus one batch.
+#: (#1068 review F1: a full 100-session pass took 3-17 s on the
+#: production-scale copy, past the 15 s busy_timeout other writers wait with.)
+_CONVERSATION_FINGERPRINT_REFRESH_BUDGET_S = 1.0
+_CONVERSATION_FINGERPRINT_REFRESH_BATCH = 5
+
+
+def _conversation_rollup_epoch(conn) -> "str | None":
+    """The first 32 hex digits of a SHA-256 over the fingerprint format
+    version, the derivation version, this process's ``PRICING_SNAPSHOT_DATE``,
+    both stores' migration ledgers (every applied row with its timestamp and
+    every skipped row, sorted) and both incarnation ids.
+
+    None when ``cache_db`` is not attached, either ledger is unreadable or
+    either incarnation id is absent. Every read names its schema, so a scoped
+    connection's TEMP shadows cannot change it."""
+    try:
+        ledgers = []
+        for schema in ("main", "cache_db"):
+            applied = sorted(
+                (str(name), str(ts)) for name, ts in conn.execute(
+                    f"SELECT name, applied_at_utc FROM {schema}.schema_migrations"))
+            skipped = sorted(
+                (str(name), str(ts)) for name, ts in conn.execute(
+                    f"SELECT name, skipped_at_utc "
+                    f"FROM {schema}.schema_migrations_skipped"))
+            ledgers.append([schema, applied, skipped])
+        ids = []
+        for schema, key in (("main", "conversations_incarnation_id"),
+                            ("cache_db", "cache_incarnation_id")):
+            row = conn.execute(
+                f"SELECT value FROM {schema}.cache_meta WHERE key=?", (key,)
+            ).fetchone()
+            if row is None or not row[0]:
+                return None
+            ids.append(str(row[0]))
+    except sqlite3.Error:
+        return None
+    payload = json.dumps(
+        [_CONVERSATION_FINGERPRINT_FORMAT_VERSION,
+         _CONVERSATION_ROLLUP_DERIVATION_VERSION,
+         str(PRICING_SNAPSHOT_DATE), ledgers, ids],
+        separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()[:32]
+
+
+def _rollup_row_seal(content) -> str:
+    """A SHA-256 prefix over a stored row's nine content columns, in
+    ``_ROLLUP_SEAL_COLUMNS`` order, as read back from the table (so a writer's
+    seal and a reader's seal see the same affinity-converted values). A writer
+    that rewrites content without maintaining the fingerprint breaks it."""
+    values = list(content)
+    if len(values) != len(_ROLLUP_SEAL_COLUMNS):
+        raise ValueError("a rollup seal covers exactly the nine content columns")
+    payload = json.dumps(values, separators=(",", ":"), ensure_ascii=True,
+                         default=repr)
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()[:32]
+
+
+def _format_input_fingerprint(epoch: str, max_id: int, entries: int,
+                              max_seq: "int | None", seal: str) -> str:
+    """``<epoch>:<max_id>:<entries>:<max_seq>:<seal>``; ``max_seq`` is the
+    empty string when no in-scope entry has a non-NULL ``mutation_seq``."""
+    seq = "" if max_seq is None else str(int(max_seq))
+    return f"{epoch}:{int(max_id)}:{int(entries)}:{seq}:{seal}"
+
+
+def _account_scoped_connection(conn) -> bool:
+    """True on a connection set up by ``scope_conversations_db_to_account``
+    (its TEMP ``_conversation_account_scope`` table exists)."""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_temp_master "
+            "WHERE type='table' AND name='_conversation_account_scope'"
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def _rollup_certification_allowed(conn) -> bool:
+    """D2's certification rule, read in the caller's snapshot: no in-place
+    rewrite flag (``conversation_promote_command_args_pending``) and no
+    reingest flag (``conversation_reingest_pending``, which changes the title
+    fill itself and is cleared in a commit separate from the backfill arm;
+    #1068 review F4) in either store, no migration fence in either store,
+    ``cache_db`` attached with both ledgers readable, and both incarnation ids
+    present. Fails closed on any read it cannot perform."""
+    for schema in ("main", "cache_db"):
+        if _cctally_db_sib.migration_fence_present(conn, schema):
+            return False
+        try:
+            if conn.execute(
+                f"SELECT 1 FROM {schema}.cache_meta WHERE key IN ("
+                "'conversation_promote_command_args_pending', "
+                "'conversation_reingest_pending')"
+            ).fetchone() is not None:
+                return False
+        except sqlite3.Error:
+            return False
+    return _conversation_rollup_epoch(conn) is not None
+
+
+def _session_max_message_ids(conn, ids) -> "dict[str, int]":
+    """{session_id: MAX(id)} over the deriving view, one aggregate per chunk."""
+    out: "dict[str, int]" = {}
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        for sid, max_id in conn.execute(
+            "SELECT session_id, MAX(id) FROM conversation_messages "
+            f"WHERE session_id IN ({placeholders}) GROUP BY session_id",
+            chunk,
+        ):
+            if max_id is not None:
+                out[sid] = max_id
+    return out
+
+
+def _refresh_uncertified_conversation_sessions(conn, *, limit: int = 100) -> int:
+    """D8 convergence: re-derive up to ``limit`` persistent sessions, in
+    ascending ``session_id``, whose fingerprint is NULL, carries another epoch
+    or fails its seal, through the same recompute the steady pass uses for its
+    touched sessions. Returns how many it re-derived (0 when the rollup is not
+    authoritative, certification cannot hold, the column is absent, or the
+    recompute was refused, which writes nothing). The caller owns the commit.
+
+    It does not detect a row whose fingerprint is current but whose inputs
+    changed since (an accounting-only change, a delete): the scoped reader's
+    gate rejects such a row and derives that session fresh."""
+    lq = _load_lib("_lib_conversation_query")
+    cols = {r[1] for r in conn.execute(
+        "PRAGMA main.table_info(conversation_sessions)")}
+    if "input_fingerprint" not in cols:
+        return 0
+    if not lq._rollup_authoritative(conn):
+        return 0
+    # A process the pricing order refuses re-derives nothing here: unlike a
+    # touched-session recompute, convergence is optional work, so it must not
+    # arm the backfill flag or record a refusal on an otherwise idle pass.
+    if not may_write_materialized_cost(
+            _read_pricing_fingerprint_observation(conn), PRICING_SNAPSHOT_DATE):
+        return 0
+    if not _rollup_certification_allowed(conn):
+        return 0
+    epoch = _conversation_rollup_epoch(conn)
+    if epoch is None:
+        return 0
+    prefix = epoch + ":"
+    stale: "list[str]" = []
+    for row in conn.execute(
+        "SELECT session_id, " + ", ".join(_ROLLUP_SEAL_COLUMNS)
+        + ", input_fingerprint FROM main.conversation_sessions "
+        "ORDER BY session_id"
+    ):
+        fingerprint = row[-1]
+        if (fingerprint is None or not fingerprint.startswith(prefix)
+                or fingerprint.rsplit(":", 1)[-1] != _rollup_row_seal(row[1:-1])):
+            stale.append(row[0])
+            if len(stale) >= limit:
+                break
+    if not stale:
+        return 0
+    # Batches within the caller's transaction, bounded by the time budget;
+    # the first batch always runs, so every pass makes progress, and the
+    # ascending order makes the next pass resume where this one stopped.
+    batch = max(1, int(_CONVERSATION_FINGERPRINT_REFRESH_BATCH))
+    started = time.monotonic()
+    refreshed = 0
+    for i in range(0, len(stale), batch):
+        if (refreshed and time.monotonic() - started
+                >= _CONVERSATION_FINGERPRINT_REFRESH_BUDGET_S):
+            break
+        chunk = stale[i:i + batch]
+        if not _recompute_conversation_sessions(conn, chunk):
+            break
+        refreshed += len(chunk)
+    return refreshed
+
+
+# --------------------------------------------------------------------------
+# #1072: accounting-driven invalidation of the persistent Claude rollup
+# --------------------------------------------------------------------------
+# A rollup row depends on its session's messages (conversations.db) and on the
+# accounting rows of its turn keys (cache.db). The steady writer used to
+# re-derive only the sessions its own transcript batches touched, so a row
+# whose accounting changed (a late finalization, a delete, the orphan prune, a
+# migration) or whose pass died before its rollup step stayed stale. The rollup
+# now records, atomically with the rows it writes, the input version it
+# consumed, and every pass re-derives exactly the sessions whose inputs moved
+# since; anything it cannot attribute to sessions runs a chunked, resumable
+# full re-derive. Five conversations.db `cache_meta` keys carry the state; no
+# table, column or trigger is added (spec §4.11).
+
+#: The consumed input version (§4.3): ``{"v": 1, "generation", "seq",
+#: "message_id", "migrations"}``. Written only by the transaction that writes
+#: the last rollup rows it describes, and by the prune's acknowledgement.
+ROLLUP_INPUT_WATERMARK_KEY = "conversation_sessions_input_watermark"
+#: The rebuild's staged watermark (§4.7), moved to the live key by the publish.
+ROLLUP_STAGING_WATERMARK_KEY = "conversation_sessions_staging_input_watermark"
+#: Sessions whose messages a transcript writer deleted (§4.4), written in the
+#: deleting transaction: ``{"v": 1, "sessions": [...]}`` or ``{"v": 1,
+#: "full": true}``. A frontier pending key.
+ROLLUP_PENDING_KEY = "conversation_sessions_rederive_pending"
+#: A full re-derive in progress (§4.5): ``{"v": 1, "target", "after",
+#: "pricing", "derivation"}``. A frontier pending key.
+ROLLUP_CURSOR_KEY = "conversation_sessions_rederive_cursor"
+
+#: Beyond this many ids the pending set becomes ``full`` (a traversal).
+_ROLLUP_PENDING_MAX_IDS = 5000
+#: One re-derive transaction covers at most this many sessions and, after its
+#: first session, at most this many of their messages (§4.5; the §7 gate is at
+#: most 5 s of write-lock occupancy per transaction on the production copy).
+#: Measured there (2026-11-09, cold page cache): a chunk costs up to about
+#: 0.15 ms per message, so 100,000 let a 50-session chunk of 73k messages hold
+#: the lock for 8.3 s; 20,000 keeps a chunk near 3 s. A single session is
+#: always admitted whole; the largest there (38k messages) costs under 1 s warm.
+_ROLLUP_CHUNK_SESSIONS = 50
+_ROLLUP_CHUNK_MESSAGES = 20_000
+#: Pause between two re-derive transactions of one traversal or change set.
+#: SQLite's busy handler wakes a waiting writer at most every 100 ms, so
+#: chunks committed back to back starve it: the Codex conversation writer
+#: (15 s busy timeout) waited up to 8.5 s on the production copy while every
+#: single chunk took under 5.2 s. A pause longer than one poll lets it in.
+_ROLLUP_CHUNK_YIELD_S = 0.15
+#: A traversal reads every session cold, and deriving a chunk cold under the
+#: write lock is what made it long: one 38,146-message session held it 5.2 s
+#: on the production copy, against 0.33 s warm. Each traversal chunk is first
+#: derived into this connection-local TEMP table, which takes no lock on the
+#: store, so the transaction that writes the real rows runs over warm pages.
+_ROLLUP_PREWARM_TABLE = "_rollup_traversal_prewarm"
+#: Change-set bounds over physical rows, read with ``LIMIT bound + 1``
+#: (§4.6 step 3). Beyond either, a traversal is cheaper than the mapping.
+_ROLLUP_ACCOUNTING_CHANGE_BOUND = 100_000
+_ROLLUP_MESSAGE_CHANGE_BOUND = 200_000
+#: At most this many full traversals per pass (§4.6 step 2).
+_ROLLUP_MAX_TRAVERSALS = 2
+
+
+@dataclass(frozen=True)
+class RollupInputState:
+    """One version of the rollup's inputs (#1072 §4.3): the cache.db accounting
+    generation and mutation counter, the conversation-message id mark and the
+    applied Claude accounting migrations."""
+
+    generation: "str | None"
+    seq: int
+    message_id: int
+    migrations: "tuple[str, ...]"
+
+    def as_json_obj(self) -> dict:
+        return {"v": 1, "generation": self.generation, "seq": self.seq,
+                "message_id": self.message_id,
+                "migrations": list(self.migrations)}
+
+
+def _rollup_state_from_obj(obj) -> "RollupInputState | None":
+    """A parsed watermark, or None for anything that is not a complete v1 value
+    (absent, another ``v``, a missing generation, a non-integer counter)."""
+    if not isinstance(obj, dict) or obj.get("v") != 1:
+        return None
+    generation = obj.get("generation")
+    seq, message_id = obj.get("seq"), obj.get("message_id")
+    migrations = obj.get("migrations")
+    if not isinstance(generation, str) or not generation:
+        return None
+    if type(seq) is not int or type(message_id) is not int:
+        return None
+    if (not isinstance(migrations, list)
+            or not all(isinstance(name, str) for name in migrations)):
+        return None
+    return RollupInputState(generation, seq, message_id, tuple(migrations))
+
+
+def _rollup_input_state(conn) -> "RollupInputState | None":
+    """The current input version, read in ONE statement so each database
+    contributes one snapshot (#1072 §4.3). None when the ``cache_db``
+    attachment is missing or the read fails; an absent generation is reported
+    as ``generation=None``.
+
+    The message mark is the AUTOINCREMENT high-water of
+    ``conversation_messages`` (``sqlite_sequence``), falling back to
+    ``MAX(id)``: an id above it is a message no completed rollup step has seen,
+    and unlike ``MAX(id)`` it does not regress when a writer deletes the newest
+    rows (a file replacement with nothing to insert, the orphan prune,
+    retention), so those deletes, which the pending set already records, do not
+    read as a discontinuity."""
+    placeholders = ",".join("?" for _ in _CLAUDE_ACCOUNTING_MIGRATIONS)
+    try:
+        row = conn.execute(
+            "SELECT "
+            "(SELECT value FROM cache_db.cache_meta WHERE key=?), "
+            "(SELECT value FROM cache_db.cache_meta "
+            " WHERE key='session_entries_mutation_seq'), "
+            "COALESCE((SELECT seq FROM main.sqlite_sequence "
+            "          WHERE name='conversation_messages'), "
+            "         (SELECT MAX(id) FROM main.conversation_messages), 0), "
+            "(SELECT group_concat(name, char(10)) FROM cache_db.schema_migrations "
+            f" WHERE name IN ({placeholders}))",
+            (CLAUDE_ACCOUNTING_GENERATION_KEY, *_CLAUDE_ACCOUNTING_MIGRATIONS),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    generation, seq_raw, mark, names = row
+    try:
+        seq = int(seq_raw) if seq_raw is not None else 0
+    except (TypeError, ValueError):
+        seq = 0
+    return RollupInputState(
+        None if generation is None else str(generation),
+        seq,
+        int(mark or 0),
+        tuple(sorted(name for name in str(names or "").split("\n") if name)),
+    )
+
+
+def _read_rollup_meta(conn, key: str) -> "str | None":
+    try:
+        row = conn.execute(
+            "SELECT value FROM main.cache_meta WHERE key=?", (key,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return None if row is None or row[0] is None else str(row[0])
+
+
+def _delete_rollup_meta(conn, key: str) -> None:
+    conn.execute("DELETE FROM main.cache_meta WHERE key=?", (key,))
+
+
+def _read_rollup_watermark(
+    conn, key: str = ROLLUP_INPUT_WATERMARK_KEY,
+) -> "RollupInputState | None":
+    """The stored watermark; absent, unparseable or another ``v`` is None."""
+    raw = _read_rollup_meta(conn, key)
+    if raw is None:
+        return None
+    try:
+        return _rollup_state_from_obj(json.loads(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _write_rollup_watermark(
+    conn, state: RollupInputState, key: str = ROLLUP_INPUT_WATERMARK_KEY,
+) -> None:
+    """Never commits: the caller's transaction also writes the rows."""
+    _set_cache_meta(conn, key, json.dumps(state.as_json_obj(), sort_keys=True))
+
+
+def _mint_claude_accounting_generation() -> bool:
+    """Mint the accounting generation through a short-lived separate writable
+    connection to cache.db (#1072 §4.1): the conversations connection attaches
+    cache.db read-only. False on any failure, which the consumer reports as
+    ``accounting_generation_unavailable`` rather than falling back silently."""
+    path = pathlib.Path(_cctally_core.CACHE_DB_PATH)
+    if not path.exists():
+        return False
+    try:
+        mint = sqlite3.connect(str(path), timeout=5.0)
+    except sqlite3.Error:
+        return False
+    try:
+        mint.execute("PRAGMA busy_timeout = 5000")
+        if _ensure_claude_accounting_generation(mint) is None:
+            mint.rollback()
+            return False
+        mint.commit()
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        mint.close()
+
+
+def _cache_db_attached(conn) -> bool:
+    """Whether ``conn`` has the ``cache_db`` attachment. A failed probe reads
+    as attached, so an unreadable connection defers rather than degrading
+    silently to the touched-only recompute."""
+    try:
+        return any(row[1] == "cache_db"
+                   for row in conn.execute("PRAGMA database_list"))
+    except sqlite3.Error:
+        return True
+
+
+def _current_rollup_input_state(conn, stats) -> "RollupInputState | None":
+    """`_rollup_input_state`, minting an absent generation first (§4.6 step 1).
+    None when the attachment is missing (today's behaviour follows), and also
+    when the read failed with cache.db attached or the mint failed; those two
+    set ``stats.deferred_reason``, because the pass then consumed no version
+    and must not be certified as caught up."""
+    cur = _rollup_input_state(conn)
+    if cur is None:
+        if _cache_db_attached(conn) and stats.deferred_reason is None:
+            stats.deferred_reason = "accounting_generation_unavailable"
+        return None
+    if cur.generation is not None:
+        return cur
+    if _mint_claude_accounting_generation():
+        cur = _rollup_input_state(conn)
+        if cur is not None and cur.generation is not None:
+            return cur
+    if stats.deferred_reason is None:
+        stats.deferred_reason = "accounting_generation_unavailable"
+    return None
+
+
+def _read_rollup_pending(conn) -> "tuple[bool, frozenset[str]]":
+    """``(full, ids)`` of the durable pending set (§4.4). A value that does not
+    parse is read as ``full``: losing a recorded deletion is the failure this
+    key exists to prevent, so the unreadable case falls toward a traversal."""
+    raw = _read_rollup_meta(conn, ROLLUP_PENDING_KEY)
+    if raw is None:
+        return False, frozenset()
+    try:
+        obj = json.loads(raw)
+    except (TypeError, ValueError):
+        return True, frozenset()
+    if not isinstance(obj, dict) or obj.get("v") != 1 or obj.get("full") is True:
+        return True, frozenset()
+    sessions = obj.get("sessions")
+    if (not isinstance(sessions, list)
+            or not all(isinstance(sid, str) for sid in sessions)):
+        return True, frozenset()
+    return False, frozenset(sessions)
+
+
+def _write_rollup_pending(conn, ids: "set[str] | frozenset[str]") -> None:
+    if len(ids) > _ROLLUP_PENDING_MAX_IDS:
+        value = {"v": 1, "full": True}
+    else:
+        value = {"v": 1, "sessions": sorted(ids)}
+    _set_cache_meta(conn, ROLLUP_PENDING_KEY, json.dumps(value, sort_keys=True))
+
+
+def _merge_rollup_pending(conn, session_ids: "Iterable[str]") -> None:
+    """Add sessions to the pending set, in the caller's transaction (the one
+    that deletes their messages). Never commits; nothing to add writes
+    nothing."""
+    ids = {sid for sid in session_ids if sid is not None}
+    if not ids:
+        return
+    full, current = _read_rollup_pending(conn)
+    if full:
+        return
+    if ids <= current:
+        return
+    _write_rollup_pending(conn, set(current) | ids)
+
+
+def _remove_rollup_pending(conn, session_ids: "Iterable[str]") -> None:
+    """Remove re-derived sessions from the pending set (the prune's step 4).
+    A ``full`` set stays: only a traversal start may clear it. Never commits."""
+    full, current = _read_rollup_pending(conn)
+    if full or not current:
+        return
+    remaining = set(current) - set(session_ids)
+    if remaining == current:
+        return
+    if remaining:
+        _write_rollup_pending(conn, remaining)
+    else:
+        _delete_rollup_meta(conn, ROLLUP_PENDING_KEY)
+
+
+def _clear_rollup_pending(conn) -> None:
+    if _read_rollup_meta(conn, ROLLUP_PENDING_KEY) is not None:
+        _delete_rollup_meta(conn, ROLLUP_PENDING_KEY)
+
+
+def _arm_rollup_backfill_restarting_traversal(conn) -> None:
+    """Arm the rollup backfill after a writer that rewrote message rows
+    without recording their sessions (the message backfill, the resumable
+    reingest, a rebuild), and delete a traversal cursor in the same
+    transaction. A cursor written before the rewrite would resume above its
+    ``after`` and never revisit a session sorting before it that lost all its
+    messages, leaving its row in the Viewer; the backfill's own traversal then
+    starts fresh and covers every session. Never commits."""
+    _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+    _delete_rollup_meta(conn, ROLLUP_CURSOR_KEY)
+
+
+def _rollup_identity() -> "tuple[str, int]":
+    """The pricing identity one traversal is bound to (§4.5, N2)."""
+    return (PRICING_SNAPSHOT_DATE, _CONVERSATION_ROLLUP_DERIVATION_VERSION)
+
+
+def _read_rederive_cursor(conn) -> "dict | None":
+    """The traversal cursor; None when absent, ``{}`` when present but not a
+    JSON object (which never matches an identity, so it restarts)."""
+    raw = _read_rollup_meta(conn, ROLLUP_CURSOR_KEY)
+    if raw is None:
+        return None
+    try:
+        obj = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _write_rederive_cursor(
+    conn, target: "RollupInputState | None", after: str,
+) -> None:
+    pricing, derivation = _rollup_identity()
+    _set_cache_meta(conn, ROLLUP_CURSOR_KEY, json.dumps({
+        "v": 1,
+        "target": None if target is None else target.as_json_obj(),
+        "after": after,
+        "pricing": pricing,
+        "derivation": derivation,
+    }, sort_keys=True))
+
+
+def _resumable_cursor(
+    cursor: "dict | None",
+) -> "tuple[bool, RollupInputState | None, str]":
+    """``(resumable, target, after)``: a cursor resumes only when its pricing
+    identity equals this process's (N2), its fields parse and it has processed
+    a chunk. A Start that processed nothing (``after == ""``, the marker a
+    targeted or rollup-only pass leaves) is restarted with the caller's
+    current state instead, so a rotation after the marker costs one traversal,
+    not two; clearing the pending set again there is sound, because the
+    caller read its state after every pending entry was written."""
+    if not cursor or cursor.get("v") != 1:
+        return False, None, ""
+    if (cursor.get("pricing"), cursor.get("derivation")) != _rollup_identity():
+        return False, None, ""
+    after = cursor.get("after")
+    if not isinstance(after, str) or after == "":
+        return False, None, ""
+    raw_target = cursor.get("target")
+    target = None if raw_target is None else _rollup_state_from_obj(raw_target)
+    if raw_target is not None and target is None:
+        return False, None, ""
+    return True, target, after
+
+
+def _session_message_count(conn, session_id: str) -> int:
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM main.conversation_messages WHERE session_id=?",
+        (session_id,)).fetchone()[0])
+
+
+def _split_by_volume(conn, ids: "list[str]", *,
+                     max_chunks: "int | None" = None) -> "list[list[str]]":
+    """Split sorted session ids into re-derive chunks of at most
+    ``_ROLLUP_CHUNK_SESSIONS`` sessions and, past each chunk's first session,
+    at most ``_ROLLUP_CHUNK_MESSAGES`` messages (§4.5). ``max_chunks`` stops
+    after that many chunks, so a caller that needs only the first does not
+    count the messages of every later candidate."""
+    limit = max(1, int(_ROLLUP_CHUNK_SESSIONS))
+    budget = max(1, int(_ROLLUP_CHUNK_MESSAGES))
+    chunks: "list[list[str]]" = []
+    chunk: "list[str]" = []
+    volume = 0
+    for sid in ids:
+        count = _session_message_count(conn, sid)
+        if chunk and (len(chunk) >= limit or volume + count > budget):
+            chunks.append(chunk)
+            if max_chunks is not None and len(chunks) >= max_chunks:
+                return chunks
+            chunk, volume = [], 0
+        chunk.append(sid)
+        volume += count
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
+def _rollup_next_chunk(conn, after: str) -> "list[str]":
+    """The next traversal chunk above ``after``: from the union of the sessions
+    holding messages and the sessions holding a row (so a row whose messages
+    all vanished is removed), by index seeks only, then bounded by volume."""
+    limit = max(1, int(_ROLLUP_CHUNK_SESSIONS))
+    from_messages: "list[str]" = []
+    position = after
+    for _ in range(limit):
+        row = conn.execute(
+            "SELECT session_id FROM main.conversation_messages "
+            "WHERE session_id > ? ORDER BY session_id LIMIT 1",
+            (position,)).fetchone()
+        if row is None:
+            break
+        from_messages.append(row[0])
+        position = row[0]
+    from_rows = [
+        row[0] for row in conn.execute(
+            "SELECT session_id FROM main.conversation_sessions "
+            "WHERE session_id > ? ORDER BY session_id LIMIT ?",
+            (after, limit))
+    ]
+    candidates = sorted(set(from_messages) | set(from_rows))[:limit]
+    chunks = _split_by_volume(conn, candidates, max_chunks=1)
+    return chunks[0] if chunks else []
+
+
+def _rollup_has_empty_session_id(conn, *, rows_too: bool = True) -> bool:
+    """Whether a session whose id is the empty string holds messages, or
+    (``rows_too``) a rollup row. Every chunk seek is strictly above an
+    ``after`` that starts at the empty string, so a traversal and a rebuild's
+    staging visit that one session as their own first chunk (a transcript line
+    may carry ``"sessionId": ""``; no ingest step rejects it). Literal SQL
+    only: the static freezes of dynamic-target reads count a ``{table}``."""
+    if conn.execute(
+            "SELECT 1 FROM main.conversation_messages "
+            "WHERE session_id = '' LIMIT 1").fetchone() is not None:
+        return True
+    return rows_too and conn.execute(
+        "SELECT 1 FROM main.conversation_sessions "
+        "WHERE session_id = '' LIMIT 1").fetchone() is not None
+
+
+def _rollup_has_session_after(conn, after: str) -> bool:
+    for sql in (
+        "SELECT 1 FROM main.conversation_messages "
+        "WHERE session_id > ? ORDER BY session_id LIMIT 1",
+        "SELECT 1 FROM main.conversation_sessions "
+        "WHERE session_id > ? ORDER BY session_id LIMIT 1",
+    ):
+        if conn.execute(sql, (after,)).fetchone() is not None:
+            return True
+    return False
+
+
+def _run_rollup_traversal(
+    conn, target: "RollupInputState | None", *,
+    on_complete: "Callable[[sqlite3.Connection], None] | None" = None,
+) -> bool:
+    """The chunked, resumable full re-derive (#1072 §4.5). Returns True when it
+    completed, False when a chunk's recompute was refused (#705: the refusal
+    record is committed and the cursor stays).
+
+    A cursor whose pricing identity equals this process's resumes from its
+    ``after`` under its own ``target``; any other cursor, or none, starts a new
+    traversal with ``target`` (one transaction writing the cursor and clearing
+    the pending set, whose every entry predates ``target``). Each chunk
+    re-derives its sessions and advances ``after`` in one transaction; the
+    completing chunk writes ``target`` as the watermark (when there is one),
+    deletes the cursor (never the pending set: entries written between the
+    passes of an interrupted traversal survive to the incremental step) and
+    runs ``on_complete`` inside the same transaction."""
+    resumable, resumed_target, after = _resumable_cursor(
+        _read_rederive_cursor(conn))
+    if resumable:
+        target = resumed_target
+    else:
+        _write_rederive_cursor(conn, target, "")
+        _clear_rollup_pending(conn)
+        conn.commit()
+        after = ""
+    # A traversal starts at `after == ""` (a resumed cursor never does), and
+    # no seek above it reaches an empty session id: visit that one first.
+    first: "list[str] | None" = (
+        [""] if after == "" and _rollup_has_empty_session_id(conn) else None)
+    while True:
+        if first is not None:
+            ids, first = first, None
+        else:
+            ids = _rollup_next_chunk(conn, after)
+        if ids:
+            _prewarm_rollup_chunk(conn, ids)
+            if not _recompute_conversation_sessions(conn, ids):
+                conn.commit()
+                return False
+            after = ids[-1]
+        if not ids or not _rollup_has_session_after(conn, after):
+            if target is not None:
+                _write_rollup_watermark(conn, target)
+            _delete_rollup_meta(conn, ROLLUP_CURSOR_KEY)
+            if on_complete is not None:
+                on_complete(conn)
+            conn.commit()
+            return True
+        _write_rederive_cursor(conn, target, after)
+        conn.commit()
+        _yield_between_rollup_chunks()
+
+
+def _prewarm_rollup_chunk(conn, ids: "list[str]") -> None:
+    """Derive ``ids`` into the connection-local ``_ROLLUP_PREWARM_TABLE`` and
+    discard the result, so the pages the real derivation reads are warm when
+    it runs under the write lock (§7). Writes nothing persistent: the target
+    is TEMP, ``authorize=False`` skips the refusal record and the refusal
+    clear, and no render revision is taken. Never ends a caller's
+    transaction: with one open it does nothing, as with no ids."""
+    if not ids or conn.in_transaction:
+        return
+    # Literal target (it equals `_ROLLUP_PREWARM_TABLE`): the static freeze
+    # of dynamic-target write sites counts a `{table}` target.
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _rollup_traversal_prewarm AS "
+        "SELECT * FROM main.conversation_sessions WHERE 0")
+    try:
+        _recompute_conversation_sessions(
+            conn, ids, target=_ROLLUP_PREWARM_TABLE,
+            advance_render_revision=False, authorize=False)
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+
+
+def _yield_between_rollup_chunks() -> None:
+    """Leave the conversations write lock free for longer than one busy
+    poll, so a writer waiting on it gets in between two chunks."""
+    if _ROLLUP_CHUNK_YIELD_S > 0:
+        time.sleep(_ROLLUP_CHUNK_YIELD_S)
+
+
+def _sessions_holding_turn_key(conn, msg_id, req_id) -> "list[tuple]":
+    return conn.execute(
+        "SELECT session_id, source_path FROM main.conversation_messages "
+        "WHERE msg_id=? AND req_id=?", (msg_id, req_id)).fetchall()
+
+
+def _rollup_dirty_sessions(
+    conn, wm: RollupInputState, cur: RollupInputState, touched: "set[str]",
+) -> "set[str] | None":
+    """The sessions whose inputs moved past ``wm`` (§4.6 step 3), or None when
+    a change set exceeds its bound (a traversal is then cheaper).
+
+    Both change sets are read AFTER ``cur`` and are unbounded above, so a
+    change committed between the two reads is included now (one redundant
+    re-derive) or found by the next pass, never lost. Physical rows are read
+    with ``LIMIT bound + 1`` and de-duplicated here, so neither read sorts."""
+    dirty = {sid for sid in touched if sid is not None}
+    full, pending = _read_rollup_pending(conn)
+    if full:
+        return None
+    dirty.update(pending)
+    message_bound = int(_ROLLUP_MESSAGE_CHANGE_BOUND)
+    rows = conn.execute(
+        "SELECT session_id FROM main.conversation_messages WHERE id > ? LIMIT ?",
+        (wm.message_id, message_bound + 1)).fetchall()
+    if len(rows) > message_bound:
+        return None
+    dirty.update(row[0] for row in rows if row[0] is not None)
+    accounting_bound = int(_ROLLUP_ACCOUNTING_CHANGE_BOUND)
+    keys = conn.execute(
+        "SELECT msg_id, req_id FROM cache_db.session_entries "
+        "WHERE mutation_seq > ? AND msg_id IS NOT NULL AND req_id IS NOT NULL "
+        "LIMIT ?", (wm.seq, accounting_bound + 1)).fetchall()
+    if len(keys) > accounting_bound:
+        return None
+    for msg_id, req_id in dict.fromkeys(tuple(key) for key in keys):
+        dirty.update(
+            sid for sid, _path in _sessions_holding_turn_key(conn, msg_id, req_id)
+            if sid is not None)
+    return dirty
+
+
+def _recompute_touched_only(conn, touched: "set[str]") -> bool:
+    """Today's steady behaviour: re-derive only the pass's touched sessions."""
+    if not touched:
+        return True
+    authorized = _recompute_conversation_sessions(conn, touched)
+    conn.commit()
+    return authorized
+
+
+def _start_rollup_traversal_marker(conn, cursor, cur: RollupInputState) -> None:
+    """Leave a traversal Start for the next full pass (§4.6 step 2)."""
+    if cursor is None:
+        _write_rederive_cursor(conn, cur, "")
+        _clear_rollup_pending(conn)
+        conn.commit()
+
+
+def _advance_claude_rollup(
+    conn, touched_sessions: "set[str]", stats, *, allow_traversal: bool,
+    max_traversals: "int | None" = None,
+) -> bool:
+    """The rollup consumer (#1072 §4.6). Re-derives exactly the sessions whose
+    inputs moved since the watermark and acknowledges the version it read, or
+    runs (``allow_traversal``) or schedules a full traversal when the change
+    cannot be attributed to sessions. Returns whether the rollup stayed
+    authorized (False only on a #705 refusal, which the caller reports).
+
+    ``max_traversals`` is what is left of the pass's allowance of
+    ``_ROLLUP_MAX_TRAVERSALS`` (the whole allowance when None, read at call
+    time): a backfill pass that already ran one passes the remainder, so no
+    pass runs more than two (each is minutes cold on a production-sized
+    store).
+
+    Commits its own work. An idle call (the state equals the watermark, no
+    pending set, no cursor, nothing touched) writes nothing and opens no
+    transaction (§4.12)."""
+    if max_traversals is None:
+        max_traversals = _ROLLUP_MAX_TRAVERSALS
+    touched = {sid for sid in touched_sessions if sid is not None}
+    cur = _current_rollup_input_state(conn, stats)
+    if cur is None:
+        return _recompute_touched_only(conn, touched)
+    traversals = 0
+    while True:
+        cursor = _read_rederive_cursor(conn)
+        wm = _read_rollup_watermark(conn)
+        full_pending, pending = _read_rollup_pending(conn)
+        dirty = None
+        if not (cursor is not None or wm is None or full_pending
+                or wm.generation != cur.generation
+                or cur.seq < wm.seq
+                or cur.message_id < wm.message_id
+                or wm.migrations != cur.migrations):
+            dirty = (set(touched) | set(pending) if wm == cur
+                     else _rollup_dirty_sessions(conn, wm, cur, touched))
+            if dirty is not None:
+                break
+        if not allow_traversal:
+            _start_rollup_traversal_marker(conn, cursor, cur)
+            authorized = _recompute_touched_only(conn, touched)
+            if authorized and stats.deferred_reason is None:
+                stats.deferred_reason = "rollup_traversal_pending"
+            return authorized
+        if traversals >= max_traversals:
+            # The accounting writer keeps rotating the generation: leave the
+            # traversal for the next full pass and acknowledge nothing newer.
+            _start_rollup_traversal_marker(conn, cursor, cur)
+            if stats.deferred_reason is None:
+                stats.deferred_reason = "rollup_traversal_incomplete"
+            return True
+        if not _run_rollup_traversal(conn, cur):
+            return False
+        traversals += 1
+        # Every session was re-derived against the inputs as they stood after
+        # this pass's transcript batches; what a resumed traversal's earlier
+        # chunks predate lies above its target's marks, which the re-check
+        # below finds (N3).
+        touched = set()
+        # The traversal's completion removed the cursor, so a re-read that
+        # fails must defer like the first read (§4.3): returning success here
+        # let a change that landed during the traversal, on a session an
+        # earlier chunk already derived, go unapplied in a certifiable pass.
+        nxt = _current_rollup_input_state(conn, stats)
+        if nxt is None:
+            return True
+        cur = nxt
+    if not dirty:
+        if wm != cur:
+            _write_rollup_watermark(conn, cur)
+            conn.commit()
+        return True
+    chunks = _split_by_volume(conn, sorted(dirty))
+    for index, chunk in enumerate(chunks):
+        # A session dirty only through an accounting change or the pending
+        # set is read cold, so it is derived first where no store lock is held
+        # (`_prewarm_rollup_chunk`); this pass's touched sessions were just
+        # ingested and are warm, so a steady pass prewarms nothing.
+        _prewarm_rollup_chunk(
+            conn, [sid for sid in chunk if sid not in touched])
+        if not _recompute_conversation_sessions(conn, chunk):
+            # #705: commit the refusal record; neither the watermark nor the
+            # pending set moves, so the next authorized pass rebuilds this
+            # dirty set from durable state.
+            conn.commit()
+            return False
+        if index == len(chunks) - 1:
+            _write_rollup_watermark(conn, cur)
+            if pending:
+                _delete_rollup_meta(conn, ROLLUP_PENDING_KEY)
+        conn.commit()
+        if index < len(chunks) - 1:
+            _yield_between_rollup_chunks()
+    return True
+
+
+def _rollup_staging_next_chunk(conn, after: str) -> "list[str]":
+    """The next rebuild staging chunk above ``after``: the sessions holding
+    messages, by index seeks only (staging starts empty, so no row of another
+    table needs visiting), bounded by volume like a traversal chunk."""
+    limit = max(1, int(_ROLLUP_CHUNK_SESSIONS))
+    candidates: "list[str]" = []
+    position = after
+    for _ in range(limit):
+        row = conn.execute(
+            "SELECT session_id FROM main.conversation_messages "
+            "WHERE session_id > ? ORDER BY session_id LIMIT 1",
+            (position,)).fetchone()
+        if row is None:
+            break
+        candidates.append(row[0])
+        position = row[0]
+    chunks = _split_by_volume(conn, candidates, max_chunks=1)
+    return chunks[0] if chunks else []
+
+
+def _derive_rollup_staging(
+    conn, target: str, staged_state: "RollupInputState | None",
+) -> bool:
+    """A rebuild's staging derivation (#752, #1072 §4.7) in chunks of the
+    traversal's bounds, each prewarmed outside the write lock and committed in
+    its own transaction, with `_yield_between_rollup_chunks` between them.
+    Returns whether it completed; False on a #705 refusal in any chunk, whose
+    record (and armed flag) is committed while nothing is published.
+
+    The completing chunk's transaction deletes the backfill flag, clears the
+    pricing write refusal and stages ``staged_state`` (or deletes a stale
+    staged watermark), exactly as the single transaction did. A store with no
+    messages takes the old single derivation, which still runs the #705
+    authorization before that clear. Staging is invisible to readers until
+    `_publish_title_generation`, so a death mid-way publishes nothing and the
+    next rebuild, which empties staging first, starts again."""
+
+    def complete() -> None:
+        conn.execute(
+            "DELETE FROM cache_meta "
+            "WHERE key='conversation_sessions_backfill_pending'"
+        )
+        _clear_pricing_write_refusal(conn)
+        if staged_state is not None:
+            _write_rollup_watermark(
+                conn, staged_state, ROLLUP_STAGING_WATERMARK_KEY)
+        else:
+            _delete_rollup_meta(conn, ROLLUP_STAGING_WATERMARK_KEY)
+        conn.commit()
+
+    ids = _rollup_staging_next_chunk(conn, "")
+    if _rollup_has_empty_session_id(conn, rows_too=False):
+        # No seek above the empty string reaches an empty session id (see
+        # `_rollup_has_empty_session_id`): stage that session first.
+        ids = [""]
+    if not ids:
+        if not _recompute_conversation_sessions(conn, target=target):
+            conn.commit()
+            return False
+        complete()
+        return True
+    while True:
+        _prewarm_rollup_chunk(conn, ids)
+        if not _recompute_conversation_sessions(conn, ids, target=target):
+            conn.commit()
+            return False
+        if conn.execute(
+                "SELECT 1 FROM main.conversation_messages "
+                "WHERE session_id > ? ORDER BY session_id LIMIT 1",
+                (ids[-1],)).fetchone() is None:
+            complete()
+            return True
+        conn.commit()
+        _yield_between_rollup_chunks()
+        ids = _rollup_staging_next_chunk(conn, ids[-1])
+        if not ids:  # unreachable while the flock freezes the messages
+            complete()
+            return True
+
+
+def _acknowledge_generation_rotation(conn, old: str, new: str) -> None:
+    """Replace the accounting generation ``old`` with ``new`` in the watermark
+    and in a cursor's ``target``, changing nothing else (#1072 §4.8 step 4).
+    Never commits. Sound only for the orphan prune, which holds both flocks
+    from its read of ``old`` to here, so its own delete is the only accounting
+    change between the two, and which has just re-derived every session that
+    delete affected."""
+    if not old or not new or old == new:
+        return
+    wm = _read_rollup_watermark(conn)
+    if wm is not None and wm.generation == old:
+        _write_rollup_watermark(conn, _dc_replace(wm, generation=new))
+    cursor = _read_rederive_cursor(conn)
+    if cursor and isinstance(cursor.get("target"), dict):
+        target = _rollup_state_from_obj(cursor["target"])
+        if target is not None and target.generation == old:
+            updated = dict(cursor)
+            updated["target"] = _dc_replace(target, generation=new).as_json_obj()
+            _set_cache_meta(conn, ROLLUP_CURSOR_KEY,
+                            json.dumps(updated, sort_keys=True))
+
+
+def sync_claude_rollup(
+    conn: sqlite3.Connection, *, lock_timeout: "float | None" = None,
+) -> IngestStats:
+    """The rollup-only pass of a caught-up dashboard tick (#1072 §4.12).
+
+    Takes the Claude conversations flock without waiting (contention is
+    ``lock_contended`` and retried next tick) and runs the consumer without
+    traversal, so an accounting-only change is consumed when no transcript
+    changed. A discontinuity leaves the traversal cursor, which the frontier
+    reads as pending maintenance and answers with a full pass. With nothing to
+    do it reads the state and returns: no write, no transaction (#939). It is
+    not a sync writer: it arms no WAL checkpoint policy and its result does
+    not change the caught-up certificate."""
+    stats = IngestStats()
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _cctally_core.CONVERSATIONS_LOCK_PATH.touch()
+    lock_fh = open(_cctally_core.CONVERSATIONS_LOCK_PATH, "w")
+    try:
+        if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
+            stats.lock_contended = True
+            return stats
+        try:
+            if conn.execute(
+                "SELECT 1 FROM main.cache_meta "
+                "WHERE key='conversation_rebuild_claude_pending'"
+            ).fetchone() is not None:
+                return stats
+        except sqlite3.Error:
+            return stats
+        # Read-only pricing check: arming the backfill (or recording a
+        # refusal) is a full pass's job. A store whose rollup this binary has
+        # not priced yet (never synced, an upgrade, a newer writer) is left
+        # untouched here, so a caught-up tick never takes the write lock for
+        # it; the full pass that follows any of those states owns them.
+        if (_read_pricing_fingerprint_observation(conn).raw
+                != PRICING_SNAPSHOT_DATE):
+            return stats
+        if _conversation_sessions_backfill_pending(conn):
+            # A full pass owns the backfill traversal; the flag is a frontier
+            # pending key, so the next plan is full.
+            return stats
+        if not _advance_claude_rollup(conn, set(), stats, allow_traversal=False):
+            if stats.deferred_reason is None:
+                stats.deferred_reason = "pricing_write_refused"
+        return stats
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_fh.close()
+
+
 def _fill_conversation_sessions_filter_columns(conn, session_ids, *,
                                                target="conversation_sessions"):
     """Fill the rollup's browse-FILTER columns (project_label / cost_usd /
@@ -12107,7 +14650,26 @@ def _fill_conversation_sessions_filter_columns(conn, session_ids, *,
         ids = [s for s in session_ids if s is not None]
     if not ids:
         return
-    cost = lq._session_cost_map(conn, ids)
+    fingerprinted = "input_fingerprint" in cols
+    if fingerprinted:
+        # #1068 D2: the cost and the fingerprint's accounting half come from
+        # the very same session_entries rows.
+        accounting = lq._session_cost_and_accounting_map(conn, ids)
+        cost = {sid: row[0] for sid, row in accounting.items()}
+        # A scoped connection always fingerprints its TEMP rows ('-' when the
+        # epoch is unavailable); a persistent row is certified only when D2's
+        # rule holds in this snapshot, otherwise written NULL.
+        epoch = _conversation_rollup_epoch(conn)
+        if _account_scoped_connection(conn):
+            epoch_text = epoch if epoch is not None else "-"
+        elif epoch is not None and _rollup_certification_allowed(conn):
+            epoch_text = epoch
+        else:
+            epoch_text = None
+        max_ids = (_session_max_message_ids(conn, ids)
+                   if epoch_text is not None else {})
+    else:
+        cost = lq._session_cost_map(conn, ids)
     meta = lq._session_latest_meta_map(conn, ids)
     models = lq._session_models_map(conn, ids)
     first_titles = lq._session_first_prompt_titles_map(conn, ids)
@@ -12124,6 +14686,25 @@ def _fill_conversation_sessions_filter_columns(conn, session_ids, *,
             "WHERE session_id=?",
             (proj, round(cost.get(sid, 0.0), 6), rebuilds, branch, models_json,
              title, sid),
+        )
+        if not fingerprinted:
+            continue
+        fingerprint = None
+        if epoch_text is not None and sid in max_ids:
+            # The seal covers the values read back after the UPDATE, in this
+            # transaction, so storage affinity cannot split writer and reader.
+            content = conn.execute(
+                "SELECT " + ", ".join(_ROLLUP_SEAL_COLUMNS)
+                + f" FROM {target} WHERE session_id=?", (sid,)
+            ).fetchone()
+            if content is not None:
+                _cost, entries, max_seq = accounting.get(sid, (0.0, 0, None))
+                fingerprint = _format_input_fingerprint(
+                    epoch_text, max_ids[sid], entries, max_seq,
+                    _rollup_row_seal(content))
+        conn.execute(
+            f"UPDATE {target} SET input_fingerprint=? WHERE session_id=?",
+            (fingerprint, sid),
         )
 
 
@@ -12228,9 +14809,10 @@ def _consume_title_fts(conn) -> None:
         # False → _apply_cache_schema creates the title FTS) re-runs this consumer
         # and completes the backfill. Match the message-FTS path's resilience.
         try:
-            conn.execute(
-                "INSERT INTO conversation_title_fts(conversation_title_fts) "
-                "VALUES('rebuild')")
+            # #1094: through the FTS-command chokepoint, which retracts the
+            # tokenizer verification first for an unlisted build.
+            _fts_integrity.conversation_fts_command(
+                conn, "conversation_title_fts", "rebuild")
         except sqlite3.OperationalError:
             return   # title FTS not yet created (legacy-shape pre-swap); leave
                      # the flag set, retry on the next open
@@ -12363,13 +14945,14 @@ def _consume_promote_command_args(conn) -> None:
     last_id = int(row[0]) if row else 0
     while True:
         batch = conn.execute(
-            "SELECT id, blocks_json FROM conversation_messages "
+            "SELECT id, blocks_json, session_id FROM conversation_messages "
             "WHERE id > ? AND entry_type='meta' ORDER BY id LIMIT 500",
             (last_id,)).fetchall()
         if not batch:
             break
         ups = []
-        for rid, bj in batch:
+        promoted_sessions = set()
+        for rid, bj, sid in batch:
             last_id = rid
             try:
                 blocks = json.loads(bj) if bj else []
@@ -12381,10 +14964,15 @@ def _consume_promote_command_args(conn) -> None:
                 continue
             st, sth = _lib_conversation._derive_search_columns(blocks)
             ups.append((inv["args"], st, sth, rid))
+            promoted_sessions.add(sid)
         if ups:
             conn.executemany(
                 "UPDATE conversation_messages SET entry_type='human', text=?, "
                 "search_tool=?, search_thinking=? WHERE id=?", ups)
+            # #1072 §4.9: `entry_type` and `text` feed the rollup's title, and
+            # this rewrite keeps the message ids, so no mark sees it; the
+            # sessions are recorded in the same transaction for the consumer.
+            _merge_rollup_pending(conn, promoted_sessions)
         _cctally_db_sib._set_cache_meta(
             conn, "conversation_promote_command_args_cursor", str(last_id))
         conn.commit()
@@ -12884,7 +15472,8 @@ def get_claude_session_entries(
         # #341: an account-scoped read can't degrade to the identity-less
         # direct-JSONL path — fail closed (exit 3) rather than mislabel.
         _guard_account_attribution(account_key, "cache open failed")
-        eprint(f"[cache] unavailable ({exc}); falling back to direct JSONL parse")
+        eprint(f"[cache] unavailable ({_cctally_core.store_refusal_text(exc)}); "
+               "falling back to direct JSONL parse")
         return _direct_parse_claude_session_entries(
             range_start, range_end, project=project
         )
@@ -12911,6 +15500,132 @@ def get_claude_session_entries(
                 range_start, range_end, project=project
             )
 
+    conn.close()
+    return _facade_session_read(
+        lambda q: _read_claude_session_entries(
+            q, range_start, range_end, project=project,
+            account_key=account_key),
+        account_key=account_key,
+        fallback=lambda: _direct_parse_claude_session_entries(
+            range_start, range_end, project=project))
+
+
+#: Readiness reasons today's full cache opener resolved inline (spec 5.11);
+#: the facades keep their owner-connection read for these under an owner
+#: authority instead of degrading to the direct-JSONL parse.
+_FACADE_OWNER_READ_REASONS = frozenset({
+    "schema_behind", "schema_ahead", "recovery_pending",
+    "legacy_bridge_pending"})
+
+
+def _facade_session_read(read, *, account_key, fallback):
+    """The facades' read phase (#787 / #861 spec 5.11).
+
+    The facade's owner phase (startup, refresh) has run and closed its
+    writer; the entries are read through one cache query session, under
+    the command policy on a thread that established an authority (the CLI
+    main thread) and the interactive one elsewhere. A race to
+    unavailability keeps the facade's existing contention behavior: an
+    account-scoped read fails closed, anything else degrades to the
+    direct-JSONL parse with today's notice.
+
+    A reason today's full opener resolves inline (a chunked migration such as
+    cache 050 that stays pending across invocations, a fence, a bridge) can
+    outlast the owner phase. Under an owner authority that state keeps
+    today's read on the owner connection, so the command's output is
+    unchanged (spec 5.11: every CLI command keeps today's outputs); only a
+    raising reason, or a thread without owner authority, degrades."""
+    import _cctally_store_access as _access
+    policy = ("command" if _cctally_core.current_authority() is not None
+              else "interactive")
+    try:
+        with _access.QueryService.session("cache", policy=policy) as q:
+            return read(q.conn)
+    except _cctally_core.StoreUnavailable as exc:
+        if (exc.reason in _FACADE_OWNER_READ_REASONS
+                and _cctally_core.has_capability("STARTUP")):
+            try:
+                conn = open_cache_db()
+            except sqlite3.DatabaseError as owner_exc:
+                exc = owner_exc
+            else:
+                try:
+                    return read(conn)
+                finally:
+                    conn.close()
+        _guard_account_attribution(account_key, "cache open failed")
+        eprint(f"[cache] unavailable ({_cctally_core.store_refusal_text(exc)}); "
+               "falling back to direct JSONL parse")
+        return fallback()
+
+
+#: Refusals a facade raised today (its open failed or was contended): the
+#: query-ceiling reader keeps the facade's direct-JSONL fallback for them.
+_QUERY_READER_FALLBACK_REASONS = frozenset({
+    "corrupt", "maintenance", "busy", "unavailable"})
+
+
+def query_entries(kind: str, range_start, range_end, *,
+                  project: "str | None" = None,
+                  account_key: "str | None" = None):
+    """A pure query caller's entry read (#787 / #861 spec 5.11): a dashboard
+    request route, a share override, a detail route. ``kind`` is
+    ``"entries"`` (``get_entries``' rows) or ``"claude_session_entries"``.
+
+    It never syncs, opens a full opener or launches: one interactive query
+    session over cache.db, through the facades' own read kernels. For the
+    reasons a facade raised today (corruption, maintenance, contention, an
+    unusable store) it keeps the facade's fallback: an account-scoped read
+    fails closed, anything else is the direct-JSONL parse with today's
+    notice. A reason today's full opener resolved inline (absent, behind,
+    ahead, a pending recovery or bridge) is the owner's: the session has
+    told it, and the refusal is raised for the caller's degraded path."""
+    import _cctally_store_access as _access
+    if kind == "entries":
+        def read(q):
+            return iter_entries(q, range_start, range_end, project=project,
+                                account_key=account_key)
+
+        def fallback():
+            return _collect_entries_direct(range_start, range_end,
+                                           project=project)
+    elif kind == "claude_session_entries":
+        def read(q):
+            return _read_claude_session_entries(
+                q, range_start, range_end, project=project,
+                account_key=account_key)
+
+        def fallback():
+            return _direct_parse_claude_session_entries(
+                range_start, range_end, project=project)
+    else:
+        raise ValueError(f"unknown entry read {kind!r}")
+    try:
+        with _access.QueryService.session("cache",
+                                          policy="interactive") as q:
+            return read(q.conn)
+    except _cctally_core.StoreUnavailable as exc:
+        if exc.reason not in _QUERY_READER_FALLBACK_REASONS:
+            _cctally_core.notify_owner("cache", _cctally_core.Readiness(
+                "cache", False, exc.reason, frozenset()))
+            raise
+        _guard_account_attribution(account_key, "cache open failed")
+        eprint(f"[cache] unavailable ({_cctally_core.store_refusal_text(exc)}); "
+               "falling back to direct JSONL parse")
+        return fallback()
+
+
+def _read_claude_session_entries(
+    conn: sqlite3.Connection,
+    range_start: dt.datetime,
+    range_end: dt.datetime,
+    *,
+    project: str | None = None,
+    account_key: "str | None" = None,
+) -> list[_JoinedClaudeEntry]:
+    """The joined Claude entry read shared by ``get_claude_session_entries``
+    and ``QueryService.claude_session_entries`` (#787 spec 5.11): pure SQL
+    over ``conn``, which the caller owns and closes."""
     start_iso = range_start.astimezone(dt.timezone.utc).isoformat()
     end_iso = range_end.astimezone(dt.timezone.utc).isoformat()
 
@@ -12955,10 +15670,7 @@ def get_claude_session_entries(
     # which plan SQLite picks for either window.
     sql += " ORDER BY se.timestamp_utc ASC, se.id ASC"
 
-    try:
-        rows = conn.execute(sql, params).fetchall()
-    finally:
-        conn.close()
+    rows = conn.execute(sql, params).fetchall()
 
     return [
         _JoinedClaudeEntry(
@@ -13530,6 +16242,8 @@ def _defer_codex_replay_drain(*, short: bool = False) -> str:
     the short retry throttle even when no heal record exists (a replay
     re-armed after the pass's transition leaves only the marker).
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("LAUNCH", entry="_defer_codex_replay_drain")
     marker = _cctally_core.APP_DIR / CODEX_REPLAY_DRAIN_MARKER_NAME
     try:
         age = time.time() - marker.stat().st_mtime
@@ -14071,6 +16785,13 @@ def _sync_codex_cache_locked(
     sets ``stats.replay_refill``), and an unbudgeted ordinary call completes
     the remaining refill as an ordinary walk.
     """
+    _refuse_codex_sync_under_off_hook_policy()
+    # #1076 D4: inside a held ingest cycle (a pending observation's pipeline
+    # reading Codex spend) the automatic projection is never decided here: its
+    # reconcile could only wait for the ingest lock this context holds, and
+    # its stats-side probe would open stats.db inside the cycle. The stale
+    # certificate makes the next unnested sync reconcile.
+    nested_in_ingest = _cctally_store.holds_ingest_lock()
     if quota_reconcile not in ("auto", "defer"):
         raise ValueError(
             "sync_codex_cache: quota_reconcile must be 'auto' or 'defer'")
@@ -14120,7 +16841,8 @@ def _sync_codex_cache_locked(
     finalizing = False
     # #981 A2: the hook's read policy pins its snapshot at the exit, after the
     # last commit and before the flocks are released; the scope is the one
-    # this call discovered.
+    # this call discovered. Hook-only on purpose: the off-hook policy (#1076)
+    # is never pinned, and a sync under it was refused at entry.
     read_policy = _active_hook_codex_read_policy()
     rebuild_prune_scope: "_CodexPruneScope | None" = None
     ordinary_prune_scope: "_CodexPruneScope | None" = None
@@ -16849,7 +19571,9 @@ def _sync_codex_cache_locked(
         # post-flock stats.db open below: the hook does its own reconcile
         # immediately after this call, and that reconcile re-reads the same
         # certificate and signatures itself.
-        if not targeted and quota_reconcile == "auto":
+        #
+        # #1076 D4: a sync nested inside a held ingest cycle skips it too.
+        if not targeted and quota_reconcile == "auto" and not nested_in_ingest:
             cur_seq = codex_physical_mutation_seq(conn)
             if cur_seq != seq_before:
                 project_after_unlock = True
@@ -17105,21 +19829,42 @@ def sync_codex_cache(conn: sqlite3.Connection, *, maintenance: str = "defer",
     detached workers; ``maintenance="caller"`` (explicit ``cache-sync``) leaves
     them to the caller, which drains synchronously through the same executors.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability(
+        _cctally_core.sync_capability("sync_codex_cache"), entry="sync_codex_cache")
     if maintenance not in ("defer", "caller"):
         raise ValueError(f"unknown maintenance mode {maintenance!r}")
+    _refuse_codex_sync_under_off_hook_policy()
     if kwargs.get("budget_seconds") is None:
         _ensure_quota_index_before_producer_locks()
     stats = _sync_codex_cache_locked(conn, **kwargs)
+    request = _cctally_core.current_request_ingest("sync_codex_cache")
     if maintenance == "defer":
         for command in stats.drain_requested:
             _request_codex_drain_worker(command)
     if stats.deferred_reason == "quota_index_pending":
+        if request is not None:
+            # #787 spec 5.9: a request entry never LAUNCHes; the owner does.
+            request.pending.add("quota_index_pending")
+            return stats
         # #977 C5: after every producer lock is released, in either
         # maintenance mode — the rebuild is the journal's, not a drain the
         # caller could run.
         import _cctally_journal as _jr
         _jr.request_quota_index_rebuild()
     return stats
+
+
+def _refuse_codex_sync_under_off_hook_policy() -> None:
+    """#1076 D3: no Codex sync runs under the off-hook read policy.
+
+    ``get_codex_entries`` never reaches a sync under it; a future path that
+    would sync inside an off-hook reconcile's ingest fails here, before any
+    lock, index or walk work, instead of doing the unbudgeted work #1076
+    removed (and a sync under it could never pin it anyway)."""
+    if isinstance(_HOOK_CODEX_READ_POLICY.get(), _OffHookCodexReadPolicy):
+        raise RuntimeError(
+            "sync_codex_cache must not run under the off-hook Codex read policy")
 
 
 def _ensure_quota_index_before_producer_locks() -> None:
@@ -17140,6 +19885,8 @@ def _ensure_quota_index_before_producer_locks() -> None:
 
 def _request_codex_drain_worker(command: str) -> str:
     """Attempt-throttled detached spawn of one drain worker (no inline fallback)."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("LAUNCH", entry="_request_codex_drain_worker")
     if command == CODEX_PRUNE_DRAIN_COMMAND:
         marker_name = CODEX_PRUNE_DRAIN_MARKER_NAME
         throttle = CODEX_PRUNE_DRAIN_SPAWN_THROTTLE_SECONDS
@@ -19282,6 +22029,8 @@ def run_codex_admitted_heal(
     the short retry throttle. Only the next pass's start unit performs the
     fresh clear, so no piece skips a file it visited before that clear.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="run_codex_admitted_heal")
     import _lib_codex_drain_admission as adm
     worker = _worker_lock(CODEX_HEAL_WALK_LOCK_NAME)
     if worker is None:
@@ -20073,15 +22822,20 @@ CODEX_READ_DEFERRAL_REASONS = frozenset({
     "sync_contended", "ingest_incomplete", "prune_debt", "replay_pending",
     "inventory_pending", "finalization_debt", "cache_unavailable",
     "scope_unavailable",
+    # #1076 D1: the off-hook policy proves nothing, so it always defers.
+    "off_hook_unpinned",
 })
 
 
 class CodexReadDeferred(Exception):
-    """A hook-scoped Codex read cannot prove a complete snapshot (A1).
+    """A policy-scoped Codex read cannot prove a complete snapshot (A1).
 
-    ``reason`` is one token of :data:`CODEX_READ_DEFERRAL_REASONS`. The budget
-    ladders and the projected Codex axis catch it and skip this tick; nothing
-    is fabricated and nothing is evaluated on a partial total."""
+    Raised under the hook's policy (#981) when its pinned snapshot is not
+    eligible, and always under the off-hook policy (#1076, reason
+    ``off_hook_unpinned``). ``reason`` is one token of
+    :data:`CODEX_READ_DEFERRAL_REASONS`. The budget ladders and the projected
+    Codex axis catch it and skip this tick; nothing is fabricated and nothing
+    is evaluated on a partial total."""
 
     def __init__(self, reason: str) -> None:
         if reason not in CODEX_READ_DEFERRAL_REASONS:
@@ -20187,8 +22941,46 @@ class _HookCodexReadPolicy:
                 pass
 
 
-_HOOK_CODEX_READ_POLICY: "contextvars.ContextVar[_HookCodexReadPolicy | None]" = (
-    contextvars.ContextVar("cctally_hook_codex_read_policy", default=None))
+@dataclass
+class _OffHookCodexReadPolicy:
+    """A defer-only Codex read policy for an off-hook reconcile's ingest (#1076).
+
+    A reconcile outside the hook runs every pending journal observation's
+    pipeline inside its own ``run_stats_ingest``. A Claude observation reaches
+    the dollar axes, whose Codex spend readers would otherwise run an
+    unbudgeted ``sync_codex_cache`` inside that ingest and, with a stale quota
+    certificate, a nested reconcile that can only wait for the ingest lock its
+    own context holds. Under this policy every such read defers instead.
+
+    It is never eligible: no sync of its own proved completeness, a quota
+    certificate proves projection consistency rather than complete spend, and a
+    full-walk marker says nothing about later source changes. So it has the
+    hook policy's reader and deferral interface and nothing else: no snapshot,
+    no ``pin``, no ``invalidate``, no eligibility fields."""
+
+    #: Append-only: one entry per skipped reader (ladder), in order.
+    deferred: list = field(default_factory=list)
+    #: The reason of each ``deferred`` entry, index for index.
+    deferred_reasons: list = field(default_factory=list)
+
+    def record_deferral(self, reader: str, reason: str) -> None:
+        self.deferred.append(reader)
+        self.deferred_reasons.append(reason)
+
+    def first_deferral_reason(self) -> "str | None":
+        return self.deferred_reasons[0] if self.deferred_reasons else None
+
+    def read_entries(self, range_start: dt.datetime, range_end: dt.datetime,
+                     *, account_key: "str | None") -> "list[CodexEntry]":
+        """Every read defers, vendor-wide and account-scoped alike."""
+        raise CodexReadDeferred("off_hook_unpinned")
+
+
+#: The active Codex read policy of either class (#981 hook, #1076 off-hook).
+#: The symbol keeps its #981 name so existing seams keep working.
+_HOOK_CODEX_READ_POLICY: (
+    "contextvars.ContextVar[_HookCodexReadPolicy | _OffHookCodexReadPolicy | None]"
+) = contextvars.ContextVar("cctally_hook_codex_read_policy", default=None)
 
 
 @contextlib.contextmanager
@@ -20205,8 +22997,34 @@ def hook_codex_read_policy() -> "Iterator[_HookCodexReadPolicy]":
         _HOOK_CODEX_READ_POLICY.reset(token)
 
 
-def _active_hook_codex_read_policy() -> "_HookCodexReadPolicy | None":
+@contextlib.contextmanager
+def off_hook_codex_read_policy() -> "Iterator[_OffHookCodexReadPolicy]":
+    """Make every Codex entry read in this context defer (#1076 D1).
+
+    Refuses to nest over an active policy of either class: a caller under the
+    hook's policy keeps it. The variable is reset on every exit path."""
+    if _HOOK_CODEX_READ_POLICY.get() is not None:
+        raise RuntimeError(
+            "off_hook_codex_read_policy: a Codex read policy is already active")
+    policy = _OffHookCodexReadPolicy()
+    token = _HOOK_CODEX_READ_POLICY.set(policy)
+    try:
+        yield policy
+    finally:
+        _HOOK_CODEX_READ_POLICY.reset(token)
+
+
+def _active_codex_read_policy(
+) -> "_HookCodexReadPolicy | _OffHookCodexReadPolicy | None":
+    """The active Codex read policy of either class, or ``None`` (#1076)."""
     return _HOOK_CODEX_READ_POLICY.get()
+
+
+def _active_hook_codex_read_policy() -> "_HookCodexReadPolicy | None":
+    """The active policy only when it is the hook's (#981); the sync's pin
+    site uses this, so an off-hook policy is never pinned."""
+    policy = _HOOK_CODEX_READ_POLICY.get()
+    return policy if isinstance(policy, _HookCodexReadPolicy) else None
 
 
 def _hook_snapshot_connect(db_path) -> sqlite3.Connection:
@@ -20273,9 +23091,11 @@ def get_codex_entries(
 
     Under the hook's read policy (#981 A4) this never opens the cache, syncs,
     recovers or direct-parses: it reads the snapshot the hook's budgeted sync
-    pinned, or raises :class:`CodexReadDeferred`.
+    pinned, or raises :class:`CodexReadDeferred`. Under the off-hook policy
+    (#1076, an off-hook reconcile's own ingest) it always raises
+    ``CodexReadDeferred("off_hook_unpinned")``, ``skip_sync=True`` included.
     """
-    policy = _active_hook_codex_read_policy()
+    policy = _active_codex_read_policy()
     if policy is not None:
         return policy.read_entries(
             range_start, range_end, account_key=account_key)
@@ -20287,47 +23107,48 @@ def get_codex_entries(
         # path — fail closed (exit 3) rather than return ALL Codex entries
         # mislabeled as the selected account. No-op for merged (None) reads.
         _guard_account_attribution(account_key, "cache open failed")
-        eprint(f"[cache] unavailable ({exc}); falling back to direct JSONL parse")
+        eprint(f"[cache] unavailable ({_cctally_core.store_refusal_text(exc)}); "
+               "falling back to direct JSONL parse")
         return _collect_codex_entries_direct(range_start, range_end)
     try:
-        if skip_sync:
-            return iter_codex_entries(
-                conn, range_start, range_end, account_key=account_key,
-                current_roots_only=True)
-        # #344: route the ingest through the guarded recovery boundary so a
-        # classified corruption closes the handle, quarantines once, and
-        # restarts on a fresh family (reassigning `conn`, closed in finally).
-        stats, conn = _run_cache_operation_with_recovery(
-            conn,
-            lambda active_conn: sync_codex_cache(active_conn),
-            origin="codex.entries.sync",
-        )
-        if stats.lock_contended:
-            # Sync commits file-by-file, so contention on the ingest lock
-            # (e.g. a concurrent --rebuild, or a first-run sync still in
-            # flight) can leave the cache PARTIALLY populated — some files
-            # ingested, others pending. An "is the table empty?" guard passes
-            # in that window and we'd silently return results missing the
-            # caller's range. Fall back to a direct JSONL parse unconditionally
-            # on contention; correctness > speed in the rare-but-real window
-            # where cache state does not match disk.
-            # #341 (Task 4): fail closed on an account-scoped read — the
-            # direct-JSONL fallback carries no account identity (exit 3, not a
-            # mislabel). Symmetric with get_entries / get_claude_session_entries.
-            _guard_account_attribution(account_key, "concurrent ingest")
-            eprint(
-                "[cache] concurrent codex ingest in progress; "
-                "falling back to direct JSONL parse for correctness"
+        if not skip_sync:
+            # #344: route the ingest through the guarded recovery boundary so a
+            # classified corruption closes the handle, quarantines once, and
+            # restarts on a fresh family (reassigning `conn`, closed in finally).
+            stats, conn = _run_cache_operation_with_recovery(
+                conn,
+                lambda active_conn: sync_codex_cache(active_conn),
+                origin="codex.entries.sync",
             )
-            return _collect_codex_entries_direct(range_start, range_end)
-        _warn_compressed_unreadable_once(stats)
-        if stats.drain_requested:
-            _note_maintenance_deferred_once()
-        return iter_codex_entries(
-            conn, range_start, range_end, account_key=account_key,
-            current_roots_only=True)
+            if stats.lock_contended:
+                # Sync commits file-by-file, so contention on the ingest lock
+                # (e.g. a concurrent --rebuild, or a first-run sync still in
+                # flight) can leave the cache PARTIALLY populated — some files
+                # ingested, others pending. An "is the table empty?" guard passes
+                # in that window and we'd silently return results missing the
+                # caller's range. Fall back to a direct JSONL parse unconditionally
+                # on contention; correctness > speed in the rare-but-real window
+                # where cache state does not match disk.
+                # #341 (Task 4): fail closed on an account-scoped read — the
+                # direct-JSONL fallback carries no account identity (exit 3, not a
+                # mislabel). Symmetric with get_entries / get_claude_session_entries.
+                _guard_account_attribution(account_key, "concurrent ingest")
+                eprint(
+                    "[cache] concurrent codex ingest in progress; "
+                    "falling back to direct JSONL parse for correctness"
+                )
+                return _collect_codex_entries_direct(range_start, range_end)
+            _warn_compressed_unreadable_once(stats)
+            if stats.drain_requested:
+                _note_maintenance_deferred_once()
     finally:
         conn.close()
+    return _facade_session_read(
+        lambda q: iter_codex_entries(
+            q, range_start, range_end, account_key=account_key,
+            current_roots_only=True),
+        account_key=account_key,
+        fallback=lambda: _collect_codex_entries_direct(range_start, range_end))
 
 
 def _sum_codex_cost_for_range(
@@ -20420,7 +23241,8 @@ def get_entries(
         # #341: an account-scoped read can't degrade to the identity-less
         # direct-JSONL path — fail closed (exit 3) rather than mislabel.
         _guard_account_attribution(account_key, "cache open failed")
-        eprint(f"[cache] unavailable ({exc}); falling back to direct JSONL parse")
+        eprint(f"[cache] unavailable ({_cctally_core.store_refusal_text(exc)}); "
+               "falling back to direct JSONL parse")
         return _collect_entries_direct(range_start, range_end, project=project)
     # Close the cache connection on every return path (#341 P2-CQ2 hygiene): the
     # prior code opened it and returned `iter_entries(conn, …)` — a materialized
@@ -20452,10 +23274,15 @@ def get_entries(
                     "falling back to direct JSONL parse for correctness"
                 )
                 return _collect_entries_direct(range_start, range_end, project=project)
-        return iter_entries(
-            conn, range_start, range_end, project=project, account_key=account_key)
     finally:
         conn.close()
+    return _facade_session_read(
+        lambda q: iter_entries(
+            q, range_start, range_end, project=project,
+            account_key=account_key),
+        account_key=account_key,
+        fallback=lambda: _collect_entries_direct(
+            range_start, range_end, project=project))
 
 
 def _harden_cache_sidecars() -> None:
@@ -20517,6 +23344,39 @@ def _open_maintenance_lock_fd(lock_path: pathlib.Path) -> int:
         return os.open(lock_path, flags, 0o666)
 
 
+def _owner_admission_deadline() -> "float | None":
+    """The AD7 per-open ``admission_deadline`` (#787 / #861, O5).
+
+    ``monotonic() + owner_wait_s`` when the current authority carries a CLI
+    owner bound, computed once on the guarded opener's entry; None (today's
+    blocking waits) with no bound or no authority. Kept apart from the
+    keeper-drain ``drain_deadline``: recovery execution keeps its own
+    budgets and neither interrupts nor replenishes this one."""
+    authority = _cctally_core.current_authority()
+    if authority is None or authority.owner_wait_s is None:
+        return None
+    return time.monotonic() + float(authority.owner_wait_s)
+
+
+def _owner_admission_flock(lock_fh, operation: int,
+                           admission_deadline: "float | None",
+                           sentence) -> None:
+    """Take ``operation`` on the maintenance lock within the AD7 deadline.
+
+    Unbounded (``admission_deadline`` None) it is today's blocking ``flock``.
+    Bounded, it polls through ``_cctally_store.admission_flock``: an OS error
+    other than contention propagates unchanged, and an expired contention
+    wait raises ``sqlite3.DatabaseError(sentence(err))`` chained from the
+    final ``BlockingIOError``, holding nothing."""
+    if admission_deadline is None:
+        fcntl.flock(lock_fh, operation)
+        return
+    err = _cctally_store.admission_flock(lock_fh, operation,
+                                         admission_deadline)
+    if err is not None:
+        raise sqlite3.DatabaseError(sentence(err)) from err
+
+
 def _cache_open_guarded() -> sqlite3.Connection:
     """Open cache.db while excluding a destructive recovery handshake.
 
@@ -20533,15 +23393,22 @@ def _cache_open_guarded() -> sqlite3.Connection:
     # other than "absent" (EIO, EACCES, ...), where ``os.path.exists`` would
     # return False and admit a connection while a repair may be running.
     lock_path = pathlib.Path(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH)
+    admission_deadline = _owner_admission_deadline()
     lock_fh = _open_maintenance_lock_fd(lock_path)
     try:
         for _attempt in range(2):
             conn = None
-            fcntl.flock(lock_fh, fcntl.LOCK_SH)
+            _owner_admission_flock(
+                lock_fh, fcntl.LOCK_SH, admission_deadline,
+                lambda _err: "cache.db maintenance is in progress")
             if marker.exists() or pending.exists():
+                # AD7 round 7: the recovery cause is captured HERE, under the
+                # initial shared lock; an exclusive-upgrade expiry reports it
+                # without re-inspecting the paths after the unlocked wait.
+                marker_cause = marker.exists()
                 live, reason = (
                     _cctally_db_sib._repair_marker_is_live(marker)
-                    if marker.exists()
+                    if marker_cause
                     else (False, "pending quarantine")
                 )
                 fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -20552,7 +23419,14 @@ def _cache_open_guarded() -> sqlite3.Connection:
                 # Drop shared before taking exclusive so two stale-marker
                 # reclaimers cannot deadlock while upgrading. Recheck under
                 # exclusive: a live owner may have replaced the stale marker.
-                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+                _owner_admission_flock(
+                    lock_fh, fcntl.LOCK_EX, admission_deadline,
+                    (lambda _err:
+                     "cache.db stale maintenance marker could not be "
+                     "reclaimed")
+                    if marker_cause else
+                    (lambda err:
+                     f"cache.db pending quarantine could not resume: {err}"))
                 if marker.exists():
                     live, reason = _cctally_db_sib._repair_marker_is_live(marker)
                     if live:
@@ -20567,9 +23441,9 @@ def _cache_open_guarded() -> sqlite3.Connection:
                         # drain grace, then resume under the same request.
                         with _cctally_db_sib._keeper_yield_request(
                             path
-                        ) as deadline:
+                        ) as drain_deadline:
                             open_pids = _cctally_db_sib._await_family_drained(
-                                path, deadline
+                                path, drain_deadline
                             )
                             if open_pids is None:
                                 raise OSError(
@@ -20774,6 +23648,8 @@ def _recover_corrupt_cache(
     original exception through its established direct-JSONL/error fallback.
     Raises a guided DatabaseError when recovery cannot prove exclusivity.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="_recover_corrupt_cache")
     if not _cctally_db_sib._is_sqlite_corruption_error(exc):
         return False
     if not origin.strip():
@@ -20992,6 +23868,19 @@ def open_cache_db() -> sqlite3.Connection:
     handle check prove replacement cannot invalidate a live WAL reader.
     """
     c = _cctally()
+    # #787 spec 5.1: per-branch capability, classified effect-free before the
+    # first file effect (the data-dir mkdir/chmod below); each branch
+    # re-checks in this frame. No authority (parts 1-2): no probe.
+    _cache_path = pathlib.Path(_cctally_core.CACHE_DB_PATH)
+    _branch_cap = _cctally_core.full_open_branch_capability(
+        "cache", _cache_path, head=len(_CACHE_MIGRATIONS),
+        recovery_paths=lambda: (
+            _cctally_db_sib._repair_marker_path(_cache_path),
+            _cctally_db_sib._quarantine_pending_path(_cache_path),
+        ),
+    )
+    if _branch_cap is not None:
+        _cctally_core.require_capability(_branch_cap, entry="open_cache_db")
     # cache.db holds plaintext conversation prose at rest (Plan 2, spec §5).
     # Harden the data dir to 0700 so the WAL window between connect and the
     # first write (which materializes the -wal/-shm sidecars, hardened in
@@ -21004,15 +23893,21 @@ def open_cache_db() -> sqlite3.Connection:
     )
     if not app_dir_present:
         _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    chmod_error = None
     if not app_dir_private:
         try:
             os.chmod(_cctally_core.APP_DIR, 0o700)
         except OSError as exc:
+            chmod_error = exc
             eprint(f"[cache] could not chmod data dir 0700 ({exc}); continuing")
+    # AD20: record (or retire) the access record when the mode did not take,
+    # under `ensure_dirs()`'s rule for a chmod that raised (revision 20).
+    _cctally_core._record_data_dir_access_after_chmod(chmod_error)
     recovered = False
     try:
         conn = _cache_open_guarded()
     except sqlite3.DatabaseError as exc:
+        _cctally_core.require_capability("MAINTENANCE", entry="open_cache_db")
         if not _recover_corrupt_cache(
             exc,
             origin="cache.open",
@@ -21043,7 +23938,11 @@ def open_cache_db() -> sqlite3.Connection:
     ).fetchone() is not None
     journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
 
-    if schema_current and compatibility_current and journal_mode == "wal":
+    # #1068 D3: a fence row left by a finished or dead migration run sends the
+    # open through the serialized branch, whose exclusive cleanup releases it;
+    # the lock-free fast path below would otherwise keep it forever.
+    if (schema_current and compatibility_current and journal_mode == "wal"
+            and not _cctally_db_sib.migration_fence_present(conn, "main")):
         # Steady-state opens stay lock-free and apply connection-local policy
         # only. Persistent/schema PRAGMAs and every DDL/DML migration path are
         # reserved for the globally serialized branch below.
@@ -21051,8 +23950,10 @@ def open_cache_db() -> sqlite3.Connection:
         _cctally_db_sib._reconcile_durable_applied_migration_errors(
             conn, _CACHE_MIGRATIONS, "cache.db",
         )
+        _cctally_core.require_capability("WRITE", entry="open_cache_db")
         return conn
 
+    _cctally_core.require_capability("STARTUP", entry="open_cache_db")
     from _lib_cache_writer_lock import (
         acquire_ordered_flocks,
         release_cache_writer_flocks,
@@ -21109,6 +24010,11 @@ def open_cache_db() -> sqlite3.Connection:
         # §6.2 version gate: schema apply, ALTER/purge, and the complete cache
         # migration dispatcher all run under maintenance-exclusive → global writer
         # exclusion. No first-open or upgrade write can overlap provider sync.
+        if schema_current:
+            # #1068 D3: the dispatcher (whose entry releases fence rows left by
+            # finished or dead runs) runs only behind head here, so a current
+            # store's open makes that cleanup itself.
+            _cctally_db_sib._try_clear_inactive_migration_fences(conn, "cache.db")
         if not schema_current:
             _cctally_db_sib._apply_cache_schema(conn)
             if add_column_if_missing(
@@ -21307,7 +24213,7 @@ def _conversation_derivations_enabled(run_derivations: "bool | None") -> bool:
 
 @contextlib.contextmanager
 def conversation_ro_guarded(
-    *, timeout: float,
+    *, timeout: float = 0.0, connect=None,
 ) -> "Iterator[sqlite3.Connection | None]":
     """Bounded read-only transcript handle participating in #415 recovery.
 
@@ -21321,11 +24227,34 @@ def conversation_ro_guarded(
     before and after the connect). The connection is a ``mode=ro`` URI, which
     cannot create the main file. It never claims, resumes or reclaims
     anything and runs no schema work.
+
+    #787 / #861 (spec 5.4, AD22): the maintenance lock is opened
+    ``O_RDONLY`` and never created (nor its directory). A missing lock means
+    no owner established the store: the typed `absent` refusal, a
+    `ConversationReaderUnavailable` (``sqlite3.DatabaseError``) every caller
+    already degrades on.
+
+    #787 / #861 (spec 5.4): the `mode=ro` connect may create ``-wal`` and
+    ``-shm``, which is acceptable only inside a data directory an owner
+    established as private, so any other directory is the typed
+    `unavailable` refusal before the lock or the store is opened, as every
+    query session refuses it.
+
+    #787 / #861 AD31: ``connect`` (the store path to a connection) replaces
+    the plain connect for a reader on a query path: `explain`'s reader
+    passes the held-session query connection
+    (`_cctally_store_access.held_query_connection`), which fixes its own
+    busy timeout from the running admission, so ``timeout`` is then unused.
     """
     path = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
     if not path.exists():
         yield None
         return
+    import _cctally_store_access
+    if not _cctally_store_access._private_data_dir_ok():
+        raise _cctally_store_access._unavailable(
+            "conversations", "unavailable",
+            "the cctally data directory is not private")
     marker = path.with_name(f"{path.name}.repairing")
     pending = path.with_name(f"{path.name}.quarantine-pending.json")
     recovery = path.with_name(f"{path.name}.recovery.json")
@@ -21334,8 +24263,14 @@ def conversation_ro_guarded(
     )
     lock_fh = conn = None
     try:
-        maintenance.parent.mkdir(parents=True, exist_ok=True)
-        lock_fh = open(maintenance, "a+")
+        try:
+            lock_fd = os.open(maintenance,
+                              os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        except FileNotFoundError:
+            raise ConversationReaderUnavailable(
+                "conversations.db maintenance lock is absent",
+                reason="absent") from None
+        lock_fh = os.fdopen(lock_fd, "rb")
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -21344,11 +24279,14 @@ def conversation_ro_guarded(
         if marker.exists() or pending.exists() or recovery.exists():
             yield None
             return
-        conn = sqlite3.connect(
-            path.resolve().as_uri() + "?mode=ro",
-            uri=True,
-            timeout=max(0.0, timeout),
-        )
+        if connect is not None:
+            conn = connect(path)
+        else:
+            conn = sqlite3.connect(
+                path.resolve().as_uri() + "?mode=ro",
+                uri=True,
+                timeout=max(0.0, timeout),
+            )
         if marker.exists() or pending.exists() or recovery.exists():
             conn.close()
             conn = None
@@ -21390,10 +24328,13 @@ def _conversations_open_guarded(
         _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
     )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    admission_deadline = _owner_admission_deadline()
     lock_fh = open(lock_path, "a+")
     try:
         for _attempt in range(2):
-            fcntl.flock(lock_fh, fcntl.LOCK_SH)
+            _owner_admission_flock(
+                lock_fh, fcntl.LOCK_SH, admission_deadline,
+                lambda _err: "conversations.db maintenance is in progress")
             if recovery.exists() and not allow_recovery_state:
                 fcntl.flock(lock_fh, fcntl.LOCK_UN)
                 raise sqlite3.DatabaseError(
@@ -21412,7 +24353,13 @@ def _conversations_open_guarded(
                         "conversations.db maintenance is in progress "
                         f"({reason})"
                     )
-                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+                # AD7: an exclusive-upgrade expiry, whether the captured
+                # cause was a marker or a pending quarantine only, reports
+                # that this attempt could not reclaim the recovery state.
+                _owner_admission_flock(
+                    lock_fh, fcntl.LOCK_EX, admission_deadline,
+                    lambda _err: "conversations.db stale recovery state "
+                                 "could not be reclaimed")
                 provider_locks: list[Any] | None = None
                 try:
                     if marker.exists():
@@ -21438,9 +24385,9 @@ def _conversations_open_guarded(
                         # drain grace, then resume under the same request.
                         with _cctally_db_sib._keeper_yield_request(
                             path
-                        ) as deadline:
+                        ) as drain_deadline:
                             open_pids = _cctally_db_sib._await_family_drained(
-                                path, deadline
+                                path, drain_deadline
                             )
                             if open_pids is None:
                                 raise sqlite3.DatabaseError(
@@ -21545,12 +24492,17 @@ def _open_conversations_db_unlocked(
     a mode allowed to do work runs.
     """
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    chmod_error = None
     try:
         os.chmod(_cctally_core.APP_DIR, 0o700)
     except OSError as exc:
+        chmod_error = exc
         eprint(
             f"[conversations] could not chmod data dir 0700 ({exc}); continuing"
         )
+    # AD20: record (or retire) the access record when the mode did not take,
+    # under `ensure_dirs()`'s rule for a chmod that raised (revision 20).
+    _cctally_core._record_data_dir_access_after_chmod(chmod_error)
 
     path = _cctally_core.CONVERSATIONS_DB_PATH
     conn: sqlite3.Connection | None = None
@@ -21574,7 +24526,27 @@ def _open_conversations_db_unlocked(
         raise
 
     assert conn is not None
+    # Every way the open fails after the connect closes this writer
+    # connection before the error propagates. Left to the garbage collector
+    # (an attach refused while another process repairs cache.db), its close
+    # ran later, inside whatever scope was active, and checkpointed and
+    # deleted the WAL there (#787 R32-V5).
+    try:
+        return _prepare_conversations_connection(
+            conn, path, attach_cache=attach_cache,
+            run_derivations=run_derivations,
+        )
+    except BaseException:
+        conn.close()
+        raise
 
+
+def _prepare_conversations_connection(
+    conn: sqlite3.Connection, path: pathlib.Path, *, attach_cache: bool,
+    run_derivations: "bool | None",
+) -> sqlite3.Connection:
+    """The policy, schema, migration and attach steps of
+    ``_open_conversations_db_unlocked`` on its freshly connected ``conn``."""
     try:
         os.chmod(path, 0o600)
     except OSError as exc:
@@ -21585,6 +24557,12 @@ def _open_conversations_db_unlocked(
     # §6.1 PRAGMA policy (auto_vacuum=INCREMENTAL first / WAL / busy_timeout /
     # journal_size_limit / synchronous=NORMAL) via the shared table.
     _cctally_store.apply_policy(conn, "conversations")
+    # #1094 D4: admission of a build with an equal tokenizer fingerprint, then
+    # this connection's TEMP write guard, before any schema work so the
+    # migrations and the derivations are covered. Writes nothing on a store
+    # without build rows. Every temp_store change below deletes the guard, so
+    # each is followed at once by a reinstall.
+    _fts_integrity.prepare_writer_connection(conn)
     # §6.2 version gate. conversations.db is under the migration framework
     # (spec §7.2): the schema apply runs only when the stamped user_version is
     # behind the registry head; the dispatcher below then stamps user_version to
@@ -21595,7 +24573,11 @@ def _open_conversations_db_unlocked(
     if schema_work:
         # PR-3: pending schema and migration work sorts under FILE.
         _cctally_store.apply_schema_work_temp_store(conn)
+        _fts_integrity.install_conversation_fts_guard(conn)
         _cctally_db_sib._apply_conversations_schema(conn)
+        # The schema apply can create a content table the guard did not yet
+        # cover (a first open, or a store older than one).
+        _fts_integrity.install_conversation_fts_guard(conn)
     # Commit the schema apply BEFORE the dispatcher: _apply_conversations_schema
     # can leave an open implicit transaction (its trailing marker INSERT), and
     # the dispatcher's bootstrap-rename opens its own BEGIN — which would collide
@@ -21606,12 +24588,31 @@ def _open_conversations_db_unlocked(
     # unconditionally with its own fast-path (user_version == registry head).
     # recover_version_ahead=True because conversations.db is re-derivable from
     # provider JSONL, matching the cache.db posture.
-    _run_pending_migrations(
-        conn, registry=_CONVERSATIONS_MIGRATIONS, db_label="conversations.db",
-        recover_version_ahead=True,
-    )
+    migration_mark = _conversations_migration_mark(conn)
+    try:
+        _run_pending_migrations(
+            conn, registry=_CONVERSATIONS_MIGRATIONS,
+            db_label="conversations.db", recover_version_ahead=True,
+        )
+    except BaseException:
+        # #1094 (review F18): a migration that committed before the
+        # dispatcher raised still retracts for this build; best effort, and
+        # never in place of the dispatcher's own exception.
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+            _retract_after_conversations_migrations(conn, migration_mark)
+        except Exception:  # noqa: BLE001 — the original error propagates
+            pass
+        raise
+    _retract_after_conversations_migrations(conn, migration_mark)
+    # #1068 D2: the writer opener gives the store its incarnation id once; a
+    # re-created store gets a new one, and D3 rotates it on migration-state
+    # changes.
+    _ensure_incarnation_id_committed(conn, "conversations.db")
     if schema_work:
         _cctally_store.apply_writer_temp_store(conn)
+        _fts_integrity.install_conversation_fts_guard(conn)
 
     if attach_cache:
         # Ensure the compact schema exists before opening it read-only.  This
@@ -21625,13 +24626,58 @@ def _open_conversations_db_unlocked(
         if _conversation_derivations_enabled(run_derivations):
             _import_legacy_conversation_rows(conn)
             _ensure_codex_conversation_contract(conn)
+            # A derivation can recreate a content table; reinstall the guard
+            # for it (IF NOT EXISTS, so a surviving guard is untouched).
+            _fts_integrity.install_conversation_fts_guard(conn)
     _harden_conversation_sidecars()
     return conn
+
+
+def _retract_after_conversations_migrations(conn: sqlite3.Connection,
+                                            migration_mark: tuple) -> None:
+    """#1094 D4: a migration may recreate a content table (dropping its TEMP
+    guard with it) or write an FTS table directly, so after one applied in
+    this open the guard's retraction runs once for this build; it writes
+    nothing for a listed build or a store without build rows."""
+    migrated = _conversations_migration_mark(conn) != migration_mark
+    _fts_integrity.install_conversation_fts_guard(conn)
+    if migrated:
+        if _fts_integrity.retract_unless_listed(conn):
+            conn.commit()
+
+
+def _conversations_migration_mark(conn: sqlite3.Connection) -> tuple:
+    """``(user_version, ledger rows)`` of a conversations connection: a
+    change across the dispatcher means it applied a migration in this open
+    (#1094). An unreadable ledger reads as None, which still compares."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    try:
+        ledger = tuple(conn.execute(
+            "SELECT * FROM schema_migrations ORDER BY 1").fetchall())
+    except sqlite3.OperationalError:
+        ledger = None
+    return version, ledger
 
 
 def open_conversations_db(
     *, attach_cache: bool = True, run_derivations: "bool | None" = None,
 ) -> sqlite3.Connection:
+    # #787 spec 5.1: per-branch capability, classified effect-free before
+    # `_conversations_open_guarded` creates, migrates or recovers anything.
+    # The steady state needs WRITE; no authority (parts 1-2): no probe.
+    _conv_path = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
+    _branch_cap = _cctally_core.full_open_branch_capability(
+        "conversations", _conv_path, head=len(_CONVERSATIONS_MIGRATIONS),
+        recovery_paths=lambda: (
+            _cctally_db_sib._repair_marker_path(_conv_path),
+            _cctally_db_sib._quarantine_pending_path(_conv_path),
+            _conversation_recovery_state_path(),
+        ),
+    )
+    if _branch_cap is not None:
+        _cctally_core.require_capability(
+            _branch_cap, entry="open_conversations_db")
+    _cctally_core.require_capability("WRITE", entry="open_conversations_db")
     return _conversations_open_guarded(
         attach_cache=attach_cache, run_derivations=run_derivations,
     )
@@ -21647,8 +24693,16 @@ def _install_codex_last_good_views(conn: sqlite3.Connection) -> bool:
     list, children, parent, spawn links, source paths, the rollup writer)
     inherits this without being rewritten. False when either store lacks the
     barrier tables: the conversation pass then fails closed.
+
+    Any cached threads-table answer for ``conn`` is forgotten FIRST (#854 R2),
+    so a False return, or an exception from a probe, a drop or a create,
+    leaves no answer from before the reinstall and the next resolver call
+    probes afresh. The installer never seeds: only
+    ``open_conversations_db_readonly`` does, once it can hand the connection
+    to its caller.
     """
     import _lib_codex_metadata
+    _lib_codex_metadata.invalidate_codex_threads_table_resolution(conn)
     try:
         conn.execute("SELECT 1 FROM cache_db.codex_barrier_population LIMIT 0")
         conn.execute("SELECT 1 FROM cache_db.codex_barrier_entry_threads LIMIT 0")
@@ -21674,7 +24728,6 @@ def _install_codex_last_good_views(conn: sqlite3.Connection) -> bool:
         "WHERE q.conversation_key = e.conversation_key)")
     conn.execute("CREATE TEMP VIEW codex_conversation_threads AS "
                  f"SELECT * FROM temp.{view}")
-    _lib_codex_metadata.invalidate_codex_threads_table_resolution(conn)
     return True
 
 
@@ -21701,14 +24754,19 @@ CONVERSATION_READONLY_TIMEOUT_S = 0.25
 SCHEMA_WAKE_HOOK = None
 
 
-class ConversationReaderUnavailable(sqlite3.DatabaseError):
+class ConversationReaderUnavailable(_cctally_core.StoreUnavailable):
     """A read route could not be admitted. Carries a typed ``reason``.
 
-    A subclass of ``sqlite3.DatabaseError`` so the existing route boundary,
-    which already catches ``DatabaseError`` and ``OSError``, keeps catching it
-    rather than letting a new exception class escape as a 500.
+    A subclass of ``sqlite3.DatabaseError`` (through
+    `_cctally_core.StoreUnavailable`, #787 spec 5.5) so the existing route
+    boundary, which already catches ``DatabaseError`` and ``OSError``, keeps
+    catching it rather than letting a new exception class escape as a 500.
+    The class-level ``store``/``reason`` defaults keep every subclass's
+    one-argument constructor; a raise site may pass ``store="cache"`` for an
+    attached-cache state.
     """
 
+    store = "conversations"
     reason = "unavailable"
 
 
@@ -21749,51 +24807,6 @@ class LegacyBridgePending(ConversationReaderUnavailable):
     reason = "legacy_bridge_pending"
 
 
-def probe_conversations_maintenance_free() -> None:
-    """Raise `MaintenanceInProgress` if maintenance holds the flock right now.
-
-    The non-blocking admission `open_conversations_db_readonly` performs,
-    factored out for the three request-path sites that must reach the BLOCKING
-    full opener but must not queue behind a rebuild on the way (#780).
-
-    Those sites are the live-tail preflight and `_open_conversation_reader`'s
-    two fallbacks. Each of them hands the open to `open_conversations_db`,
-    whose maintenance admission is a plain `LOCK_SH` with no timeout, so a
-    request arriving during a rebuild held a server thread for the rebuild's
-    whole duration — 716.9 s in the measured run. §4a names the live-tail
-    preflight among the routes that must fail soft, and the other two reach the
-    same opener by the same route.
-
-    An absent lock file is NOT a refusal, for the same reason the read-only
-    opener gives: it means no maintenance has ever claimed it, which is a
-    first-run state rather than a busy one, and the full opener is what creates
-    it. An unopenable lock file is not a refusal either — an undecidable probe
-    must not be what takes a read route down; the full opener behind it will
-    fail loudly on its own if the state is genuinely bad.
-    """
-    maintenance_path = pathlib.Path(
-        _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
-    )
-    if not maintenance_path.is_file():
-        return
-    try:
-        probe_fh = open(maintenance_path, "r")
-    except OSError:
-        return
-    try:
-        try:
-            fcntl.flock(probe_fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise MaintenanceInProgress(
-                "conversations.db maintenance is in progress") from exc
-        try:
-            fcntl.flock(probe_fh, fcntl.LOCK_UN)
-        except OSError:
-            pass
-    finally:
-        probe_fh.close()
-
-
 def open_conversations_db_readonly(
     *, attach_cache: bool = True, timeout: "float | None" = None,
 ) -> sqlite3.Connection:
@@ -21830,6 +24843,12 @@ def open_conversations_db_readonly(
     advance the store; ``ahead`` raises ``SchemaAhead`` and attempts no
     recovery, matching the existing version-ahead posture. The opener never
     migrates from a request thread.
+
+    When the last-good views install, the returned connection carries a
+    seeded threads-table resolution (#854 R2): its owner must call
+    ``_lib_codex_metadata.invalidate_codex_threads_table_resolution(conn)``
+    before closing it, as the dashboard reader and request lifecycle do, or
+    the resolver cache keeps the closed object until newer entries evict it.
     """
     path = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
     marker = _cctally_db_sib._repair_marker_path(path)
@@ -21855,6 +24874,7 @@ def open_conversations_db_readonly(
         raise ConversationReaderUnavailable("accounting store is not present")
 
     conn: sqlite3.Connection | None = None
+    installed = False
     maintenance_fh = open(maintenance_path, "r")
     try:
         try:
@@ -21889,17 +24909,33 @@ def open_conversations_db_readonly(
                 pass
         _gate_reader_schema(conn, attach_cache=attach_cache)
         if attach_cache:
-            _install_codex_last_good_views(conn)
-        return conn
+            installed = _install_codex_last_good_views(conn)
     except BaseException:
         if conn is not None:
             try:
                 conn.close()
             except sqlite3.Error:
                 pass
-        raise
-    finally:
         maintenance_fh.close()
+        raise
+    # #854 R2: the seed follows every fallible step of the open, so the
+    # connection that carries it is the one the caller receives, and the
+    # dashboard request lifecycle evicts it before closing it. Until the
+    # return, a failure (the maintenance-file close, the seed itself) means
+    # the caller never receives the connection and no eviction downstream can
+    # run, so this guard evicts and closes it.
+    try:
+        maintenance_fh.close()
+        if installed:
+            _lib_codex_metadata.seed_codex_last_good_threads_resolution(conn)
+    except BaseException:
+        _lib_codex_metadata.invalidate_codex_threads_table_resolution(conn)
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        raise
+    return conn
 
 
 def conversation_legacy_bridge_pending(conn: sqlite3.Connection) -> bool:
@@ -21951,8 +24987,329 @@ def _gate_reader_schema(conn: sqlite3.Connection, *, attach_cache: bool) -> None
         raise SchemaAhead(f"{store_name} store is ahead of head")
 
 
+# --------------------------------------------------------------------------
+# #1068 D4/D6: scoped reuse of verified stored rollup rows
+# --------------------------------------------------------------------------
+
+#: Flags whose presence keeps the scoped reader off every stored Claude
+#: rollup row (D4(b)): the targeted-decline set plus a Claude rebuild in
+#: progress and the full-recompute flag.
+_SCOPED_REUSE_BLOCKING_FLAGS = tuple(dict.fromkeys(
+    _TARGETED_DECLINE_FLAGS + (
+        "conversation_rebuild_claude_pending",
+        "conversation_sessions_backfill_pending",
+    )))
+
+
+def _scoped_reuse_schema_gate(conn) -> bool:
+    """D4(c), read inside the caller's snapshot, ``main`` first: each store's
+    ``user_version`` equals this binary's registry length, every registered
+    migration is applied or skipped, neither ledger names a migration outside
+    the registry, and neither store holds a migration fence. Fails closed on
+    any read it cannot perform."""
+    try:
+        attached = {row[1] for row in conn.execute("PRAGMA database_list")}
+    except sqlite3.Error:
+        return False
+    if "cache_db" not in attached:
+        return False
+    for schema, registry in (("main", _CONVERSATIONS_MIGRATIONS),
+                             ("cache_db", _CACHE_MIGRATIONS)):
+        try:
+            version = conn.execute(
+                f"PRAGMA {schema}.user_version").fetchone()[0]
+            if version != len(registry):
+                return False
+            names = {row[0] for row in conn.execute(
+                f"SELECT name FROM {schema}.schema_migrations")}
+            names |= {row[0] for row in conn.execute(
+                f"SELECT name FROM {schema}.schema_migrations_skipped")}
+        except sqlite3.Error:
+            return False
+        if names != {m.name for m in registry}:
+            return False
+        if _cctally_db_sib.migration_fence_present(conn, schema):
+            return False
+    return True
+
+
+def _claude_rollup_reuse_epoch(conn) -> "str | None":
+    """D4's global gate on an account-scoped connection, read inside the
+    scoper's snapshot (``main`` first, ``cache_db`` second). Returns the
+    current rollup epoch when every condition holds, else None:
+
+    (a) the rollup is authoritative; (b) no rollup-blocking flag is present;
+    (c) both stores are at this binary's schema and not mid-migration
+    (``_scoped_reuse_schema_gate``); (d) both incarnation ids are present
+    (``_conversation_rollup_epoch`` is None without them). A store whose
+    ``conversation_sessions`` lacks ``input_fingerprint`` never reuses."""
+    lq = _load_lib("_lib_conversation_query")
+    try:
+        cols = {row[1] for row in conn.execute(
+            "PRAGMA main.table_info(conversation_sessions)")}
+    except sqlite3.Error:
+        return None
+    if "input_fingerprint" not in cols:
+        return None
+    if not lq._rollup_authoritative(conn):
+        return None
+    placeholders = ",".join("?" for _ in _SCOPED_REUSE_BLOCKING_FLAGS)
+    try:
+        if conn.execute(
+            f"SELECT 1 FROM main.cache_meta WHERE key IN ({placeholders}) "
+            "LIMIT 1", _SCOPED_REUSE_BLOCKING_FLAGS,
+        ).fetchone() is not None:
+            return None
+    except sqlite3.Error:
+        return None
+    if not _scoped_reuse_schema_gate(conn):
+        return None
+    return _conversation_rollup_epoch(conn)
+
+
+def _scoped_claude_reuse_partition(
+    conn, epoch: str,
+) -> "tuple[list[str], list[str]]":
+    """Split the scope's Claude sessions into ``(reusable, fresh)``, both in
+    ascending ``session_id`` (D4 (e) and (f)).
+
+    The scoped aggregate is ``_CONV_SESSIONS_SELECT``'s COUNT/MIN/MAX plus
+    ``MAX(id)`` over the scoped view (a covering read of
+    ``idx_conv_messages_account_session``). The in-scope accounting is one
+    scan of the scoped ``session_entries`` view, joined index-only through
+    ``idx_conv_turnkey`` to a TEMP id map of the scope's messages, counting
+    distinct entry rows per session (a key held by several fragments counts
+    once, a key shared by two sessions counts once in each) and their largest
+    ``mutation_seq`` — exactly the ``entries`` / ``max_seq`` the fill computes
+    from ``_session_cost_and_accounting_map`` over the same view, because
+    ``(msg_id, req_id)`` is unique in ``session_entries``.
+
+    A session is reusable only when its stored row exists, its
+    ``(msg_count, started_utc, last_activity_utc)`` equals the scoped
+    aggregate, and its stored fingerprint equals the one recomputed from the
+    current epoch, the scoped ``MAX(id)``, the in-scope entries and maximum
+    sequence, and the stored row's seal. Any read it cannot perform makes
+    every session fresh."""
+    aggregate: "dict[str, tuple]" = {}
+    for sid, count, started, last, max_id in conn.execute(
+        "SELECT session_id, COUNT(*), MIN(timestamp_utc), MAX(timestamp_utc), "
+        "MAX(id) FROM conversation_messages WHERE session_id IS NOT NULL "
+        "GROUP BY session_id"
+    ):
+        aggregate[sid] = (count, started, last, max_id)
+    if not aggregate:
+        return [], []
+    every = sorted(aggregate)
+    accounting: "dict[str, tuple[int, int | None]]" = {}
+    try:
+        conn.execute("DROP TABLE IF EXISTS temp._conversation_scope_ids")
+        conn.execute(
+            "CREATE TEMP TABLE _conversation_scope_ids "
+            "(id INTEGER PRIMARY KEY, session_id TEXT NOT NULL)")
+        try:
+            conn.execute(
+                "INSERT INTO temp._conversation_scope_ids(id, session_id) "
+                "SELECT id, session_id FROM conversation_messages "
+                "WHERE session_id IS NOT NULL")
+            for sid, entries, max_seq in conn.execute(
+                "SELECT s.session_id, COUNT(DISTINCT e.id), MAX(e.mutation_seq) "
+                "FROM session_entries e "
+                "CROSS JOIN main.conversation_messages m "
+                "INDEXED BY idx_conv_turnkey "
+                "CROSS JOIN temp._conversation_scope_ids s "
+                "WHERE e.msg_id IS NOT NULL AND e.req_id IS NOT NULL "
+                "AND m.msg_id = e.msg_id AND m.req_id = e.req_id "
+                "AND s.id = m.id "
+                "GROUP BY s.session_id"
+            ):
+                accounting[sid] = (int(entries), max_seq)
+        finally:
+            conn.execute("DROP TABLE IF EXISTS temp._conversation_scope_ids")
+        stored: "dict[str, tuple]" = {}
+        for row in conn.execute(
+            "SELECT session_id, " + ", ".join(_ROLLUP_SEAL_COLUMNS)
+            + ", input_fingerprint FROM main.conversation_sessions"
+        ):
+            if row[0] in aggregate:
+                stored[row[0]] = row[1:]
+    except sqlite3.Error:
+        return [], every
+    reusable: "list[str]" = []
+    fresh: "list[str]" = []
+    for sid in every:
+        row = stored.get(sid)
+        if row is None or row[-1] is None:
+            fresh.append(sid)
+            continue
+        count, started, last, max_id = aggregate[sid]
+        # (msg_count, started_utc, last_activity_utc) lead the seal columns.
+        if tuple(row[:3]) != (count, started, last):
+            fresh.append(sid)
+            continue
+        entries, max_seq = accounting.get(sid, (0, None))
+        expected = _format_input_fingerprint(
+            epoch, max_id, entries, max_seq, _rollup_row_seal(row[:-1]))
+        (reusable if row[-1] == expected else fresh).append(sid)
+    return reusable, fresh
+
+
+def _scoped_claude_rollup(conn) -> None:
+    """Fill the scoper's TEMP ``conversation_sessions`` (D4). With the global
+    gate passing, verified stored rows are copied with ``render_revision`` 0
+    (fingerprint included) and only the other sessions are derived; the table
+    is then rewritten in ascending ``session_id`` so its row order equals the
+    full derivation's (a reader iterating it without an ORDER BY observes it,
+    F13).
+    Otherwise it is today's full derivation over the scoped views."""
+    epoch = _claude_rollup_reuse_epoch(conn)
+    if epoch is None:
+        _recompute_conversation_sessions(
+            conn, advance_render_revision=False, authorize=False)
+        return
+    reusable, fresh = _scoped_claude_reuse_partition(conn, epoch)
+    for i in range(0, len(reusable), 400):
+        chunk = reusable[i:i + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        conn.execute(
+            "INSERT INTO temp.conversation_sessions "
+            "SELECT * FROM main.conversation_sessions "
+            f"WHERE session_id IN ({placeholders}) ORDER BY session_id",
+            chunk,
+        )
+    if reusable:
+        conn.execute("UPDATE temp.conversation_sessions SET render_revision=0")
+    if fresh:
+        _recompute_conversation_sessions(
+            conn, session_ids=fresh, advance_render_revision=False,
+            authorize=False)
+    _rewrite_temp_rollup_in_key_order(
+        conn, "conversation_sessions", "session_id")
+
+
+def _rewrite_temp_rollup_in_key_order(conn, table: str, key: str) -> None:
+    """Rewrite a scoper TEMP rollup table so its rowids ascend with ``key``
+    (at most a few thousand small rows), matching the full derivation's
+    insertion order."""
+    conn.execute(f"DROP TABLE IF EXISTS temp._{table}_ordered")
+    conn.execute(
+        f"CREATE TEMP TABLE _{table}_ordered AS "
+        f"SELECT * FROM temp.{table} ORDER BY {key}")
+    conn.execute(f"DELETE FROM temp.{table}")
+    conn.execute(
+        f"INSERT INTO temp.{table} "
+        f"SELECT * FROM temp._{table}_ordered ORDER BY rowid")
+    conn.execute(f"DROP TABLE temp._{table}_ordered")
+
+
+def _scoped_codex_reuse_partition(
+    conn, codex_keys,
+) -> "tuple[list[str], list[str]]":
+    """Split the scope's Codex conversations into ``(reusable, fresh)``, both
+    in ascending ``conversation_key`` (D6).
+
+    A conversation's rows-derived rollup columns (``item_count``, ``title``,
+    ``started_utc``, ``last_activity_utc``, ``models_json``) are a function of
+    its normalized rows alone, written atomically with them (F12). So the
+    stored row is reusable when the normalized corpus is authoritative,
+    stored rollups are present, D4(c) holds, the conversation has a stored
+    row, and every one of its rows is in scope (scoped count = total count,
+    both covering index reads)."""
+    keys = sorted({key for key in codex_keys if key})
+    if not keys:
+        return [], []
+    import _lib_codex_conversation_query as codex_query
+    try:
+        if not codex_query.codex_normalization_authoritative(conn):
+            return [], keys
+        if conn.execute(
+            "SELECT 1 FROM main.codex_conversation_rollups LIMIT 1"
+        ).fetchone() is None:
+            return [], keys
+    except sqlite3.Error:
+        return [], keys
+    if not _scoped_reuse_schema_gate(conn):
+        return [], keys
+    reusable: "list[str]" = []
+    fresh: "list[str]" = []
+    try:
+        for key in keys:
+            stored = conn.execute(
+                "SELECT 1 FROM main.codex_conversation_rollups "
+                "WHERE conversation_key=?", (key,)).fetchone()
+            if stored is None:
+                fresh.append(key)
+                continue
+            scoped = conn.execute(
+                "SELECT COUNT(*) FROM codex_conversation_messages "
+                "WHERE conversation_key=?", (key,)).fetchone()[0]
+            total = conn.execute(
+                "SELECT COUNT(*) FROM main.codex_conversation_messages "
+                "WHERE conversation_key=?", (key,)).fetchone()[0]
+            (reusable if scoped and scoped == total else fresh).append(key)
+    except sqlite3.Error:
+        return [], keys
+    return reusable, fresh
+
+
+def _scoped_codex_rollup(conn, codex_keys) -> None:
+    """Fill the scoper's TEMP ``codex_conversation_rollups`` (D6): reused
+    conversations take their five rows-derived columns from the stored
+    rollup, and their scope-dependent fields the way the fresh derivation
+    gets them under the scope's empty thread view (``source_root_key`` from
+    the first row, ``parent_thread_id`` NULL, project fields that the
+    caller's safe-attribution UPDATE then sets as today). The rest go through
+    ``_recompute_codex_rollups``; the table ends in ascending
+    ``conversation_key`` order, today's order, which the facets observe."""
+    reusable, fresh = _scoped_codex_reuse_partition(conn, codex_keys)
+    for key in reusable:
+        stored = conn.execute(
+            "SELECT item_count, started_utc, last_activity_utc, models_json, "
+            "title FROM main.codex_conversation_rollups "
+            "WHERE conversation_key=?", (key,)).fetchone()
+        root = _codex_first_row_root(conn, key)
+        if stored is None or not root:
+            fresh.append(key)
+            continue
+        source_root_key, parent_thread_id, project_key, project_label = (
+            _codex_rollup_thread_fields(
+                conn, key, first_row_root=lambda root=root: root))
+        item_count, started, last_activity, models_json, title = stored
+        conn.execute(
+            "INSERT INTO temp.codex_conversation_rollups "
+            "(conversation_key, source_root_key, parent_thread_id, item_count, "
+            " started_utc, last_activity_utc, project_key, project_label, "
+            " models_json, title, render_revision) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,0)",
+            (key, source_root_key, parent_thread_id, item_count, started,
+             last_activity, project_key, project_label, models_json, title),
+        )
+    _recompute_codex_rollups(conn, fresh, advance_render_revision=False)
+    if reusable:
+        _rewrite_temp_rollup_in_key_order(
+            conn, "codex_conversation_rollups", "conversation_key")
+
+
+def _execute_script_in_session(conn: sqlite3.Connection, script: str) -> None:
+    """``executescript`` without its leading COMMIT (#787 spec 5.13 step 8).
+
+    Splits the script at statement boundaries SQLite itself recognizes
+    (`sqlite3.complete_statement`, which tokenizes comments and literals) and
+    runs each statement through ``execute()`` inside the caller's
+    transaction, so a query session's one snapshot is never ended."""
+    buffer = ""
+    for piece in script.split(";"):
+        buffer += piece + ";"
+        if sqlite3.complete_statement(buffer):
+            statement = buffer.strip()
+            buffer = ""
+            if statement.strip("; \n\t"):
+                conn.execute(statement)
+    if buffer.strip("; \n\t"):
+        conn.execute(buffer)
+
+
 def scope_conversations_db_to_account(
-    conn: sqlite3.Connection, account_key: str,
+    conn: sqlite3.Connection, account_key: str, *, in_session: bool = False,
 ) -> None:
     """Narrow one conversation read connection to ``account_key`` (#347).
 
@@ -21963,23 +25320,35 @@ def scope_conversations_db_to_account(
     search, detail, outline, export, payload, media, find, and cost/token joins
     all inherit the same physical-row predicate without a parallel query stack.
 
-    The two rollups are rebuilt into TEMP tables from the filtered leaves.  No
+    The two rollups are built into TEMP tables from the filtered leaves.  No
     persistent row is changed and an unqualified connection takes none of this
     path, preserving the existing SQL plans and serialized bytes.
+
+    #1068: a stored rollup row the scope can prove equal to its fresh scoped
+    derivation is copied instead of re-derived (D4 for Claude, verified by the
+    row's input fingerprint; D6 for Codex, when every row is in scope), and
+    the rest are derived as before. Both TEMP tables end in ascending key
+    order, so every response is byte-identical to a full derivation.
     """
     import _lib_accounts
 
     key = str(account_key or "").strip()
     if not key:
         raise ValueError("account_key is required")
+    # #1068 D1: both predicates are sargable rewrites of the earlier
+    # ``COALESCE(account_key,'unattributed') = <scope>`` form, so every leaf
+    # reads through its ``(account_key, …)`` index instead of scanning the
+    # table and walking each row's overflow chain to the trailing column.
+    # A real key never equals 'unattributed' (that is the separate scope), so
+    # the real-key form is exact; the unattributed scope keeps BOTH stored
+    # spellings, NULL and the literal.
     if key == _lib_accounts.UNATTRIBUTED:
-        stored_predicate = "COALESCE(account_key,'unattributed')='unattributed'"
+        stored_predicate = "(account_key IS NULL OR account_key='unattributed')"
     else:
         # The value lives in a one-row TEMP table and reaches every view through
         # a subquery; never interpolate an opaque account key into DDL.
         stored_predicate = (
-            "COALESCE(account_key,'unattributed')="
-            "(SELECT account_key FROM _conversation_account_scope)"
+            "account_key=(SELECT account_key FROM _conversation_account_scope)"
         )
 
     conn.execute(
@@ -21991,7 +25360,12 @@ def scope_conversations_db_to_account(
     )
 
     conn.execute("DROP VIEW IF EXISTS temp.codex_conversation_threads")
-    conn.executescript(
+    # #787 spec 5.13 step 8: inside a query session the TEMP scope is built
+    # in the session's transaction with individual `execute()` statements:
+    # no `executescript` (it COMMITs first) and no final commit.
+    (_execute_script_in_session if in_session else
+     (lambda _c, script: _c.executescript(script)))(
+        conn,
         f"""
         CREATE TEMP VIEW conversation_messages AS
             SELECT * FROM main.conversation_messages WHERE {stored_predicate};
@@ -22000,11 +25374,14 @@ def scope_conversations_db_to_account(
         -- retained in-scope message of the title's session, (c) no retained
         -- message of the session, in any file, is outside the scope, and
         -- (d) no Claude conversation rebuild is in progress (its message
-        -- table may be partial). (b) reads the scoped TEMP view; (a), (c)
-        -- and (d) read main. The fragment's unqualified account_key binds to
-        -- the innermost FROM (main.conversation_messages m). The base rowid
-        -- is projected as `rowid` so the title FTS joins resolve on a scoped
-        -- connection and return the base row (C1).
+        -- table may be partial). (b) reads the scoped TEMP view; (a) and (d)
+        -- read main. (c) is a count equality (#1068 D1): the in-scope rows
+        -- are a subset of the session's rows, so the two counts are equal
+        -- exactly when no out-of-scope row exists, NULL-account rows
+        -- included (a naive NOT (account_key = K) would read NULL as unknown
+        -- and admit them); both counts are covering-index reads. The base
+        -- rowid is projected as `rowid` so the title FTS joins resolve on a
+        -- scoped connection and return the base row (C1).
         CREATE TEMP VIEW conversation_ai_titles AS
             SELECT t.rowid AS rowid, t.* FROM main.conversation_ai_titles t
             WHERE EXISTS (
@@ -22017,10 +25394,12 @@ def scope_conversations_db_to_account(
                 WHERE m.session_id = t.session_id
                   AND m.source_path = t.source_path
             )
-            AND NOT EXISTS (
-                SELECT 1 FROM main.conversation_messages m
+            AND (
+                SELECT COUNT(*) FROM main.conversation_messages m
                 WHERE m.session_id = t.session_id
-                  AND NOT ({stored_predicate})
+            ) = (
+                SELECT COUNT(*) FROM conversation_messages m
+                WHERE m.session_id = t.session_id
             )
             AND NOT EXISTS (
                 SELECT 1 FROM main.cache_meta
@@ -22082,6 +25461,13 @@ def scope_conversations_db_to_account(
         );
         """
     )
+    # #1068 D4: one snapshot of each store for the whole setup. The DDL above
+    # committed; the gate reads `main` first and `cache_db` second, and SQLite
+    # fixes each database's read snapshot at its first access, so every gate
+    # read, fresh derivation and TEMP write sees one state of each store. The
+    # commit at the end closes it, as before.
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
     # These are read-scope TEMP projections. They must neither consume nor
     # advance the durable render frontier used by writer recomputes.
     # authorize=False (#705): this connection shadows the leaves AND
@@ -22089,8 +25475,8 @@ def scope_conversations_db_to_account(
     # writes no persistent row. The ordered-write guard protects the persistent
     # store's materialized cost, so it does not apply here — and applying it
     # would make a read-scope projection refuse and record a spurious refusal.
-    _recompute_conversation_sessions(
-        conn, advance_render_revision=False, authorize=False)
+    # #1068 D4: verified stored rows are reused; only the rest are derived.
+    _scoped_claude_rollup(conn)
     codex_keys = {
         row[0]
         for row in conn.execute(
@@ -22137,9 +25523,9 @@ def scope_conversations_db_to_account(
                     _codex_conversation_project_attribution(
                         thread[0], decoded.cwd, decoded.git_json)
                 )
-    _recompute_codex_rollups(
-        conn, codex_keys, advance_render_revision=False,
-    )
+    # #1068 D6: conversations whose rows are all in scope reuse the stored
+    # rows-derived columns; the rest are derived as before.
+    _scoped_codex_rollup(conn, codex_keys)
     # Project identity is safe conversation-level enrichment: it is already
     # visible on the unqualified rail and contains only an opaque key plus the
     # derived display label. Preserve those two fields for conversations that
@@ -22158,7 +25544,9 @@ def scope_conversations_db_to_account(
     # TEMP rollup writes open a transaction. Close it before a long-lived
     # account-scoped SSE reader starts watching so later provider-writer commits
     # are visible to the dynamic leaf views and never contend on this setup work.
-    conn.commit()
+    # Inside a query session the session owns the transaction (spec 5.13).
+    if not in_session:
+        conn.commit()
 
 
 def _open_conversations_db_for_recovery(
@@ -23022,6 +26410,25 @@ def read_session_titles_bounded(
     ids = [sid for sid in dict.fromkeys(session_ids or ()) if sid]
     if not ids:
         return {}
+    import _cctally_store_access as _access
+    if _access.reads_through_query():
+        # #787 / #861 spec 5.4 (X16): a query scope (the narrowed dashboard
+        # snapshot build) opens only session-factory connections. One
+        # interactive conversations session, the same indexed reads; any
+        # refusal (missing, maintenance, recovery, busy) is the same
+        # fail-soft empty answer, and never creates or repairs the store.
+        # A schema behind or ahead of this binary is read as base's raw
+        # `mode=ro` read read it (R8): the two indexed SELECTs name their
+        # tables and columns, and an absent one is the empty answer.
+        try:
+            with _access.QueryService.session(
+                    "conversations", policy="interactive",
+                    tolerate=_access.SCHEMA_MISMATCH_REASONS) as q:
+                return dict(
+                    _load_lib("_lib_conversation_query")
+                    .session_titles_indexed_map(q.conn, ids))
+        except (sqlite3.Error, OSError):
+            return {}
     path = _cctally_core.CONVERSATIONS_DB_PATH
     marker = _cctally_db_sib._repair_marker_path(path)
     pending = _cctally_db_sib._quarantine_pending_path(path)
@@ -23269,6 +26676,8 @@ def _ensure_codex_conversation_contract(conn: sqlite3.Connection) -> bool:
     missing identities, which is why that marker belongs to
     ``sync_codex_conversations`` alone.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("STARTUP", entry="_ensure_codex_conversation_contract")
     current = _lib_codex_conversation.CODEX_CONVERSATION_CONTRACT_VERSION
 
     def needs_replay() -> bool:
@@ -23385,7 +26794,7 @@ def _prepare_claude_conversation_maintenance(
             "('conversation_search_split_pending',"
             " 'conversation_search_split_cursor')"
         )
-        _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+        _arm_rollup_backfill_restarting_traversal(conn)
         conn.commit()
         # The caller's own offset-zero walk is the replay; it already sets
         # did_from_zero_replay for the rebuild case.
@@ -23401,7 +26810,7 @@ def _prepare_claude_conversation_maintenance(
         conn.execute(
             "DELETE FROM cache_meta WHERE key='conversation_backfill_pending'"
         )
-        _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
+        _arm_rollup_backfill_restarting_traversal(conn)
         conn.commit()
 
     if conn.execute(
@@ -23424,11 +26833,10 @@ def _prepare_claude_conversation_maintenance(
         "'conversation_background_mcp_reingest_pending')"
     ).fetchone() is not None
     if reingest:
+        # Arms the rollup backfill in its own completion commit.
         _resumable_reingest_conversation_messages(
             conn, active_account_key=active_account_key,
         )
-        _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
-        conn.commit()
 
     _consume_search_split(conn)
     _consume_promote_command_args(conn)
@@ -23930,15 +27338,46 @@ def _publish_title_generation(conn, _pause=None) -> None:
             "SELECT session_id,ai_title,source_path,byte_offset "
             "FROM conversation_ai_titles_staging"
         )
-        conn.execute(
-            "INSERT INTO conversation_sessions"
-            "(session_id,msg_count,started_utc,last_activity_utc,project_label,"
-            "cost_usd,cache_rebuild_count,git_branch,models_json,title,"
-            "render_revision) "
-            "SELECT session_id,msg_count,started_utc,last_activity_utc,"
-            "project_label,cost_usd,cache_rebuild_count,git_branch,models_json,"
-            "title,render_revision FROM conversation_sessions_staging"
-        )
+        # #1068 D2: a published row carries the fingerprint of the inputs it
+        # was derived from, however late it is published. Migration 013
+        # delivers the column to both tables; a store it never reached keeps
+        # today's copy.
+        if all("input_fingerprint" in {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+               for table in ("conversation_sessions",
+                             "conversation_sessions_staging")):
+            conn.execute(
+                "INSERT INTO conversation_sessions"
+                "(session_id,msg_count,started_utc,last_activity_utc,"
+                "project_label,cost_usd,cache_rebuild_count,git_branch,"
+                "models_json,title,render_revision,input_fingerprint) "
+                "SELECT session_id,msg_count,started_utc,last_activity_utc,"
+                "project_label,cost_usd,cache_rebuild_count,git_branch,"
+                "models_json,title,render_revision,input_fingerprint "
+                "FROM conversation_sessions_staging"
+            )
+        else:
+            conn.execute(
+                "INSERT INTO conversation_sessions"
+                "(session_id,msg_count,started_utc,last_activity_utc,"
+                "project_label,cost_usd,cache_rebuild_count,git_branch,"
+                "models_json,title,render_revision) "
+                "SELECT session_id,msg_count,started_utc,last_activity_utc,"
+                "project_label,cost_usd,cache_rebuild_count,git_branch,"
+                "models_json,title,render_revision "
+                "FROM conversation_sessions_staging"
+            )
+        # #1072 §4.7: the published generation's input version replaces the
+        # live watermark (or removes it when none was staged), and a traversal
+        # or pending set describing the previous generation is retired with it.
+        staged_watermark = _read_rollup_meta(conn, ROLLUP_STAGING_WATERMARK_KEY)
+        if staged_watermark is None:
+            _delete_rollup_meta(conn, ROLLUP_INPUT_WATERMARK_KEY)
+        else:
+            _set_cache_meta(conn, ROLLUP_INPUT_WATERMARK_KEY, staged_watermark)
+            _delete_rollup_meta(conn, ROLLUP_STAGING_WATERMARK_KEY)
+        _delete_rollup_meta(conn, ROLLUP_CURSOR_KEY)
+        _delete_rollup_meta(conn, ROLLUP_PENDING_KEY)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -24010,6 +27449,81 @@ def _restore_conversation_sync_cache(
         conn.execute(f"PRAGMA main.cache_size = {int(previous)}")
     except sqlite3.Error:
         pass
+
+
+# #1041 D1: the conversation FTS5 indexes merge segments 16 at a time. A pass
+# flushes one segment per inserted row (each trigger-bearing INSERT is its own
+# statement), and FTS5's default automerge of 4 rewrites those segments again
+# and again across the pass's commits. crisismerge moves to 32 with it: FTS5
+# merges a level that reaches crisismerge segments at once, in one commit, and
+# only a gap above automerge keeps merges incremental, spread over later writes
+# as they are today. The values persist in each table's own config, so only a
+# store's first pass after an upgrade, or after an index is recreated, writes
+# them.
+CONVERSATION_FTS_TABLES = (
+    "conversation_fts", "codex_conversation_fts", "conversation_title_fts")
+CONVERSATION_FTS_MERGE_OPTIONS = (("automerge", 16), ("crisismerge", 32))
+
+
+def _ensure_conversation_fts_merge_policy(conn: sqlite3.Connection) -> None:
+    """Set the merge options on each present conversation FTS index (#1041 D1).
+
+    Best effort, like the writer cache. It does nothing inside a transaction
+    the caller holds, so it never commits the caller's rows. It skips an
+    absent index and one the store marks unavailable on this build (its
+    config shadow table may outlive the module). It writes the options in
+    one transaction of its own, committed at once, and any ``sqlite3.Error``
+    rolls that transaction back and leaves the store as it was. It does not
+    wait for another writer: the busy timeout is zero while it runs and is
+    restored after, so a write-locked store costs the pass nothing here and
+    the next pass writes the options. The value is an optimization; the
+    index is correct without it."""
+    if conn.in_transaction:
+        return
+    try:
+        (previous_timeout,) = conn.execute("PRAGMA busy_timeout").fetchone()
+        conn.execute("PRAGMA busy_timeout = 0")
+    except sqlite3.Error:
+        return
+    try:
+        _write_conversation_fts_merge_options(conn)
+    finally:
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {int(previous_timeout)}")
+        except sqlite3.Error:
+            pass
+
+
+def _write_conversation_fts_merge_options(conn: sqlite3.Connection) -> None:
+    """The option write of ``_ensure_conversation_fts_merge_policy``."""
+    try:
+        present = {name for (name,) in conn.execute(
+            "SELECT name FROM main.sqlite_master WHERE type='table' "
+            "AND name IN (?, ?, ?)", CONVERSATION_FTS_TABLES)}
+        unavailable = {key for (key,) in conn.execute(
+            "SELECT key FROM main.cache_meta "
+            "WHERE key IN ('fts5_unavailable', 'codex_fts_unavailable')")}
+        for table in CONVERSATION_FTS_TABLES:
+            marker = ("codex_fts_unavailable"
+                      if table == "codex_conversation_fts" else "fts5_unavailable")
+            if table not in present or marker in unavailable:
+                continue
+            stored = dict(conn.execute(
+                f"SELECT k, v FROM main.{table}_config "
+                "WHERE k IN ('automerge', 'crisismerge')"))
+            for key, value in CONVERSATION_FTS_MERGE_OPTIONS:
+                if stored.get(key) != value:
+                    conn.execute(
+                        f"INSERT INTO main.{table}({table}, rank) "
+                        "VALUES (?, ?)", (key, value))
+        if conn.in_transaction:
+            conn.commit()
+    except sqlite3.Error:
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        except sqlite3.Error:
+            pass
 
 
 class _ReadLimitedFile:
@@ -24156,6 +27670,10 @@ def _write_claude_prepared_file(
                 (path_str,),
             )
         )
+        # #1072 §4.4: the sessions losing messages are recorded durably in the
+        # deleting transaction, so a pass that dies before its rollup step
+        # still leaves them for the next one.
+        _merge_rollup_pending(conn, sessions)
         conn.execute(
             "DELETE FROM conversation_file_touches WHERE message_id IN "
             "(SELECT id FROM conversation_messages WHERE source_path=?)",
@@ -24370,6 +27888,9 @@ def sync_claude_conversations(
     transaction as its message/title rows.  No cache.db table is written, and
     the core accounting cursor is neither read nor advanced.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability(
+        _cctally_core.sync_capability("sync_claude_conversations"), entry="sync_claude_conversations")
     # #779: FIRST executable statement, before IngestStats, before the data
     # directory is created, before the lock file is touched or opened, and
     # before any flock. This check used to sit below the rebuild branch, so a
@@ -24398,6 +27919,8 @@ def sync_claude_conversations(
         _wal_checkpoint.arm(conn)
         # #939 D2: the pass's writer cache, restored in the `finally` below.
         previous_cache_size = _set_conversation_sync_cache(conn)
+        # #1041 D1: the FTS indexes' merge policy, persisted in the store.
+        _ensure_conversation_fts_merge_policy(conn)
 
         # #347 observe-and-stamp mirrors the accounting ingest boundary.  A
         # torn credential read is undecided, not unattributed: defer before any
@@ -24528,6 +28051,9 @@ def sync_claude_conversations(
             conn, rebuild=rebuild, targeted=targeted,
             active_account_key=active_account_key,
         )
+        # #1041 D1: maintenance may have recreated an FTS index (the legacy
+        # split swap), which resets its options.
+        _ensure_conversation_fts_merge_policy(conn)
 
         # #777: the per-incarnation published high-water offset, captured at
         # rebuild START. It is what separates the two attribution rules the
@@ -24913,13 +28439,19 @@ def sync_claude_conversations(
             # message row, so a scoped recompute would describe a fraction of
             # the store. The live rollup is still the previous complete
             # generation at this point and stays so until the publish below.
-            if _recompute_conversation_sessions(conn, target=rollup_table):
-                conn.execute(
-                    "DELETE FROM cache_meta "
-                    "WHERE key='conversation_sessions_backfill_pending'"
-                )
-                _clear_pricing_write_refusal(conn)
-                conn.commit()
+            # #1072 §4.7: the input version the staged generation consumes is
+            # read BEFORE its derivation and staged in the same commit; the
+            # publish moves it to the live watermark.
+            #
+            # The staging derivation runs in bounded, prewarmed chunks, each
+            # in its own transaction (`_derive_rollup_staging`): one
+            # transaction held the conversations write lock for the whole
+            # derivation, minutes cold on a large store, while the Codex
+            # conversation writer waits 15 s. Staging is invisible to readers
+            # until the publish, and the flock this pass holds freezes
+            # `conversation_messages`, so chunking changes nothing published.
+            staged_state = _current_rollup_input_state(conn, stats)
+            if _derive_rollup_staging(conn, rollup_table, staged_state):
                 # Titles that arrived on the LIVE table while staging was being
                 # built are folded in before the publish, or the publish would
                 # silently drop them. `INSERT OR IGNORE` keeps the replayed
@@ -24955,23 +28487,51 @@ def sync_claude_conversations(
             # the backfill and died is not followed by a stale successor either
             # rewriting cost from its old table or declaring an unrecomputed
             # rollup authoritative.
-            if _recompute_conversation_sessions(conn):
-                conn.execute(
+            #
+            # #1072 §4.7: the backfill runs the chunked, resumable traversal
+            # instead of one long transaction. The flag stays armed until the
+            # completing chunk, which deletes it with the cursor and the
+            # refusal record and writes the watermark, so readers keep their
+            # live fallback meanwhile and the flag is cleared only over rows
+            # all derived under one pricing table (the cursor's identity). A
+            # refused chunk commits the refusal record and the armed flag
+            # (#705) and stops, as the single transaction did.
+            def _complete_backfill(c) -> None:
+                c.execute(
                     "DELETE FROM cache_meta "
                     "WHERE key='conversation_sessions_backfill_pending'"
                 )
-                _clear_pricing_write_refusal(conn)
-                conn.commit()
+                _clear_pricing_write_refusal(c)
+
+            if _run_rollup_traversal(
+                    conn, _current_rollup_input_state(conn, stats),
+                    on_complete=_complete_backfill):
+                # What changed while it ran, and what a resumed traversal's
+                # earlier chunks predate, is consumed in this same pass, within
+                # what is left of the pass's traversal allowance (§4.6).
+                if not _advance_claude_rollup(
+                        conn, touched_sessions, stats, allow_traversal=True,
+                        max_traversals=_ROLLUP_MAX_TRAVERSALS - 1):
+                    rollup_authorized = False
             else:
-                # #705: same as the sync_cache twin — commit the refusal record
-                # and the armed flag here rather than relying on the trailing
-                # `conversation_rebuild_claude_pending` clear, which is skipped
-                # whenever a single file failed to ingest.
-                conn.commit()
                 rollup_authorized = False
-        elif touched_sessions:
-            if not _recompute_conversation_sessions(conn, touched_sessions):
+        else:
+            # #1072 §4.6: the dirty set is global (the watermark and durable
+            # state, not only this pass's touched sessions), so a targeted
+            # pass may consume accounting changes too; only a steady full pass
+            # may run a traversal.
+            if not _advance_claude_rollup(
+                    conn, touched_sessions, stats,
+                    allow_traversal=only_paths is None):
                 rollup_authorized = False
+            if rollup_authorized and only_paths is None:
+                # #1068 D8: a steady (not targeted live-tail) pass brings up to
+                # N rows to a current fingerprint (NULL, another epoch, or a
+                # broken seal), with the touched sessions' recompute arguments;
+                # it checks the authoritative rollup and the certification rule
+                # itself.
+                _refresh_uncertified_conversation_sessions(
+                    conn, limit=_CONVERSATION_FINGERPRINT_REFRESH_LIMIT)
             conn.commit()
         if not rollup_authorized and stats.deferred_reason is None:
             # #705: the rebuild pre-clear was not the only refusal this call can
@@ -25010,7 +28570,16 @@ def sync_claude_conversations(
         lock_fh.close()
     if did_from_zero_replay:
         _report_conversation_progress(progress, "retention", stats)
-        _force_retention_prune_after_replay()
+        _request = (
+            _cctally_core.current_request_ingest("sync_claude_conversations")
+            or _cctally_core.current_request_ingest(
+                "sync_codex_conversations"))
+        if _request is not None:
+            # #787 spec 5.9 (X15): the prune after a from-zero replay is an
+            # owner duty; a request entry hands it over as pending.
+            _request.pending.add("retention_prune_pending")
+        else:
+            _force_retention_prune_after_replay()
     _report_conversation_progress(progress, "complete", stats)
     return stats
 
@@ -25067,6 +28636,9 @@ def _clear_codex_conversation_store(conn: sqlite3.Connection) -> None:
 
     conn.execute("DELETE FROM codex_conversation_publications")
     conn.execute("DELETE FROM codex_conversation_published_threads")
+    # #1090 §5.3: every legacy retry record (any version) goes with them.
+    conn.execute("DELETE FROM cache_meta WHERE key >= 'codex_legacy_retry:' "
+                 "AND key < 'codex_legacy_retry;'")
 
 
 # #901 §5.3c (W7, Q13): the bounds of one batch inside a Codex
@@ -25220,6 +28792,46 @@ def _codex_conversation_membership_keys(conn, identity: str) -> "set[str]":
         "WHERE file_identity=?", (identity,))}
 
 
+def _codex_conversation_population_present(conn) -> bool:
+    """Whether the barrier population holds any conversation (the
+    publication work's ``population_present``)."""
+    return conn.execute(
+        "SELECT 1 FROM cache_db.codex_barrier_population LIMIT 1"
+    ).fetchone() is not None
+
+
+def _codex_conversation_before_read_hit(
+        conn, discovered, *, zstd: bool, population_present: bool,
+        cursor_key: "str | None",
+        reset_path: "str | None") -> "set[str] | None":
+    """The before-read deferral rule (5.11): None when the file is read,
+    otherwise the population keys it defers on (possibly none: a compressed
+    container always defers, since the cache admits whatever it feeds when it
+    reads it). ``cursor_key`` is the retained cursor's conversation key;
+    ``reset_path`` names a file being reset, whose retained keys count too.
+    Shared by the walk and the #1090 cache-held gate."""
+    if not zstd and not population_present:
+        return None
+    keys = _codex_conversation_membership_keys(
+        conn, codex_file_identity(discovered))
+    if cursor_key:
+        keys.add(cursor_key)
+    if reset_path is not None:
+        keys |= _codex_conversation_source_keys(conn, reset_path)
+    hit = _codex_conversation_population_subset(conn, keys)
+    return hit if (zstd or hit) else None
+
+
+def _codex_conversation_after_read_hit(conn, events, *,
+                                       population_present: bool) -> "set[str]":
+    """The after-read deferral rule (5.11): the population keys the freshly
+    parsed records name. Shared by the walk and the #1090 cache-held gate."""
+    if not population_present:
+        return set()
+    return _codex_conversation_population_subset(
+        conn, {e.conversation_key for e in events if e.conversation_key})
+
+
 def _codex_conversation_source_keys(conn, path: str) -> "set[str]":
     # The same statement the reset branch already runs.
     return {row[0] for row in conn.execute(
@@ -25312,9 +28924,7 @@ class _CodexPublicationWork:
         self.executor_paths = frozenset(executor_paths)
         self.protected_paths = frozenset(protected_paths)
         self.requal_held = requal_held or {}
-        self.population_present = conn.execute(
-            "SELECT 1 FROM cache_db.codex_barrier_population LIMIT 1"
-        ).fetchone() is not None
+        self.population_present = _codex_conversation_population_present(conn)
         self.deferred: dict = {}
         self.units: list = []
         self.seal_seq = None
@@ -25406,28 +29016,20 @@ class _CodexPublicationWork:
         """Before any byte is read: may this file change a population
         conversation? A compressed container always defers: the cache admits
         whatever it feeds when it reads it (5.11 "Population and lifetime")."""
-        zstd = selected.kind == _rc.ZSTD
-        if not zstd and not self.population_present:
+        hit = _codex_conversation_before_read_hit(
+            self.conn, discovered, zstd=selected.kind == _rc.ZSTD,
+            population_present=self.population_present,
+            cursor_key=None if prev is None else prev[10],
+            reset_path=str(discovered.source_path) if reset_file else None)
+        if hit is None:
             return False
-        keys = _codex_conversation_membership_keys(
-            self.conn, codex_file_identity(discovered))
-        if prev is not None and prev[10]:
-            keys.add(prev[10])
-        if reset_file:
-            keys |= _codex_conversation_source_keys(
-                self.conn, str(discovered.source_path))
-        hit = _codex_conversation_population_subset(self.conn, keys)
-        if zstd or hit:
-            return self._defer(discovered, hit, generation=generation, size=size)
-        return False
+        return self._defer(discovered, hit, generation=generation, size=size)
 
     def defer_after_read(self, discovered, events, *, generation: str,
                          size: int) -> bool:
         """The freshly parsed records name a population conversation."""
-        if not self.population_present:
-            return False
-        hit = _codex_conversation_population_subset(
-            self.conn, {e.conversation_key for e in events if e.conversation_key})
+        hit = _codex_conversation_after_read_hit(
+            self.conn, events, population_present=self.population_present)
         return (self._defer(discovered, hit, generation=generation, size=size)
                 if hit else False)
 
@@ -25928,6 +29530,8 @@ def _sync_codex_conversations_locked(
         # #939 D2: the pass's writer cache, restored in the `finally` below.
         # The W7 batch bounds are unchanged (#939 D3 was withdrawn).
         previous_cache_size = _set_conversation_sync_cache(conn)
+        # #1041 D1: the FTS indexes' merge policy, persisted in the store.
+        _ensure_conversation_fts_merge_policy(conn)
         targeted = only_paths is not None
         pending_rebuild = conn.execute(
             "SELECT 1 FROM cache_meta "
@@ -26060,6 +29664,12 @@ def _sync_codex_conversations_locked(
         # that lands at the same size moves neither the size nor the cursor, so
         # identity is the only evidence that the retained offset describes a
         # file that is no longer there.
+        if only_paths is None and _reevaluate_codex_legacy_rejections(conn):
+            # #1090 §5.4 entrance 1: re-armed rows are usually seen below as
+            # `verification-pending` skips, but the drain must run whatever
+            # the pass's other counters show, a row the walk never meets too.
+            stats.drain_requested = tuple(sorted(
+                set(stats.drain_requested) | {CODEX_REPLAY_DRAIN_COMMAND}))
         existing = {
             row[0]: tuple(row[1:])
             for row in conn.execute(
@@ -26377,20 +29987,9 @@ def _sync_codex_conversations_locked(
                             path_str, int(prior_accounting[1]), start_offset,
                             open_stream=lambda: _rc.open_decoded(selected)))
             if initial_native and initial_root:
-                state.thread = _lib_jsonl.CodexThreadMetadata(
-                    source_root_key=discovered.source_root_key,
-                    source_path=path_str,
-                    native_thread_id=initial_native,
-                    root_thread_id=initial_root,
-                    parent_thread_id=initial_parent,
-                    conversation_key=initial_conversation,
-                    cwd=None,
-                    git_json=None,
-                    source_kind=None,
-                    thread_source_json=None,
-                    model_provider=None,
-                    context_window=None,
-                )
+                state.thread = _codex_resumed_thread(
+                    discovered.source_root_key, path_str, initial_native,
+                    initial_root, initial_parent, initial_conversation)
             events = []
             event_rows = []
             account_by_physical: dict[tuple[str, int], str | None] = {}
@@ -26680,7 +30279,10 @@ def _sync_codex_conversations_locked(
         if (stats.container_pending
                 or stats.container_skipped.get("verification-pending", 0)
                 or stats.barrier_container_skipped.get("verification-pending", 0)):
-            stats.drain_requested = ("_codex-replay-drain",)
+            # Added, never assigned: a prune-drain request made earlier in
+            # this pass must survive (#1090 F3).
+            stats.drain_requested = tuple(sorted(
+                set(stats.drain_requested) | {CODEX_REPLAY_DRAIN_COMMAND}))
         run_codex_find_projection_backfill(conn)
         _report_conversation_progress(progress, "finalize", stats)
         if only_paths is None and stats.files_failed == 0:
@@ -26761,7 +30363,16 @@ def _sync_codex_conversations_locked(
         lock_fh.close()
     if did_from_zero_replay:
         _report_conversation_progress(progress, "retention", stats)
-        _force_retention_prune_after_replay()
+        _request = (
+            _cctally_core.current_request_ingest("sync_claude_conversations")
+            or _cctally_core.current_request_ingest(
+                "sync_codex_conversations"))
+        if _request is not None:
+            # #787 spec 5.9 (X15): the prune after a from-zero replay is an
+            # owner duty; a request entry hands it over as pending.
+            _request.pending.add("retention_prune_pending")
+        else:
+            _force_retention_prune_after_replay()
     _report_conversation_progress(progress, "complete", stats)
     return stats
 
@@ -26774,6 +30385,9 @@ def sync_codex_conversations(conn: sqlite3.Connection, *,
     #968 spec 5.8: requested maintenance is spawned only after the provider
     lock is released; ``maintenance="caller"`` leaves it to the caller.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability(
+        _cctally_core.sync_capability("sync_codex_conversations"), entry="sync_codex_conversations")
     if maintenance not in ("defer", "caller"):
         raise ValueError(f"unknown maintenance mode {maintenance!r}")
     stats = _sync_codex_conversations_locked(conn, **kwargs)
@@ -26789,6 +30403,155 @@ class _TranscriptRebuildOutcome(NamedTuple):
     error: "str | None"
     elapsed_seconds: float
 
+
+
+# --------------------------------------------------------------------------
+# #787 / #861 spec 5.9 — restricted request-writer entry points
+# --------------------------------------------------------------------------
+
+#: The budgeted Codex walk a request entry runs (public #5's hook budget
+#: shape): an invalid quota index yields the walk's ``quota_index_pending``
+#: deferral instead of the unbudgeted inline rebuild.
+_REQUEST_CODEX_BUDGET_S = 2.0
+#: A request entry never queues behind a writer; contention is pending.
+_REQUEST_LOCK_TIMEOUT_S = 0.25
+
+
+@dataclass(frozen=True)
+class RequestIngestResult:
+    ingested: bool
+    pending: frozenset   # pending reasons, handed to notify_owner
+    #: The full entry's ingest stats (`IngestStats` / `CodexIngestStats`)
+    #: when it ran, for a caller that reads its targeted-ingest fields (the
+    #: live-tail watch's ``targeted_clean``); None when refused up front.
+    stats: Any = field(default=None, compare=False)
+
+
+def _request_paths(only_paths) -> "set[str]":
+    return {str(p) for p in (only_paths or ()) if str(p)}
+
+
+def _request_meta_present(conn, schema: str, keys) -> bool:
+    for key in keys:
+        try:
+            if conn.execute(
+                    f"SELECT 1 FROM {schema}.cache_meta WHERE key=?",
+                    (key,)).fetchone():
+                return True
+        except sqlite3.Error:
+            return True     # undecidable: never run a request ingest
+    return False
+
+
+def _finish_request(store: str, stats, request, *, debt: bool):
+    pending = set(request.pending)
+    if getattr(stats, "lock_contended", False):
+        pending.add("busy")
+    reason = getattr(stats, "deferred_reason", None)
+    if reason:
+        pending.add(str(reason))
+    for command in getattr(stats, "drain_requested", ()) or ():
+        pending.add(f"drain:{command}")
+    if pending:
+        _cctally_core.notify_owner(store, _cctally_core.Readiness(
+            store=store, readable=True, reason=None,
+            obligations=frozenset({"codex_maintenance_debt"}) if debt
+            else frozenset()))
+    return RequestIngestResult(ingested=not pending, pending=frozenset(pending),
+                               stats=stats)
+
+
+def _refused_request(store: str, reason: str, *, debt: bool):
+    _cctally_core.notify_owner(store, _cctally_core.Readiness(
+        store=store, readable=True, reason=None,
+        obligations=frozenset({"codex_maintenance_debt"}) if debt
+        else frozenset()))
+    return RequestIngestResult(ingested=False, pending=frozenset({reason}))
+
+
+def sync_cache_request(conn, only_paths) -> RequestIngestResult:
+    """Targeted Claude accounting ingest for a request writer (spec 5.9).
+
+    Runs `sync_cache`'s targeted path under INGEST_CURRENT: rows, cursors
+    and the accounting generation only. Contention or a deferral is pending.
+    """
+    _cctally_core.require_capability("INGEST_CURRENT",
+                                     entry="sync_cache_request")
+    paths = _request_paths(only_paths)
+    if not paths:
+        return RequestIngestResult(ingested=False, pending=frozenset())
+    with _cctally_core.request_ingest_scope("sync_cache") as request:
+        stats = sync_cache(conn, only_paths=paths,
+                           lock_timeout=_REQUEST_LOCK_TIMEOUT_S)
+    return _finish_request("cache", stats, request, debt=False)
+
+
+def sync_codex_cache_request(conn, only_paths) -> RequestIngestResult:
+    """Targeted Codex accounting ingest for a request writer (spec 5.9).
+
+    The budgeted quota-index walk, ``quota_reconcile="defer"`` (no stats
+    open, no projection reconcile), ``maintenance="caller"`` (no drain
+    worker request) and no recovery wrapper. A pending from-zero replay is a
+    full rebuild this entry refuses up front."""
+    _cctally_core.require_capability("INGEST_CURRENT",
+                                     entry="sync_codex_cache_request")
+    paths = _request_paths(only_paths)
+    if not paths:
+        return RequestIngestResult(ingested=False, pending=frozenset())
+    if _request_meta_present(conn, "main", (CODEX_REPLAY_FROM_ZERO_KEY,)):
+        return _refused_request("cache", "codex_replay_pending", debt=True)
+    with _cctally_core.request_ingest_scope("sync_codex_cache") as request:
+        stats = sync_codex_cache(
+            conn, maintenance="caller", only_paths=paths,
+            lock_timeout=_REQUEST_LOCK_TIMEOUT_S,
+            budget_seconds=_REQUEST_CODEX_BUDGET_S, quota_reconcile="defer")
+    return _finish_request("cache", stats, request, debt=True)
+
+
+def sync_claude_conversations_request(conn, only_paths) -> RequestIngestResult:
+    """Targeted Claude transcript ingest for a request writer (spec 5.9).
+
+    A pending Claude conversation rebuild is a from-zero replay this entry
+    refuses up front; a replay discovered during the walk (a truncated file)
+    hands its retention prune to the owner as pending."""
+    _cctally_core.require_capability(
+        "INGEST_CURRENT", entry="sync_claude_conversations_request")
+    paths = _request_paths(only_paths)
+    if not paths:
+        return RequestIngestResult(ingested=False, pending=frozenset())
+    if _request_meta_present(conn, "main",
+                             ("conversation_rebuild_claude_pending",)):
+        return _refused_request("conversations", "claude_rebuild_pending",
+                                debt=False)
+    with _cctally_core.request_ingest_scope(
+            "sync_claude_conversations") as request:
+        stats = sync_claude_conversations(
+            conn, only_paths=paths, lock_timeout=_REQUEST_LOCK_TIMEOUT_S)
+    return _finish_request("conversations", stats, request, debt=False)
+
+
+def sync_codex_conversations_request(conn, only_paths) -> RequestIngestResult:
+    """Targeted Codex transcript ingest for a request writer (spec 5.9).
+
+    A pending Codex conversation replay or rebuild (either store's marker) is
+    refused up front; worker requests are returned as pending."""
+    _cctally_core.require_capability(
+        "INGEST_CURRENT", entry="sync_codex_conversations_request")
+    paths = _request_paths(only_paths)
+    if not paths:
+        return RequestIngestResult(ingested=False, pending=frozenset())
+    if (_request_meta_present(conn, "main", (
+            CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY,
+            "conversation_rebuild_codex_pending"))
+            or _cache_side_replay_pending(conn)):
+        return _refused_request("conversations", "codex_replay_pending",
+                                debt=True)
+    with _cctally_core.request_ingest_scope(
+            "sync_codex_conversations") as request:
+        stats = sync_codex_conversations(
+            conn, maintenance="caller", only_paths=paths,
+            lock_timeout=_REQUEST_LOCK_TIMEOUT_S)
+    return _finish_request("conversations", stats, request, debt=True)
 
 def _write_transcript_worker_event(fd: int, payload: dict[str, Any]) -> None:
     """Write one PIPE_BUF-sized JSON event from the isolated #395 worker."""
@@ -26858,6 +30621,9 @@ def _run_transcript_rebuild_worker(
     started = time.monotonic()
     pid = os.fork()
     if pid == 0:
+        # #787 / #861 AD16: the kill-safe child is a process owner; it starts
+        # with no authority and establishes `process` until it exits.
+        _cctally_core.establish_authority("process").__enter__()
         os.close(read_fd)
 
         def emit(payload: dict[str, Any]) -> None:
@@ -27052,6 +30818,23 @@ def _run_transcript_rebuild_worker(
 
 
 # === Region 7: cmd_cache_sync (was bin/cctally:11563-11616) ===
+
+
+def _cache_sync_verify_conversation_fts() -> None:
+    """`cache-sync`'s automatic conversation FTS verification (#1094 D6).
+
+    The step opens its own connection and takes the maintenance and provider
+    flocks itself, so it runs with no conversations connection or flock held
+    here. A store it cannot open is logged; nothing it reports changes
+    `cache-sync`'s exit code."""
+    import _lib_conversation_fts_integrity as fts
+    try:
+        fts.verify_conversation_fts(mode="automatic", notice=eprint)
+    except fts.StoreOpenError as exc:
+        eprint(fts.TEXT_OPEN_FAILED.format(error=exc))
+    except (OSError, sqlite3.DatabaseError) as exc:
+        eprint(fts.TEXT_CHECK_FAILED.format(kind=type(exc).__name__,
+                                            error=exc))
 
 
 def cmd_cache_sync(args: argparse.Namespace) -> int:
@@ -27612,6 +31395,13 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 or conv_result.outcome == "busy"):
             # Both executors share this single operator-facing notice.
             _note_maintenance_deferred_once()
+
+    # #1094 D6: verify the conversation FTS indexes against their messages
+    # (automatic: only after an upgrade, a tokenizer change, a failed attempt
+    # past its cooldown, or 30 days) once the routine conversation sync and
+    # the Codex drains, or `--rebuild`'s conversation rebuild, are done. Its
+    # outcome never changes this command's exit code.
+    _cache_sync_verify_conversation_fts()
 
     _p_root.__exit__(None, None, None)
     # #276 perf: when tracing is enabled, flush the completed "cache-sync"

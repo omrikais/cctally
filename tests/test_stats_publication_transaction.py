@@ -1692,6 +1692,7 @@ _LIVE_REBUILD_CHILD = (
     "module = importlib.util.module_from_spec(spec)\n"
     "sys.modules['cctally'] = module\n"
     "loader.exec_module(module)\n"
+    "sys.modules['_cctally_core'].establish_script_owner()\n"
     "import _cctally_core, _cctally_journal as jr, _cctally_store\n"
     "fd = os.open(str(_cctally_core.STATS_LOCK_MAINTENANCE_PATH),\n"
     "             os.O_RDWR | os.O_CREAT, 0o600)\n"

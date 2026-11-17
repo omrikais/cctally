@@ -23,7 +23,9 @@ import threading
 import pytest
 
 from conftest import load_script, redirect_paths
-from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+from tests._support_http import (PRESENCE_BACKSTOP_SECONDS,
+                                 inert_startup_heap_freeze)
+from _fts5_gate import requires_fts5
 
 
 def _dash():
@@ -223,6 +225,7 @@ def _install_pass_doubles(
     counters.setdefault("opens", 0)
     counters.setdefault("prunes", 0)
     counters.setdefault("claude", 0)
+    counters.setdefault("claude_rollup", 0)
 
     class _Conn:
         def close(self):
@@ -241,6 +244,10 @@ def _install_pass_doubles(
 
     monkeypatch.setattr(dash, "open_conversations_db", _open)
     monkeypatch.setattr(dash, "sync_claude_conversations", _claude)
+    monkeypatch.setattr(
+        dash, "sync_claude_rollup",
+        lambda conn: counters.__setitem__(
+            "claude_rollup", counters["claude_rollup"] + 1))
     monkeypatch.setattr(dash, "sync_codex_conversations", lambda conn: None)
     monkeypatch.setattr(
         dash,
@@ -363,7 +370,51 @@ def test_caught_up_frontier_skips_both_provider_syncs(monkeypatch):
     assert status.modes == {"claude": "caught_up", "codex": "caught_up"}
     assert status.files == {"claude": 0, "codex": 0}
     assert counters["claude"] == 0
+    # #1072 §4.12: the caught-up Claude tick still runs its rollup-only step.
+    assert counters["claude_rollup"] == 1
     assert counters["prunes"] == 1
+
+
+def test_caught_up_rollup_error_keeps_the_codex_leg(monkeypatch):
+    """A `database is locked` from the caught-up Claude rollup step must not
+    cost the whole tick: reaching the pass-level handler skipped the Codex
+    leg and reported the store unavailable, so a busy conversations store
+    starved Codex ingest. The rollup step's durable keys retry it next
+    tick."""
+    dash = _dash()
+    counters = _install_pass_doubles(dash, monkeypatch)
+    counters["codex"] = 0
+
+    def locked(_conn):
+        raise sqlite3.OperationalError("database is locked")
+
+    def codex(_conn, **_kwargs):
+        counters["codex"] += 1
+
+    monkeypatch.setattr(dash, "sync_claude_rollup", locked)
+    monkeypatch.setattr(dash, "sync_codex_conversations", codex)
+
+    class _Plan:
+        def __init__(self, mode):
+            self.mode, self.paths, self.reason = mode, frozenset(), ""
+
+    class _FrontierModule:
+        @staticmethod
+        def conversation_sync_certifiable(mode, stats, **_kwargs):
+            return False
+
+    monkeypatch.setattr(
+        dash,
+        "_conversation_frontier_plans",
+        lambda _conn: (
+            _FrontierModule(), object(), object(),
+            {"claude": ((), (), True), "codex": ((), (), True)},
+            {"claude": _Plan("caught_up"), "codex": _Plan("full")},
+        ),
+    )
+    status = dash._conversation_sync_pass()
+    assert status == "ok"
+    assert counters["codex"] == 1
 
 
 def test_targeted_frontier_passes_only_ticketed_paths(monkeypatch):
@@ -587,6 +638,7 @@ def test_production_thread_target_is_the_extracted_loop(monkeypatch, tmp_path):
     # the network; the conversations thread is the one under test.
     monkeypatch.setattr(dash, "_DashboardUpdateCheckThread", _NoopThread)
     monkeypatch.setitem(ns, "_TuiSyncThread", _NoopSyncThread)
+    inert_startup_heap_freeze(monkeypatch, dash)
 
     servers = []
     real_server_cls = dash._QuietThreadingHTTPServer
@@ -623,6 +675,8 @@ def test_production_thread_target_is_the_extracted_loop(monkeypatch, tmp_path):
     )
     assert seen["interval"] >= 5.0
     assert seen["stop"] is not None
+    # #1094 D6: production runs the automatic FTS verification step.
+    assert isinstance(seen["fts_step"], dash._ConversationFtsStep)
 
 
 def test_no_sync_never_starts_the_conversation_thread(monkeypatch):
@@ -985,6 +1039,7 @@ def test_cmd_dashboard_places_the_hold_before_the_main_sync_thread(
     monkeypatch.setattr(dash, "_conversation_sync_loop", lambda **kw: None)
     monkeypatch.setattr(dash, "_DashboardUpdateCheckThread", _NoopThread)
     monkeypatch.setitem(ns, "_TuiSyncThread", _OrderedSyncThread)
+    inert_startup_heap_freeze(monkeypatch, dash)
     servers = []
     real_server_cls = dash._QuietThreadingHTTPServer
 
@@ -1001,3 +1056,656 @@ def test_cmd_dashboard_places_the_hold_before_the_main_sync_thread(
     for server in servers:
         server.server_close()
     assert events == ([] if no_sync else ["hold", "sync_start"])
+
+
+# --- #1094 D6: the automatic FTS verification step on the conversation thread
+
+
+class _FtsRun:
+    """A scripted verification step: each call charges ``cost`` seconds of the
+    virtual clock and returns the next outcome; it records which write-I/O
+    intervals were open while it ran and whether the startup hold was held."""
+
+    def __init__(self, clock, outcomes, *, cost=100.0, on_run=None):
+        self.clock = clock
+        self.outcomes = list(outcomes)
+        self.cost = cost
+        self.on_run = on_run
+        self.calls = []
+
+    def __call__(self):
+        wio = importlib.import_module("_lib_write_io")
+        self.calls.append({
+            "at": self.clock.now,
+            "open_kinds": [kind for kind, _ in _OPEN_INTERVALS],
+            "held": wio.admission_held(),
+        })
+        self.clock.advance(self.cost)
+        outcome = self.outcomes.pop(0)
+        if self.on_run is not None:
+            self.on_run(outcome)
+        return type("R", (), {"outcome": outcome})()
+
+
+_OPEN_INTERVALS = []
+
+
+def _track_intervals(dash, monkeypatch):
+    """Record the kind of every write-I/O interval open at a moment."""
+    wio = dash._lib_write_io
+    real_begin, real_end = wio.begin_interval, wio.end_interval
+
+    def begin(kind):
+        interval = real_begin(kind)
+        _OPEN_INTERVALS.append((kind, interval))
+        return interval
+
+    def end(interval):
+        _OPEN_INTERVALS[:] = [entry for entry in _OPEN_INTERVALS
+                              if entry[1] is not interval]
+        return real_end(interval)
+
+    _OPEN_INTERVALS.clear()
+    monkeypatch.setattr(wio, "begin_interval", begin)
+    monkeypatch.setattr(wio, "end_interval", end)
+
+
+def _fts_loop(dash, *, clock, passes, step, interval=5.0, work=1.0,
+              record=None):
+    """Run the real loop over scripted pass statuses with ``step`` as its FTS
+    verification step; return each pass's start time."""
+    starts = []
+    remaining = list(passes)
+
+    def run_iteration():
+        starts.append(clock.now)
+        clock.advance(work)
+        status = remaining.pop(0)
+        return status() if callable(status) else status
+
+    dash._conversation_sync_loop(
+        stop=_Stop(remaining), interval=interval, run_iteration=run_iteration,
+        monotonic=clock.monotonic, thread_time_ns=lambda: 0,
+        wait=lambda seconds: clock.advance(max(0.0, seconds)),
+        record=record if record is not None else (lambda **kw: None),
+        fts_step=step)
+    return starts
+
+
+def _status(dash, *, changed, eligible, drain=None):
+    return dash._ConversationPassStatus("ok", drain=drain,
+                                        changed_rows=changed,
+                                        fts_eligible=eligible)
+
+
+def test_an_idle_pass_runs_the_fts_step_outside_the_pass_and_its_work(
+        monkeypatch):
+    """Detects (#1094 D6): the verification's writes counted as a conversation
+    pass's (it must run in its own maintenance interval), its seconds charged
+    to the scheduler's `work` (ingest then waits twice the maintenance), or
+    the next pass scheduled from the pass's end instead of the step's."""
+    dash = _dash()
+    _track_intervals(dash, monkeypatch)
+    clock = _VirtualClock()
+    run = _FtsRun(clock, ["verified"], cost=100.0)
+    step = dash._ConversationFtsStep(run=run)
+    recorded = []
+    starts = _fts_loop(
+        dash, clock=clock, step=step, record=lambda **kw: recorded.append(kw),
+        passes=[_status(dash, changed=True, eligible=True),
+                _status(dash, changed=False, eligible=True),
+                _status(dash, changed=False, eligible=False)])
+    # The changed pass does not run it; the idle one does, once.
+    assert len(run.calls) == 1
+    call = run.calls[0]
+    assert call["open_kinds"] == ["maintenance"]
+    assert call["at"] == starts[1] + 1.0           # after the idle pass ended
+    # `work` is the pass alone, and the next pass starts one interval after
+    # the step's end.
+    assert [r["duration_ns"] for r in recorded] == [int(1e9)] * 3
+    assert starts[2] == call["at"] + 100.0 + 5.0
+    # Without a step the cadence is unchanged: work + interval.
+    assert starts[1] - starts[0] == 1.0 + 5.0
+
+
+@pytest.mark.parametrize("first_outcome", ["verified", "busy"])
+def test_the_startup_hold_waits_for_the_fts_step_outcome(monkeypatch,
+                                                         first_outcome):
+    """Detects (#1094 D6): a catch-up pass followed by an idle pass that
+    repairs releasing writeIo's startup hold before the repair, so the
+    repair's writes land in the warm window; and a `busy` step (nothing done)
+    counted as the step settling."""
+    dash = _dash()
+    wio = dash._lib_write_io
+    monkeypatch.setattr(wio, "_STATE", wio._STATE)   # restored at teardown
+    wio.reset_for_tests(counter=wio.ProcessWriteCounter(
+        platform="darwin", darwin_reader=lambda _pid=None: 0))
+    wio.hold_admission()
+    wio.observe_accounting_tick(ended_ns=0, census_complete=True,
+                                residuals={"claude": (), "codex": ()})
+    clock = _VirtualClock()
+    clock.advance(1.0)
+    released = []
+    real_release = wio.release_admission
+    monkeypatch.setattr(wio, "release_admission",
+                        lambda reason: released.append((reason, clock.now))
+                        or real_release(reason))
+    drain = {"census_complete": True, "certifiable": True,
+             "providers": {"pass": {"mode": "full", "residual": ()}},
+             "deferrals": None, "facts": {}}
+    verified = {"done": False}
+    outcomes = ([first_outcome, "verified"] if first_outcome == "busy"
+                else ["verified"])
+    run = _FtsRun(clock, outcomes,
+                  on_run=lambda outcome: verified.update(
+                      done=outcome == "verified"))
+    step = dash._ConversationFtsStep(run=run)
+
+    def idle():
+        return _status(dash, changed=False, eligible=not verified["done"],
+                       drain=dict(drain))
+
+    passes = [_status(dash, changed=True, eligible=True, drain=dict(drain))]
+    # A `busy` step waits out its retry backoff (passes ~6 s apart).
+    passes += [idle] * (len(outcomes) + 1
+                        + (60 if first_outcome == "busy" else 0))
+    _fts_loop(dash, clock=clock, passes=passes, step=step)
+    assert len(run.calls) == len(outcomes)
+    assert all(call["held"] for call in run.calls), run.calls
+    assert [reason for reason, _at in released] == ["drained", "loopExit"]
+    assert released[0][1] > run.calls[-1]["at"]
+    assert wio.write_io_payload()["coldStartup"]["releasedBy"] == "drained"
+
+
+def test_passes_that_always_change_rows_reach_the_fts_step_in_an_hour(
+        monkeypatch):
+    """Detects (#1094 D6): a dashboard that ingests on every pass postponing
+    the verification forever, and with it the startup hold."""
+    dash = _dash()
+    wio = dash._lib_write_io
+    monkeypatch.setattr(wio, "_STATE", wio._STATE)   # restored at teardown
+    wio.reset_for_tests(counter=wio.ProcessWriteCounter(
+        platform="darwin", darwin_reader=lambda _pid=None: 0))
+    wio.hold_admission()
+    wio.observe_accounting_tick(ended_ns=0, census_complete=True,
+                                residuals={"claude": (), "codex": ()})
+    clock = _VirtualClock()
+    clock.advance(1.0)
+    released = []
+    real_release = wio.release_admission
+    monkeypatch.setattr(wio, "release_admission",
+                        lambda reason: released.append((reason, clock.now))
+                        or real_release(reason))
+    verified = {"done": False}
+    run = _FtsRun(clock, ["verified"], cost=30.0,
+                  on_run=lambda outcome: verified.update(done=True))
+    step = dash._ConversationFtsStep(run=run)
+    # A residual that never changes: without the step this settles at once.
+    residual = wio.conversation_residual(type("S", (), {
+        "failed_paths": {"/bad"}, "files_failed": 1})())
+
+    def changing():
+        return _status(dash, changed=True, eligible=not verified["done"],
+                       drain={"census_complete": True, "certifiable": False,
+                              "providers": {"claude": {
+                                  "mode": "full", "residual": residual}},
+                              "deferrals": None, "facts": {}})
+
+    starts = _fts_loop(dash, clock=clock, passes=[changing] * 700, step=step)
+    assert len(run.calls) == 1
+    reached = run.calls[0]["at"]
+    first_end = starts[0] + 1.0
+    assert reached - first_end >= 3600.0
+    assert reached - first_end <= 3600.0 + 2 * 6.0   # the next ok pass
+    assert run.calls[0]["held"] is True
+    assert released[0][0] == "settled"
+    assert released[0][1] > reached
+
+
+def test_a_failing_fts_step_is_logged_and_never_stops_ingest(monkeypatch,
+                                                            capsys):
+    """Detects (#1094 D6): an exception in the verification (the store cannot
+    be opened) ending transcript ingest, or holding writeIo's startup hold
+    for the dashboard's life by never counting as the step's outcome; and the
+    production step not calling the kernel in automatic mode with a notice
+    sink."""
+    dash = _dash()
+    fts = importlib.import_module("_lib_conversation_fts_integrity")
+    calls = []
+
+    def broken(**kw):
+        calls.append(kw)
+        raise sqlite3.DatabaseError("file is not a database")
+
+    monkeypatch.setattr(fts, "verify_conversation_fts", broken)
+    step = dash._ConversationFtsStep()
+    assert step.pending(True) is True
+    clock = _VirtualClock()
+    starts = _fts_loop(
+        dash, clock=clock, step=step,
+        passes=[_status(dash, changed=False, eligible=True)] * 3)
+    assert len(starts) == 3
+    # Still eligible, but a raised step backs off for an hour: one attempt
+    # (and one logged line), not one per idle pass.
+    assert len(calls) == 1
+    assert all(kw["mode"] == "automatic" and callable(kw["notice"])
+               for kw in calls)
+    assert step.pending(True) is False
+    assert "file is not a database" in capsys.readouterr().err
+
+
+class _RaisingRun:
+    """A step that raises on every call, charging ``cost`` seconds."""
+
+    def __init__(self, clock, *, cost=1.0):
+        self.clock = clock
+        self.cost = cost
+        self.calls = []
+
+    def __call__(self):
+        self.calls.append({"at": self.clock.now})
+        self.clock.advance(self.cost)
+        raise sqlite3.OperationalError("disk I/O error")
+
+
+@pytest.mark.parametrize("outcome, backoff", [
+    ("busy", 300.0), ("deferred", 900.0), ("skipped", 900.0),
+    ("raised", 3600.0), ("unavailable", None)])
+def test_the_fts_step_backs_off_after_an_outcome_that_records_no_attempt(
+        monkeypatch, capsys, outcome, backoff):
+    """Detects (#1094 F5): an outcome that commits no `lastAttemptAt` (lock
+    contention, a pending rebuild, an exception) leaving the store eligible,
+    so every idle pass reopens a writer connection and retries (and a raising
+    step logs a line every few seconds); and an FTS5-less build retrying at
+    all."""
+    dash = _dash()
+    clock = _VirtualClock()
+    if outcome == "raised":
+        run = _RaisingRun(clock)
+    else:
+        run = _FtsRun(clock, [outcome] * 50, cost=1.0)
+    step = dash._ConversationFtsStep(run=run)
+    span = 4000.0 if backoff is None else backoff * 2.5
+    passes = [_status(dash, changed=False, eligible=True)] * int(span / 6.0)
+    _fts_loop(dash, clock=clock, passes=passes, step=step)
+    times = [call["at"] for call in run.calls]
+    if backoff is None:
+        assert len(times) == 1, times
+        return
+    assert len(times) >= 2, times
+    for earlier, later in zip(times, times[1:]):
+        # Measured from the step's end (cost 1 s).
+        assert later - (earlier + 1.0) >= backoff, times
+        assert later - (earlier + 1.0) <= backoff + 2 * 6.0, times
+    if outcome == "raised":
+        failures = [line for line in capsys.readouterr().err.splitlines()
+                    if "disk I/O error" in line]
+        assert len(failures) == len(times)
+
+
+@pytest.mark.parametrize("outcome, backoff", [("busy", 300.0),
+                                              ("raised", 3600.0)])
+def test_a_backoff_counts_toward_the_postponement_bound(monkeypatch, outcome,
+                                                        backoff):
+    """Detects (review C3): each backoff restarting the 60-minute
+    postponement clock, so under passes that always change rows an initial
+    `busy` delays the next attempt to about 65 minutes and an exception to
+    about two hours, instead of the first pass after both the retry deadline
+    and 60 minutes from first eligibility."""
+    dash = _dash()
+    clock = _VirtualClock()
+    if outcome == "raised":
+        run = _RaisingRun(clock)
+    else:
+        run = _FtsRun(clock, [outcome] * 50, cost=1.0)
+    step = dash._ConversationFtsStep(run=run)
+    passes = ([_status(dash, changed=False, eligible=True)]
+              + [_status(dash, changed=True, eligible=True)] * 1500)
+    starts = _fts_loop(dash, clock=clock, passes=passes, step=step)
+    times = [call["at"] for call in run.calls]
+    assert len(times) >= 2, times
+    first_eligible = starts[0]
+    due = max(times[0] + 1.0 + backoff,
+              first_eligible + dash._ConversationFtsStep.POSTPONE_SECONDS)
+    assert due <= times[1] <= due + 2 * 6.0, (times, due)
+
+
+def test_a_step_that_stays_busy_stops_holding_admission_after_an_hour(
+        monkeypatch):
+    """Detects (#1094 F5): another process holding the conversation locks
+    for the dashboard's life keeping writeIo's startup hold placed forever,
+    because a `busy` step never counts as settled."""
+    dash = _dash()
+    wio = dash._lib_write_io
+    monkeypatch.setattr(wio, "_STATE", wio._STATE)   # restored at teardown
+    wio.reset_for_tests(counter=wio.ProcessWriteCounter(
+        platform="darwin", darwin_reader=lambda _pid=None: 0))
+    wio.hold_admission()
+    wio.observe_accounting_tick(ended_ns=0, census_complete=True,
+                                residuals={"claude": (), "codex": ()})
+    clock = _VirtualClock()
+    clock.advance(1.0)
+    released = []
+    real_release = wio.release_admission
+    monkeypatch.setattr(wio, "release_admission",
+                        lambda reason: released.append((reason, clock.now))
+                        or real_release(reason))
+    drain = {"census_complete": True, "certifiable": True,
+             "providers": {"pass": {"mode": "full", "residual": ()}},
+             "deferrals": None, "facts": {}}
+    run = _FtsRun(clock, ["busy"] * 100, cost=1.0)
+    step = dash._ConversationFtsStep(run=run)
+    passes = [_status(dash, changed=False, eligible=True, drain=dict(drain))
+              for _ in range(800)]
+    starts = _fts_loop(dash, clock=clock, passes=passes, step=step)
+    assert len(run.calls) >= 2
+    first_eligible = starts[0]
+    reason, at = released[0]
+    assert reason == "drained"
+    assert at - first_eligible >= dash._ConversationFtsStep.POSTPONE_SECONDS
+    assert at - first_eligible <= (dash._ConversationFtsStep.POSTPONE_SECONDS
+                                   + 2 * 7.0)
+
+
+def test_the_fts_steps_writes_are_excluded_from_steady_writes(monkeypatch):
+    """Detects (#1094 F1): a multi-gigabyte index rebuild in a running
+    dashboard counted as steady writes (the budget verdict turns `over` and
+    Doctor warns about the dashboard's disk writes), or counted as an
+    expired-transcript deletion in writeIo's deletion figures; and (review
+    C2) the publications evaluated WHILE a long rebuild is still running
+    counting its bytes and advancing the excess-write hysteresis, because
+    the exclusion existed only once the step had ended."""
+    dash = _dash()
+    wio = dash._lib_write_io
+    budget = importlib.import_module("_lib_write_budget")
+    monkeypatch.setattr(wio, "_STATE", wio._STATE)   # restored at teardown
+    written = {"bytes": 0}
+    now = {"ns": 1000 * 10 ** 9}
+    wio.reset_for_tests(
+        counter=wio.ProcessWriteCounter(
+            platform="darwin",
+            darwin_reader=lambda _pid=None: written["bytes"]),
+        clock_ns=lambda: now["ns"], wall_s=lambda: 1_700_000_000)
+
+    def advance(seconds, nbytes):
+        now["ns"] += int(seconds * 10 ** 9)
+        written["bytes"] += nbytes
+
+    during = []
+
+    def rebuild():
+        # A ten-minute rebuild writing 200 MiB every 5 s, while the
+        # publication thread keeps evaluating the window.
+        for _ in range(120):
+            advance(5.0, 200 * 1024 * 1024)
+            wio.note_publication(cold=False)
+            stat, hysteresis = wio.evaluate()
+            during.append((stat, hysteresis))
+        return type("R", (), {"outcome": "verified"})()
+
+    step = dash._ConversationFtsStep(run=rebuild)
+    wio.note_publication(cold=False)
+    # 400 s of ordinary writes (a full window), the step, then 250 s more:
+    # the last window still overlaps 50 s of the step.
+    for i in range(130):
+        advance(5.0, 1024 * 1024)
+        if i == 130 - 1 - 50:
+            assert step.run() == "verified"
+        wio.note_publication(cold=False)
+    for stat, hysteresis in during:
+        # Its bytes are never steady writes: the window either excludes them
+        # or (excluded time over the limit) yields no verdict.
+        assert (stat.status != "qualified"
+                or stat.bytes_written < 1024 ** 3), stat
+        assert hysteresis == budget.HysteresisState(), hysteresis
+    assert any(stat.status == "qualified" for stat, _h in during[:5]), during
+    assert any(stat.reasons == ("excluded_time_over_limit",)
+               for stat, _h in during), during
+    stat, _ = wio.evaluate()
+    assert stat.status == "qualified", stat
+    assert stat.bytes_written < 1024 ** 3, stat
+    payload = wio.write_io_payload()
+    assert payload["excludedDeletions"]["operations"] == 0
+    assert payload["excludedIndexMaintenance"]["operations"] == 1
+    assert payload["excludedIndexMaintenance"]["bytes"] >= 1024 ** 3
+    assert payload["budget"]["verdict"] != "over"
+
+
+@requires_fts5
+def test_an_ok_pass_reports_changed_rows_and_fts_eligibility(monkeypatch,
+                                                            tmp_path):
+    """Detects (#1094 D6): a pass that never reports whether it changed rows
+    or whether the store awaits verification, so the step never runs (or the
+    hold never waits for it)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    dash = _dash()
+    cache = importlib.import_module("_cctally_cache")
+    cache.open_conversations_db().close()        # the store exists, steady
+    lifecycle = importlib.import_module("_lib_codex_worker_lifecycle")
+    monkeypatch.setattr(lifecycle, "any_in_progress", lambda *_a, **_k: False)
+    monkeypatch.setattr(dash, "_dashboard_maybe_prune_retention", lambda: None)
+    monkeypatch.setattr(dash, "_conversation_frontier_plans", lambda _c: None)
+    monkeypatch.setattr(dash, "sync_claude_conversations",
+                        lambda _c, **_k: None)
+    monkeypatch.setattr(dash, "sync_codex_conversations",
+                        lambda _c, **_k: None)
+    status = dash._conversation_sync_pass()
+    assert status == "ok"
+    assert status.changed_rows is False
+    assert status.fts_eligible is True            # a new store is unverified
+    fts = importlib.import_module("_lib_conversation_fts_integrity")
+    assert fts.verify_conversation_fts(
+        mode="force", free_bytes=lambda _p: 1 << 50).outcome == "verified"
+    status = dash._conversation_sync_pass()
+    assert status.changed_rows is False
+    assert status.fts_eligible is False
+
+
+# --- #1072 T8: rollup work reaches a pass without a transcript change --------
+# The Claude plan is `caught_up` whenever no transcript changed, so an
+# accounting-only change (a late finalization) and the durable rollup keys must
+# be scheduled by the worker itself: the rollup-only step on caught-up ticks,
+# and a full plan (no certificate) while a traversal cursor or pending set
+# exists. Real stores, real `sync_claude_*` functions; only the frontier plans
+# and the Codex/retention legs are stand-ins.
+
+import json as _json
+
+_CURSOR_KEY = "conversation_sessions_rederive_cursor"
+
+
+def _jsonl(uuid, msg_id, session_id, ts, *, out=5, assistant=True):
+    if not assistant:
+        return _json.dumps({
+            "type": "user", "uuid": uuid, "sessionId": session_id,
+            "timestamp": ts, "message": {"role": "user", "content": "hi"},
+        }) + "\n"
+    return _json.dumps({
+        "type": "assistant", "uuid": uuid, "sessionId": session_id,
+        "requestId": "r-" + msg_id, "timestamp": ts,
+        "message": {
+            "role": "assistant", "id": msg_id, "model": "claude-opus-4-7",
+            "content": [{"type": "text", "text": "x"}],
+            "usage": {"input_tokens": 10, "output_tokens": out,
+                      "cache_creation_input_tokens": 0,
+                      "cache_read_input_tokens": 0},
+        },
+    }) + "\n"
+
+
+@pytest.fixture
+def real_worker(tmp_path, monkeypatch):
+    from conftest import rollup_fresh_mismatches
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    dash = importlib.import_module("_cctally_dashboard")
+    import _cctally_cache as cache
+    import _cctally_core as core
+    import _lib_ingest_frontier as frontier
+    projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    projects.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(dash, "sync_codex_conversations",
+                        lambda conn, **_kwargs: None)
+    monkeypatch.setattr(dash, "_dashboard_maybe_prune_retention", lambda: None)
+    a = projects / "a.jsonl"
+    a.write_text(_jsonl("a0", "", "s1", "2026-06-01T00:00:00Z", assistant=False)
+                 + _jsonl("a1", "m1", "s1", "2026-06-01T00:00:01Z", out=5))
+    accounting = cache.open_cache_db()
+    try:
+        cache.sync_cache(accounting)
+    finally:
+        accounting.close()
+    conn = cache.open_conversations_db()
+    cache.sync_claude_conversations(conn)
+    assert rollup_fresh_mismatches(conn) == []
+    seeds, commits = [], []
+
+    class _Plan:
+        def __init__(self, mode, paths=frozenset()):
+            self.mode, self.paths, self.reason = mode, frozenset(paths), ""
+
+    class _Frontier:
+        def seed_provider(self, provider, *_args, **_kwargs):
+            seeds.append(provider)
+
+        def commit_provider(self, plan, *_args, **_kwargs):
+            commits.append(plan.mode)
+
+    def plan(claude_mode, paths=()):
+        monkeypatch.setattr(
+            dash, "_conversation_frontier_plans",
+            lambda _conn: (
+                frontier, _Frontier(), object(),
+                {"claude": ((), (), True), "codex": ((), (), True)},
+                {"claude": _Plan(claude_mode, paths),
+                 "codex": _Plan("caught_up")},
+            ))
+
+    def raw_cache(sql, params=()):
+        raw = sqlite3.connect(str(core.CACHE_DB_PATH), timeout=5.0)
+        try:
+            raw.execute(sql, params)
+            raw.commit()
+        finally:
+            raw.close()
+
+    def rotate():
+        import uuid
+        raw_cache("UPDATE cache_meta SET value=? "
+                  "WHERE key='claude_accounting_generation'",
+                  (uuid.uuid4().hex,))
+
+    env = type("Env", (), {})()
+    env.__dict__.update(
+        dash=dash, cache=cache, frontier=frontier, conn=conn, a=a,
+        seeds=seeds, commits=commits, plan=plan, raw_cache=raw_cache,
+        rotate=rotate, mismatches=lambda: rollup_fresh_mismatches(conn),
+        pending=lambda: frontier._conversation_pending_identity(conn))
+    yield env
+    conn.close()
+
+
+def test_caught_up_tick_consumes_accounting_only_change(real_worker):
+    """A finalization priced after the transcript pass read its line changes
+    no transcript, so the Claude plan stays `caught_up`; without the worker's
+    rollup-only step the session's cost would stay stale indefinitely."""
+    env = real_worker
+    with env.a.open("a") as fh:
+        fh.write(_jsonl("a2", "m1", "s1", "2026-06-01T00:00:02Z", out=5000))
+    env.cache.sync_claude_conversations(env.conn)
+    accounting = env.cache.open_cache_db()
+    try:
+        env.cache.sync_cache(accounting)
+    finally:
+        accounting.close()
+    assert env.mismatches() != []
+    env.plan("caught_up")
+    assert env.dash._conversation_sync_pass() == "ok"
+    assert env.mismatches() == []
+
+
+def test_idle_caught_up_tick_writes_nothing(real_worker, monkeypatch):
+    """#939's no-catch-up-writes property: an idle dashboard's caught-up tick
+    must not open a write transaction on conversations.db every few seconds."""
+    env = real_worker
+
+    class _Held:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(env.dash, "open_conversations_db",
+                        lambda *a, **k: _Held(env.conn))
+    env.plan("caught_up")
+    before = env.conn.total_changes
+    assert env.dash._conversation_sync_pass() == "ok"
+    assert env.conn.total_changes == before
+    assert not env.conn.in_transaction
+
+
+def test_targeted_rotation_forces_next_full_plan(real_worker):
+    """A targeted pass that meets a rotated generation cannot run the
+    traversal; it must leave the cursor (a frontier pending key, so the next
+    plan is full) and must not advance the certificate, or the rotation is
+    never consumed."""
+    env = real_worker
+    env.rotate()
+    env.raw_cache("UPDATE session_entries SET output_tokens=4321 "
+                  "WHERE msg_id='m1'")
+    env.plan("targeted", {str(env.a)})
+    assert env.dash._conversation_sync_pass() == "ok"
+    assert env.commits == []
+    assert _CURSOR_KEY in env.pending()
+    env.plan("full")
+    assert env.dash._conversation_sync_pass() == "ok"
+    assert env.seeds == ["claude"]
+    assert _CURSOR_KEY not in env.pending()
+    assert env.mismatches() == []
+
+
+def test_exhausted_traversal_allowance_forces_full_plan(real_worker, monkeypatch):
+    """An accounting writer that keeps rotating the generation must not hold a
+    full pass forever: after two traversals the pass leaves the cursor and
+    reports itself incomplete, so no certificate is seeded and the next plan
+    is full."""
+    env = real_worker
+    real = env.cache._run_rollup_traversal
+
+    def rotating(conn, target, **kwargs):
+        done = real(conn, target, **kwargs)
+        env.rotate()
+        return done
+
+    env.rotate()
+    monkeypatch.setattr(env.cache, "_run_rollup_traversal", rotating)
+    env.plan("full")
+    assert env.dash._conversation_sync_pass() == "ok"
+    assert env.seeds == []
+    assert _CURSOR_KEY in env.pending()
+    monkeypatch.setattr(env.cache, "_run_rollup_traversal", real)
+    assert env.dash._conversation_sync_pass() == "ok"
+    assert env.seeds == ["claude"]
+    assert env.mismatches() == []
+
+
+def test_mint_failure_full_pass_not_certifiable(real_worker, monkeypatch):
+    """A full pass that could not mint the accounting generation consumed no
+    accounting version; certifying it would let the frontier skip the work."""
+    env = real_worker
+    env.raw_cache("DELETE FROM cache_meta "
+                  "WHERE key='claude_accounting_generation'")
+    real = env.cache._mint_claude_accounting_generation
+    monkeypatch.setattr(env.cache, "_mint_claude_accounting_generation",
+                        lambda: False)
+    env.plan("full")
+    assert env.dash._conversation_sync_pass() == "ok"
+    assert env.seeds == []
+    monkeypatch.setattr(env.cache, "_mint_claude_accounting_generation", real)
+    assert env.dash._conversation_sync_pass() == "ok"
+    assert env.seeds == ["claude"]

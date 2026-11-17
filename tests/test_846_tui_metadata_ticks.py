@@ -644,3 +644,74 @@ def test_857_entering_the_settled_cycle_exception_clears_only_the_codex_key(
         harness.cache.close()
         harness.stats.close()
         tui._tui_reset_partial_retry_state()
+
+
+def test_tui_refresh_heal_outside_query_scope(tmp_path, monkeypatch):
+    """#787 / #861 spec 5.12: the TUI sync thread runs its snapshot build
+    narrowed to `query` and the post-query stats heal outside that scope, at
+    the thread's own `process` authority. Detects a heal reached under the
+    query scope (the replacement engine needs MAINTENANCE, so it would raise
+    and the corrupt index would never be healed) and a build or retry that
+    reads at the owner's authority instead of `query`."""
+    import os
+    import pathlib
+    import sqlite3
+    import threading
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    core = sys.modules["_cctally_core"]
+    cache = sys.modules["_cctally_cache"]
+    app = pathlib.Path(core.APP_DIR)
+    app.mkdir(parents=True, exist_ok=True)
+    os.chmod(app, 0o700)
+    with core.establish_authority("process"):
+        core.open_db().close()
+        cache.open_cache_db().close()
+    tui = sys.modules["_cctally_tui"]
+    cctally = sys.modules["cctally"]
+
+    def kind():
+        a = core.current_authority()
+        return a.kind if a is not None else None
+
+    seen: list = []
+    real_alerts = cctally._build_alerts_envelope_array
+
+    def alerts(conn, *a, **k):
+        seen.append(("build", kind()))
+        if len([s for s in seen if s[0] == "build"]) == 1:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return real_alerts(conn, *a, **k)
+
+    def heal(exc):
+        seen.append(("heal", kind()))
+        return True
+
+    monkeypatch.setattr(cctally, "_build_alerts_envelope_array", alerts)
+    monkeypatch.setattr(tui, "_tui_heal_post_query_stats", heal)
+    outcomes: list = []
+    built = threading.Event()
+    real_build = cctally._tui_build_snapshot
+
+    def build(**kwargs):
+        try:
+            outcomes.append(real_build(**kwargs))
+        except BaseException as exc:  # noqa: BLE001 — recorded, re-raised
+            outcomes.append(exc)
+            raise
+        finally:
+            built.set()
+
+    monkeypatch.setattr(cctally, "_tui_build_snapshot", build)
+    ref = ns["_SnapshotRef"](tui._tui_empty_snapshot(NOW))
+    thread = tui._TuiSyncThread(ref, 60.0, skip_sync=True, now_utc=NOW)
+    thread.start()
+    try:
+        assert built.wait(60), "the TUI sync thread never built"
+    finally:
+        thread.stop()
+    assert len(outcomes) == 1 and not isinstance(outcomes[0], BaseException), (
+        outcomes)
+    assert seen == [("build", "query"), ("heal", "process"),
+                    ("build", "query")], seen

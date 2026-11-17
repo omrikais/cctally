@@ -168,6 +168,22 @@ def _env(tmp_path, monkeypatch):
     return ns, conn, retention, pathlib.Path(retention._resolve_main_db_path(conn))
 
 
+#: #990 (spec D1): the planner helper's real-time floor for the tests whose
+#: subject is a chunk's outcome, never the helper's own failure or deadline.
+_PLANNER_FLOOR_SECONDS = 30.0
+
+
+def _floor_planner_budget(monkeypatch, retention) -> None:
+    """Give every planner helper of this test 30 s of its own deadline, and
+    31 s of subprocess timeout with the 1.0 s start-up slack, instead of a
+    direct chunk's 1.5 s default, so a multi-second host stall cannot turn
+    the chunk under test into a ``helper_timeout`` refusal (#990). The
+    product constants are unchanged, and a passing run never waits on the
+    floor: a helper returns in about 0.05 s."""
+    monkeypatch.setattr(retention, "_PLANNER_MIN_DEADLINE_SECONDS",
+                        _PLANNER_FLOOR_SECONDS)
+
+
 def _fill_and_free(conn, rows=400):
     conn.execute("CREATE TABLE IF NOT EXISTS rp_filler(payload BLOB)")
     conn.executemany("INSERT INTO rp_filler VALUES (?)",
@@ -278,6 +294,7 @@ def test_a_wal_reset_between_attempts_uses_no_stale_frame(
     """After a chunk, the WAL is restarted and a new generation overwrites
     its start; the next plan equals one made from a WAL-free copy."""
     ns, conn, retention, db_path = _store_with_wal(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     rc = retention.open_reclaim_connection(db_path)
     try:
         first = retention.reclaim_chunk(rc, now_utc=NOW, pages=4)
@@ -421,6 +438,7 @@ def test_the_parent_opens_no_raw_descriptor_and_keeps_its_locks(
     a reader pinned in this process still blocks another process's TRUNCATE
     checkpoint after the chunk."""
     ns, conn, retention, db_path = _store_with_wal(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     conn.close()
     reader = sqlite3.connect(db_path)
     reader.execute("BEGIN")

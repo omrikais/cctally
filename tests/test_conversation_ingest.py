@@ -1,5 +1,5 @@
 import json
-import sqlite3, sys, pathlib
+import sqlite3, sys, pathlib, time
 import types
 
 import pytest
@@ -1101,6 +1101,10 @@ def test_sync_consumes_search_split_flag_backfills_and_swaps(isolated):
     sync()   # consumes the flag under the flock
 
     assert db._conversation_fts_is_split(conn), "sync swapped to the split shape"
+    # #1041 D1: the swap recreates the index, so the pass re-applies its
+    # merge policy before it ingests.
+    stored = _conversation_fts_config(conn)["conversation_fts"]
+    assert {k: stored.get(k) for k in _MERGE_OPTIONS} == _MERGE_OPTIONS
     assert conn.execute(
         "SELECT 1 FROM sqlite_master WHERE name='conversation_fts_aux'"
     ).fetchone() is None
@@ -1133,6 +1137,10 @@ def test_rebuild_swaps_legacy_shape_and_clears_split_flag(isolated):
     sync(rebuild=True)
 
     assert db._conversation_fts_is_split(conn), "rebuild swapped to the split shape"
+    # #1041 D1: the swap recreates the index, so the pass re-applies its
+    # merge policy before it ingests.
+    stored = _conversation_fts_config(conn)["conversation_fts"]
+    assert {k: stored.get(k) for k in _MERGE_OPTIONS} == _MERGE_OPTIONS
     assert conn.execute(
         "SELECT 1 FROM cache_meta WHERE key='conversation_search_split_pending'"
     ).fetchone() is None
@@ -2003,3 +2011,138 @@ def test_conversation_sync_cache_scope(isolated, provider, fails):
     assert conn.execute("PRAGMA main.cache_size").fetchone()[0] == -1234
     assert conn.execute(
         "PRAGMA cache_db.cache_size").fetchone()[0] == cache_db_before
+
+
+_CONVERSATION_FTS = (
+    "conversation_fts", "codex_conversation_fts", "conversation_title_fts")
+_MERGE_OPTIONS = {"automerge": 16, "crisismerge": 32}
+
+
+def _conversation_fts_config(conn):
+    """Each present conversation FTS index's stored options."""
+    present = {name for (name,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    return {t: dict(conn.execute(f"SELECT k, v FROM {t}_config"))
+            for t in _CONVERSATION_FTS if t in present}
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize(
+    "case", ["all_indexes", "no_title_index", "write_fails"])
+def test_conversation_fts_merge_policy(isolated, provider, case):
+    """Detects: a catch-up pass merging its FTS indexes at FTS5's default
+    automerge 4, which rewrites segments across commits, or with crisismerge
+    equal to automerge, which merges a full level in one commit (#1041 D1);
+    the options re-written on every pass; a store without the title index failing
+    the pass or losing the other two; and a failing option write failing the
+    pass, half-applying the options or leaving a transaction open."""
+    require_fts5()
+    ns, conn, projects, _sync = isolated
+    sync = ns[f"sync_{provider}_conversations"]
+    if provider == "claude":
+        (path,) = _d1_files(projects, ["a"])
+    if case == "no_title_index":
+        db._drop_conversation_title_fts_triggers(conn)
+        conn.execute("DROP TABLE conversation_title_fts")
+        conn.commit()
+    before = _conversation_fts_config(conn)
+    expected = set(_CONVERSATION_FTS) - (
+        {"conversation_title_fts"} if case == "no_title_index" else set())
+    assert set(before) == expected
+
+    sync(conn)
+    assert not conn.in_transaction
+    assert _conversation_fts_config(conn) == {
+        t: {**options, **_MERGE_OPTIONS} for t, options in before.items()}
+
+    if case == "write_fails":
+        for t in before:
+            conn.execute(f"INSERT INTO {t}({t}, rank) VALUES('automerge', 4)")
+        conn.commit()
+        if provider == "claude":
+            with path.open("a") as fh:
+                fh.write(_d1_line("s-a", "a-1", "a text 1"))
+    settled = _conversation_fts_config(conn)
+    (rows_before,) = conn.execute(
+        "SELECT count(*) FROM conversation_messages").fetchone()
+    writes = []
+
+    def authorize(action, table, _column, _schema, trigger):
+        # A direct INSERT into an FTS table is a special command such as an
+        # option write; the index's row writes come from its triggers.
+        if (action == sqlite3.SQLITE_INSERT and table in _CONVERSATION_FTS
+                and trigger is None):
+            writes.append(table)
+            if case == "write_fails" and table == "codex_conversation_fts":
+                return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(authorize)
+    try:
+        stats = sync(conn)
+    finally:
+        conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK)
+    assert not conn.in_transaction
+    assert _conversation_fts_config(conn) == settled
+    (rows_after,) = conn.execute(
+        "SELECT count(*) FROM conversation_messages").fetchone()
+    if case == "write_fails":
+        assert "codex_conversation_fts" in writes
+        if provider == "claude":
+            assert stats.files_processed == 1
+            assert rows_after == rows_before + 1
+    else:
+        assert writes == []
+        assert rows_after == rows_before
+
+
+@pytest.mark.parametrize("state", [
+    "caller_transaction", "write_locked", "fts5_unavailable",
+    "codex_fts_unavailable"])
+def test_conversation_fts_merge_policy_leaves_store(isolated, state):
+    """Detects: the option write committing a caller's uncommitted rows;
+    waiting out the busy timeout, failing, leaving a transaction open or
+    losing the caller's busy timeout while another writer holds the store;
+    and writing an index the store marks unavailable on this build, or
+    skipping the indexes the other marker leaves available."""
+    require_fts5()
+    import _cctally_cache as cache
+    ns, conn, _projects, _sync = isolated
+    before = _conversation_fts_config(conn)
+    merged = {t: {**options, **_MERGE_OPTIONS} for t, options in before.items()}
+    expected = before
+    other = None
+    if state == "caller_transaction":
+        conn.execute("INSERT INTO cache_meta(key, value) VALUES('t-1041', '1')")
+    elif state == "write_locked":
+        conn.execute("PRAGMA busy_timeout = 20000")
+        other = _d1_other(ns, timeout=0)
+        other.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES(?, '1')", (state,))
+        conn.commit()
+        gated = ({"codex_conversation_fts"} if state == "codex_fts_unavailable"
+                 else {"conversation_fts", "conversation_title_fts"})
+        expected = {t: (before[t] if t in gated else merged[t])
+                    for t in before}
+
+    started = time.monotonic()
+    cache._ensure_conversation_fts_merge_policy(conn)
+    elapsed = time.monotonic() - started
+
+    assert _conversation_fts_config(conn) == expected
+    if state == "caller_transaction":
+        assert conn.in_transaction
+        conn.rollback()
+        assert conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key='t-1041'").fetchone() is None
+    else:
+        assert not conn.in_transaction
+    if other is not None:
+        assert elapsed < 5
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 20000
+        other.rollback()
+        other.close()
+        cache._ensure_conversation_fts_merge_policy(conn)
+        assert _conversation_fts_config(conn) == merged

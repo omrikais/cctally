@@ -1022,69 +1022,131 @@ def session_cache_rebuild_count(conn, session_id) -> int:
         _lightweight_rebuild_events(conn, session_id))
 
 
-def _turn_costs_for_keys(conn, keys):
-    """{(msg_id, req_id): cost_usd} for the given turn keys, joined ONCE to the
-    deduped session_entries row per (msg_id, req_id) (#217 S1 / U7b — the SINGLE
-    cost-attribution chokepoint both ``_turn_cost_map`` and ``_session_cost_map``
-    delegate to, so the cost-once-per-turn rule is never reimplemented).
+def _turn_cost_rows_for_keys(conn, keys):
+    """{(msg_id, req_id): (cost_usd, mutation_seq)} for the given turn keys,
+    joined ONCE to the deduped session_entries row per (msg_id, req_id) (#217 S1
+    / U7b — the SINGLE cost-attribution chokepoint ``_turn_cost_map``,
+    ``_turn_costs_for_keys`` and ``_session_cost_and_accounting_map`` share, so
+    the cost-once-per-turn rule is never reimplemented).
 
     NULL-filters the keys, chunks the OR-of-pairs to stay well under SQLite's
     variable limit, and computes each cost via the shared pricing helper
     (honoring a vendor ``cost_usd_raw`` override). Keys absent from
     session_entries (e.g. ``<synthetic>`` walker-skipped rows) are simply not
-    present in the result -> cost 0 by omission. Parity guard:
-    ``test_session_and_turn_cost_map_share_helper_parity``."""
-    costs = {}
+    present in the result -> cost 0 by omission. ``mutation_seq`` (#1068 D2) is
+    the row's accounting sequence stamp, None when the row carries none or the
+    store predates the column."""
+    rows = {}
     norm = [(m, r) for (m, r) in keys if m is not None and r is not None]
     if not norm:
-        return costs
+        return rows
+    base = ("SELECT msg_id, req_id, model, input_tokens, output_tokens, "
+            "cache_create_tokens, cache_read_tokens, cost_usd_raw, "
+            "cache_create_1h_tokens, speed")
+    with_seq = True
     for i in range(0, len(norm), 400):
         chunk = norm[i:i + 400]
         cond = " OR ".join("(msg_id=? AND req_id=?)" for _ in chunk)
         params = [v for pair in chunk for v in pair]
-        sql = ("SELECT msg_id, req_id, model, input_tokens, output_tokens, "
-               "cache_create_tokens, cache_read_tokens, cost_usd_raw, "
-               "cache_create_1h_tokens, speed "
-               "FROM session_entries WHERE " + cond)
-        for m, r, model, inp, out, cc, cr, raw, cc1h, speed in conn.execute(
-            sql, params
-        ):
-            costs[(m, r)] = _entry_cost(
-                model, inp, out, cc, cr, raw, cc_1h=cc1h, speed=speed
+        if with_seq:
+            try:
+                cur = conn.execute(
+                    base + ", mutation_seq FROM session_entries WHERE " + cond,
+                    params)
+            except sqlite3.OperationalError as exc:
+                if "mutation_seq" not in str(exc):
+                    raise
+                with_seq = False
+        if not with_seq:
+            cur = conn.execute(
+                base + ", NULL FROM session_entries WHERE " + cond, params)
+        for m, r, model, inp, out, cc, cr, raw, cc1h, speed, seq in cur:
+            rows[(m, r)] = (
+                _entry_cost(model, inp, out, cc, cr, raw, cc_1h=cc1h,
+                            speed=speed),
+                seq,
             )
-    return costs
+    return rows
 
 
-def _session_cost_map(conn, session_ids):
-    """{session_id: total_cost_usd} for the given sessions. Resolves each
-    session's distinct (msg_id, req_id) turn keys, then attributes cost via the
-    shared ``_turn_costs_for_keys`` helper (cost-once per deduped session_entries
-    row), summing into the owning session. (msg_id, req_id) is globally unique in
-    session_entries and maps to exactly one session_id, so per-session sums are
-    clean and a turn replayed across files contributes once.
+def _turn_costs_for_keys(conn, keys):
+    """{(msg_id, req_id): cost_usd} — the cost projection of
+    ``_turn_cost_rows_for_keys``. Parity guard:
+    ``test_session_and_turn_cost_map_share_helper_parity``."""
+    return {key: row[0]
+            for key, row in _turn_cost_rows_for_keys(conn, keys).items()}
 
-    #901 Amendment 19 T1 (spec I1): the de-duplication runs in Python over the
-    streamed rows, keeping each key's FIRST occurrence in scan order — exactly
-    the rows, and the order, ``SELECT DISTINCT`` returned. The DISTINCT built a
-    temp b-tree of every turn of every touched session, and one session's
-    history is not a bound."""
-    costs = {sid: 0.0 for sid in session_ids}
+
+def _uuid_id_order(row):
+    """Sort key for one physical message row ``(uuid, id, ...)``: NULL uuids
+    first, then uuid, then id — the encounter order of
+    ``idx_conv_session_uuid (session_id, uuid)`` (``id`` is the rowid)."""
+    return (row[0] is not None, row[0] if row[0] is not None else "", row[1])
+
+
+def _session_cost_and_accounting_map(conn, session_ids):
+    """{session_id: (total_cost_usd, entries, max_seq)} for the given sessions.
+
+    Cost: each session's distinct (msg_id, req_id) turn keys are attributed via
+    the shared ``_turn_cost_rows_for_keys`` helper (cost-once per deduped
+    session_entries row), summing into the owning session. A key shared by two
+    sessions counts once in each.
+
+    #1068 D5: the summation order is PINNED. Each session's physical rows are
+    sorted by ``(uuid, id)``, NULL uuids first, before each turn key keeps its
+    first occurrence, so the float sum is the one the ``idx_conv_session_uuid``
+    traversal produced whatever plan the statement gets (a scoped view may read
+    through another index). The sort runs in Python over the streamed rows, so
+    no SQL sorter (and no temp b-tree, #901 Amendment 19 T1) is involved.
+
+    ``entries`` is how many of the session's distinct turn keys have a
+    session_entries row (a NULL ``mutation_seq`` still counts) and ``max_seq``
+    the largest non-NULL ``mutation_seq`` among them, None when there is none:
+    the accounting half of the rollup's input fingerprint (D2)."""
+    out = {sid: (0.0, 0, None) for sid in session_ids}
     if not session_ids:
-        return costs
+        return out
     placeholders = ",".join("?" for _ in session_ids)
-    pairs = list(dict.fromkeys(conn.execute(
-        "SELECT session_id, msg_id, req_id "
+    physical: dict = {}
+    for sid, m, r, uuid, rid in conn.execute(
+        "SELECT session_id, msg_id, req_id, uuid, id "
         "FROM conversation_messages "
         "WHERE session_id IN (%s) AND msg_id IS NOT NULL AND req_id IS NOT NULL"
         % placeholders,
         list(session_ids),
-    )))
-    if not pairs:
-        return costs
-    key_cost = _turn_costs_for_keys(conn, [(m, r) for _, m, r in pairs])
-    for sid, m, r in pairs:
-        costs[sid] = costs.get(sid, 0.0) + key_cost.get((m, r), 0.0)
-    return costs
+    ):
+        physical.setdefault(sid, []).append((uuid, rid, m, r))
+    if not physical:
+        return out
+    ordered_keys = {}
+    all_keys: dict = {}
+    for sid, rows in physical.items():
+        rows.sort(key=_uuid_id_order)
+        keys = list(dict.fromkeys((m, r) for _u, _i, m, r in rows))
+        ordered_keys[sid] = keys
+        all_keys.update(dict.fromkeys(keys))
+    key_rows = _turn_cost_rows_for_keys(conn, list(all_keys))
+    for sid, keys in ordered_keys.items():
+        cost, entries, max_seq = out.get(sid, (0.0, 0, None))
+        for key in keys:
+            row = key_rows.get(key)
+            if row is None:
+                cost = cost + 0.0
+                continue
+            cost = cost + row[0]
+            entries += 1
+            seq = row[1]
+            if seq is not None and (max_seq is None or seq > max_seq):
+                max_seq = seq
+        out[sid] = (cost, entries, max_seq)
+    return out
+
+
+def _session_cost_map(conn, session_ids):
+    """{session_id: total_cost_usd} for the given sessions — the cost
+    projection of ``_session_cost_and_accounting_map`` (D5's pinned order)."""
+    return {sid: row[0] for sid, row in
+            _session_cost_and_accounting_map(conn, session_ids).items()}
 
 
 def _models_main_first(rows):
@@ -1297,7 +1359,8 @@ _FILTER_KEYS = ("date_from", "date_to", "projects",
 # The rollup-only axes — the ones the live fallback cannot express. Used to set
 # the page's filter_degraded flag when one is requested under the live branch.
 # NOTE (#278 Theme C): "models" is deliberately NOT here. The model axis is a
-# live session_id IN (…conversation_messages.model…) restriction that applies on
+# session_id IN (…) restriction (unscoped: live conversation_messages.model;
+# account-scoped: the scope's TEMP rollup snapshot, #1073) that applies on
 # BOTH branches, so a model-only filter under a pending rollup still applies and
 # must NEVER set filter_degraded.
 _ROLLUP_ONLY_FILTER_KEYS = ("projects", "cost_min", "cost_max", "rebuild_min")
@@ -1307,6 +1370,21 @@ def _empty_filters() -> dict:
     """A no-op filter dict (every axis None) — the unfiltered default and the
     shape the row-source helpers expect."""
     return {k: None for k in _FILTER_KEYS}
+
+
+# #1073: the per-session model pairs of an account-scoped connection. The
+# scoper (``scope_conversations_db_to_account``) shadows conversation_messages
+# with a TEMP view, and SQLite cannot apply ``INDEXED BY`` to a view, so the
+# unscoped clause below raises ``no such index`` there. The scope's TEMP
+# conversation_sessions rollup already holds, per in-scope session, the
+# distinct non-empty models of its in-scope messages (or NULL), built from the
+# setup snapshot; the scoped model filter and the scoped model facets both read
+# it, so they agree on one connection and cost a scan of the account's
+# sessions, not its messages.
+_SCOPED_SESSION_MODELS = (
+    "FROM temp.conversation_sessions AS s, json_each(s.models_json) AS j "
+    "WHERE s.models_json IS NOT NULL"
+)
 
 
 def _model_clause(conn, families):
@@ -1332,10 +1410,28 @@ def _model_clause(conn, families):
 
     The fragment ANDs into any WHERE that has a ``session_id`` column, so the
     IDENTICAL string composes into both the ``conversation_sessions`` rollup and
-    the ``conversation_messages`` live branch verbatim (spec §1)."""
+    the ``conversation_messages`` live branch verbatim (spec §1).
+
+    #1073: on an account-scoped connection both steps read the scope's TEMP
+    rollup (``_SCOPED_SESSION_MODELS``) instead, so membership is "sessions
+    with an in-scope message of a chosen family" from the setup snapshot —
+    the same set the scoped facets count. The unscoped SQL below is unchanged."""
     if not families:
         return "", []
     wanted = set(families)
+    if _anon_scope_account(conn) is not None:
+        ids = sorted(
+            m for (m,) in conn.execute(
+                "SELECT DISTINCT j.value " + _SCOPED_SESSION_MODELS)
+            if _chip_for_model(m) in wanted
+        )
+        if not ids:
+            return "session_id IN (SELECT session_id FROM conversation_messages WHERE 0)", []
+        return (
+            "session_id IN (SELECT s.session_id " + _SCOPED_SESSION_MODELS
+            + " AND j.value IN (%s))" % ",".join("?" for _ in ids),
+            ids,
+        )
     ids = [
         m for (m,) in conn.execute(
             "SELECT DISTINCT model FROM conversation_messages "
@@ -1552,6 +1648,11 @@ def list_conversation_facets(conn) -> dict:
     popover list is stable — so a family's facet count equals the rows selecting
     its chip yields (self-consistent with the §1 filter semantics).
 
+    #1073: on an account-scoped connection ``models`` folds the scope's TEMP
+    rollup pairs (``_SCOPED_SESSION_MODELS``) through the same classifier
+    instead, matching the scoped ``_model_clause``; that TEMP table is built
+    whatever ``main``'s backfill flag says.
+
     Returns ``{"projects": [{"project_label", "count"}, ...],
                 "models": [{"family", "count"}, ...]}``."""
     # #717. `projects` is read from the rollup, so while the rollup is being
@@ -1576,10 +1677,17 @@ def list_conversation_facets(conn) -> dict:
         projects = [{"project_label": p, "count": n} for p, n in rows]
 
     fam_sessions: dict = {}
-    for sid, model in conn.execute(
-        "SELECT DISTINCT session_id, model FROM conversation_messages "
-        "WHERE session_id IS NOT NULL AND model IS NOT NULL AND model != ''"
-    ):
+    if _anon_scope_account(conn) is not None:
+        # #1073 D3: on an account-scoped connection the model facets read the
+        # same TEMP rollup pairs as the scoped ``_model_clause``, so a facet
+        # count and the rows its chip yields come from one setup snapshot.
+        pairs_sql = "SELECT s.session_id, j.value " + _SCOPED_SESSION_MODELS
+    else:
+        pairs_sql = (
+            "SELECT DISTINCT session_id, model FROM conversation_messages "
+            "WHERE session_id IS NOT NULL AND model IS NOT NULL AND model != ''"
+        )
+    for sid, model in conn.execute(pairs_sql):
         fam = _chip_for_model(model)
         if fam == "other":
             continue
@@ -1589,9 +1697,11 @@ def list_conversation_facets(conn) -> dict:
         for fam in _MODEL_FAMILY_ORDER
         if fam in fam_sessions
     ]
-    # `models` keeps its live counts in both states: it folds
-    # `conversation_messages` directly and never touches the rollup, so a
-    # pending backfill does not make it wrong. The flag is OMITTED on the
+    # `models` keeps its counts in both states: unscoped it folds
+    # `conversation_messages` directly and never touches the persistent rollup,
+    # and account-scoped it folds the scope's TEMP rollup, which the scoper
+    # builds whatever the backfill flag says (#1073), so a pending backfill
+    # does not make it wrong. The flag is OMITTED on the
     # authoritative path, so the ordinary envelope is byte-identical to what
     # every existing consumer already parses.
     facets = {"projects": projects, "models": models}
@@ -2607,16 +2717,32 @@ def _assemble_memo_key(conn, session_id):
     the key so equal rollup watermarks can never reuse another store's or
     account's private transcript. The caller has already confirmed the rollup
     is authoritative.
+
+    #1068 D7: the row's ``input_fingerprint`` joins the key. A TEMP row's
+    fingerprint always describes its current scoped inputs (a reused row's
+    equals the scoped computation, a fresh row's is computed by the fill), so
+    any change to a session's scoped messages or entries changes the key,
+    including a delete that advances no counter. A store without the column
+    keeps the earlier key.
     """
     try:
         row = conn.execute(
-            "SELECT msg_count, last_activity_utc, render_revision "
-            "FROM conversation_sessions "
+            "SELECT msg_count, last_activity_utc, render_revision, "
+            "input_fingerprint FROM conversation_sessions "
             "WHERE session_id=?", (session_id,)).fetchone()
-    except sqlite3.OperationalError:
-        return None
+    except sqlite3.OperationalError as exc:
+        if "input_fingerprint" not in str(exc):
+            return None
+        try:
+            row = conn.execute(
+                "SELECT msg_count, last_activity_utc, render_revision "
+                "FROM conversation_sessions "
+                "WHERE session_id=?", (session_id,)).fetchone()
+        except sqlite3.OperationalError:
+            return None
     if row is None:
         return None
+    rollup = tuple(row)
     try:
         schemas = {row[1] for row in conn.execute("PRAGMA database_list")}
         meta_schema = "cache_db" if "cache_db" in schemas else "main"
@@ -2659,9 +2785,7 @@ def _assemble_memo_key(conn, session_id):
         database_identity,
         account_scope,
         session_id,
-        row[0],
-        row[1],
-        row[2],
+        *rollup,
         seq,
     )
 
@@ -4127,12 +4251,23 @@ def _texts_for_ids(conn, ids):
     it for just the page so `_manual_snippet` runs at most `limit` times."""
     if not ids:
         return {}
-    ph = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"SELECT id, text FROM conversation_messages WHERE id IN ({ph})",
-        tuple(ids),
-    ).fetchall()
-    return {r[0]: r[1] for r in rows}
+    # #1068 D1: drive from the id list (CROSS JOIN fixes the loop order) so
+    # each id is one primary-key probe of the scoped view. With a sargable
+    # scope predicate and no sqlite_stat1, a plain ``id IN (...)`` lets the
+    # planner walk the account's whole idx_conv_messages_account_session
+    # range instead. The scope still filters every returned row.
+    out = {}
+    for i in range(0, len(ids), 500):
+        chunk = list(ids[i:i + 500])
+        values = ",".join("(?)" for _ in chunk)
+        rows = conn.execute(
+            f"WITH page_ids(id) AS (VALUES {values}) "
+            "SELECT cm.id, cm.text FROM page_ids "
+            "CROSS JOIN conversation_messages cm ON cm.id = page_ids.id",
+            tuple(chunk),
+        ).fetchall()
+        out.update({r[0]: r[1] for r in rows})
+    return out
 
 
 # #177 S6: FTS-column index → badge label (col 0 = prose = no badge).
@@ -4298,11 +4433,20 @@ def _all_matched_rids_by_group(conn, et_pred, et_args, groups):
     # page groups, 2 params each → one or two chunks in practice).
     for i in range(0, len(groups), 300):
         chunk = groups[i:i + 300]
+        # #1068 D1: the group keys select base rows through
+        # idx_conv_session_uuid (``p``, an unscoped read that only yields row
+        # ids), and the scoped view is joined by primary key, so the scope
+        # still filters every returned row. Querying the scoped view directly
+        # lets the planner (no sqlite_stat1) prefer the sargable account
+        # predicate's idx_conv_messages_account_session and walk the whole
+        # account (measured ~1 s per content search on a 1.6M-message account).
         cond = " OR ".join(
-            "(cm.session_id IS ? AND cm.uuid IS ?)" for _ in chunk)
+            "(p.session_id IS ? AND p.uuid IS ?)" for _ in chunk)
         params = [v for g in chunk for v in g]
         rows = conn.execute(
-            "SELECT cm.id, cm.session_id, cm.uuid FROM conversation_messages cm "
+            "SELECT cm.id, cm.session_id, cm.uuid "
+            "FROM main.conversation_messages p "
+            "CROSS JOIN conversation_messages cm ON cm.id = p.id "
             f"WHERE ({cond}){et_pred}",
             (*params, *et_args),
         ).fetchall()
@@ -4425,8 +4569,8 @@ def _search_title(conn, q, limit, offset, fts_available, filt_sql="", filt_param
     """#217 S2 / E7: ``kind=title`` cross-session search over the per-session AI
     title (conversation_ai_titles). Emits ONE SESSION-level hit per matching
     session, anchored to that session's FIRST turn (the earliest
-    ``(timestamp_utc, id)`` conversation_messages row), ``match_kinds:["title"]``,
-    snippet = the matched title.
+    ``(timestamp_utc, id)`` conversation_messages row, NULL timestamps first),
+    ``match_kinds:["title"]``, snippet = the matched title.
 
     FTS5 available: ``MATCH ai_title`` over the external-content
     ``conversation_title_fts``, mapping each hit rowid →
@@ -4434,52 +4578,76 @@ def _search_title(conn, q, limit, offset, fts_available, filt_sql="", filt_param
     Else: a LIKE scan over ``conversation_ai_titles`` with the whole title as the
     snippet (degraded; no marked span).
 
+    #1093: the anchor is resolved only for the matched titles. A MATERIALIZED
+    matched-title CTE carries two correlated ``ORDER BY timestamp_utc, id LIMIT
+    1`` lookups per matched session (its anchor id and timestamp, the same
+    order, so both describe one row), each a per-session index seek
+    (``idx_conv_session_ts`` unscoped; on a real-account scope the planner
+    may seek ``idx_conv_messages_account_session`` instead); the page is cut
+    over that set and the anchor row's wide columns are read by primary key
+    for the page rows only. The old form ranked every message
+    row with ``ROW_NUMBER()`` in both statements, so a search matching a handful
+    of titles read the whole transcript corpus. Every lookup reads the
+    unqualified ``conversation_messages`` (the scoped TEMP view on an
+    account-scoped connection).
+
     P2-9 (load-bearing): a session's title counts toward ``total`` and the page
-    ONLY when it has an anchorable first turn. Both the COUNT and the page JOIN
-    the SAME first-message anchor (``INNER JOIN`` against the per-session
-    first-turn CTE), so a title row whose session has no surviving message rows is
+    ONLY when it has an anchorable first turn. The COUNT tests the session's
+    existence in ``conversation_messages`` and the page drops titles with no
+    anchor id (``aid IS NOT NULL``, never ``ats``: a NULL-timestamp anchor is
+    valid), so a title row whose session has no surviving message rows is
     excluded from both — no lying count.
+
+    Snapshots: the FTS count, page and snippet extraction share one read
+    snapshot (#1036), and so do the LIKE count and page (#1093); a caller-held
+    transaction is left untouched. The enrichment tail runs after it.
 
     Filtered-search: the ``filt_sql`` session-scope restriction (over
     conversation_ai_titles.session_id) applies the same as the message kinds.
     """
     fpred = _session_filter_pred("t.session_id", filt_sql)
     fargs = tuple(filt_params)
-    # First-turn anchor per session: earliest (timestamp_utc, id) row. Rides
-    # idx_conv_session_ts. One row per session_id.
-    anchor_cte = (
-        "anchor AS ("
-        "  SELECT session_id, aid, auuid, ats, acwd, amid, arqd FROM ("
-        "    SELECT session_id, id AS aid, uuid AS auuid, timestamp_utc AS ats, "
-        "           cwd AS acwd, msg_id AS amid, req_id AS arqd, "
-        "           ROW_NUMBER() OVER (PARTITION BY session_id "
-        "                              ORDER BY timestamp_utc, id) AS rn "
-        "    FROM conversation_messages WHERE session_id IS NOT NULL"
-        "  ) WHERE rn = 1)")
+    # First-turn anchor of one matched session: its earliest (timestamp_utc,
+    # id) row. Both lookups use the identical order so aid and ats are one row.
+    anchor_cols = (
+        "(SELECT cm.id FROM conversation_messages cm "
+        "  WHERE cm.session_id = t.session_id "
+        "  ORDER BY cm.timestamp_utc, cm.id LIMIT 1) AS aid, "
+        "(SELECT cm.timestamp_utc FROM conversation_messages cm "
+        "  WHERE cm.session_id = t.session_id "
+        "  ORDER BY cm.timestamp_utc, cm.id LIMIT 1) AS ats")
+    anchorable = (" AND EXISTS (SELECT 1 FROM conversation_messages cm "
+                  "WHERE cm.session_id = t.session_id)")
+
+    def page_sql(source, where, carry):
+        # ``carry`` is the title rowid (FTS) or the title itself (LIKE).
+        return (
+            "WITH matched AS MATERIALIZED ("
+            f"  SELECT t.session_id AS sid, {carry} AS carry, {anchor_cols} "
+            f"  FROM {source} WHERE {where}), "
+            "page AS ("
+            "  SELECT sid, carry, aid, ats FROM matched WHERE aid IS NOT NULL "
+            "  ORDER BY ats DESC, sid DESC LIMIT ? OFFSET ?) "
+            "SELECT page.sid, cm.uuid, page.ats, cm.cwd, cm.msg_id, cm.req_id, "
+            "       page.carry "
+            "FROM page CROSS JOIN conversation_messages cm ON cm.id = page.aid "
+            "ORDER BY page.ats DESC, page.sid DESC")
 
     if fts_available:
-        # matched titles: rowid → session_id, INNER-joined to the anchor so only
-        # anchorable sessions survive (P2-9). #1036: the page selects the title
-        # rowid and the snippet comes from the collision-checked extraction,
-        # inside the same read snapshot as the count and the page.
+        # matched titles: rowid → session_id; only anchorable sessions survive
+        # (P2-9). #1036: the page selects the title rowid and the snippet comes
+        # from the collision-checked extraction, inside the same read snapshot
+        # as the count and the page.
         fts_q = _fts_query(q, prefix_last=True)
+        source = ("conversation_title_fts f "
+                  "JOIN conversation_ai_titles t ON t.rowid = f.rowid")
+        where = f"f.conversation_title_fts MATCH ?{fpred}"
         with _read_snapshot(conn):
             total = conn.execute(
-                "WITH " + anchor_cte + " "
-                "SELECT COUNT(*) FROM conversation_title_fts f "
-                "JOIN conversation_ai_titles t ON t.rowid = f.rowid "
-                "JOIN anchor a ON a.session_id = t.session_id "
-                f"WHERE f.conversation_title_fts MATCH ?{fpred}",
+                f"SELECT COUNT(*) FROM {source} WHERE {where}{anchorable}",
                 (fts_q, *fargs)).fetchone()[0]
             page = conn.execute(
-                "WITH " + anchor_cte + " "
-                "SELECT t.session_id, a.auuid, a.ats, a.acwd, a.amid, a.arqd, "
-                "       t.rowid AS trid "
-                "FROM conversation_title_fts f "
-                "JOIN conversation_ai_titles t ON t.rowid = f.rowid "
-                "JOIN anchor a ON a.session_id = t.session_id "
-                f"WHERE f.conversation_title_fts MATCH ?{fpred} "
-                "ORDER BY a.ats DESC, t.session_id DESC LIMIT ? OFFSET ?",
+                page_sql(source, where, "t.rowid"),
                 (fts_q, *fargs, limit, offset)).fetchall()
             snips = (_extract_fts_snippets(
                 conn, fts_table="conversation_title_fts",
@@ -4495,21 +4663,16 @@ def _search_title(conn, q, limit, offset, fts_available, filt_sql="", filt_param
                 "hits": _attach_search_meta(conn, hits),
                 "total": total}
     like = _like_pattern(q)
-    total = conn.execute(
-        "WITH " + anchor_cte + " "
-        "SELECT COUNT(*) FROM conversation_ai_titles t "
-        "JOIN anchor a ON a.session_id = t.session_id "
-        f"WHERE t.ai_title LIKE ? ESCAPE '\\'{fpred}",
-        (like, *fargs)).fetchone()[0]
-    rows = conn.execute(
-        "WITH " + anchor_cte + " "
-        "SELECT t.session_id, a.auuid, a.ats, a.acwd, a.amid, a.arqd, "
-        "       t.ai_title AS snip "
-        "FROM conversation_ai_titles t "
-        "JOIN anchor a ON a.session_id = t.session_id "
-        f"WHERE t.ai_title LIKE ? ESCAPE '\\'{fpred} "
-        "ORDER BY a.ats DESC, t.session_id DESC LIMIT ? OFFSET ?",
-        (like, *fargs, limit, offset)).fetchall()
+    source = "conversation_ai_titles t"
+    where = f"t.ai_title LIKE ? ESCAPE '\\'{fpred}"
+    # #1093: the count and the page describe one state of the store.
+    with _read_snapshot(conn):
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM {source} WHERE {where}{anchorable}",
+            (like, *fargs)).fetchone()[0]
+        rows = conn.execute(
+            page_sql(source, where, "t.ai_title"),
+            (like, *fargs, limit, offset)).fetchall()
 
     hits = [_row_to_hit(auuid, sid, ats, acwd, snip, amid, arqd,
                         match_kinds=["title"])
@@ -4591,12 +4754,19 @@ def _like_badges(conn, like, groups):
     if not groups:
         return {}
     out = {g: [] for g in groups}
-    ph = " OR ".join("(session_id=? AND uuid=?)" for _ in groups)
+    # #1068 D1: key the groups on the unscoped base rows (``p``, ids only)
+    # and join the scoped view by primary key, as _all_matched_rids_by_group
+    # does; on the scoped view itself the planner walks the account's whole
+    # idx_conv_messages_account_session range (measured 142 s per column on a
+    # 1.6M-message account).
+    ph = " OR ".join("(p.session_id=? AND p.uuid=?)" for _ in groups)
     flat = [v for g in groups for v in g]
     for col, label in _KIND_PROBE_COLUMNS:
         rows = conn.execute(
-            f"SELECT DISTINCT session_id, uuid FROM conversation_messages "
-            f"WHERE {col} LIKE ? ESCAPE '\\' AND {col} != '' AND ({ph})",
+            "SELECT DISTINCT cm.session_id, cm.uuid "
+            "FROM main.conversation_messages p "
+            "CROSS JOIN conversation_messages cm ON cm.id = p.id "
+            f"WHERE cm.{col} LIKE ? ESCAPE '\\' AND cm.{col} != '' AND ({ph})",
             (like, *flat)).fetchall()
         for sid, uuid in rows:
             if (sid, uuid) in out:

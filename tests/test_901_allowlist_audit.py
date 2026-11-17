@@ -54,14 +54,21 @@ TEMP_STORES = sorted(TEMP_STORE_CODE)
 UTC = dt.timezone.utc
 
 
-def _bounded(recorder, call_site: str, temp_store: str) -> list:
+def _bounded(recorder, call_site: str, temp_store: str, *,
+             query_session: bool = False) -> list:
     """Every statement whose stack reaches ``call_site``: it ran, it ran under
     the selected temp store, and no plan line builds an unexplained temp
-    structure."""
+    structure.
+
+    ``query_session``: the call site reads through a #787 query session,
+    whose connections select ``temp_store=MEMORY`` themselves (#861 spec
+    5.4), so the statements run under MEMORY whatever the capture selected.
+    """
     statements = [s for s in recorder.statements if call_site in s.call_sites]
     assert statements, f"non-vacuity: {call_site} executed"
     stores = {s.temp_store for s in statements}
-    assert stores == {TEMP_STORE_CODE[temp_store]}, (call_site, stores)
+    expected = "MEMORY" if query_session else temp_store
+    assert stores == {TEMP_STORE_CODE[expected]}, (call_site, stores)
     unexplained, _stale = guard.classify(
         statements, allowlist=guard.ALLOWLIST, pending=())
     assert unexplained == [], guard.format_findings(unexplained)
@@ -90,9 +97,12 @@ def test_the_audit_removed_every_unbounded_rule_and_states_each_bound():
 
 LONG_SESSION = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 LONG_MESSAGES = 3000
+# #1068 D2: the rollup fill reads the cost and the fingerprint's accounting
+# half through ``_session_cost_and_accounting_map`` (``_session_cost_map`` is
+# its cost projection), so that is the frame every cost statement's stack holds.
 SESSION_MAP_SITES = tuple(
     f"_lib_conversation_query.{name}" for name in (
-        "_session_cost_map", "_session_models_map",
+        "_session_cost_and_accounting_map", "_session_models_map",
         "_session_first_prompt_titles_map"))
 
 
@@ -1190,7 +1200,7 @@ def test_a_large_trailing_week_counts_accounts_without_a_temp_structure(
         state = doctor._gather_accounts_state(NOW)
     assert state["recent_attributed"] + state["recent_unattributed"] == 3000
     statements = _bounded(recorder, "_cctally_doctor._gather_accounts_state",
-                          temp_store)
+                          temp_store, query_session=True)
     assert any("FROM weekly_usage_snapshots" in s.sql for s in statements)
 
 

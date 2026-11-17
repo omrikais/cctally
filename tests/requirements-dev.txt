@@ -67,6 +67,8 @@
 # dependencies at all, so they close on themselves.
 pip==26.2
 pytest==9.1.1
+# tests/_xdist_recovery.py overrides this release's scheduler internals and
+# guards on its exact version (#1086): change the pin and the module together.
 pytest-xdist==3.8.0
 pytest-timeout==2.4.0
 PyYAML==6.0.3

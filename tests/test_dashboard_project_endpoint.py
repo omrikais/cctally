@@ -376,6 +376,9 @@ class _FakeHandler:
     def log_error(self, *a, **kw) -> None:  # silenced
         pass
 
+    def log_message(self, *a, **kw) -> None:  # silenced
+        pass
+
 
 def _build_fake_snapshot():
     """Conjure a minimal object that the handler dereferences via
@@ -459,3 +462,41 @@ def test_http_endpoint_urldecodes_key():
     assert h.status == 200, f"status={h.status} body={h.body!r}"
     body = json.loads(h.body)
     assert body["key"] == "foo (repos)"
+
+
+@pytest.mark.parametrize("failure, status, notified", [
+    ("recovery_pending", 503, True),
+    ("maintenance", 503, False),
+    ("corrupt", 500, False),
+    ("genuine", 500, False),
+])
+def test_http_endpoint_answers_store_unavailability_like_session_detail(
+        monkeypatch, failure, status, notified):
+    """#787 / #861 spec 5.11: the project route answered every failure of its
+    query session with the generic 500, where `/api/session` and
+    `/api/block` answer a store that is not readable now with the typed,
+    retryable 503 + ``Retry-After``. Detects a store the owner is resolving
+    (or a maintenance hold) reported as a server fault, and an owner-resolved
+    refusal the owner is never told about; corruption and genuine failures
+    keep today's 500."""
+    core = _NS["_cctally_core"]
+
+    def refuse(primary, **kwargs):
+        if failure == "genuine":
+            raise OSError("disk fell off")
+        raise core.StoreUnavailable(f"cache.db {failure}", store="cache",
+                                    reason=failure)
+
+    told: list = []
+    monkeypatch.setattr(_cctally_dashboard, "_query_held", refuse)
+    monkeypatch.setattr(core, "notify_owner",
+                        lambda store, readiness: told.append(
+                            (store, readiness.reason)))
+    h = _FakeHandler("/api/project/cctally-dev?weeks=4",
+                     _build_fake_snapshot(), _cctally_dashboard)
+    _cctally_dashboard.DashboardHTTPHandler._handle_get_project_detail(h)
+    assert h.status == status, (h.status, h.body)
+    if status == 503:
+        assert json.loads(h.body) == {"error": "project detail unavailable"}
+        assert ("Retry-After", "1") in h.headers, h.headers
+    assert told == ([("cache", failure)] if notified else []), told

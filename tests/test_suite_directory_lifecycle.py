@@ -245,12 +245,13 @@ def test_a_refused_removal_fails_a_passing_run_as_infrastructure(tmp_path):
 
 
 # A harness that, when S1_READY is set, publishes its process group (the pool's)
-# and holds the run in the pool for 30 s: long enough to outlive the signal.
+# and holds the run in the pool for S1_SLEEP seconds (30 by default): long
+# enough to outlive the signal, and bounded, so it ends by itself.
 _SLOW_HARNESS = (
     "#!/usr/bin/env bash\n"
     "if [ -n \"${S1_READY:-}\" ]; then\n"
     "  ps -o pgid= -p $$ | tr -d ' ' > \"$S1_READY.tmp\" && mv \"$S1_READY.tmp\" \"$S1_READY\"\n"
-    "  sleep 30\n"
+    "  sleep \"${S1_SLEEP:-30}\"\n"
     "fi\n"
     "printf 'passed: 5   failed: 0\\n'\n"
 )
@@ -268,14 +269,9 @@ def _wait_for(path, proc, timeout=60):
     pytest.fail("the run's pool never started", pytrace=False)
 
 
-def _kill_group(pgid):
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
-def _wait_group_gone(pgid, timeout=15):
+def _wait_group_gone(pgid, timeout=20):
+    """Wait until group ``pgid`` has no member, probing with signal 0 only.
+    The default bound covers the holder's 5 s grace and 5 s kill wait."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -303,7 +299,6 @@ def test_an_interrupted_run_removes_its_suite_dir_once_reaped(tmp_path, signame,
         [sys.executable, "-c", _SIGINT_RESET_SHIM, str(est / "bin" / "cctally-test-all")],
         env=_env(est, tmp_path, {"S1_READY": str(ready)}),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    pool = None
     try:
         pool = _wait_for(ready, proc)
         assert len(_suites(tmp_path)) == 1, _leftovers(tmp_path)
@@ -311,11 +306,11 @@ def test_an_interrupted_run_removes_its_suite_dir_once_reaped(tmp_path, signame,
         assert proc.wait(timeout=60) == expected
         _wait_group_gone(pool)
     finally:
+        # Never a signal to the pool's group number from here: once its
+        # holder has reaped the leader, the number is no longer this run's.
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-        if pool:
-            _kill_group(pool)
     assert _leftovers(tmp_path) == [], (
         "an interrupted run whose groups were reaped kept %r" % _leftovers(tmp_path))
 
@@ -337,62 +332,100 @@ def test_phases_tsv_records_both_pytest_legs_and_the_cleanup(tmp_path):
     assert "cleanup" not in timing and "pytest-main" not in timing, timing
 
 
-# ---- process groups: signalled only while this run still holds the number --
+# ---- process groups: settled by their holders, never signalled by the run --
 #
-# A process group number is this run's only while the group has a member or
-# its leader is an unwaited child: once the leader is waited and the last
-# member is gone the number is free, and another process (another repository's
-# listener runs unconfined as the same user on these hosts) can lead a group
-# with it. The run therefore reaps each group right after its leader's `wait`
-# returns, sends TERM or KILL only to a group a probe has just found present,
-# and never addresses a group again once a probe found it gone.
+# #1087: a process group's number is this run's only while its leader is an
+# unreaped child, and bash reaps a finished background job on its own, so a
+# `kill` from this script could reach whichever process was given the number
+# next (another repository's listener runs unconfined as the same user on the
+# runners). The pool and each pytest leg therefore run under a group-scope
+# holder (bin/_lib_hold.py), their leader's parent and only reaper, which
+# signals the group only while it holds that leader; the aggregator asks the
+# holder to stop and reads the settlement it publishes.
 #
 # `kill` is a bash builtin, so a PATH shim cannot see it. BASH_ENV can: bash
 # sources it before the script, and a function named `kill` shadows the
-# builtin. The tracer records every call the aggregator makes, with its status
-# and stderr, and still performs it.
+# builtin. The tracer records every call, with its status, and still performs
+# it. The holders record their own signal calls through CCTALLY_HOLD_TRACE.
 _KILL_TRACER = (
     "kill() {\n"
-    "    local _trace_err _trace_rc\n"
-    "    _trace_err=$(builtin kill \"$@\" 2>&1 >/dev/null)\n"
-    "    _trace_rc=$?\n"
-    "    [ -z \"$_trace_err\" ] || printf '%s\\n' \"$_trace_err\" >&2\n"
-    "    printf '%s|%s|%s|%s\\n' \"$$\" \"$*\" \"$_trace_rc\" \"$_trace_err\" >> \"$S1_KILL_LOG\"\n"
+    "    local _trace_rc=0\n"
+    "    builtin kill \"$@\" || _trace_rc=$?\n"
+    "    printf '%s|%s|%s\\n' \"$$\" \"$*\" \"$_trace_rc\" >> \"$S1_KILL_LOG\"\n"
     "    return \"$_trace_rc\"\n"
     "}\n"
 )
 
+# A pool harness that leaves a process behind in the pool's group: it traps
+# TERM, recording that it received it, and publishes its group before the
+# harness exits. Self-bounded at 30 s.
+_LEFTOVER_PY = (
+    "import os, signal, sys, time\n"
+    "def _termed(*_):\n"
+    "    open(sys.argv[2], 'w').write('termed')\n"
+    "    os._exit(0)\n"
+    "signal.signal(signal.SIGTERM, _termed)\n"
+    "open(sys.argv[1] + '.tmp', 'w').write(str(os.getpgrp()))\n"
+    "os.rename(sys.argv[1] + '.tmp', sys.argv[1])\n"
+    "time.sleep(30)\n"
+)
+_LEFTOVER_HARNESS = (
+    "#!/usr/bin/env bash\n"
+    "if [ -n \"${S1_LEFTOVER:-}\" ]; then\n"
+    "  python3 -c \"$S1_LEFTOVER_PY\" \"$S1_LEFTOVER\" \"$S1_TERMED\" >/dev/null 2>&1 &\n"
+    "  while [ ! -f \"$S1_LEFTOVER\" ]; do sleep 0.1; done\n"
+    "fi\n"
+    "printf 'passed: 5   failed: 0\\n'\n"
+)
 
-def _group_calls(log, pid):
-    """The aggregator's own `kill <sig> -<group>` calls, in order."""
+
+def _aggregator_kills(log, pid):
+    """The aggregator's own `kill` calls (its reporter subshell shares `$$`)."""
     calls = []
     for line in log.read_text(encoding="utf-8").splitlines():
-        caller, args, rc, err = line.split("|", 3)
-        argv = args.split()
-        if caller != str(pid) or len(argv) != 2:
-            continue
-        sig, target = argv
-        if target.startswith("-") and target[1:].isdigit():
-            calls.append((sig, int(target[1:]), int(rc), err))
+        caller, args, rc = line.split("|", 2)
+        if caller == str(pid):
+            calls.append((args.split(), int(rc)))
     return calls
 
 
-def test_a_group_is_signalled_only_after_a_probe_found_it_present(tmp_path):
-    """F1 (session 4 review): the run used to keep every group number it
-    started and TERM and KILL all of them again at exit, long after each
-    leader was waited, so a reused number could take another process group's
-    signals. Each group is now reaped once, right after its leader's `wait`:
-    a probe first, a signal only to a group the probe found present, and
-    nothing at all to a group once a probe found it gone."""
+def _holder_signals(trace):
+    """Every signal a holder delivered, as (call, target, signal), in order.
+    Signal 0 probes are left out: they deliver nothing."""
+    out = []
+    if not trace.exists():
+        return out
+    for line in trace.read_text(encoding="utf-8").splitlines():
+        call, target, sig, _result = json.loads(line)
+        if sig != 0:
+            out.append((call, target, sig))
+    return out
+
+
+def test_the_run_signals_nothing_and_its_holders_settle_each_group(tmp_path):
+    """#1087 (replaces the F1 probe-then-signal case): the aggregator sends no
+    signal to any process number; the pool and the main leg are each settled
+    by their holder, which TERMs the whole group, so a pool harness's leftover
+    in the pool's group receives TERM and is gone, and no survivor is noted."""
     est = _estate(tmp_path)
+    harness = est / "bin" / "cctally-alpha-test"
+    harness.write_text(_LEFTOVER_HARNESS, encoding="utf-8")
+    harness.chmod(0o755)
     tracer = tmp_path / "kill-tracer.sh"
     tracer.write_text(_KILL_TRACER, encoding="utf-8")
     log = tmp_path / "kill.log"
     log.write_text("", encoding="utf-8")
-    proc = subprocess.Popen([str(est / "bin" / "cctally-test-all")],
-                            env=_env(est, tmp_path, {"BASH_ENV": str(tracer),
-                                                     "S1_KILL_LOG": str(log)}),
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    trace = tmp_path / "hold-trace.jsonl"
+    leftover, termed = tmp_path / "leftover.pgid", tmp_path / "leftover.termed"
+    proc = subprocess.Popen(
+        [str(est / "bin" / "cctally-test-all")],
+        env=_env(est, tmp_path, {
+            "BASH_ENV": str(tracer), "S1_KILL_LOG": str(log),
+            "CCTALLY_HOLD_TRACE": str(trace),
+            "S1_LEFTOVER": str(leftover), "S1_TERMED": str(termed),
+            "S1_LEFTOVER_PY": _LEFTOVER_PY,
+        }),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         out, _ = proc.communicate(timeout=100)
     finally:
@@ -400,43 +433,213 @@ def test_a_group_is_signalled_only_after_a_probe_found_it_present(tmp_path):
             proc.kill()
             proc.wait()
     assert proc.returncode == 0, out
-    calls = _group_calls(log, proc.pid)
-    last = {}
-    for sig, group, rc, err in calls:
-        assert last.get(group) != "gone", (
-            "group %d was addressed again after a probe found it gone: %r" % (group, calls))
-        if sig == "-0":
-            last[group] = "gone" if (rc != 0 and "No such process" in err) else "present"
-        else:
-            assert last.get(group) == "present", (
-                "%s was sent to group %d without a probe that found it present: %r"
-                % (sig, group, calls))
-    # Non-vacuity: the pool and the main pytest leg are both reaped, each
-    # through a probe that found it gone.
-    gone = [group for group, verdict in last.items() if verdict == "gone"]
-    assert len(gone) >= 2, calls
+    delivering = [(argv, rc) for argv, rc in _aggregator_kills(log, proc.pid)
+                  if not argv or argv[0] != "-0"]
+    assert delivering == [], "the aggregator signalled a process number: %r" % delivering
+    terms = [target for call, target, sig in _holder_signals(trace)
+             if call == "killpg" and sig == signal.SIGTERM]
+    # Non-vacuity: the pool's and the main leg's holders both settled a group.
+    assert len(set(terms)) >= 2, _holder_signals(trace)
+    # The pool is the first group settled, and the leftover was in it.
+    assert int(leftover.read_text(encoding="utf-8")) == terms[0], (terms, out)
+    assert termed.read_text(encoding="utf-8") == "termed", out
+    assert "could not confirm its process group empty" not in out, out
+    assert "exited without publishing its settlement" not in out, out
     assert _leftovers(tmp_path) == [], _leftovers(tmp_path)
 
 
-def _group_probe(err, rc):
-    """Run the aggregator's own `_suite_group_present` against a stub `kill`
-    that fails with ``err`` and status ``rc``; return the probe's status."""
-    source = (REPO / "bin" / "cctally-test-all").read_text(encoding="utf-8")
-    match = re.search(r"^_suite_group_present\(\) \{[^\n]*\n.*?^\}\n", source, re.M | re.S)
-    assert match, "bin/cctally-test-all defines no _suite_group_present"
-    stub = "kill() { [ -z \"$STUB_ERR\" ] || printf '%s\\n' \"$STUB_ERR\" >&2; return \"$STUB_RC\"; }\n"
-    proc = subprocess.run(["bash", "-c", stub + match.group(0) + '_suite_group_present 12345'],
-                          env={"PATH": os.environ["PATH"], "STUB_ERR": err, "STUB_RC": str(rc)},
-                          capture_output=True, text=True, timeout=30)
-    return proc.returncode
+def _wait_path(path, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.1)
+    return False
 
 
-def test_only_no_such_process_counts_as_a_gone_group():
-    """Review Focus 3 and #1006: only ESRCH means the group is gone. EPERM is
-    what macOS answers for a group whose last members are zombies, and the
-    number is still that group's until they are reaped, so it counts as
-    present; so does any failure the probe cannot read (fail closed)."""
-    assert _group_probe("", 0) == 0
-    assert _group_probe("bash: kill: (-12345) - No such process", 1) == 1
-    assert _group_probe("bash: kill: (-12345) - Operation not permitted", 1) == 0
-    assert _group_probe("bash: kill: something unexpected", 1) == 0
+def _aggregator_processes(est):
+    """Processes still running the estate's aggregator (its reporter subshell
+    carries the same command line). Read with ps; nothing is signalled."""
+    needle = str(est / "bin" / "cctally-test-all")
+    listing = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "command="],
+                             capture_output=True, text=True, timeout=30).stdout
+    return [line for line in listing.splitlines() if needle in line]
+
+
+def test_a_run_killed_during_its_pool_leaves_no_member_of_the_pool_group(tmp_path):
+    """#1087: SIGKILL gives the aggregator no teardown at all. The pool's
+    holder sees its launcher gone and settles the group by itself, within its
+    grace and kill wait, and publishes a complete settlement."""
+    est = _estate(tmp_path)
+    harness = est / "bin" / "cctally-alpha-test"
+    harness.write_text(_SLOW_HARNESS, encoding="utf-8")
+    harness.chmod(0o755)
+    ready = tmp_path / "ready"
+    proc = subprocess.Popen([str(est / "bin" / "cctally-test-all")],
+                            env=_env(est, tmp_path, {"S1_READY": str(ready)}),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        pool = _wait_for(ready, proc)
+        suites = _suites(tmp_path)
+        assert len(suites) == 1, _leftovers(tmp_path)
+        proc.kill()
+        proc.wait(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    status_path = suites[0] / "hold.pool" / "status"
+    assert _wait_path(status_path), "the pool holder published no settlement"
+    _wait_group_gone(pool)
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["stopped"] is True and status["complete"] is True, status
+    assert status["reaped"] is True, status
+    deadline = time.monotonic() + 30
+    while _aggregator_processes(est) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert _aggregator_processes(est) == [], _aggregator_processes(est)
+    res = T.remove(str(suites[0]))
+    assert res.removed, res.findings
+    assert _leftovers(tmp_path) == []
+
+
+def test_a_pool_holder_killed_from_outside_keeps_the_suite_directory(tmp_path):
+    """#1087: a holder that dies before it publishes leaves its group
+    unsettled, so the run cannot know the group is empty. It notes that, keeps
+    its suite directory and fails as infrastructure, and it signals nothing."""
+    est = _estate(tmp_path)
+    harness = est / "bin" / "cctally-alpha-test"
+    harness.write_text(_SLOW_HARNESS, encoding="utf-8")
+    harness.chmod(0o755)
+    ready = tmp_path / "ready"
+    errors = tmp_path / "stderr.txt"
+    with open(errors, "w", encoding="utf-8") as err:
+        proc = subprocess.Popen([str(est / "bin" / "cctally-test-all")],
+                                env=_env(est, tmp_path, {"S1_READY": str(ready),
+                                                         "S1_SLEEP": "4"}),
+                                stdout=subprocess.DEVNULL, stderr=err)
+        try:
+            pool = _wait_for(ready, proc)
+            suites = _suites(tmp_path)
+            assert len(suites) == 1, _leftovers(tmp_path)
+            # The holder is the aggregator's live, unwaited child here: the
+            # harness it holds is still asleep.
+            holder = int((suites[0] / "hold.pool" / "holder").read_text(encoding="utf-8"))
+            os.kill(holder, signal.SIGKILL)
+            rc = proc.wait(timeout=100)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    stderr = errors.read_text(encoding="utf-8")
+    # The orphaned pool ends by itself once its harness's 4 s sleep is over.
+    _wait_group_gone(pool)
+    try:
+        assert rc == 3, stderr
+        assert ("suite directory %s: the pool holder exited without publishing its settlement"
+                % suites[0].name) in stderr, stderr
+        assert suites[0].is_dir(), "the unsettled suite directory was removed"
+        assert not (suites[0] / "hold.pool" / "status").exists()
+        out = json.loads((est / "outcome.json").read_text(encoding="utf-8"))
+        assert out["failureClass"] == "infrastructure", out
+    finally:
+        res = T.remove(str(suites[0]))
+        assert res.removed, res.findings
+    assert _leftovers(tmp_path) == []
+
+
+# The estate's holder, wrapped so that each settlement it publishes is also
+# copied out of the suite directory (which the run removes) for the case to
+# read: the work's own status, as the aggregator read it.
+_STATUS_COPYING_HOLDER = (
+    "import os, shutil, sys\n"
+    "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+    "import _lib_hold_real\n"
+    "try:\n"
+    "    rc = _lib_hold_real.main()\n"
+    "finally:\n"
+    "    control = sys.argv[sys.argv.index('--control') + 1]\n"
+    "    try:\n"
+    "        shutil.copy(os.path.join(control, 'status'),\n"
+    "                    os.path.join(os.environ['S1_HOLD_STATUS'], os.path.basename(control)))\n"
+    "    except OSError:\n"
+    "        pass\n"
+    "sys.exit(rc)\n"
+)
+
+
+@pytest.mark.parametrize("failing", ["pool-harness", "pytest-test"])
+def test_a_failure_reaches_the_verdict_through_its_holder(tmp_path, failing):
+    """#1087 spec test 10: under the holders a failure must still decide the
+    run. A pool harness that exits 1 fails the run through its `.exit` file,
+    while the pool holder's own status (xargs') stays 0; a failing pytest
+    test reaches `leg_rc` through its leg's holder as a product failure, not
+    infrastructure. Either way the suite directory is removed. Detects a
+    holder change that turned a red estate green, or a product failure into
+    an infrastructure one."""
+    if failing == "pool-harness":
+        est = _estate(tmp_path, harness_output={"alpha": "passed: 3   failed: 2\n"},
+                      harness_exit={"alpha": 1})
+    else:
+        est = _estate(tmp_path)
+        (est / "tests" / "test_scratch_smoke.py").write_text(
+            "def test_bad():\n    assert False\n", encoding="utf-8")
+    real = est / "bin" / "_lib_hold.py"
+    real.rename(est / "bin" / "_lib_hold_real.py")
+    real.write_text(_STATUS_COPYING_HOLDER, encoding="utf-8")
+    statuses = tmp_path / "statuses"
+    statuses.mkdir()
+    r = _run(est, tmp_path, {"S1_HOLD_STATUS": str(statuses)})
+    assert r.returncode == 1, r.stdout + r.stderr
+    out = json.loads(r.outcome_path.read_text(encoding="utf-8"))  # type: ignore[attr-defined]
+    assert out["failureClass"] == "product", out
+    codes = {(x["code"], x["subject"]) for x in out["reasons"]}
+    pool = json.loads((statuses / "hold.pool").read_text(encoding="utf-8"))
+    assert pool["rc"] == 0 and pool["complete"] is True, pool
+    leg = json.loads((statuses / "hold.pytest").read_text(encoding="utf-8"))
+    assert leg["complete"] is True, leg
+    if failing == "pool-harness":
+        assert ("harness-failed", "alpha") in codes, out["reasons"]
+        assert leg["rc"] == 0, leg
+    else:
+        assert any(code == "pytest-failed" for code, _ in codes), out["reasons"]
+        assert leg["rc"] == 1, leg
+    assert _leftovers(tmp_path) == [], _leftovers(tmp_path)
+
+
+def test_a_pytest_leg_killed_by_sigkill_is_infrastructure(tmp_path):
+    """#1087: the leg's status now comes from its holder. A leg killed by a
+    signal is not a product failure: the holder reports 128 + the signal, which
+    classifies as pytest-internal, and the run still removes its directory."""
+    est = _estate(tmp_path)
+    # The leg's own pytest process is killed: under xdist that is the
+    # worker's parent (the controller), otherwise the test's own process.
+    (est / "tests" / "test_scratch_smoke.py").write_text(
+        "import os, signal\n"
+        "def test_dies():\n"
+        "    target = os.getppid() if os.environ.get('PYTEST_XDIST_WORKER') else os.getpid()\n"
+        "    os.kill(target, signal.SIGKILL)\n", encoding="utf-8")
+    r = _run(est, tmp_path)
+    assert r.returncode == 3, r.stdout + r.stderr
+    out = json.loads(r.outcome_path.read_text(encoding="utf-8"))  # type: ignore[attr-defined]
+    assert out["failureClass"] == "infrastructure", out
+    codes = {x["code"] for x in out["reasons"]}
+    assert "pytest-internal" in codes and "pytest-failed" not in codes, out["reasons"]
+    assert _leftovers(tmp_path) == [], _leftovers(tmp_path)
+
+
+def test_a_stalled_reporter_is_left_to_exit_and_never_signalled(tmp_path):
+    """#1087: the reporter's join used to TERM a reporter still running after
+    its 10 s bound, by a job number bash may already have reaped. It now notes
+    the reporter and leaves it; the run still finishes and removes its suite
+    directory, and the reporter, which records any signal it receives while
+    stalled, records none."""
+    # alpha sleeps 2 s, so the reporter acknowledges the pool phase before it
+    # sees a completion and stalls; the stall outlasts the whole run.
+    est = _estate(tmp_path, harness_sleep={"alpha": 2})
+    r = _run(est, tmp_path, {"CCTALLY_TEST_ALL_REPORTER_STALL_S": "40"}, timeout=150)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert ("the progress reporter had not exited 10 s after its stop marker; "
+            "left to exit on its own") in r.stderr, r.stderr
+    assert "progress reporter received" not in r.stderr, r.stderr
+    assert _leftovers(tmp_path) == [], _leftovers(tmp_path)

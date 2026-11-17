@@ -96,6 +96,7 @@ def _estate(
     testsdir = repo / "tests"
     testsdir.mkdir(parents=True)
     _ct.copy_aggregator(bindir, capabilities=_capability_rows(capabilities))
+    _ct.copy_pytest_plugins(testsdir)
 
     # `reconcile` is the aggregator's last report row, so every estate carries
     # it as a real harness does.
@@ -716,6 +717,33 @@ def test_pytest_internal_statuses_are_infrastructure(tmp_path, rc):
     out = _outcome(r)
     assert out["failureClass"] == "infrastructure"
     assert "pytest-internal" in {x["code"] for x in out["reasons"]}
+
+
+def test_an_exhausted_worker_restart_keeps_the_crash_node(tmp_path):
+    """#1086: a worker death that exhausts xdist's restart limit ends the bulk
+    leg with status 3, where pytest prints no short summary of its own. The
+    recovery plugin's abort writes it, so through the real aggregator the leg
+    is classified infrastructure and the crash node still reaches the run's
+    failing node ids, instead of a run that names nothing."""
+    pytest.importorskip("xdist")
+    est = _estate(tmp_path)
+    (est / "pytest.ini").write_text("[pytest]\naddopts = --max-worker-restart=0\n",
+                                    encoding="utf-8")
+    (est / "tests" / "test_worker_death.py").write_text(
+        "import os\n\n\ndef test_dies():\n"
+        "    if os.environ.get('PYTEST_XDIST_WORKER'):\n"
+        "        os._exit(1)\n", encoding="utf-8")
+    r = _drive(est)
+    assert r.returncode == 3, r.stdout + r.stderr
+    out = _outcome(r)
+    assert out["failureClass"] == "infrastructure", out
+    assert any(x["code"] == "pytest-internal" and x["subject"] == "pytest"
+               for x in out["reasons"]), out["reasons"]
+    lines = r.stdout.splitlines()
+    assert "pytest failing node ids:" in lines, r.stdout
+    listed = lines[lines.index("pytest failing node ids:") + 1:]
+    assert any(line.strip().startswith("FAILED tests/test_worker_death.py::test_dies")
+               for line in listed), r.stdout
 
 
 def test_the_benchmark_leg_is_inside_the_verdict(tmp_path):

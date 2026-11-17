@@ -11,6 +11,7 @@ import types
 
 import pytest
 from conftest import load_script
+from conftest import as_process_owner  # noqa: E402
 
 # #948: the OAuth refresh layer checks the plausibility band
 # [now-30d, now+8d] before `cmd_record_usage` (stubbed here) is called, so a
@@ -181,7 +182,7 @@ def _run_hook_tick(ns, args, timeout):
     def body():
         result["rc"] = ns["cmd_hook_tick"](args)
 
-    worker = threading.Thread(target=body, daemon=True)
+    worker = threading.Thread(target=as_process_owner(body), daemon=True)
     worker.start()
     worker.join(timeout)
     return result.get("rc", "blocked")

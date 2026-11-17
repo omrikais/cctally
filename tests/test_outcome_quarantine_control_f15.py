@@ -30,6 +30,7 @@ import types
 import pytest
 
 import _outcome_quarantine_trace as T
+from conftest import as_process_owner  # noqa: E402
 
 DEADLINE = 180
 TICK = 10
@@ -492,8 +493,8 @@ def test_a_two_producer_race_with_a_legacy_write_before_the_loser_resumes(
         except BaseException as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
 
-    winner = threading.Thread(target=run, name="winner")
-    loser = threading.Thread(target=run, name="loser")
+    winner = threading.Thread(target=as_process_owner(run), name="winner")
+    loser = threading.Thread(target=as_process_owner(run), name="loser")
     winner.start()
     loser.start()
     winner.join(timeout=30)

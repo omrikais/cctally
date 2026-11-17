@@ -56,6 +56,11 @@ FIX_DIR="$REPO_ROOT/tests/fixtures/update"
 # a phantom "stderr diverged" with no diff to show.
 # shellcheck source=bin/_lib-golden-diff.sh
 source "$REPO_ROOT/bin/_lib-golden-diff.sh"
+# The live-lock scenario's lock holder runs under a child-scope holder (issue
+# #1087), which stops it while it holds it unreaped; this harness never
+# signals a process number.
+# shellcheck source=bin/_lib-hold.sh
+source "$REPO_ROOT/bin/_lib-hold.sh"
 
 default_jobs() {
     local n
@@ -355,7 +360,7 @@ NPMSHIM
     # holds flock indefinitely; for the stale-PID scenario we just
     # write the body (no flock holder) and rely on the second
     # LOCK_NB attempt succeeding inside the reclaim path.
-    local flock_holder_pid=""
+    local flock_holder_pid="" flock_hold="" flock_holder=""
     if [ -n "$FAKE_LOCK_PID" ]; then
         local lock_path="$scratch/.local/share/cctally/update.lock"
         cat > "$lock_path" <<LOCKBODY
@@ -366,22 +371,33 @@ LOCKBODY
         if [ "${FAKE_LOCK_LIVE:-0}" = "1" ]; then
             # Background python holds LOCK_EX flock for 30 s. cctally's
             # first LOCK_NB attempt will BlockingIOError; the body's PID
-            # is alive (the holder's own pid), so cctally raises
-            # UpdateInProgressError. Sleep duration covers slow CI cold
-            # starts; the harness kills it explicitly afterwards.
-            python3 -c "
+            # is alive (the lock holder's own pid, which it prints with
+            # READY), so cctally raises UpdateInProgressError. Sleep
+            # duration covers slow CI cold starts; the harness stops it
+            # through its holder afterwards.
+            flock_hold="$scratch/_lockholder.hold"
+            hold_start "$flock_hold" child -- python3 -c "
 import fcntl, os, sys, time
 fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
 fcntl.flock(fd, fcntl.LOCK_EX)
-sys.stdout.write('READY\n'); sys.stdout.flush()
+sys.stdout.write('READY %d\n' % os.getpid()); sys.stdout.flush()
 time.sleep(30)
-" "$lock_path" >"$scratch/_lockholder.out" 2>"$scratch/_lockholder.err" &
-            flock_holder_pid=$!
+" "$lock_path" >"$scratch/_lockholder.out" 2>"$scratch/_lockholder.err"
+            flock_holder=$HOLD_PID
             local waited=0
-            while [ "$waited" -lt 50 ] && ! grep -q "^READY$" "$scratch/_lockholder.out" 2>/dev/null; do
+            while [ "$waited" -lt 50 ] && ! grep -q "^READY [0-9]*$" "$scratch/_lockholder.out" 2>/dev/null; do
                 sleep 0.1
                 waited=$((waited + 1))
             done
+            flock_holder_pid=$(sed -n 's/^READY \([0-9]*\)$/\1/p' "$scratch/_lockholder.out" 2>/dev/null)
+            if [ -z "$flock_holder_pid" ]; then
+                # An empty `PID=` would make the case test a malformed lock
+                # body instead of a live holder's.
+                hold_stop "$flock_holder" "$flock_hold"
+                echo "FAIL $name: the lock holder printed no READY line within 5 s"
+                cat "$scratch/_lockholder.err" 2>/dev/null || true
+                return 1
+            fi
             cat > "$lock_path" <<LOCKBODY
 PID=$flock_holder_pid
 STARTED_AT_UTC=$AS_OF
@@ -510,9 +526,8 @@ LOCKBODY
         actual_stderr=$(cat "$err_file")
     fi
     set -u
-    if [ -n "$flock_holder_pid" ]; then
-        kill "$flock_holder_pid" 2>/dev/null || true
-        wait "$flock_holder_pid" 2>/dev/null || true
+    if [ -n "$flock_holder" ]; then
+        hold_stop "$flock_holder" "$flock_hold"
     fi
     if [ "$STDOUT_DISCARD" = "1" ]; then
         # Banner-only mode: drop stdout entirely.
@@ -662,6 +677,8 @@ run_scenario () {
 export -f _run_scenario_inner run_scenario normalize_json redact_state
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.
 export -f _golden_diff_files _golden_diff_str _golden_diff_two_str
+# The hold functions too (`_HOLD_PY` is exported by bin/_lib-hold.sh).
+export -f hold_start hold_alive hold_cont hold_wait hold_stop _hold_read
 export REPO_ROOT BIN FIX_DIR SCRATCH_ROOT
 
 # Dispatch in parallel. Buffered output flushed in scenario order.

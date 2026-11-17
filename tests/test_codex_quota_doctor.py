@@ -7,6 +7,8 @@ import sqlite3
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from conftest import load_script, redirect_paths
 from test_doctor_gather import _run_gather
 
@@ -359,3 +361,120 @@ def test_the_verify_activity_parser_ignores_lifecycle_lines(tmp_path, monkeypatc
     assert counts["success_count_24h"] == 0, (
         "a success outside the 24h window, or the drain worker's line, was "
         "counted as a completed verification")
+
+
+def test_contended_and_unavailable_verifications_count_as_failed_hand_offs(
+    tmp_path, monkeypatch,
+):
+    """Detects a verification failure Doctor reports as healthy (#1069): a
+    worker whose reconcile was contended or found the cache unreadable did
+    not verify anything, so its line must be ``result=error`` with the
+    projection status, which Doctor's unchanged parser counts as a failed
+    hand-off; a day of only those warns."""
+    import argparse
+    import datetime as _dt
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_doctor
+    import _cctally_quota
+    import _lib_doctor
+
+    for status in ("contended", "unavailable"):
+        monkeypatch.setattr(
+            _cctally_quota, "reconcile_codex_quota_projection",
+            lambda _s=status, **_kwargs: _cctally_quota.QuotaProjectionResult(
+                None, 0, 0, 0, 0, 0, 0, status=_s))
+        assert _cctally_quota.cmd_codex_quota_verify_internal(
+            argparse.Namespace()) == 0
+
+    log = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
+    for status in ("contended", "unavailable"):
+        assert f"result=error" in log and f"projection={status}" in log, log
+    counts = _cctally_doctor._codex_quota_verify_activity_24h(
+        now_utc=_dt.datetime.now(_dt.timezone.utc))
+    assert counts["error_count_24h"] == 2, counts
+    assert counts["success_count_24h"] == 0, counts
+    result = _lib_doctor._check_data_codex_quota_verification(
+        _verify_state(counts))
+    assert result.severity == "warn", result
+
+
+# ── #1070 T11: the activation worker's lines through Doctor (spec §5.6) ────
+
+@pytest.mark.parametrize("outcome", [
+    "success", "alert_lifecycle_contended", "alert_activation_failed"])
+def test_activation_worker_lines_read_back_through_doctor(
+    tmp_path, monkeypatch, outcome,
+):
+    """Detects an activation outcome Doctor misreads (Q16): the worker's one
+    aggregate line is ``result=success`` only when the requested alert work
+    completed, and a contended lifecycle lock or a failed activation is
+    ``result=error`` with its fixed token, which Doctor's unchanged parser
+    counts as a failed hand-off."""
+    import argparse
+    import datetime as _dt
+    import fcntl
+    import json as _json
+    import os
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core
+    import _cctally_doctor
+    import _cctally_quota
+    import _cctally_record
+    import _lib_doctor
+    from _lib_codex_hooks import CodexHookRoot
+
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    root = CodexHookRoot("root-doctor", home, home / "hooks.json")
+    monkeypatch.setattr(_cctally_record, "_codex_lifecycle_roots", lambda: [root])
+    now = _dt.datetime.now(_dt.timezone.utc)
+    config = _cctally_quota._quota_alert_config()
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    (_cctally_core.APP_DIR / _cctally_quota.CODEX_QUOTA_ALERT_OBLIGATIONS_NAME
+     ).write_text(_json.dumps({"version": 1, "requests": [{
+         "id": "req-1", "reason": "gate_enabled",
+         "config_fingerprint": _cctally_quota._codex_alert_config_fingerprint(
+             config),
+         "roots": [], "cutoffs": {"root-doctor": now.isoformat()},
+         "created_at": now.isoformat()}]}))
+
+    def reconcile(**kwargs):
+        if outcome == "alert_activation_failed":
+            raise RuntimeError("activation boom")
+        return _cctally_quota.QuotaProjectionResult(
+            "gen", 4, 6, 0, 0, 1, 1, status="published")
+
+    monkeypatch.setattr(
+        _cctally_quota, "reconcile_codex_quota_projection", reconcile)
+    held = None
+    if outcome == "alert_lifecycle_contended":
+        lock_dir = _cctally_core.APP_DIR / "codex-hook-tick"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        held = os.open(lock_dir / "root-doctor.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        assert _cctally_quota.cmd_codex_quota_verify_internal(
+            argparse.Namespace()) == 0
+    finally:
+        if held is not None:
+            fcntl.flock(held, fcntl.LOCK_UN)
+            os.close(held)
+
+    log = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
+    [line] = [entry for entry in log.splitlines() if " op=quota-verify " in entry]
+    counts = _cctally_doctor._codex_quota_verify_activity_24h(
+        now_utc=_dt.datetime.now(_dt.timezone.utc))
+    result = _lib_doctor._check_data_codex_quota_verification(
+        _verify_state(counts))
+    if outcome == "success":
+        assert "result=success" in line and "mode=activation" in line, line
+        assert counts["success_count_24h"] == 1, counts
+        assert result.severity == "ok", result
+    else:
+        assert "result=error" in line and f"projection={outcome}" in line, line
+        assert counts["error_count_24h"] == 1, counts
+        assert result.severity == "warn", result

@@ -541,16 +541,24 @@ def test_k_the_keeper_holds_no_read_transaction(w9, tmp_path):
     assert _count(db) == 8
 
 
+@pytest.mark.parametrize("arming", ["process", "request_writer"])
 def test_k_a_replaced_store_gets_a_new_keeper_and_the_old_family_is_untouched(
-    w9, tmp_path,
+    w9, tmp_path, arming,
 ):
     """Store recovery moves the whole family aside and creates a new one;
     the next arm opens a keeper on the new file, and closing the old keeper
-    neither copies into the moved family nor removes the new store's WAL."""
+    neither copies into the moved family nor removes the new store's WAL.
+
+    #787 / #861 spec 5.9 (W9 keeper row): the request writer arms the store
+    when no owner has, and after a replacement, so both arms also run under
+    ``request_writer``."""
+    import _cctally_core
+
     wal, _clock = w9
     db = tmp_path / "store.db"
     writer = _wal_store(db)
-    assert wal.arm(writer)
+    with _cctally_core.authority_scope(arming):
+        assert wal.arm(writer)
     _fill(writer, 4)
     writer.close()
     old_identity = _identity(db)
@@ -567,7 +575,8 @@ def test_k_a_replaced_store_gets_a_new_keeper_and_the_old_family_is_untouched(
     replacement = _wal_store(db)
     replacement.execute("PRAGMA wal_autocheckpoint = 0")
     _fill(replacement, 3)
-    assert wal.arm(replacement)
+    with _cctally_core.authority_scope(arming):
+        assert wal.arm(replacement)
     assert wal.kept_stores()[os.path.realpath(db)] == _identity(db) != old_identity
     replacement.close()
 
@@ -583,6 +592,161 @@ def test_k_a_replaced_store_gets_a_new_keeper_and_the_old_family_is_untouched(
         "closing the old keeper removed the new store's WAL")
     assert _count(db) == 3
 
+
+
+# ── (k) the keeper's authority (#787 / #861 spec 5.9, W9 keeper row) ─────────
+#
+# The keeper is the request writer's own WAL lifecycle: a first arm under
+# ``request_writer`` opens it, ``at_boundary`` attempts on the writer's own
+# connection, and the process timer thread establishes ``process`` when it
+# starts, so its rounds (the timed attempt, the fence yield, the shared-lock
+# readmission) are owner work whichever connection armed the store. A
+# ``QueryAuthorityViolation`` in a round is recorded (observers and the latch
+# see it) and the thread survives it.
+
+
+class _AuthorityLog:
+    """Each call of the named module functions: (thread name, authority)."""
+
+    def __init__(self, wal, monkeypatch, *names: str) -> None:
+        import _cctally_core
+
+        self.calls: list[tuple[str, str, "str | None"]] = []
+        self.lock = threading.Lock()
+        for name in names:
+            real = getattr(wal, name)
+
+            def spy(*args, _real=real, _name=name, **kwargs):
+                a = _cctally_core.current_authority()
+                with self.lock:
+                    self.calls.append((_name, threading.current_thread().name,
+                                       a.kind if a is not None else None))
+                return _real(*args, **kwargs)
+
+            monkeypatch.setattr(wal, name, spy)
+
+    def of(self, name: str, *, thread: "str | None" = None):
+        with self.lock:
+            return [kind for n, t, kind in self.calls
+                    if n == name and (thread is None or t == thread)]
+
+
+def _request_writer_store(wal, db: pathlib.Path) -> sqlite3.Connection:
+    """A WAL store first armed in this process under ``request_writer``."""
+    import _cctally_core
+
+    writer = _wal_store(db)
+    with _cctally_core.authority_scope("request_writer"):
+        assert wal.arm(writer)
+        _fill(writer, 8)
+        wal.after_commit(writer)
+    assert wal.kept_stores() == {os.path.realpath(db): _identity(db)}
+    return writer
+
+
+def test_k_a_first_arm_under_request_writer_keeps_the_store_and_its_boundary(
+    w9, tmp_path, monkeypatch,
+):
+    """Detects a keeper refused (or never opened) on the request writer's
+    first arm: its frames would fall back to the close-time checkpoint and WAL
+    reset W9 removed. ``at_boundary`` is writer-phase work on the writer's own
+    connection, so its timed attempt runs under ``request_writer``."""
+    import _cctally_core
+
+    wal, clock = w9
+    log = _AuthorityLog(wal, monkeypatch, "_open_keeper")
+    passive = PassiveSpy(wal, monkeypatch)
+    db = tmp_path / "store.db"
+    writer = _request_writer_store(wal, db)
+    try:
+        assert log.of("_open_keeper") == ["request_writer"]
+        clock.advance(61)
+        with _cctally_core.authority_scope("request_writer"):
+            wal.at_boundary(writer)
+        rows = passive.for_path(db)
+        assert len(rows) == 1 and rows[0] is not None, rows
+        assert wal.kept_stores() == {os.path.realpath(db): _identity(db)}
+    finally:
+        writer.close()
+    assert _count(db) == 8
+
+
+def test_k_the_timer_thread_runs_at_process_and_survives_a_violation(
+    w9, tmp_path, monkeypatch,
+):
+    """Detects a timer thread that starts with no authority (its rounds would
+    run owner work unspecified, which final enforcement refuses) or that dies
+    on a ``QueryAuthorityViolation`` (a BaseException, so ``except Exception``
+    lets it end the thread and no later round ever checkpoints the store)."""
+    import _cctally_core
+
+    wal, clock = w9
+    monkeypatch.setattr(wal, "TIMER_INTERVAL_SECONDS", 0.02, raising=False)
+    refused = []
+    monkeypatch.setattr(_cctally_core, "CAPABILITY_OBSERVERS",
+                        [*_cctally_core.CAPABILITY_OBSERVERS,
+                         lambda event: refused.append(event)
+                         if not event.permitted else None])
+    rounds: list["str | None"] = []
+    real_round = wal._timer_round
+
+    def violating_then_real(stop=None):
+        a = _cctally_core.current_authority()
+        rounds.append(a.kind if a is not None else None)
+        if len(rounds) == 1:
+            with _cctally_core.authority_scope("query"):
+                _cctally_core.require_capability(
+                    "INGEST_CURRENT", entry="w9-control")
+        return real_round(stop)
+
+    monkeypatch.setattr(wal, "_timer_round", violating_then_real)
+    passive = PassiveSpy(wal, monkeypatch)
+    db = tmp_path / "store.db"
+    writer = _request_writer_store(wal, db)
+    writer.close()
+    assert _wait(lambda: len(rounds) >= 1), "the timer never ran a round"
+    clock.advance(61)
+    assert _wait(lambda: passive.for_path(db)), (
+        "no timed attempt after the violating round: the timer thread died")
+    thread = wal.timer_thread()
+    assert thread is not None and thread.is_alive()
+    assert set(rounds) == {"process"}, rounds
+    assert [(e.entry, e.authority) for e in refused] == [
+        ("w9-control", "query")], "the violation was not recorded"
+
+
+def test_k_the_timer_yields_and_resumes_a_request_writer_keeper_at_process(
+    w9, tmp_path, monkeypatch, capsys,
+):
+    """Detects the timer's fence yield or shared-lock readmission running
+    without authority: the yield must close the request writer's keeper with
+    no checkpoint, and the readmission reopens it as owner work."""
+    import _cctally_db
+
+    wal, _clock = w9
+    monkeypatch.setattr(wal, "TIMER_INTERVAL_SECONDS", 0.02, raising=False)
+    log = _AuthorityLog(wal, monkeypatch, "_open_keeper", "_yield_locked")
+    passive = PassiveSpy(wal, monkeypatch)
+    db = tmp_path / "store.db"
+    writer = _request_writer_store(wal, db)
+    writer.close()
+    key = os.path.realpath(db)
+    fence = _cctally_db._quarantine_pending_path(db)
+    fence.write_text(json.dumps({"schemaVersion": 1,
+                                 "originalPath": str(db)}) + "\n")
+    try:
+        assert _wait(lambda: key in wal.suspended_stores()), "no yield"
+        assert wal.kept_stores() == {}
+        assert passive.for_path(db) == [], "the yield checkpointed"
+    finally:
+        fence.unlink()
+    assert _wait(lambda: key in wal.kept_stores()), "no readmission"
+    timer = wal.TIMER_THREAD_NAME
+    assert log.of("_yield_locked", thread=timer) == ["process"]
+    assert log.of("_open_keeper") == ["request_writer", "process"]
+    assert log.of("_open_keeper", thread=timer) == ["process"]
+    capsys.readouterr()
+    assert _count(db) == 8
 
 _EXITING_WRITER = r'''
 import json, os, sqlite3, sys
@@ -711,9 +875,25 @@ def store(path):
     return conn
 
 
+class StandInTimer:
+    """The parent's timer, without a thread: forking a process that runs
+    one risks a deadlock in the child (Python warns about it), so the at-fork
+    rule is checked against this stand-in. `arm` sees it alive and starts no
+    real thread; the child must still drop it and start its own."""
+    name = wal.TIMER_THREAD_NAME
+
+    def is_alive(self):
+        return True
+
+    def join(self, timeout=None):
+        pass
+
+
+wal._TIMER = StandInTimer()
 parent = store(parent_db)
 assert wal.arm(parent)
 parent.close()
+assert threading.active_count() == 1, "a thread runs at the fork"
 before = sorted(wal.kept_stores())
 pid = os.fork()
 if pid == 0:
@@ -734,8 +914,7 @@ _pid, status = os.waitpid(pid, 0)
 print(json.dumps({"status": status, "before": before,
                   "kept": sorted(wal.kept_stores()),
                   "suspended": sorted(wal.suspended_stores()),
-                  "timer": wal.timer_thread() is not None
-                  and wal.timer_thread().is_alive()}))
+                  "timer": isinstance(wal.timer_thread(), StandInTimer)}))
 '''
 
 
@@ -746,6 +925,9 @@ def test_k_a_forked_child_starts_with_no_keeper_and_arms_its_own(tmp_path):
          str(child_db)],
         env=_child_env(), capture_output=True, text=True, timeout=60)
     assert run.returncode == 0, run.stderr[-4000:]
+    # F9: no thread runs at the fork, so Python's fork-with-threads
+    # DeprecationWarning (a deadlock hazard in the test itself) never fires.
+    assert "DeprecationWarning" not in run.stderr, run.stderr[-4000:]
     parent = json.loads(run.stdout.strip().splitlines()[-1])
     child = json.loads(pathlib.Path(f"{child_db}.json").read_text())
     assert parent["status"] == 0

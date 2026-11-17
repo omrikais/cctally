@@ -92,3 +92,39 @@ def test_schema_current_still_answers_its_own_callers(tmp_path):
         assert store.schema_current(conn, "conversations") is False
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("target", ["conversations", "cache"])
+@pytest.mark.parametrize("delta,reason", [(-1, "schema_behind"),
+                                          (1, "schema_ahead")])
+def test_conversations_query_session_reports_direction(
+        monkeypatch, tmp_path, target, delta, reason):
+    """#787 spec 5.8: the conversations query session gates BOTH stores by
+    direction through the schema-qualified probe, raising inside the
+    `ConversationReaderUnavailable` family (with ``store="cache"`` for the
+    attached cache) and never migrating."""
+    import os
+    from conftest import load_script, redirect_paths
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    core = sys.modules["_cctally_core"]
+    cache = sys.modules["_cctally_cache"]
+    os.makedirs(core.APP_DIR, exist_ok=True)
+    os.chmod(core.APP_DIR, 0o700)
+    with core.establish_authority("process"):
+        cache.open_conversations_db().close()
+    path = core.CONVERSATIONS_DB_PATH if target == "conversations" \
+        else core.CACHE_DB_PATH
+    conn = sqlite3.connect(path)
+    conn.execute(f"PRAGMA user_version={_head(target) + delta}")
+    conn.commit()
+    conn.close()
+    import _cctally_store_access as access
+    with pytest.raises(cache.ConversationReaderUnavailable) as info:
+        with access.QueryService.session("conversations", attach=("cache",)):
+            pass  # pragma: no cover
+    assert (info.value.reason, info.value.store) == (reason, target)
+    reread = sqlite3.connect(path)
+    assert reread.execute("PRAGMA user_version").fetchone()[0] == \
+        _head(target) + delta
+    reread.close()

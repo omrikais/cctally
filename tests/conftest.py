@@ -725,11 +725,48 @@ def _reset_snapshot_dispatch_state():
     yield
 
 
+def reset_perf_process_state() -> None:
+    """Reset ``_lib_perf``'s process-global state at a test boundary.
+
+    That state is the ``_ENABLED`` flag, this thread's in-flight tree, the two
+    stash slots (``_LAST_BACKEND_PERF``, ``_LAST_INGEST_PERF``) and the arming
+    mailbox (#583 S1). ``request_enabled`` only records a request, and
+    ``apply_pending`` applies it at a later refresh, so a test that ends with an
+    unconsumed request (an accepted ``{"enabled": false}`` POST) used to disarm
+    the next test's refresh on the same worker (#1083). The mailbox is drained
+    with ``apply_pending()`` BEFORE ``set_enabled(False)``, so a request pending
+    at the boundary is consumed and then overridden.
+
+    Limit: this covers a request pending when the reset runs. A request made
+    after it can only come from a producer that outlived its own test, such as
+    a dashboard handler thread that ``stop()`` failed to join, and that test's
+    cleanup has then already failed; the reset does not defend against it.
+    A no-op when ``_lib_perf`` cannot be imported.
+    """
+    try:
+        import _lib_perf as _perf  # bin/ is on sys.path (see top)
+    except Exception:
+        return
+    # The drain has its own guard, so a failing drain cannot skip the resets
+    # below (they never depended on it before #1083).
+    try:
+        _perf.apply_pending()
+    except Exception:
+        pass
+    try:
+        _perf.set_enabled(False)
+        _perf.reset_thread()
+        _perf._LAST_BACKEND_PERF = None
+        _perf._LAST_INGEST_PERF = None
+    except Exception:
+        pass
+
+
 @pytest.fixture(autouse=True)
 def _reset_perf_state():
     """Isolate the opt-in backend-perf collector (#276) between tests.
 
-    ``_lib_perf`` holds two pieces of process-global state: the module
+    ``_lib_perf`` holds process-global state, among it the module
     ``_ENABLED`` flag and the ``_LAST_BACKEND_PERF`` stash slot. A test that
     enables tracing and builds a snapshot (e.g. ``test_perf_snapshot``) stashes
     a completed ``snapshot`` tree into that slot; without a reset the slot then
@@ -737,29 +774,14 @@ def _reset_perf_state():
     the ``/api/debug/backend`` shape test asserts ``phases is None`` when
     tracing is off, and a leaked stash flips it non-null. (It only survived the
     parallel suite because the two files happened to land on different
-    pytest-xdist workers.) Force the flag off, clear the stash, and clear this
-    thread's in-flight tree before AND after every test. A no-op for the vast
-    majority that never load the module; mirrors ``_reset_snapshot_dispatch_state``.
+    pytest-xdist workers.) ``reset_perf_process_state`` drains the arming
+    mailbox, forces the flag off, clears the stash and clears this thread's
+    in-flight tree before AND after every test. A no-op for the vast majority
+    that never load the module; mirrors ``_reset_snapshot_dispatch_state``.
     """
-    try:
-        import _lib_perf as _perf  # bin/ is on sys.path (see top)
-    except Exception:
-        _perf = None
-
-    def _reset():
-        if _perf is None:
-            return
-        try:
-            _perf.set_enabled(False)
-            _perf.reset_thread()
-            _perf._LAST_BACKEND_PERF = None
-            _perf._LAST_INGEST_PERF = None
-        except Exception:
-            pass
-
-    _reset()
+    reset_perf_process_state()
     yield
-    _reset()
+    reset_perf_process_state()
 
 
 @pytest.fixture(autouse=True)
@@ -816,6 +838,49 @@ def _reset_frontier_process_state():
     finally:
         _frontier._FRONTIER_GENERATIONS = real_registry
         _frontier.reset_frontier_counters()
+
+
+def as_process_owner(fn):
+    """Wrap ``fn``, a thread or child-process target a test starts, so it
+    runs at ``process`` on its own thread (#787 / #861 spec 5.1, D5).
+
+    For a target that stands in for a process owner the test models: a
+    concurrent CLI command, writer or hook process, or the CLI main thread
+    of a command run off the test thread. A production thread target is never
+    wrapped: it establishes its own authority, or raises.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def owned(*args, **kwargs):
+        import _cctally_core
+        with _cctally_core.establish_authority("process"):
+            return fn(*args, **kwargs)
+    return owned
+
+
+@pytest.fixture(autouse=True)
+def _store_authority_process():
+    """Plan D5 (#787 / #861 spec 5.1, AD5): each test runs on a test thread
+    that holds the `process` authority, as a CLI main thread does.
+
+    Final enforcement makes an unspecified authority raise in every owner
+    entry, and a test thread is not a product entry point that establishes
+    one. Only this thread receives it: a thread or forked child the test
+    starts through a production target still has no authority until its own
+    target establishes one (D1, AD16), so a missed owner thread still raises.
+    A test that needs no authority runs its body on a fresh thread.
+    """
+    import _cctally_core
+
+    scope = _cctally_core.establish_authority("process")
+    scope.__enter__()
+    try:
+        yield
+    finally:
+        scope.__exit__(None, None, None)
+        # A test that leaked a narrowed scope must not hand it to the next.
+        _cctally_core._STORE_AUTHORITY.set(None)
 
 
 @pytest.fixture(autouse=True)
@@ -1008,6 +1073,11 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     """
     share = tmp_path / ".local" / "share" / "cctally"
     share.mkdir(parents=True, exist_ok=True)
+    # The data directory cctally creates is private (`ensure_dirs`), and a
+    # query session refuses one that is not (#787 / #861 AD20); a store a
+    # test builds by hand, without the owner opener, lives in the same
+    # directory as in production.
+    os.chmod(share, 0o700)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
@@ -1120,6 +1190,58 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     # the kernel patches above propagate directly — no extra block here.
 
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+
+
+#: The persisted ``conversation_sessions`` columns a fresh derivation must
+#: reproduce (#1072). ``render_revision`` is a pass counter, not content.
+ROLLUP_DERIVED_COLUMNS = (
+    "msg_count", "started_utc", "last_activity_utc", "project_label",
+    "cost_usd", "cache_rebuild_count", "git_branch", "models_json", "title",
+)
+
+
+def rollup_fresh_mismatches(conn):
+    """#1072: every committed ``conversation_sessions`` row that differs from a
+    fresh full derivation of the same stores, as ``(session_id, persisted,
+    fresh)``.
+
+    ``conn`` must not hold an open transaction: a writer commits its own work,
+    and an oracle that committed it would hide a missing commit. Both reads go
+    through a separate raw connection (no opener side effects) with cache.db
+    attached read-only, so only committed state is compared. The derivation
+    writes the staging table inside a transaction this rolls back. A persisted
+    ``input_fingerprint`` must be NULL (uncertified) or equal the fresh one."""
+    import sqlite3 as _sqlite3
+
+    import _cctally_cache as cache_mod
+    import _cctally_core as core_mod
+    assert not conn.in_transaction, "writer left an uncommitted transaction"
+    cols = ", ".join(ROLLUP_DERIVED_COLUMNS) + ", input_fingerprint"
+    conv_path = pathlib.Path(core_mod.CONVERSATIONS_DB_PATH).resolve()
+    cache_path = pathlib.Path(core_mod.CACHE_DB_PATH).resolve()
+    raw = _sqlite3.connect(conv_path.as_uri(), uri=True)
+    try:
+        raw.execute("ATTACH DATABASE ? AS cache_db", (cache_path.as_uri() + "?mode=ro",))
+        persisted = {row[0]: row[1:] for row in raw.execute(
+            f"SELECT session_id, {cols} FROM main.conversation_sessions")}
+        try:
+            raw.execute("DELETE FROM main.conversation_sessions_staging")
+            assert cache_mod._recompute_conversation_sessions(
+                raw, None, target="conversation_sessions_staging",
+                advance_render_revision=False)
+            fresh = {row[0]: row[1:] for row in raw.execute(
+                f"SELECT session_id, {cols} FROM main.conversation_sessions_staging")}
+        finally:
+            raw.rollback()
+    finally:
+        raw.close()
+    out = []
+    for sid in sorted(set(persisted) | set(fresh)):
+        p, f = persisted.get(sid), fresh.get(sid)
+        if (p is None or f is None or p[:-1] != f[:-1]
+                or (p[-1] is not None and p[-1] != f[-1])):
+            out.append((sid, p, f))
+    return out
 
 
 @pytest.fixture
@@ -1261,6 +1383,8 @@ def _reset_outline_derivation_cache():
 # here because `from conftest import ...` is how this estate's test modules
 # already reach shared test infrastructure.
 from _shared_corpus import (  # noqa: E402,F401
+    CORPUS_SEED,
+    build_private_corpus,
     copy_shared_corpus,
     corpus_lock_path,
     describe_fingerprint_change,
@@ -1357,7 +1481,8 @@ def shared_corpus(corpus_root):
                 # built here, so a corpus another tree left behind is simply
                 # replaced. A capture refuses instead, because it publishes.
                 data_dir = generator.build_fixture_isolated(
-                    scale=scale, seed=42, root=root, on_mismatch="rebuild")
+                    scale=scale, seed=CORPUS_SEED, root=root,
+                    on_mismatch="rebuild")
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         built[scale] = data_dir
@@ -1406,27 +1531,45 @@ def small_corpus(shared_corpus):
 
 
 @pytest.fixture
-def private_corpus(shared_corpus, tmp_path):
-    """A function-scoped PRIVATE copy of a built scale, by name.
+def private_corpus(tmp_path):
+    """A function-scoped PRIVATE corpus of a scale, BUILT at its own root.
 
-    `private_corpus("small")` returns the copy's data dir, in the same shape
+    `private_corpus("small")` returns the corpus's data dir, in the same shape
     `small_corpus` returns for the shared one, so a caller swaps one for the
-    other and changes nothing else. Repeated calls for one scale inside a
-    single test return the same copy; two different scales get two copies,
-    which is what the >=10x row-count pair needs.
+    other and changes nothing else. Repeated calls for one `(scale, name)`
+    inside a single test return the same corpus; a different scale, or the
+    same scale under another `name`, gets an independent one, which is what the
+    >=10x row-count pair and a test needing two corpora of one scale need. A
+    `name` that would put a second scale at a root already built is refused.
 
-    The copy goes through `copy_shared_corpus`, so it is taken under the
-    scale's build lock held shared and never races a rebuild.
+    BUILT, not copied (#1099). Every store in a corpus records the absolute
+    paths and root keys of the tree it was built in, so a copy of the shared
+    corpus named the SHARED tree: its first ingest re-read every file under
+    the copy's own identities, doubled the Codex rows and quota history and
+    withheld the walk-complete marker, and its snapshots published Codex
+    sessions without their project metadata. A build at the private root
+    names that root everywhere and refreshes exactly as the shared corpus
+    does. It does not touch the shared corpus at all.
     """
-    copies = {}
+    built = {}
 
-    def _copy(scale="small"):
-        if scale not in copies:
-            copies[scale] = copy_shared_corpus(
-                shared_corpus(scale), tmp_path / f"private-corpus-{scale}")
-        return copies[scale]
+    def _build(scale="small", name=None):
+        # Memoised by the ROOT the corpus is built at, which is what makes two
+        # corpora independent: a name reused for another scale would otherwise
+        # reach the same root and be refused by the builder mid-test.
+        root = tmp_path / (name or f"private-corpus-{scale}")
+        if root in built:
+            built_scale, data_dir = built[root]
+            if built_scale != scale:
+                raise ValueError(
+                    f"private_corpus root {root.name!r} already holds the "
+                    f"{built_scale!r} corpus; name the {scale!r} one apart")
+            return data_dir
+        data_dir = build_private_corpus(scale, root)
+        built[root] = (scale, data_dir)
+        return data_dir
 
-    return _copy
+    return _build
 
 
 @pytest.fixture(scope="session")

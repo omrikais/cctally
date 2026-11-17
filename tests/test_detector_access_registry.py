@@ -1053,6 +1053,9 @@ def base_shapes(graph):
     (_reprice_first_model("CODEX_MODEL_PRICING"), "CODEX_MODEL_PRICING"),
     (_advance_snapshot_date, "PRICING_SNAPSHOT_DATE"),
 ], ids=["claude-table-value", "codex-table-value", "snapshot-date"])
+# Up to 107.5 s with setup at 21 workers on a 10-core runner, where two workers
+# died together in its cases; this relaxes only its own hang bound (#996).
+@pytest.mark.timeout(240)
 def test_a_pricing_sync_invalidates_exactly_the_affected_pins(
         graph, reachable, base_shapes, edit, binding):
     """Decisive test (a): a real pricing-table value or the snapshot date
@@ -1110,6 +1113,9 @@ def _in_five_hour_backfill(old, new):
     (_MAX_ROW_SELECT, "SELECT captured_at_utc, weekly_percent"),
 ], ids=["account-predicate-removed", "ordering-reversed",
         "selected-column-dropped"])
+# Up to 102.4 s with setup at 21 workers on a 10-core runner, against the suite's
+# 120 s cap; this relaxes only its own hang bound (#996).
+@pytest.mark.timeout(240)
 def test_a_pricing_only_repin_does_not_mask_a_producer_access_change(
         graph, reachable, claude_repinned, old, new):
     """Decisive test (b): with the pricing-only pin in place, an imported
@@ -1173,6 +1179,9 @@ def test_an_unresolved_producer_dependency_survives_a_bulk_repin(
         findings)
 
 
+# Up to 119.0 s with setup at 21 workers on a 10-core runner, against the suite's
+# 120 s cap; this relaxes only its own hang bound (#996).
+@pytest.mark.timeout(240)
 def test_the_review_report_names_each_changed_dependency(
         graph, claude_repinned):
     """`review_report` (the maintainer's `--base` command) lists the

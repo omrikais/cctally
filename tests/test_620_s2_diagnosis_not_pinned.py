@@ -12,8 +12,9 @@ that instrumentation complete rather than a sample, and the last test in this
 file pins both:
 
   * every diagnosis read goes through `_cctally_diagnosis_sources._execute`,
-  * every diagnosis store open goes through `open_read_only`, or, for
-    `conversations.db`, `StoreBundle._open_conversations` (#1000).
+  * every diagnosis store open goes through `query_session` (#787 / #861
+    AD21; `open_read_only` before it), or, for `conversations.db`,
+    `StoreBundle._open_conversations` (#1000).
 
 Whether a pin is HELD is read off the production cache connections themselves —
 `sqlite3.Connection.in_transaction` on the objects `open_cache_db` handed out —
@@ -28,6 +29,7 @@ import datetime as dt
 import pathlib
 import sqlite3
 import sys
+import threading
 from dataclasses import dataclass
 
 import pytest
@@ -81,6 +83,26 @@ def _instrument_store_reads(ns, monkeypatch, record: list):
         return conn
 
     monkeypatch.setitem(ns, "open_cache_db", _open)
+    # #787 / #861 spec 5.12: the narrowed snapshot build reads cache.db
+    # through query sessions, whose connection transaction is the pin
+    # (AD21); observe their connections the same way. Only the building
+    # thread's: a request's own query sessions (the diagnosis route reads
+    # through them too) hold their session transaction, not the build's pin.
+    access = sys.modules["_cctally_store_access"]
+    real_connect_ro = access._connect_ro
+    building_thread = threading.get_ident()
+
+    def _connect_ro(store, path, policy, tag):
+        conn = real_connect_ro(store, path, policy, tag)
+        if store == "cache" and threading.get_ident() == building_thread:
+            cache_connections.append(conn)
+            conn.set_trace_callback(
+                lambda sql, _c=conn: record.append(
+                    _Observed("cache", _in_transaction(_c), sql[:60]))
+            )
+        return conn
+
+    monkeypatch.setattr(access, "_connect_ro", _connect_ro)
 
     def _pin_held() -> bool:
         return any(_in_transaction(c) for c in cache_connections)
@@ -97,8 +119,17 @@ def _instrument_store_reads(ns, monkeypatch, record: list):
         record.append(_Observed("diagnosis", _pin_held(), f"open:{kind}"))
         return real_open_ro(kind)
 
+    # #787 / #861 AD21: the bundle opens stats and cache as query sessions,
+    # not through `open_read_only`, so the open is observed there too.
+    real_query_session = sources.query_session
+
+    def _query_session(kind):
+        record.append(_Observed("diagnosis", _pin_held(), f"open:{kind}"))
+        return real_query_session(kind)
+
     monkeypatch.setattr(sources, "_execute", _execute)
     monkeypatch.setattr(sources, "open_read_only", _open_read_only)
+    monkeypatch.setattr(sources, "query_session", _query_session)
     # #1000: conversations opens through the bundle's read admission.
     real_open_conversations = sources.StoreBundle._open_conversations
 
@@ -214,6 +245,9 @@ def test_the_route_reads_after_the_snapshot_transaction_has_ended(seeded,
     assert diagnosis_reads, (
         "non-vacuity: the route made no instrumented store read, so the "
         "assertion below holds over an empty set")
+    opened = {q.detail for q in diagnosis_reads if q.detail.startswith("open:")}
+    assert {"open:stats", "open:cache"} <= opened, (
+        "non-vacuity: the route's store opens were not observed", opened)
     assert not any(q.while_pinned for q in diagnosis_reads)
 
 

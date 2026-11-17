@@ -15,14 +15,15 @@ import _cctally_db as db
 import _lib_codex_conversation as codex_kernel
 import _lib_codex_conversation_query as codex_query
 import _lib_conversation_query as claude_query
-from conftest import load_script, redirect_paths
+from conftest import as_process_owner, load_script, redirect_paths
 
 
 ACCOUNT_A = "a" * 32
 ACCOUNT_B = "b" * 32
 
 
-def _open_scoped_fixture(tmp_path: pathlib.Path, account_key: str) -> sqlite3.Connection:
+def _open_scoped_fixture(tmp_path: pathlib.Path, account_key: str, *,
+                         drop_fingerprint: bool = False) -> sqlite3.Connection:
     cache_path = tmp_path / "cache.db"
     cache_conn = sqlite3.connect(cache_path)
     db._apply_cache_schema(cache_conn)
@@ -66,6 +67,10 @@ def _open_scoped_fixture(tmp_path: pathlib.Path, account_key: str) -> sqlite3.Co
              ACCOUNT_B),
         ],
     )
+    if drop_fingerprint:
+        # A store migration 013 has not reached (#1068).
+        conn.execute(
+            "ALTER TABLE conversation_sessions DROP COLUMN input_fingerprint")
     conn.execute("ATTACH DATABASE ? AS cache_db", (str(cache_path),))
     cache._recompute_conversation_sessions(conn)
     conn.commit()
@@ -169,6 +174,201 @@ def test_claude_assembly_memo_never_crosses_account_scopes(tmp_path):
         claude_query._assemble_memo_clear()
         alpha.close()
         bravo.close()
+
+
+# --- #1073: model chips on an account-scoped connection ----------------------
+# Rows per session, in timestamp order: (account_key, model, text). The two
+# shared sessions put their halves in opposite insertion orders, n1 and u1 use
+# the two stored unattributed spellings, and m1 mixes both spellings (with
+# different families) with an A row.
+_UNATTRIBUTED = "unattributed"
+_SCOPED_MODEL_ROWS = (
+    ("a1", ((ACCOUNT_A, "claude-opus-4-6", "zephyr tail poll"),
+            (ACCOUNT_A, "claude-opus-4-7", "patched the cursor"))),
+    ("a2", ((ACCOUNT_A, "claude-sonnet-4-6", "release notes"),
+            (ACCOUNT_A, "claude-haiku-4-5", "zephyr section"))),
+    ("a3", ((ACCOUNT_A, "claude-sonnet-4-6", "rename helpers"),)),
+    ("b1", ((ACCOUNT_B, "claude-opus-4-6", "zephyr budget"),)),
+    ("b2", ((ACCOUNT_B, "claude-haiku-4-5", "zephyr garden"),)),
+    ("s1", ((ACCOUNT_A, "claude-sonnet-4-6", "zephyr run one"),
+            (ACCOUNT_B, "claude-opus-4-6", "zephyr run two"))),
+    ("s2", ((ACCOUNT_B, "claude-haiku-4-5", "zephyr inventory"),
+            (ACCOUNT_A, "claude-opus-4-7", "finish inventory"))),
+    ("n1", ((None, "claude-opus-4-6", "zephyr packing"),)),
+    ("u1", ((_UNATTRIBUTED, "claude-haiku-4-5", "zephyr receipts"),)),
+    ("m1", ((None, "claude-sonnet-4-6", "zephyr checklist"),
+            (_UNATTRIBUTED, "claude-fable-5", "tighten checklist"),
+            (ACCOUNT_A, "claude-opus-4-6", "review at work"))),
+)
+_SCOPE_KEYS = {"A": ACCOUNT_A, "B": ACCOUNT_B, "unattributed": _UNATTRIBUTED}
+_SCOPE_STORED = {"A": {ACCOUNT_A}, "B": {ACCOUNT_B},
+                 "unattributed": {None, _UNATTRIBUTED}}
+
+_MODEL_MSG_COLUMNS = (
+    "INSERT INTO conversation_messages "
+    "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,text,"
+    " blocks_json,model,msg_id,req_id,cwd,is_sidechain,account_key) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+
+
+def _scoped_model_message(sid, n, account, model, text, minute):
+    return (sid, f"uuid-{sid}-{n}", f"{sid}.jsonl", 100 * n,
+            "2026-08-04T10:%02d:00Z" % minute, "assistant", text, "[]",
+            model, f"msg-{sid}-{n}", f"req-{sid}-{n}", "/work/models", 0,
+            account)
+
+
+def _scope_model_store(tmp_path: pathlib.Path,
+                       account_key: str) -> sqlite3.Connection:
+    """Open the file-backed #1073 store and scope it to ``account_key``."""
+    conn = sqlite3.connect(tmp_path / "conversations.db")
+    conn.execute("ATTACH DATABASE ? AS cache_db", (str(tmp_path / "cache.db"),))
+    cache.scope_conversations_db_to_account(conn, account_key)
+    return conn
+
+
+def _open_scoped_model_fixture(tmp_path: pathlib.Path, account_key: str, *,
+                               backfill_pending: bool = False
+                               ) -> sqlite3.Connection:
+    cache_conn = sqlite3.connect(tmp_path / "cache.db")
+    db._apply_cache_schema(cache_conn)
+    cache_conn.commit()
+    cache_conn.close()
+
+    conn = sqlite3.connect(tmp_path / "conversations.db")
+    db._apply_conversations_schema(conn)
+    rows = []
+    minute = 0
+    for sid, messages in _SCOPED_MODEL_ROWS:
+        for n, (account, model, text) in enumerate(messages, start=1):
+            rows.append(_scoped_model_message(sid, n, account, model, text,
+                                              minute))
+            minute += 1
+    conn.executemany(_MODEL_MSG_COLUMNS, rows)
+    conn.execute("ATTACH DATABASE ? AS cache_db", (str(tmp_path / "cache.db"),))
+    cache._recompute_conversation_sessions(conn)
+    conn.commit()
+    if backfill_pending:
+        conn.execute(
+            "INSERT OR REPLACE INTO main.cache_meta(key, value) "
+            "VALUES('conversation_sessions_backfill_pending', '1')")
+        conn.commit()
+        assert claude_query._rollup_authoritative(conn) is False
+    else:
+        assert claude_query._rollup_authoritative(conn) is True
+    conn.close()
+    return _scope_model_store(tmp_path, account_key)
+
+
+def _stored_account_by_uuid():
+    return {
+        f"uuid-{sid}-{n}": account
+        for sid, messages in _SCOPED_MODEL_ROWS
+        for n, (account, _model, _text) in enumerate(messages, start=1)
+    }
+
+
+def _browse_sessions(conn, families):
+    page = claude_query.list_conversations(conn, limit=200, models=families)
+    return {row["session_id"] for row in page["conversations"]}
+
+
+def _model_facet_count(conn, family):
+    facets = claude_query.list_conversation_facets(conn)
+    counts = {entry["family"]: entry["count"] for entry in facets["models"]}
+    return counts.get(family, 0)
+
+
+def _assert_scoped_search(conn, scope, families, hits):
+    result = claude_query.search_conversations(
+        conn, "zephyr", limit=200, models=families, fts_available=False)
+    assert {hit["session_id"] for hit in result["hits"]} == hits
+    stored = _stored_account_by_uuid()
+    for hit in result["hits"]:
+        assert stored[hit["uuid"]] in _SCOPE_STORED[scope], hit
+
+
+_SCOPED_MODEL_CASES = [
+    ("A", ["opus"], {"a1", "s2", "m1"}, {"a1"}),
+    ("A", ["sonnet"], {"a2", "a3", "s1"}, {"a2", "s1"}),
+    ("A", ["haiku"], {"a2"}, {"a2"}),
+    ("A", ["opus", "haiku"], {"a1", "a2", "s2", "m1"}, {"a1", "a2"}),
+    ("B", ["opus"], {"b1", "s1"}, {"b1", "s1"}),
+    ("B", ["haiku"], {"b2", "s2"}, {"b2", "s2"}),
+    ("B", ["sonnet"], set(), set()),
+    ("unattributed", ["opus"], {"n1"}, {"n1"}),
+    ("unattributed", ["haiku"], {"u1"}, {"u1"}),
+    ("unattributed", ["sonnet"], {"m1"}, {"m1"}),
+    ("unattributed", ["fable"], {"m1"}, {"m1"}),
+]
+
+
+@pytest.mark.parametrize("scope,families,browse,hits", _SCOPED_MODEL_CASES)
+def test_scoped_model_chip_matches_in_scope_families(
+        tmp_path, scope, families, browse, hits):
+    """Accuracy (#1073): under an account focus a model chip must answer, not
+    raise ``no such index`` through the scoper's TEMP view, and must match a
+    session only through its in-scope messages: a shared session's other
+    half, or the other unattributed spelling's family, must never leak a
+    session or a hit into the scope. The chip's session set must equal the
+    scoped facet count, so the popover number matches the rows it yields."""
+    conn = _open_scoped_model_fixture(tmp_path, _SCOPE_KEYS[scope])
+    try:
+        assert _browse_sessions(conn, families) == browse
+        if len(families) == 1:
+            assert _model_facet_count(conn, families[0]) == len(browse)
+        _assert_scoped_search(conn, scope, families, hits)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("scope,families,browse,hits", [
+    case for case in _SCOPED_MODEL_CASES
+    if case[0] in ("A", "B") and case[1] == ["opus"]
+])
+def test_scoped_model_chip_on_live_branch(tmp_path, scope, families, browse,
+                                          hits):
+    """Accuracy (#1073, R6): while ``main``'s rollup is not authoritative,
+    browse takes the live GROUP BY branch and search takes its live
+    prefilter. A scoped model chip must still answer with the in-scope
+    sessions there, not raise or fall back to another account's models."""
+    conn = _open_scoped_model_fixture(tmp_path, _SCOPE_KEYS[scope],
+                                      backfill_pending=True)
+    try:
+        assert claude_query._rollup_authoritative(conn) is False
+        assert _browse_sessions(conn, families) == browse
+        _assert_scoped_search(conn, scope, families, hits)
+    finally:
+        conn.close()
+
+
+def test_scoped_model_filter_and_facets_share_the_setup_snapshot(tmp_path):
+    """Accuracy (#1073, D4): on one scoped connection the opus chip and the
+    opus facet count must come from the same setup snapshot, so a message
+    committed by another writer after setup cannot make the facet promise a
+    session the chip does not return. A freshly scoped connection must see
+    the committed message in both."""
+    conn = _open_scoped_model_fixture(tmp_path, ACCOUNT_A)
+    try:
+        writer = sqlite3.connect(tmp_path / "conversations.db")
+        try:
+            writer.execute(_MODEL_MSG_COLUMNS, _scoped_model_message(
+                "a3", 2, ACCOUNT_A, "claude-opus-4-6", "late opus reply", 59))
+            writer.commit()
+        finally:
+            writer.close()
+        assert _browse_sessions(conn, ["opus"]) == {"a1", "s2", "m1"}
+        assert _model_facet_count(conn, "opus") == 3
+    finally:
+        conn.close()
+
+    fresh = _scope_model_store(tmp_path, ACCOUNT_A)
+    try:
+        assert _browse_sessions(fresh, ["opus"]) == {"a1", "a3", "s2", "m1"}
+        assert _model_facet_count(fresh, "opus") == 4
+    finally:
+        fresh.close()
 
 
 def _open_scoped_codex_fixture(
@@ -2620,3 +2820,1051 @@ def test_1062_a_title_ahead_of_its_file_cursor_is_withheld(tmp_path):
         assert "a2" in scoped_titles()
     finally:
         conn.close()
+
+
+# --- #1068 D1: the sargable title clause -------------------------------------
+
+#: Extra title-bearing sessions for both unattributed spellings, appended to
+#: the #1062 corpus after it is built so the #1062 eligibility sets above stay
+#: exactly as they are. (session, [(account_key, text)], title)
+_T6_EXTRA = (
+    ("lit", [("unattributed", "literal opening lit")], "Literal findings"),
+    ("nl", [(None, "null opening nl"), ("unattributed", "literal follow nl")],
+     "Null and literal findings"),
+    ("al", [(ACCOUNT_A, "alpha opening al"),
+            ("unattributed", "literal follow al")], "Alpha literal findings"),
+)
+
+
+def _t6_seed_extra(store_paths):
+    path, _cache_path = store_paths
+    conn = sqlite3.connect(path)
+    try:
+        for sid, lines, title in _T6_EXTRA:
+            name = f"{sid}.jsonl"
+            offset = 0
+            for account, text in lines:
+                conn.execute(
+                    "INSERT INTO conversation_messages "
+                    "(session_id,uuid,source_path,byte_offset,timestamp_utc,"
+                    " entry_type,text,blocks_json,cwd,is_sidechain,account_key) "
+                    "VALUES(?,?,?,?,'2026-08-04T11:00:00Z','human',?,'[]',"
+                    "'/work/proj',0,?)",
+                    (sid, f"{name}:{offset}", name, offset, text, account))
+                offset += _T_LINE
+            conn.execute(
+                "INSERT INTO conversation_ai_titles"
+                "(session_id,ai_title,source_path,byte_offset) VALUES(?,?,?,?)",
+                (sid, title, name, offset))
+            offset += _T_LINE
+            conn.execute(
+                "INSERT INTO conversation_source_files"
+                "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at) "
+                "VALUES(?,?,1,?,'2026-08-04T11:00:00Z')", (name, offset, offset))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _t6_not_exists_oracle(conn, account_key):
+    """The #1062 title view as it stood before #1068: the COALESCE predicate
+    and the NOT EXISTS third clause, over the base tables only."""
+    pred = "COALESCE(m.account_key,'unattributed') = ?"
+    return sorted(conn.execute(
+        "SELECT t.rowid, t.session_id, t.ai_title "
+        "FROM main.conversation_ai_titles t "
+        "WHERE EXISTS (SELECT 1 FROM main.conversation_source_files f "
+        "  WHERE f.path = t.source_path AND f.last_byte_offset > t.byte_offset) "
+        f"AND EXISTS (SELECT 1 FROM main.conversation_messages m "
+        f"  WHERE m.session_id = t.session_id AND m.source_path = t.source_path "
+        f"  AND {pred}) "
+        f"AND NOT EXISTS (SELECT 1 FROM main.conversation_messages m "
+        f"  WHERE m.session_id = t.session_id AND NOT ({pred})) "
+        "AND NOT EXISTS (SELECT 1 FROM main.cache_meta "
+        "  WHERE key = 'conversation_rebuild_claude_pending')",
+        (account_key, account_key)).fetchall())
+
+
+@_T_ORDERS
+@pytest.mark.parametrize(
+    "account", [ACCOUNT_A, ACCOUNT_B, "unattributed"], ids=["A", "B", "none"])
+def test_scoped_title_clause_equals_not_exists(tmp_path, order, account):
+    """#1068 T6. Accuracy/privacy failure detected: the count-equality title
+    clause (and the sargable predicates under it) admitting a title the
+    NOT EXISTS form excluded, such as a session holding a NULL-account or a
+    literal-'unattributed' row inside a real-key scope (a naive
+    ``NOT (account_key = K)`` reads NULL as unknown and admits it), or
+    dropping one it admitted, such as a session split across the two
+    unattributed spellings in the unattributed scope."""
+    store_paths = _t_build(tmp_path, order)
+    _t6_seed_extra(store_paths)
+    conn = _t_open(store_paths, account)
+    try:
+        expected = _t6_not_exists_oracle(conn, account)
+        got = sorted(conn.execute(
+            "SELECT rowid, session_id, ai_title FROM conversation_ai_titles"
+        ).fetchall())
+        assert got == expected
+        admitted = {row[1] for row in got}
+        if account == "unattributed":
+            assert {"nn", "lit", "nl"} <= admitted, (
+                "both unattributed spellings belong to the unattributed scope")
+            assert "al" not in admitted
+        else:
+            assert not {"an", "al", "lit", "nl"} & admitted, (
+                "a NULL or literal-'unattributed' row withdraws the title")
+        if account == ACCOUNT_A:
+            assert "a1" in admitted
+    finally:
+        conn.close()
+
+
+# --- #1068 D4/D7: scoped reuse of verified stored rollup rows ---------------
+#
+# These stores are built by the real openers (both ledgers at head, both
+# incarnation ids present), so a stored rollup row is certified by the writer
+# and the scoper's reuse gate can pass. Rows are seeded by SQL so each session
+# shape (pure, mixed, impure, unattributed spellings) is exact.
+
+
+def _r_env(tmp_path, monkeypatch):
+    """Head-schema stores with settled flags and both incarnation ids."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+    core = ns["open_cache_db"]()
+    try:
+        ns["sync_cache"](core)
+    finally:
+        core.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        ns["sync_claude_conversations"](conn)
+    finally:
+        conn.close()
+    return ns, ns["_cctally_core"], ns["_cctally_cache"]
+
+
+def _r_raw(path):
+    return sqlite3.connect(str(path))
+
+
+def _r_set_counter(cache_conn, value):
+    cache_conn.execute(
+        "INSERT INTO cache_meta(key,value) "
+        "VALUES('session_entries_mutation_seq',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(value),))
+
+
+def _r_insert_messages(conn, messages):
+    """messages: (session_id, uuid, text, ts, msg_id, req_id, account_key)."""
+    for sid, uuid, text, ts, msg_id, req_id, account in messages:
+        conn.execute(
+            "INSERT INTO conversation_messages "
+            "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,"
+            " text,blocks_json,model,msg_id,req_id,cwd,is_sidechain,account_key) "
+            "VALUES(?,?,?,(SELECT COALESCE(MAX(byte_offset),0)+100 FROM "
+            " conversation_messages WHERE source_path=?),?,?,?,'[]',?,?,?,"
+            " '/work/proj',0,?)",
+            (sid, uuid, f"{sid}.jsonl", f"{sid}.jsonl", ts,
+             "assistant" if msg_id else "human", text,
+             "claude-opus-4-8" if msg_id else None, msg_id, req_id, account))
+
+
+def _r_insert_entries(cache_conn, entries):
+    """entries: (msg_id, req_id, cost_usd_raw, account_key, mutation_seq)."""
+    for msg_id, req_id, cost, account, seq in entries:
+        cache_conn.execute(
+            "INSERT INTO session_entries "
+            "(source_path,line_offset,timestamp_utc,model,msg_id,req_id,"
+            " input_tokens,output_tokens,cache_create_tokens,cache_read_tokens,"
+            " cost_usd_raw,account_key,mutation_seq) "
+            "VALUES('acct.jsonl',(SELECT COALESCE(MAX(line_offset),0)+10 "
+            " FROM session_entries),'2026-08-04T00:00:00Z','claude-opus-4-8',"
+            " ?,?,10,5,0,0,?,?,?)",
+            (msg_id, req_id, cost, account, seq))
+
+
+def _r_seed(core, cache, messages, entries):
+    """Seed accounting then transcript rows and let the writer certify the
+    whole rollup (a full recompute on the writer connection)."""
+    cache_conn = _r_raw(core.CACHE_DB_PATH)
+    try:
+        _r_insert_entries(cache_conn, entries)
+        seqs = [e[4] for e in entries if e[4] is not None]
+        _r_set_counter(cache_conn, max(seqs, default=0))
+        cache_conn.commit()
+    finally:
+        cache_conn.close()
+    conn = cache.open_conversations_db()
+    try:
+        _r_insert_messages(conn, messages)
+        assert cache._recompute_conversation_sessions(conn) is True
+        conn.commit()
+        uncertified = conn.execute(
+            "SELECT session_id FROM conversation_sessions "
+            "WHERE input_fingerprint IS NULL").fetchall()
+        assert uncertified == [], "the writer certifies every seeded row"
+    finally:
+        conn.close()
+
+
+def _r_scoped(cache, account):
+    conn = cache.open_conversations_db_readonly()
+    cache.scope_conversations_db_to_account(conn, account)
+    return conn
+
+
+def _r_detail(cache, lq, account, sid):
+    conn = _r_scoped(cache, account)
+    try:
+        return lq.get_conversation(conn, sid)
+    finally:
+        conn.close()
+
+
+_R_T3_MESSAGES = [
+    ("pa", "pa-u1", "alpha question", "2026-08-04T01:00:00Z", None, None,
+     ACCOUNT_A),
+    ("pa", "pa-a1", "alpha answer one", "2026-08-04T01:01:00Z", "m1", "r1",
+     ACCOUNT_A),
+    ("pa", "pa-a2", "alpha answer two", "2026-08-04T01:02:00Z", "m2", "r2",
+     ACCOUNT_A),
+]
+_R_T3_ENTRIES = [("m1", "r1", 1.5, ACCOUNT_A, 1),
+                 ("m2", "r2", 2.25, ACCOUNT_A, 2)]
+
+
+@pytest.mark.parametrize("change", ["append", "finalize", "move", "delete"])
+def test_scoped_detail_sees_change_through_primed_memo(
+        tmp_path, monkeypatch, change):
+    """#1068 T1/T3. Accuracy failure detected: a scoped detail request served
+    from a reused stored row or from the primed assembly memo after the
+    focused account's inputs changed, with no writer pass between the two
+    requests: a message append, an accounting finalization (stamped), an
+    accounting row moved to another account (stamped), and an accounting
+    delete that stamps nothing and advances no counter (the stale cost the
+    delete case returned before D7)."""
+    ns, core, cache = _r_env(tmp_path, monkeypatch)
+    _r_seed(core, cache, _R_T3_MESSAGES, _R_T3_ENTRIES)
+    lq = cache._load_lib("_lib_conversation_query")
+    lq._assemble_memo_clear()
+    try:
+        first = _r_detail(cache, lq, ACCOUNT_A, "pa")
+        assert first["cost_usd"] == 3.75
+        cache_conn = _r_raw(core.CACHE_DB_PATH)
+        conv_conn = _r_raw(core.CONVERSATIONS_DB_PATH)
+        try:
+            if change == "append":
+                _r_insert_messages(conv_conn, [
+                    ("pa", "pa-a3", "alpha late answer",
+                     "2026-08-04T01:03:00Z", "m3", "r3", ACCOUNT_A)])
+                _r_insert_entries(cache_conn, [("m3", "r3", 0.5, ACCOUNT_A, 3)])
+                _r_set_counter(cache_conn, 3)
+                expected = 4.25
+            elif change == "finalize":
+                cache_conn.execute(
+                    "UPDATE session_entries SET cost_usd_raw=3.0, "
+                    "mutation_seq=3 WHERE msg_id='m2'")
+                _r_set_counter(cache_conn, 3)
+                expected = 4.5
+            elif change == "move":
+                cache_conn.execute(
+                    "UPDATE session_entries SET account_key=?, mutation_seq=3 "
+                    "WHERE msg_id='m2'", (ACCOUNT_B,))
+                _r_set_counter(cache_conn, 3)
+                expected = 1.5
+            else:
+                cache_conn.execute(
+                    "DELETE FROM session_entries WHERE msg_id='m2'")
+                expected = 1.5
+            cache_conn.commit()
+            conv_conn.commit()
+        finally:
+            cache_conn.close()
+            conv_conn.close()
+        second = _r_detail(cache, lq, ACCOUNT_A, "pa")
+        assert second["cost_usd"] == expected
+        if change == "append":
+            assert "alpha late answer" in str(second)
+    finally:
+        lq._assemble_memo_clear()
+
+
+def _r_temp_rows(conn, table="conversation_sessions"):
+    return conn.execute(
+        f"SELECT rowid, * FROM temp.{table} ORDER BY rowid").fetchall()
+
+
+def _r_open_scoped(cache, account, raw_paths=None):
+    if raw_paths is None:
+        return _r_scoped(cache, account)
+    conv_path, cache_path = raw_paths
+    conn = sqlite3.connect(str(conv_path))
+    conn.execute("ATTACH DATABASE ? AS cache_db", (str(cache_path),))
+    cache.scope_conversations_db_to_account(conn, account)
+    return conn
+
+
+def _r_observe(cache, monkeypatch, account, *, reuse=True, raw_paths=None):
+    """One scoped setup: its TEMP rollup rows in rowid order, its browse
+    body, and what the reuse gate and partition returned. ``reuse=False``
+    forces the global gate closed (today's full derivation)."""
+    seen = {"epoch": [], "partition": []}
+    real_epoch = cache._claude_rollup_reuse_epoch
+    real_partition = cache._scoped_claude_reuse_partition
+
+    def epoch_spy(conn):
+        out = real_epoch(conn) if reuse else None
+        seen["epoch"].append(out)
+        return out
+
+    def partition_spy(conn, epoch):
+        out = real_partition(conn, epoch)
+        seen["partition"].append(out)
+        return out
+
+    lq = cache._load_lib("_lib_conversation_query")
+    with monkeypatch.context() as m:
+        m.setattr(cache, "_claude_rollup_reuse_epoch", epoch_spy)
+        m.setattr(cache, "_scoped_claude_reuse_partition", partition_spy)
+        conn = _r_open_scoped(cache, account, raw_paths)
+        try:
+            rows = _r_temp_rows(conn)
+            browse = lq.list_conversations(conn)
+        finally:
+            conn.close()
+    return rows, browse, seen
+
+
+def _r_relax_mutation_seq(cache_path):
+    """Let session_entries hold a NULL ``mutation_seq``, as a store whose
+    column predates the NOT NULL form does (F11). Only the stored schema text
+    changes; no row is rewritten."""
+    import re
+    conn = sqlite3.connect(str(cache_path))
+    try:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='session_entries'").fetchone()[0]
+        relaxed, count = re.subn(
+            r"mutation_seq(\s+)INTEGER NOT NULL DEFAULT 0",
+            r"mutation_seq\1INTEGER DEFAULT 0", sql)
+        assert count == 1
+        version = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql=? "
+            "WHERE type='table' AND name='session_entries'", (relaxed,))
+        conn.execute(f"PRAGMA schema_version={version + 1}")
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_UNATTR = "unattributed"
+_A, _B = ACCOUNT_A, ACCOUNT_B
+# (session, uuid, text, ts, msg_id, req_id, account)
+_R_T2_MESSAGES = [
+    # pure A, with one turn split across two fragments (a repeated key).
+    ("pa", "pa-u", "alpha pure question", "2026-08-04T01:00:00Z", None, None, _A),
+    ("pa", "pa-1a", "alpha pure answer", "2026-08-04T01:01:00Z", "m-pa1", "r-pa1", _A),
+    ("pa", "pa-1b", "alpha pure answer more", "2026-08-04T01:01:30Z", "m-pa1", "r-pa1", _A),
+    ("pa", "pa-2", "alpha pure second", "2026-08-04T01:02:00Z", "m-pa2", "r-pa2", _A),
+    ("pb", "pb-u", "bravo pure question", "2026-08-04T02:00:00Z", None, None, _B),
+    ("pb", "pb-1", "bravo pure answer", "2026-08-04T02:01:00Z", "m-pb1", "r-pb1", _B),
+    # mixed: messages of both accounts.
+    ("mx", "mx-u", "alpha mixed question", "2026-08-04T03:00:00Z", None, None, _A),
+    ("mx", "mx-1", "alpha mixed answer", "2026-08-04T03:01:00Z", "m-mx1", "r-mx1", _A),
+    ("mx", "mx-2", "bravo mixed answer", "2026-08-04T03:02:00Z", "m-mx2", "r-mx2", _B),
+    # impure A: every message A, one entry B.
+    ("ia", "ia-u", "alpha impure question", "2026-08-04T04:00:00Z", None, None, _A),
+    ("ia", "ia-1", "alpha impure answer", "2026-08-04T04:01:00Z", "m-ia1", "r-ia1", _A),
+    ("ia", "ia-2", "alpha impure second", "2026-08-04T04:02:00Z", "m-ia2", "r-ia2", _A),
+    # reverse-impure B: every message B, one entry A.
+    ("rb", "rb-u", "bravo impure question", "2026-08-04T05:00:00Z", None, None, _B),
+    ("rb", "rb-1", "bravo impure answer", "2026-08-04T05:01:00Z", "m-rb1", "r-rb1", _B),
+    ("rb", "rb-2", "bravo impure second", "2026-08-04T05:02:00Z", "m-rb2", "r-rb2", _B),
+    # one turn key held by two sessions.
+    ("sh1", "sh1-u", "alpha shared question", "2026-08-04T06:00:00Z", None, None, _A),
+    ("sh1", "sh1-1", "alpha shared answer", "2026-08-04T06:01:00Z", "m-sh", "r-sh", _A),
+    ("sh2", "sh2-1", "alpha shared resumed", "2026-08-04T06:05:00Z", "m-sh", "r-sh", _A),
+    ("sh2", "sh2-2", "alpha shared second", "2026-08-04T06:06:00Z", "m-sh2", "r-sh2", _A),
+    # an entry whose mutation_seq is NULL.
+    ("pn", "pn-u", "alpha null seq question", "2026-08-04T07:00:00Z", None, None, _A),
+    ("pn", "pn-1", "alpha null seq answer", "2026-08-04T07:01:00Z", "m-pn", "r-pn", _A),
+    # both unattributed spellings.
+    ("nn", "nn-u", "null question", "2026-08-04T08:00:00Z", None, None, None),
+    ("nn", "nn-1", "null answer", "2026-08-04T08:01:00Z", "m-nn", "r-nn", None),
+    ("lt", "lt-1", "literal answer", "2026-08-04T09:01:00Z", "m-lt", "r-lt", _UNATTR),
+    ("nl", "nl-u", "null literal question", "2026-08-04T10:00:00Z", None, None, None),
+    ("nl", "nl-1", "null literal answer", "2026-08-04T10:01:00Z", "m-nl", "r-nl", _UNATTR),
+]
+# (msg_id, req_id, cost_usd_raw, account, mutation_seq)
+_R_T2_ENTRIES = [
+    ("m-pa1", "r-pa1", 1.0e16, _A, 1), ("m-pa2", "r-pa2", 1.0, _A, 2),
+    ("m-pb1", "r-pb1", 2.5, _B, 3),
+    ("m-mx1", "r-mx1", 0.75, _A, 4), ("m-mx2", "r-mx2", 1.25, _B, 5),
+    ("m-ia1", "r-ia1", 0.5, _A, 6), ("m-ia2", "r-ia2", 0.25, _B, 7),
+    ("m-rb1", "r-rb1", 3.5, _B, 8), ("m-rb2", "r-rb2", 4.5, _A, 9),
+    ("m-sh", "r-sh", 0.125, _A, 10), ("m-sh2", "r-sh2", 0.0625, _A, 11),
+    ("m-pn", "r-pn", 0.375, _A, None),
+    ("m-nn", "r-nn", 1.5, None, 12), ("m-lt", "r-lt", 2.0, _UNATTR, 13),
+    ("m-nl", "r-nl", 2.75, None, 14),
+]
+_R_T2_EXPECTED = {
+    _A: ({"pa", "sh1", "sh2", "pn"}, {"mx", "ia"}),
+    _B: ({"pb"}, {"mx", "rb"}),
+    _UNATTR: ({"nn", "lt", "nl"}, set()),
+}
+
+
+def _r_ordered(rows, order, account_index):
+    rank = {acct: i for i, acct in enumerate(order)}
+    return sorted(rows, key=lambda r: rank.get(r[account_index], len(rank)))
+
+
+@pytest.mark.parametrize("order", [(_A, _B), (_B, _A)], ids=["a-first", "b-first"])
+def test_scoped_reuse_equals_forced_derivation(tmp_path, monkeypatch, order):
+    """#1068 T2 (Claude). Privacy/accuracy failure detected: a reused stored
+    row leaking another account's messages or cost into a scope (a mixed,
+    impure or reverse-impure session reused), a scope missing one of the two
+    unattributed spellings, an accounting count that double-counts a key held
+    by two fragments or two sessions, or a reused TEMP table whose row order
+    differs from the full derivation's. For every scope the TEMP rollup and
+    the browse body equal those with reuse forced off, row for row in rowid
+    order, and the spies prove which sessions were reused and derived."""
+    ns, core, cache = _r_env(tmp_path, monkeypatch)
+    _r_relax_mutation_seq(core.CACHE_DB_PATH)
+    _r_seed(core, cache, _r_ordered(_R_T2_MESSAGES, order, 6),
+            _r_ordered(_R_T2_ENTRIES, order, 3))
+    for account, (reusable, fresh) in _R_T2_EXPECTED.items():
+        rows, browse, seen = _r_observe(cache, monkeypatch, account)
+        off_rows, off_browse, off_seen = _r_observe(
+            cache, monkeypatch, account, reuse=False)
+        assert seen["epoch"][0] is not None, "the global gate passes"
+        assert off_seen["partition"] == []
+        assert seen["partition"] == [(sorted(reusable), sorted(fresh))], account
+        assert rows == off_rows, account
+        assert browse == off_browse, account
+        assert [row[1] for row in rows] == sorted(reusable | fresh)
+
+
+def _r_t4_store(tmp_path, monkeypatch):
+    ns, core, cache = _r_env(tmp_path, monkeypatch)
+    _r_seed(core, cache, _R_T3_MESSAGES + [
+        ("pc", "pc-u", "alpha other question", "2026-08-04T02:00:00Z", None,
+         None, ACCOUNT_A),
+        ("pc", "pc-1", "alpha other answer", "2026-08-04T02:01:00Z", "mc",
+         "rc", ACCOUNT_A),
+    ], _R_T3_ENTRIES + [("mc", "rc", 0.5, ACCOUNT_A, 3)])
+    rows, _browse, seen = _r_observe(cache, monkeypatch, ACCOUNT_A)
+    assert seen["partition"] == [(["pa", "pc"], [])], \
+        "precondition: both sessions are reused"
+    return ns, core, cache
+
+
+def _r_meta(path, sql, params=()):
+    conn = _r_raw(path)
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _r_unstamped_cost_rewrite(core, value):
+    _r_meta(core.CACHE_DB_PATH,
+            "UPDATE session_entries SET cost_usd_raw=? WHERE msg_id='m2'",
+            (value,))
+
+
+def _r_newer_migration(ns, cache, registry_name, handler):
+    """Run a newer binary's migration to completion through the real
+    dispatcher (an extended registry), then let this binary recover the
+    version-ahead store."""
+    registry = ns[registry_name]
+    db_mod = ns["_cctally_db"]
+    registry.append(db_mod.Migration(
+        seq=len(registry) + 1, name="999_newer_untracked_rewrite",
+        handler=handler))
+    try:
+        if registry_name == "_CACHE_MIGRATIONS":
+            ns["open_cache_db"]().close()
+        else:
+            cache.open_conversations_db().close()
+    finally:
+        registry.pop()
+    # This binary's next writer open trims the unknown marker (recovery).
+    if registry_name == "_CACHE_MIGRATIONS":
+        ns["open_cache_db"]().close()
+    else:
+        cache.open_conversations_db().close()
+
+
+_R_T4_GLOBAL = ("blocking_flag", "pending_known_migration", "unknown_fence",
+                "unknown_ledger_name", "user_version_mismatch",
+                "absent_incarnation_main", "absent_incarnation_cache")
+_R_T4_SESSION = ("epoch_pricing", "recreated_cache", "newer_cache_recovered",
+                 "newer_conversations_recovered", "unskip", "null_fingerprint",
+                 "seal_mismatch")
+
+
+@pytest.mark.parametrize("case", _R_T4_GLOBAL + _R_T4_SESSION)
+def test_reuse_falls_back_when_gate_fails(tmp_path, monkeypatch, case):
+    """#1068 T4. Accuracy failure detected: a stored row reused when the
+    reader cannot prove it equal to the fresh scoped derivation — a blocking
+    flag, a pending or unknown migration, a fence left by an unknown
+    migration's unstamped rewrite, a schema-version mismatch, a missing
+    incarnation id, another pricing snapshot, a re-created cache.db whose
+    ledger and counters match the old one, a newer migration's unstamped
+    rewrite then recovery (cache and conversations), a skip/unskip that
+    restores the ledger digest, a NULL fingerprint, or content rewritten
+    without the fingerprint. Each falls back (a spy observes it) and the TEMP
+    rows equal the forced full derivation."""
+    import argparse
+    ns, core, cache = _r_t4_store(tmp_path, monkeypatch)
+    raw_paths = None
+    expect_title = None
+    expected_pa_cost = 3.75
+    if case == "blocking_flag":
+        _r_meta(core.CONVERSATIONS_DB_PATH,
+                "INSERT INTO cache_meta(key,value) "
+                "VALUES('conversation_reingest_pending','1')")
+    elif case == "pending_known_migration":
+        newest = ns["_CONVERSATIONS_MIGRATIONS"][-1].name
+        _r_meta(core.CONVERSATIONS_DB_PATH,
+                "DELETE FROM schema_migrations WHERE name=?", (newest,))
+    elif case == "unknown_fence":
+        _r_meta(core.CACHE_DB_PATH,
+                "INSERT INTO cache_meta(key,value) "
+                "VALUES('migration_fence:unknown-run','t')")
+        _r_unstamped_cost_rewrite(core, 5.0)
+        expected_pa_cost = 6.5
+    elif case == "unknown_ledger_name":
+        _r_meta(core.CONVERSATIONS_DB_PATH,
+                "INSERT INTO schema_migrations(name,applied_at_utc) "
+                "VALUES('999_from_a_newer_binary','2026-08-04T00:00:00Z')")
+    elif case == "user_version_mismatch":
+        version = len(ns["_CACHE_MIGRATIONS"]) + 1
+        _r_meta(core.CACHE_DB_PATH, f"PRAGMA user_version={version}")
+        raw_paths = (core.CONVERSATIONS_DB_PATH, core.CACHE_DB_PATH)
+    elif case == "absent_incarnation_main":
+        _r_meta(core.CONVERSATIONS_DB_PATH,
+                "DELETE FROM cache_meta WHERE key='conversations_incarnation_id'")
+    elif case == "absent_incarnation_cache":
+        _r_meta(core.CACHE_DB_PATH,
+                "DELETE FROM cache_meta WHERE key='cache_incarnation_id'")
+    elif case == "epoch_pricing":
+        monkeypatch.setattr(cache, "PRICING_SNAPSHOT_DATE", "2099-01-01")
+    elif case == "recreated_cache":
+        # Same ledger, counter, counts and sequences; different accounting
+        # values and a new incarnation id, as a re-created file has.
+        _r_meta(core.CACHE_DB_PATH,
+                "UPDATE cache_meta SET value='recreated-store' "
+                "WHERE key='cache_incarnation_id'")
+        _r_unstamped_cost_rewrite(core, 5.0)
+        expected_pa_cost = 6.5
+    elif case == "newer_cache_recovered":
+        def rewrite_cost(conn):
+            conn.execute("UPDATE session_entries SET cost_usd_raw=5.0 "
+                         "WHERE msg_id='m2'")
+            conn.commit()
+        _r_newer_migration(ns, cache, "_CACHE_MIGRATIONS", rewrite_cost)
+        expected_pa_cost = 6.5
+    elif case == "newer_conversations_recovered":
+        def rewrite_title(conn):
+            conn.execute("UPDATE conversation_messages SET text='rewritten "
+                         "alpha question' WHERE uuid='pa-u1'")
+            conn.commit()
+        _r_newer_migration(ns, cache, "_CONVERSATIONS_MIGRATIONS",
+                           rewrite_title)
+        expect_title = "rewritten alpha question"
+    elif case == "unskip":
+        # Certify under a skipped migration, unskip it, rewrite an input
+        # without a stamp, then skip it again with the SAME timestamp: the
+        # ledger digest is the one the rows were certified under, and only
+        # the rotated incarnation id tells the two states apart.
+        newest = ns["_CONVERSATIONS_MIGRATIONS"][-1].name
+        qname = f"conversations.db:{newest}"
+        _r_meta(core.CONVERSATIONS_DB_PATH,
+                "DELETE FROM schema_migrations WHERE name=?", (newest,))
+        assert ns["cmd_db_skip"](argparse.Namespace(name=qname, reason="t")) == 0
+        writer = cache.open_conversations_db()
+        try:
+            assert cache._recompute_conversation_sessions(writer) is True
+            writer.commit()
+        finally:
+            writer.close()
+        _rows, _b, seen = _r_observe(cache, monkeypatch, ACCOUNT_A)
+        assert seen["partition"] == [(["pa", "pc"], [])]
+        def ledger():
+            conn = _r_raw(core.CONVERSATIONS_DB_PATH)
+            try:
+                return (
+                    sorted(conn.execute(
+                        "SELECT name, applied_at_utc FROM schema_migrations")),
+                    sorted(conn.execute(
+                        "SELECT name, skipped_at_utc "
+                        "FROM schema_migrations_skipped")))
+            finally:
+                conn.close()
+
+        certified_ledger = ledger()
+        skipped_at = dict(certified_ledger[1])[newest]
+        assert ns["cmd_db_unskip"](argparse.Namespace(name=qname)) == 0
+        _r_meta(core.CONVERSATIONS_DB_PATH,
+                "UPDATE conversation_messages SET text='rewritten alpha "
+                "question' WHERE uuid='pa-u1'")
+        assert ns["cmd_db_skip"](argparse.Namespace(name=qname, reason="t")) == 0
+        _r_meta(core.CONVERSATIONS_DB_PATH,
+                "UPDATE schema_migrations_skipped SET skipped_at_utc=? "
+                "WHERE name=?", (skipped_at, newest))
+        # Unskip lowered user_version; the next writer open's dispatcher finds
+        # nothing pending and advances it again (no run, so no rotation).
+        cache.open_conversations_db().close()
+        assert ledger() == certified_ledger, "the ledger digest recurs"
+        expect_title = "rewritten alpha question"
+    elif case == "null_fingerprint":
+        _r_meta(core.CONVERSATIONS_DB_PATH,
+                "UPDATE conversation_sessions SET input_fingerprint=NULL "
+                "WHERE session_id='pa'")
+    elif case == "seal_mismatch":
+        # An older binary's re-fill rewrites content, never the fingerprint.
+        _r_meta(core.CONVERSATIONS_DB_PATH,
+                "UPDATE conversation_sessions SET title='stale older binary' "
+                "WHERE session_id='pa'")
+    rows, browse, seen = _r_observe(cache, monkeypatch, ACCOUNT_A,
+                                    raw_paths=raw_paths)
+    off_rows, off_browse, _off = _r_observe(
+        cache, monkeypatch, ACCOUNT_A, reuse=False, raw_paths=raw_paths)
+    if case in _R_T4_GLOBAL:
+        assert seen["epoch"] == [None] and seen["partition"] == []
+    else:
+        assert seen["epoch"][0] is not None
+        reusable, fresh = seen["partition"][0]
+        assert "pa" in fresh and "pa" not in reusable
+    assert rows == off_rows
+    assert browse == off_browse
+    pa = next(row for row in browse["conversations"] if row["session_id"] == "pa")
+    assert pa["cost_usd"] == expected_pa_cost
+    if expect_title is not None:
+        assert pa["title"] == expect_title
+    if case == "seal_mismatch":
+        assert pa["title"] != "stale older binary"
+
+
+_R_CHILD_RUN = r'''
+import os, pathlib, sqlite3, sys, time
+sys.path.insert(0, sys.argv[1])
+import _cctally_db as db
+conn = sqlite3.connect(sys.argv[2])
+barrier = pathlib.Path(sys.argv[3])
+run = db._MigrationFenceRun(conn, "conversations.db")
+run.begin()
+(barrier / "fenced").write_text("1")
+deadline = time.monotonic() + 60
+while not (barrier / "go").exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+conn.execute("UPDATE conversation_messages SET text='rewritten alpha question' "
+             "WHERE uuid='pa-u1'")
+conn.commit()
+(barrier / "changed").write_text("1")
+os._exit(9)  # dies before its stamp: the row stays, the flock goes
+'''
+
+
+def _r_wait_for(path, timeout=60.0):
+    import time
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        assert time.monotonic() < deadline, f"timed out waiting for {path}"
+        time.sleep(0.02)
+
+
+def _r_fence_keys(path):
+    conn = _r_raw(path)
+    try:
+        return [row[0] for row in conn.execute(
+            "SELECT key FROM cache_meta WHERE key LIKE 'migration_fence:%'")]
+    finally:
+        conn.close()
+
+
+def _r_incarnation(path, key="conversations_incarnation_id"):
+    conn = _r_raw(path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _r_stored_fp(path, sid):
+    conn = _r_raw(path)
+    try:
+        return conn.execute(
+            "SELECT input_fingerprint FROM conversation_sessions "
+            "WHERE session_id=?", (sid,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_round4_interleaving_under_barriers(tmp_path, monkeypatch):
+    """#1068 T4 (round-4 interleaving). Accuracy failure detected: a row
+    certified, or reused, across an untracked write of a dispatcher run that
+    is still active (its fence row committed, its shared fence lock held),
+    including after that run dies before its stamp. The run is a separate
+    process so its death, not a tidy release, frees the fence lock."""
+    import subprocess
+    ns, core, cache = _r_t4_store(tmp_path, monkeypatch)
+    conv_path = core.CONVERSATIONS_DB_PATH
+    barrier = tmp_path / "barrier"
+    barrier.mkdir()
+    bin_dir = str(pathlib.Path(cache.__file__).resolve().parent)
+    child = subprocess.Popen(
+        [sys.executable, "-c", _R_CHILD_RUN, bin_dir, str(conv_path),
+         str(barrier)])
+    try:
+        _r_wait_for(barrier / "fenced")
+        before = _r_incarnation(conv_path)
+        # This binary's dispatcher entry cannot take the fence lock
+        # exclusive, so the active run's row stays; certification refuses.
+        writer = cache.open_conversations_db()
+        try:
+            assert len(_r_fence_keys(conv_path)) == 1
+            assert cache._rollup_certification_allowed(writer) is False
+            assert cache._recompute_conversation_sessions(writer, {"pa"})
+            writer.commit()
+        finally:
+            writer.close()
+        assert _r_stored_fp(conv_path, "pa") is None
+        (barrier / "go").write_text("1")
+        _r_wait_for(barrier / "changed")
+        assert child.wait(timeout=60) == 9
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    # The dead run's row remains: the reader refuses reuse.
+    assert len(_r_fence_keys(conv_path)) == 1
+    rows, browse, seen = _r_observe(cache, monkeypatch, ACCOUNT_A)
+    off_rows, off_browse, _off = _r_observe(
+        cache, monkeypatch, ACCOUNT_A, reuse=False)
+    assert seen["epoch"] == [None]
+    assert rows == off_rows and browse == off_browse
+    titles = {r["session_id"]: r["title"] for r in browse["conversations"]}
+    assert titles["pa"] == "rewritten alpha question"
+    # The next dispatcher entry holds the lock exclusive (the run is dead),
+    # removes the row and rotates the id: rows certified before the rotation
+    # (pc) are no longer current.
+    cache.open_conversations_db().close()
+    assert _r_fence_keys(conv_path) == []
+    assert _r_incarnation(conv_path) not in (None, before)
+    _rows, _browse, seen = _r_observe(cache, monkeypatch, ACCOUNT_A)
+    assert seen["epoch"][0] is not None
+    assert seen["partition"] == [([], ["pa", "pc"])]
+    # Only rows certified after the rotation are reused.
+    writer = cache.open_conversations_db()
+    try:
+        assert cache._recompute_conversation_sessions(writer) is True
+        writer.commit()
+    finally:
+        writer.close()
+    rows, browse, seen = _r_observe(cache, monkeypatch, ACCOUNT_A)
+    off_rows, off_browse, _off = _r_observe(
+        cache, monkeypatch, ACCOUNT_A, reuse=False)
+    assert seen["partition"] == [(["pa", "pc"], [])]
+    assert rows == off_rows and browse == off_browse
+
+
+def test_overlapping_same_binary_runs_keep_store_fenced(tmp_path, monkeypatch):
+    """#1068 T4 (overlapping runs). Accuracy failure detected: the first of
+    two overlapping dispatcher runs of one binary removing the other's fence
+    row (or every row) when it finishes, so a row certified while the second
+    run's handler still writes is later reused."""
+    import threading
+    ns, core, cache = _r_t4_store(tmp_path, monkeypatch)
+    conv_path = core.CONVERSATIONS_DB_PATH
+    registry = ns["_CONVERSATIONS_MIGRATIONS"]
+    db_mod = ns["_cctally_db"]
+    entered = {1: threading.Event(), 2: threading.Event()}
+    release = {1: threading.Event(), 2: threading.Event()}
+    which = threading.local()
+
+    def handler(conn):
+        entered[which.n].set()
+        assert release[which.n].wait(60)
+        conn.execute("UPDATE conversation_messages SET text=? "
+                     "WHERE uuid='pa-u1'", (f"rewritten by run {which.n}",))
+        conn.commit()
+
+    registry.append(db_mod.Migration(
+        seq=len(registry) + 1, name="999_overlapping_rewrite", handler=handler))
+    errors = []
+
+    def run(n):
+        which.n = n
+        conn = sqlite3.connect(str(conv_path), timeout=30)
+        try:
+            db_mod._run_pending_migrations(
+                conn, registry=registry, db_label="conversations.db")
+        except BaseException as exc:  # noqa: BLE001 — surfaced below
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    # Each run is its own `cctally` process owner (#787 / #861).
+    threads = {n: threading.Thread(target=as_process_owner(run), args=(n,))
+               for n in (1, 2)}
+    try:
+        threads[1].start()
+        assert entered[1].wait(60)
+        threads[2].start()
+        assert entered[2].wait(60)
+        assert len(_r_fence_keys(conv_path)) == 2
+        release[1].set()
+        threads[1].join(60)
+        assert not threads[1].is_alive()
+        # The first run removed only its own row: the store stays fenced, so
+        # a writer cannot certify and a reader cannot reuse.
+        assert len(_r_fence_keys(conv_path)) == 1
+        writer = cache.open_conversations_db()
+        try:
+            assert cache._rollup_certification_allowed(writer) is False
+        finally:
+            writer.close()
+        _rows, _browse, seen = _r_observe(cache, monkeypatch, ACCOUNT_A)
+        assert seen["epoch"] == [None]
+        release[2].set()
+        threads[2].join(60)
+        assert not threads[2].is_alive()
+        assert errors == []
+        assert _r_fence_keys(conv_path) == []
+        # After both runs, rows certified now are current and reused.
+        writer = cache.open_conversations_db()
+        try:
+            assert cache._recompute_conversation_sessions(writer) is True
+            writer.commit()
+        finally:
+            writer.close()
+        rows, browse, seen = _r_observe(cache, monkeypatch, ACCOUNT_A)
+        off_rows, off_browse, _off = _r_observe(
+            cache, monkeypatch, ACCOUNT_A, reuse=False)
+        assert seen["partition"] == [(["pa", "pc"], [])]
+        assert rows == off_rows and browse == off_browse
+        titles = {r["session_id"]: r["title"] for r in browse["conversations"]}
+        assert titles["pa"] == "rewritten by run 2"
+    finally:
+        for n in (1, 2):
+            release[n].set()
+        for t in threads.values():
+            if t.is_alive():
+                t.join(60)
+        registry.pop()
+
+
+def test_scope_without_fingerprint_column_takes_todays_path(tmp_path):
+    """#1068. Stored-data/availability failure detected: a store that has not
+    received the input_fingerprint column (migration 013 not yet applied)
+    raising in the scoper or the assembly memo key instead of serving the
+    scoped request exactly as before."""
+    conn = _open_scoped_fixture(tmp_path, ACCOUNT_A, drop_fingerprint=True)
+    try:
+        assert "input_fingerprint" not in {
+            row[1] for row in conn.execute(
+                "PRAGMA temp.table_info(conversation_sessions)")}
+        assert cache._claude_rollup_reuse_epoch(conn) is None
+        assert claude_query._assemble_memo_key(
+            conn, "shared-session") is not None, "the memo stays usable"
+        detail = claude_query.get_conversation(conn, "shared-session")
+        assert detail["cost_usd"] == 1.25
+        assert "bravo private message" not in str(detail)
+    finally:
+        claude_query._assemble_memo_clear()
+        conn.close()
+
+
+# --- #1068 D6: scoped reuse of stored Codex rollup rows ---------------------
+
+# (conversation_key, line_offset, ts, text, account_key). "v1.a-mixed" sorts
+# before "v1.b-pure" and both carry one project key with different stored
+# labels, so the facets' first-label-wins rule observes the TEMP row order.
+_R_CODEX_ROWS = [
+    ("v1.a-mixed", 10, "2026-08-04T01:00:00Z", "alpha mixed codex", _A),
+    ("v1.a-mixed", 20, "2026-08-04T01:01:00Z", "bravo mixed codex", _B),
+    ("v1.b-pure", 10, "2026-08-04T02:00:00Z", "alpha pure codex", _A),
+    ("v1.b-pure", 20, "2026-08-04T02:01:00Z", "alpha pure codex more", _A),
+    ("v1.c-pure-b", 10, "2026-08-04T03:00:00Z", "bravo pure codex", _B),
+    ("v1.d-null", 10, "2026-08-04T04:00:00Z", "null codex", None),
+    ("v1.d-null", 20, "2026-08-04T04:01:00Z", "literal codex", _UNATTR),
+]
+_R_CODEX_LABELS = {
+    "v1.a-mixed": ("pk-shared", "Label from mixed"),
+    "v1.b-pure": ("pk-shared", "Label from pure"),
+}
+_R_CODEX_EXPECTED = {
+    _A: (["v1.b-pure"], ["v1.a-mixed"]),
+    _B: (["v1.c-pure-b"], ["v1.a-mixed"]),
+    _UNATTR: (["v1.d-null"], []),
+}
+
+
+def _r_codex_seed(cache, order):
+    writer = cache.open_conversations_db()
+    try:
+        writer.execute(
+            "INSERT INTO cache_meta(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("codex_conversation_contract_version",
+             codex_kernel.CODEX_CONVERSATION_CONTRACT_VERSION))
+        for key, offset, ts, text, account in _r_ordered(
+                _R_CODEX_ROWS, order, 4):
+            path = f"{key}.jsonl"
+            writer.execute(
+                "INSERT INTO codex_conversation_messages "
+                "(conversation_key,source_root_key,source_path,line_offset,"
+                " timestamp_utc,turn_id,call_id,kind,event_type,record_family,"
+                " model,text,content_digest,content_len,detail_json,"
+                " search_tool,search_thinking,account_key) "
+                "VALUES(?,?,?,?,?,?,NULL,'user',NULL,'event_msg','gpt-5.6',?,"
+                "?,?,NULL,NULL,NULL,?)",
+                (key, "root", path, offset, ts, f"turn-{offset}", text,
+                 (key + str(offset)).ljust(64, "0")[:64], len(text), account))
+        cache._recompute_codex_rollups(writer, {r[0] for r in _R_CODEX_ROWS})
+        for key, (project_key, label) in _R_CODEX_LABELS.items():
+            writer.execute(
+                "UPDATE codex_conversation_rollups "
+                "SET project_key=?, project_label=? WHERE conversation_key=?",
+                (project_key, label, key))
+        writer.commit()
+        assert codex_query.codex_normalization_authoritative(writer)
+    finally:
+        writer.close()
+
+
+def _r_codex_observe(cache, monkeypatch, account, *, reuse=True):
+    seen = []
+    real = cache._scoped_codex_reuse_partition
+
+    def spy(conn, codex_keys):
+        out = real(conn, codex_keys) if reuse else (
+            [], sorted(k for k in codex_keys if k))
+        seen.append(out)
+        return out
+
+    with monkeypatch.context() as m:
+        m.setattr(cache, "_scoped_codex_reuse_partition", spy)
+        conn = _r_scoped(cache, account)
+        try:
+            rows = _r_temp_rows(conn, "codex_conversation_rollups")
+            facets = codex_query.list_codex_conversation_facets(conn)
+            browse = codex_query.list_codex_conversations(
+                conn, effective_speed="standard")
+        finally:
+            conn.close()
+    return rows, facets, browse, seen
+
+
+@pytest.mark.parametrize("order", [(_A, _B), (_B, _A)], ids=["a-first", "b-first"])
+def test_scoped_codex_reuse_equals_forced_derivation(
+        tmp_path, monkeypatch, order):
+    """#1068 T2 (Codex). Privacy/accuracy failure detected: a conversation
+    with rows outside the scope reused from its stored rollup (its item
+    count, title, times or models then describe another account's rows), or
+    a reused TEMP table whose row order makes the facets keep another first
+    label for a shared project key. For every scope the TEMP rollup rows,
+    the facet response and the browse body equal reuse forced off, and the
+    spy proves which conversations were reused."""
+    ns, core, cache = _r_env(tmp_path, monkeypatch)
+    _r_codex_seed(cache, order)
+    for account, expected in _R_CODEX_EXPECTED.items():
+        rows, facets, browse, seen = _r_codex_observe(
+            cache, monkeypatch, account)
+        off_rows, off_facets, off_browse, _off = _r_codex_observe(
+            cache, monkeypatch, account, reuse=False)
+        assert seen == [expected], account
+        assert rows == off_rows, account
+        assert facets == off_facets, account
+        assert browse == off_browse, account
+        assert [row[1] for row in rows] == sorted(expected[0] + expected[1])
+    _rows, facets, _browse, _seen = _r_codex_observe(cache, monkeypatch, _A)
+    projects = facets["facets"]["projects"]
+    shared = [p for p in projects if p.get("project_key") == "pk-shared"
+              or p.get("key") == "pk-shared"]
+    assert shared and "Label from mixed" in str(shared), \
+        "the first label in key order wins, as in the full derivation"
+
+
+def _scoped_key_lookup_fixture(tmp_path, account_key):
+    """One session whose logical message ``u1`` has an in-scope and an
+    out-of-scope physical row (both carrying the badge term), a second in-scope
+    group ``u2`` and an in-scope NULL-uuid group. Returns (conn, ids by tag)."""
+    cache_path = tmp_path / "cache.db"
+    cache_conn = sqlite3.connect(cache_path)
+    db._apply_cache_schema(cache_conn)
+    cache_conn.commit()
+    cache_conn.close()
+    conn = sqlite3.connect(":memory:")
+    db._apply_conversations_schema(conn)
+    inside = None if account_key == "unattributed" else account_key
+    rows = [  # (tag, uuid, account, search_tool, offset)
+        ("u1-in", "u1", inside, "grep error in", 10),
+        ("u1-out", "u1", ACCOUNT_B, "grep error out", 20),
+        ("u2-in", "u2", inside, "", 30),
+        ("null-in", None, inside, "", 40),
+    ]
+    ids = {}
+    for tag, uuid, account, tool, offset in rows:
+        ids[tag] = conn.execute(
+            "INSERT INTO conversation_messages "
+            "(session_id,uuid,source_path,byte_offset,timestamp_utc,entry_type,"
+            " text,blocks_json,model,cwd,is_sidechain,account_key,search_tool) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("s1", uuid, "s1.jsonl", offset, f"2026-08-04T10:00:{offset}Z",
+             "assistant", f"text {tag}", "[]", "claude-opus-4-8", "/work", 0,
+             account, tool)).lastrowid
+    conn.execute("ATTACH DATABASE ? AS cache_db", (str(cache_path),))
+    cache._recompute_conversation_sessions(conn)
+    conn.commit()
+    cache.scope_conversations_db_to_account(conn, account_key)
+    return conn, ids
+
+
+@pytest.mark.parametrize("account", [ACCOUNT_A, "unattributed"])
+def test_scoped_search_key_lookups_keep_key_indexes(tmp_path, account):
+    """#1068 D1 follow-up. Performance/privacy failure detected: once the
+    scope predicates are sargable, SQLite (no sqlite_stat1) estimates
+    ``account_key = K`` on idx_conv_messages_account_session as a few rows and
+    prefers it to the search helpers' per-key lookups, walking the whole
+    account per call (measured on the 2.3M-message copy, account A: 0.97 s per
+    content search for the hit-group lookup, 142 s per LIKE badge column). The
+    by-key lookups must keep their key indexes and still return only in-scope
+    physical rows, a same-group fragment of another account included."""
+    conn, ids = _scoped_key_lookup_fixture(tmp_path, account)
+    groups = [("s1", "u1"), ("s1", "u2"), ("s1", None)]
+    statements = []
+    conn.set_trace_callback(statements.append)
+    rids = claude_query._all_matched_rids_by_group(
+        conn, " AND cm.entry_type = ?", ("assistant",), groups)
+    texts = claude_query._texts_for_ids(conn, sorted(ids.values()))
+    badges = claude_query._like_badges(conn, "%error%", groups)
+    conn.set_trace_callback(None)
+
+    assert rids == {("s1", "u1"): [ids["u1-in"]], ("s1", "u2"): [ids["u2-in"]],
+                    ("s1", None): [ids["null-in"]]}
+    assert set(texts) == {ids["u1-in"], ids["u2-in"], ids["null-in"]}
+    assert badges[("s1", "u1")] == ["tool"]
+    assert badges[("s1", "u2")] == [] and badges[("s1", None)] == []
+
+    lookups = [s for s in statements if "conversation_messages" in s
+               and not s.lstrip().startswith("--")]
+    assert len(lookups) >= 3
+    for sql in lookups:
+        plan = " | ".join(
+            row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql))
+        assert "idx_conv_messages_account_session" not in plan, (sql, plan)
+        assert ("idx_conv_session_uuid" in plan
+                or "INTEGER PRIMARY KEY" in plan), (sql, plan)

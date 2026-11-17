@@ -62,6 +62,8 @@ STATS = {"allocations": 0, "released": 0, "inspect_s": 0.0, "release_s": 0.0, "b
          "reclaimed": 0, "reclaim_left": 0, "reclaim_s": 0.0}
 KEEP = pytest.StashKey()           # bool, stashed on an item whose setup or call failed,
                                    # xfailed or xpassed: its trees are evidence
+ITEM_STARTED = pytest.StashKey()   # float, time.monotonic() as the item's runtest protocol
+                                   # began: before setup, as pytest-timeout's item timer (#987)
 
 
 def install():
@@ -110,6 +112,7 @@ def _register(path):
 
 def begin_item(item):
     _ITEM[0] = item
+    item.stash[ITEM_STARTED] = time.monotonic()
 
 
 def end_item(item):

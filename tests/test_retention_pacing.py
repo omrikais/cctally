@@ -128,6 +128,23 @@ def _eligible(monkeypatch, retention):
         and geometry.freelist_count > 0)
 
 
+#: #990 (spec D1): the planner helper's real-time floor for the tests whose
+#: subject is a chunk's outcome, never the helper's own failure or deadline.
+_PLANNER_FLOOR_SECONDS = 30.0
+
+
+def _floor_planner_budget(monkeypatch, retention) -> None:
+    """Give every planner helper of this test 30 s of its own deadline, and
+    31 s of subprocess timeout with the 1.0 s start-up slack, whatever the
+    visit's remaining deadline or a direct call's 1.5 s default, so a
+    multi-second host stall cannot turn the chunk under test into a
+    ``helper_timeout`` refusal (#990). The product constants and the tests'
+    clocks are unchanged, and a passing run never waits on the floor: a
+    helper returns in about 0.05 s."""
+    monkeypatch.setattr(retention, "_PLANNER_MIN_DEADLINE_SECONDS",
+                        _PLANNER_FLOOR_SECONDS)
+
+
 def _geometry(conn):
     return (int(conn.execute("PRAGMA page_count").fetchone()[0]),
             int(conn.execute("PRAGMA page_size").fetchone()[0]))
@@ -443,6 +460,7 @@ def test_the_counterless_charge_is_the_reservation(tmp_path, monkeypatch):
 def test_a_reclaim_chunk_frees_exactly_its_pages_in_one_transaction(
         tmp_path, monkeypatch):
     ns, conn, retention, db_path = _env(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     before = _fill_and_free(conn)
     assert before > 40
     reclaim = retention.open_reclaim_connection(db_path)
@@ -493,6 +511,7 @@ def test_retained_slack_below_the_start_threshold_is_never_reclaimed(
 def test_reclaim_is_attempted_at_most_once_a_minute_in_small_chunks(
         tmp_path, monkeypatch):
     ns, conn, retention, _ = _env(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     # Enough free pages that one minute's allowance (or the 2 s deadline)
     # cannot drain them: a planned free-page chunk costs about 88 KiB.
     _fill_and_free(conn, rows=3000)
@@ -597,12 +616,15 @@ def test_a_charge_lands_in_the_hour_its_operation_started(
 
 def _chunk_driven_clock(retention, chunks):
     """(clock, record_phase) for a visit that runs exactly ``chunks`` reclaim
-    chunks. The clock stands still, so every chunk plans with the attempt's
-    whole deadline in real time, and jumps past the deadline when the
-    ``chunks``-th chunk reports. How many chunks fit in the deadline is then
-    decided by the test, not by how fast the host runs the planner helper
-    (#942: a loaded runner fitted only one, and a late chunk planned with a
-    sliver of the deadline and was refused)."""
+    chunks. The clock stands still and jumps past the deadline when the
+    ``chunks``-th chunk reports, so the test, not how fast the host runs the
+    planner helper, decides the chunk count (#942: a loaded runner fitted
+    only one, and a late chunk planned with a sliver of the deadline and was
+    refused). The clock does not bound a helper in real time: a standing
+    clock still hands each one only the 2 s deadline plus the 1.0 s start-up
+    slack, so the tests that use it also apply `_floor_planner_budget`,
+    whose 30 s floor plus that slack is each helper's real-time bound
+    (#990)."""
     now = {"t": 0.0, "reported": 0}
     ops = []
 
@@ -619,6 +641,7 @@ def _chunk_driven_clock(retention, chunks):
 def test_a_fractional_reclaim_deadline_is_never_earlier_than_the_cadence(
         tmp_path, monkeypatch):
     ns, conn, retention, _ = _env(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     _fill_and_free(conn, rows=3000)
     retention._stamp_retention_prune(conn, NOW)
     conn.commit()
@@ -647,15 +670,18 @@ def test_a_fractional_reclaim_deadline_is_never_earlier_than_the_cadence(
 
 def test_a_reclaim_attempt_stops_at_its_deadline(tmp_path, monkeypatch):
     ns, conn, retention, _ = _env(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     free = _fill_and_free(conn)
     retention._stamp_retention_prune(conn, NOW)
     conn.commit()
     _eligible(monkeypatch, retention)
     # The visit's clock stands still until a reclaim chunk reports, then jumps
-    # past the deadline. The first chunk therefore plans with the whole 2 s
-    # budget in real time, and only the check between chunks can stop the
-    # second. (A clock that ticks per call left the first chunk 0 s, floored
-    # to the planner's 50 ms, which a loaded host's planner can exceed.)
+    # past the deadline, so the test decides that one chunk runs and only the
+    # check between chunks can stop the second. (A clock that ticks per call
+    # left the first chunk 0 s, floored to the planner's 50 ms, which a loaded
+    # host's planner can exceed.) The clock does not bound the helper in real
+    # time: the 30 s floor plus the 1.0 s start-up slack does (#990), so a
+    # host stall longer than the 2 s deadline cannot refuse the chunk.
     now = {"t": 0.0}
     ops = []
 
@@ -699,6 +725,7 @@ def test_a_reclaim_visit_releases_its_flocks_within_the_deadline_plus_a_chunk(
 
 def test_the_ceiling_never_accelerates_reclaim(tmp_path, monkeypatch):
     ns, conn, retention, _ = _env(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     _fill_and_free(conn)
     retention._stamp_retention_prune(conn, NOW)
     conn.commit()
@@ -709,6 +736,11 @@ def test_the_ceiling_never_accelerates_reclaim(tmp_path, monkeypatch):
     ops = []
     _visit(retention, conn, NOW, ops)
     _visit(retention, conn, NOW + dt.timedelta(seconds=30), ops)
+    # Non-vacuity (#990): the first visit ran chunks and none was refused, so
+    # the cadence, not a refused chunk's in-memory hold, is what blocks the
+    # visit at +30 s.
+    outcomes = [p["outcome"] for kind, p in ops if kind == "reclaim"]
+    assert outcomes[:1] == ["ok"] and "skipped" not in outcomes, ops
     chunk_minutes = {p["started_at"] for kind, p in ops if kind == "reclaim"}
     assert chunk_minutes == {"2026-07-17T12:00:00Z"}, "still once a minute"
     assert all(p["pages_reclaimed"] <= 16 for _, p in ops)
@@ -751,6 +783,7 @@ def test_reclaim_never_checkpoints_even_as_the_last_connection(
         tmp_path, monkeypatch):
     import _lib_sqlite_close
     ns, conn, retention, db_path = _env(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     reader = _backlog_with_pinning_reader(conn, db_path)
     main_before = _sha(db_path)
     backlog_frames = _wal_frames(db_path)
@@ -833,6 +866,7 @@ def test_a_durable_reclaim_failure_is_retried_at_most_once_a_minute(
     the same one-minute cadence as a refusal, and reclaim resumes once the
     cause clears."""
     ns, conn, retention, _ = _env(tmp_path, monkeypatch)
+    _floor_planner_budget(monkeypatch, retention)
     _fill_and_free(conn, rows=3000)
     retention._stamp_retention_prune(conn, NOW)
     conn.commit()
@@ -881,6 +915,8 @@ import datetime as dt, os, sqlite3, sys
 sys.path.insert(0, sys.argv[1])
 import _lib_conversation_retention as r
 db, op, point = sys.argv[2], sys.argv[3], sys.argv[4]
+# #990: the parent's planner floor; a monkeypatch cannot reach this process.
+r._PLANNER_MIN_DEADLINE_SECONDS = float(sys.argv[5])
 
 
 class Crash:
@@ -937,13 +973,15 @@ def test_a_crash_at_each_commit_point(tmp_path, monkeypatch, op, point):
         delete_reservation = _reservation_rows(conn, 400)
     else:
         _fill_and_free(conn)
+        _floor_planner_budget(monkeypatch, retention)
     free_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
     conn.close()
     env = {**os.environ, "HOME": str(tmp_path),
            "CCTALLY_DATA_DIR": str(_cctally_core.APP_DIR),
            "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
     child = subprocess.run(
-        [sys.executable, "-c", _CRASH_CHILD, str(_BIN), str(db_path), op, point],
+        [sys.executable, "-c", _CRASH_CHILD, str(_BIN), str(db_path), op, point,
+         repr(retention._PLANNER_MIN_DEADLINE_SECONDS)],
         env=env, capture_output=True, text=True, timeout=120)
     assert child.returncode == 17, child.stderr
     conn = sqlite3.connect(db_path)

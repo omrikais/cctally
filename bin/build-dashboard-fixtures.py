@@ -2555,13 +2555,24 @@ def _real_store_pass(app_dir: Path, *, now: dt.datetime, action) -> None:
         spec.loader.exec_module(module)
     import _cctally_core
 
+    # #787 / #861 spec 5.1: this script's thread is a process owner.
+    _cctally_core.establish_script_owner()
     _cctally_core._init_paths_from_env()
+    # #787 / #861 AD20, AD22: the projector's cache reads are query sessions,
+    # which read only a private data dir and treat a missing maintenance lock
+    # as an absent store. Model the install an owner open leaves; both lock
+    # files are side artifacts the prune below removes.
+    previous_mode = app_dir.stat().st_mode & 0o777
+    app_dir.chmod(0o700)
+    for lock in ("cache.db.maintenance.lock", "stats.db.maintenance.lock"):
+        (app_dir / lock).touch()
     try:
         action(_cctally_core)
         _seed_fixture_weekly_confirmation(app_dir, now=now)
     finally:
         _pin_reconcile_nondeterminism(app_dir)
         _prune_reconcile_side_artifacts(app_dir)
+        app_dir.chmod(previous_mode)
         if previous_data_dir is None:
             os.environ.pop("CCTALLY_DATA_DIR", None)
         else:
@@ -2746,6 +2757,12 @@ _RECONCILE_SIDE_ARTIFACTS: frozenset[str] = frozenset({
     # A legacy cutover pass (`cut_over_with_weekly_confirmation`) over a store
     # whose stats open consults cache.db takes the cache maintenance lock.
     "cache.db.maintenance.lock",
+    # The Codex projector pass's fenced certificate finalization
+    # (`_cctally_quota._finalize_codex_quota_publication`, #1069) takes the
+    # global then the Codex cache writer flock at their production paths
+    # before it prunes the change ledger and stores the certificate.
+    "cache.db.codex.lock",
+    "cache.db.lock",
     "config.json",
     "config.json.lock",
     "journal",

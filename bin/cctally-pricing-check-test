@@ -134,10 +134,16 @@ run_scenario () {
     local golden="$GOLDEN_ROOT/$name/expected.json"
     local scratch="$SCRATCH_ROOT/$name"
     mkdir -p "$scratch/.local/share/cctally"
+    # Every install's data dir is 0700 (ensure_dirs) and every owner-created
+    # cache.db has its maintenance lock beside it; the coverage leg reads
+    # cache.db through a #787 diagnostic session, which reads only such a
+    # store (spec 5.4), as tests/test_pricing_check.py's seed already does.
+    chmod 700 "$scratch/.local/share/cctally"
 
     # Seed cache.db from the committed fixture (every scenario has one).
     if [ -f "$dir/cache.db" ]; then
         cp "$dir/cache.db" "$scratch/.local/share/cctally/cache.db"
+        : > "$scratch/.local/share/cctally/cache.db.maintenance.lock"
     fi
 
     # Per-scenario env-hook values + flags. Default both hooks empty so an

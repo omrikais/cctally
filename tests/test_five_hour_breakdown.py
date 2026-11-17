@@ -1268,6 +1268,10 @@ _R8_DERIVED_COLUMN_SITES = {
     # view; neither can contain either five_hour_blocks weekly axis.
     ("_cctally_cache.py", "_load_cursor_snapshot"): "dynamic-table-not-blocks",
     ("_cctally_cache.py", "_install_codex_last_good_views"): "dynamic-table-not-blocks",
+    # #1068: the account scoper's TEMP rollup reorder; its two callers pass
+    # the fixed TEMP tables conversation_sessions and
+    # codex_conversation_rollups, neither of which holds a weekly axis.
+    ("_cctally_cache.py", "_rewrite_temp_rollup_in_key_order"): "dynamic-table-not-blocks",
     ("_cctally_core.py", "_get_latest_row_for_week"): "dynamic-table-not-blocks",
     ("_cctally_five_hour.py", "_load_breakdown"): "dynamic-table-not-blocks",
     ("_cctally_quota.py",

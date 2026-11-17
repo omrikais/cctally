@@ -10,6 +10,7 @@ import threading
 import pytest
 
 from conftest import load_script, redirect_paths
+from conftest import as_process_owner  # noqa: E402
 
 
 UTC = dt.timezone.utc
@@ -416,7 +417,8 @@ def test_parallel_claim_rebuild_reappearance_and_label_change_never_refire(
         except Exception as exc:  # assertion below preserves the worker error
             failures.append(exc)
 
-    threads = [threading.Thread(target=run), threading.Thread(target=run)]
+    threads = [threading.Thread(target=as_process_owner(run)),
+               threading.Thread(target=as_process_owner(run))]
     for thread in threads:
         thread.start()
     for thread in threads:

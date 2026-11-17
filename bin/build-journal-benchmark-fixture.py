@@ -57,6 +57,8 @@ def _load_cctally():
         mod = importlib.util.module_from_spec(spec)
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+    # #787 / #861 spec 5.1: this script's thread is a process owner.
+    sys.modules["_cctally_core"].establish_script_owner()
 
 
 class FixtureShapeError(AssertionError):

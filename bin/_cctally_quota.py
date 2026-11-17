@@ -9,7 +9,11 @@ stats generation from the physical cache.
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
+import hashlib
 import json
+import math
+import os
 import secrets
 import sqlite3
 import sys
@@ -194,6 +198,9 @@ PROJECTION_READ_CHOKEPOINTS: "frozenset[str]" = frozenset({
     "_cctally_quota.py::_orphan_unseen::quota_window_blocks",
     "_cctally_quota.py::_orphan_unseen_scoped::quota_window_blocks",
     "_cctally_quota.py::_apply_quota_projection_rows::quota_projection_state",
+    "_cctally_quota.py::_codex_projection_witness::quota_projection_state",
+    "_cctally_quota.py::_codex_historical_block_spans::quota_window_blocks",
+    "_cctally_quota.py::_codex_projected_rows_present::quota_window_blocks",
     "_cctally_diagnosis_sources.py::<module>::quota_window_blocks",
 })
 
@@ -246,6 +253,22 @@ PROJECTION_READ_SITE_ACTIONS: "dict[str, str]" = {
     "_cctally_quota.py::_orphan_unseen_scoped::quota_window_blocks":
         "projector",
     "_cctally_quota.py::_apply_quota_projection_rows::quota_projection_state":
+        "projector",
+    # #1069/#1071: the publication witness and the interleave closure's
+    # historical spans are read by the Codex pass while it PREPARES a
+    # publication, so like the reads above they must work while the flag is
+    # set. Neither renders a projection value, and neither reads a failure as
+    # empty: an unreadable witness never compares equal (the leg re-prepares),
+    # and unreadable spans are `readable=False`, which brings every affected
+    # family whole instead of narrowing the closure.
+    "_cctally_quota.py::_codex_projection_witness::quota_projection_state":
+        "projector",
+    "_cctally_quota.py::_codex_historical_block_spans::quota_window_blocks":
+        "projector",
+    # #1069 Q4: the empty-store probe reads while the pass prepares, so it is
+    # projector machinery too; a denied read reports rows present, which keeps
+    # the pass on its ordinary route rather than certifying nothing owed.
+    "_cctally_quota.py::_codex_projected_rows_present::quota_window_blocks":
         "projector",
     # `cctally explain` holds its Codex block SQL as a module-level constant,
     # so the function that executes it gates instead.
@@ -362,7 +385,27 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # `_next_codex_debt_row`'s two keyset reads one of the two literal
     # prune-debt tables. None reaches a projection family, so none needs an
     # entry below.
-    "_cctally_cache.py": 25,
+    # Thirty-three since #1068: the account-scoped rollup reuse reads the
+    # `schema_migrations`, `schema_migrations_skipped` and `cache_meta` of
+    # `main` or `cache_db` (`_conversation_rollup_epoch`,
+    # `_rollup_certification_allowed`, `_scoped_reuse_schema_gate`), the
+    # fingerprint stamp reads one row of `{target}`, the browse rollup or its
+    # staging twin (`_fill_conversation_sessions_filter_columns`), and
+    # `_rewrite_temp_rollup_in_key_order` copies a fixed TEMP rollup table
+    # (`conversation_sessions` or `codex_conversation_rollups`) through its
+    # temporary twin. None reaches a projection family, so none needs an
+    # entry below.
+    # Thirty-four since #1041: `_write_conversation_fts_merge_options` reads
+    # each present conversation FTS index's `automerge`/`crisismerge` from
+    # `main.{table}_config`, where `{table}` iterates the hardcoded
+    # `CONVERSATION_FTS_TABLES` triple (the two message indexes and the title
+    # index). An FTS5 config shadow is never a projection family, so it needs
+    # no entry below.
+    # Thirty-five since #787 / #861: `_request_meta_present` (the request
+    # writer's ingest-evidence probe) reads `{schema}.cache_meta`, where
+    # `{schema}` is `main` or the attached `cache_db` alias: a meta table,
+    # never a projection family, so it needs no entry below.
+    "_cctally_cache.py": 35,
     # One, not two, since #750 S4: `_get_latest_row_for_week` composed
     # its `WHERE` clauses instead of branching on `as_of_utc`, so its
     # two near-identical `FROM {table_name}` reads became one. The
@@ -375,7 +418,9 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # an operator line, not a statement, and no longer counts. Seven since
     # #927: `_codex_identity_families_empty` probes the same hardcoded
     # `CODEX_IDENTITY_INVENTORY_FAMILIES` tuple, none a projection family.
-    "_cctally_db.py": 7,
+    # Nine since #1068: `migration_fence_present` probes the `sqlite_master`
+    # and `cache_meta` of `main` or `cache_db` for a migration fence row.
+    "_cctally_db.py": 9,
     "_cctally_doctor.py": 2,
     "_cctally_five_hour.py": 1,
     # Sixteen, not eighteen: the two `event {} rev {} conflicts with effective
@@ -421,11 +466,35 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # or `five_hour_blocks`; neither site reaches a quota projection table, so
     # no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
     "_cctally_statusline.py": 2,
+    # Eight, all new with #787 / #861: the query session's readiness reads.
+    # `_migration_state` reads `{schema}.schema_migrations` and
+    # `{schema}.schema_migrations_skipped`, `_applied_names`
+    # `{schema}.schema_migrations`, `_cache_meta_value` and
+    # `_codex_maintenance_debt` `{schema}.cache_meta`, `_codex_maintenance_debt`
+    # `{schema}.sqlite_master` and `{schema}.codex_prune_debt`, and
+    # `_read_store` `{schema}.sqlite_master`. `{schema}` is `main` or one
+    # fixed attachment alias. None is a projection family, so none needs an
+    # entry below.
+    "_cctally_store_access.py": 8,
     # One, in `_codex_rollup_revision`: the table is selected from a hardcoded
     # pair of Codex conversation rollups. Neither is a quota projection table,
     # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
     "_lib_codex_conversation_query.py": 1,
-    "_lib_conversation_query.py": 1,
+    # Two since #1094: `_any_content`'s `SELECT 1 FROM main.{content}` and
+    # `_source_bytes`'s `SELECT coalesce(sum(…)) FROM main.{content}`, where
+    # `{content}` iterates the hardcoded `CONTENT_TABLES` triple
+    # (`conversation_messages`, `codex_conversation_messages`,
+    # `conversation_ai_titles`) of `conversations.db`. None is a projection
+    # table, so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_lib_conversation_fts_integrity.py": 2,
+    # Four since #1093: `_search_title` names each path's title source once
+    # and interpolates it into the shared matched-title page template
+    # (`FROM {source}`) and into that path's count (`SELECT COUNT(*) FROM
+    # {source}`). `{source}` is one of two hardcoded strings, the FTS path's
+    # `conversation_title_fts f JOIN conversation_ai_titles t` or the LIKE
+    # path's `conversation_ai_titles t`. Neither is a projection table, so no
+    # `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_lib_conversation_query.py": 4,
     # Four, not two, since #901's paced retention (`f2077468a`, spec §5.4):
     # `group_row_count` counts the rows a deletion's reservation charges with
     # `SELECT COUNT(*) FROM {table}` in its two shapes (by identity key, and by
@@ -618,6 +687,24 @@ CODEX_QUOTA_VERIFY_MARKER_NAME = "codex-quota-verify.last-attempt"
 #: interval if a worker dies.
 CODEX_QUOTA_VERIFY_SPAWN_THROTTLE_SECONDS = 600
 
+#: #1070 (spec §5.6, Q16): the non-blocking flock serializing the marker's
+#: check and stamp, so concurrent hooks that each observe pending alert work
+#: reserve ONE spawn between them — a hook that loses it is ``throttled``.
+CODEX_QUOTA_VERIFY_RESERVATION_NAME = "codex-quota-verify.spawn.lock"
+
+#: #1070 (spec §5.6, Q12): the durable pending-work sidecar of the deferred
+#: Codex quota alert activation. An activation that needs complete root
+#: histories (a delivery-gate enable, a rule change, an owned or legacy
+#: scheduled evaluation) never runs on the hook; the hook records it here with
+#: its own ``now`` as the per-root cutoff and the ``_codex-quota-verify``
+#: worker completes it. In ``APP_DIR`` rather than stats.db so a stats rebuild
+#: preserves it, and separate from the spawn marker because pending work is
+#: independent of spawn attempts. Mutated only under ``journal.ingest.lock``.
+CODEX_QUOTA_ALERT_OBLIGATIONS_NAME = "codex-quota-alert-obligations.json"
+CODEX_QUOTA_ALERT_OBLIGATIONS_VERSION = 1
+_ALERT_OBLIGATION_REASONS = frozenset({
+    "gate_enabled", "rule_changed", "scheduled", "scheduled_legacy"})
+
 
 @dataclass(frozen=True)
 class QuotaProjectionResult:
@@ -630,14 +717,45 @@ class QuotaProjectionResult:
     milestones_orphaned: int
     roots_stamped: int
     alerts_dispatched: int
-    #: ``"published"`` for every pass that ran, ``"deferred_model"`` when the
-    #: #980 model-resolution fence refused it (D6): no projection rows and no
-    #: certificate were written, and the drain executor was requested.
+    #: What the reconcile actually did (#1069). Every return of
+    #: ``reconcile_codex_quota_projection`` sets it explicitly; the default
+    #: stays ``"published"`` only for the dataclass's other constructors.
+    #:
+    #: * ``"published"`` — the leg applied and the cycle committed (scoped,
+    #:   root-complete or whole-history), with its generation and counts.
+    #: * ``"current"`` — nothing was owed: a certificate-backed short-circuit,
+    #:   a superseded preparation that re-prepared to nothing, or an empty store.
+    #: * ``"deferred_verify"`` — whole-history work was handed to the
+    #:   ``_codex-quota-verify`` worker and nothing was applied.
+    #: * ``"deferred_model"`` — the #980 model-resolution fence refused it (D6):
+    #:   no projection rows and no certificate, the drain executor requested.
+    #: * ``"contended"`` — the ingest never ran: its lock was refused
+    #:   (``run_stats_ingest`` returned ``ran=False``), or the call was nested
+    #:   inside a held ingest (#1076 D4).
+    #: * ``"unavailable"`` — the cache could not be read, or (#1070) the pass
+    #:   was withheld because its alert obligation could not be recorded.
     status: str = "published"
+    #: #1070 (spec §5.6, Q13): complete-history alert work is still owed — a
+    #: recorded or merged obligation, or a damaged obligation sidecar. Separate
+    #: from ``status`` so a committed bounded publication keeps its real status
+    #: and counts; the hook never acknowledges lifecycle success while it is
+    #: set and requests the verify worker once its lifecycle locks are released.
+    alert_work_pending: bool = False
+    #: Why alert work is still pending when the obligation sidecar itself is
+    #: the blocker: ``"alert_obligations_unwritable"`` (a recording, a
+    #: supersession or a removal failed) or ``"alert_obligations_unreadable"``
+    #: (a damaged sidecar); empty otherwise. The worker's log token.
+    alert_work_issue: str = ""
 
 
 #: #980 D6: the status a refused projection publisher returns.
 PROJECTION_DEFERRED_MODEL = "deferred_model"
+#: #1069 (spec §5.1): the remaining explicit outcomes.
+PROJECTION_PUBLISHED = "published"
+PROJECTION_CURRENT = "current"
+PROJECTION_DEFERRED_VERIFY = "deferred_verify"
+PROJECTION_CONTENDED = "contended"
+PROJECTION_UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True)
@@ -670,8 +788,24 @@ def _physical_tuple(observation: QuotaObservation) -> tuple[dt.datetime, str, in
     return (observation.captured_at, observation.source_path, observation.line_offset)
 
 
-def _cache_connection() -> sqlite3.Connection:
-    """Open a read-only cache connection without invoking or re-running ingest."""
+def _cache_connection():
+    """A read-only cache reader without invoking or re-running ingest.
+
+    #787 / #861 AD21: every statement is one query session (an explicit
+    ``BEGIN`` ... ``COMMIT`` bracket is one), never the startup phase: a
+    missing store is still ``FileNotFoundError`` and a store that is not
+    readable is a typed `StoreUnavailable` (a ``sqlite3.DatabaseError``)."""
+    path = _cctally_core.CACHE_DB_PATH
+    if not path.exists():
+        raise FileNotFoundError(path)
+    import _cctally_store_access as _store_access
+    return _store_access.statement_reader(
+        "cache", row_factory=sqlite3.Row, startup=False)
+
+
+def _cache_connection_owner() -> sqlite3.Connection:
+    """The maintenance owner's raw read-only cache connection (the rebuild's
+    rematerialization runs under its own maintenance authority)."""
     path = _cctally_core.CACHE_DB_PATH
     if not path.exists():
         raise FileNotFoundError(path)
@@ -786,45 +920,63 @@ def _store_codex_quota_projection_certificate(
     signatures: Mapping[str, str],
     prune_ledger_through: "int | None" = None,
     attribution_revision: "int | None" = None,
-) -> None:
-    """Stamp exact validated signatures only if cache physical state is unchanged.
+    expected_ledger_high: "int | None" = None,
+    delete_on_mismatch: bool = False,
+) -> str:
+    """Prune the consumed ledger and stamp the certificate, behind fences.
 
-    The certificate is written after the independent stats transaction commits.
-    A later cache mutation necessarily advances ``sequence``, so a dashboard
-    reader fails coherence rather than combining new physical cache data with
-    the prior projection certificate.
+    Returns ``"stored"``, ``"fenced"`` or ``"skipped"``.
 
-    ``prune_ledger_through`` (public #5) deletes consumed change-ledger entries
-    in the same transaction. Nothing else prunes them, and nothing bounds them:
-    a ``cache-sync --rebuild`` on a 211K-observation store wipes and re-ingests,
-    which the triggers record as roughly 422K rows (one delete plus one insert
-    each). Entries at or below the committed watermark are provably consumed —
-    the projection that consumed them is already durable — and ``seq`` is
-    ``AUTOINCREMENT``, so a pruned high value is never reissued and the
-    watermark can never be overtaken from below.
+    The fences are checked FIRST, in the one ``BEGIN IMMEDIATE`` (#1069): the
+    live physical sequence must equal ``sequence``; the live attribution
+    revision must equal ``attribution_revision`` (#500 §8.3, the semantic twin
+    of the sequence, which needs no concurrency to move — the pass's OWN ingest
+    cycle materializes a pending ``codex_window_attribution`` op after the
+    observations are loaded); when ``expected_ledger_high`` is given, the live
+    ledger head must equal it; and no model-resolution debt may stand (#980
+    D6: no certificate while resolution is owed). ``None`` means no gate for
+    the first two, for callers that are not a projection pass.
 
-    The prune runs even when the certificate itself is declined: a sequence that
-    advanced mid-pass means new evidence landed, not that the old entries are
-    unconsumed.
+    All equal: ``prune_ledger_through`` (public #5) deletes the consumed
+    change-ledger entries and the certificate is stored — ``"stored"``.
+    Entries at or below the committed watermark are provably consumed, and
+    ``seq`` is ``AUTOINCREMENT``, so a pruned high value is never reissued.
 
-    ``attribution_revision`` (#500 §8.3) is the SEMANTIC twin of ``sequence``
-    and is gated the same way: the caller passes the revision its pass actually
-    computed against, and a live revision that no longer equals it declines the
-    stamp. Reading the live value here instead would certify a projection built
-    from observations that never saw the assertion — and it needs no concurrency
-    to happen, because the pass's OWN ingest cycle materializes a pending
-    ``codex_window_attribution`` op after the observations are loaded. That is
-    §8.5's ``recordedPending`` state, and the certificate would poison every
-    later reconcile with a confident no-op. ``None`` means no gate, for callers
-    that are not a projection pass.
+    Any mismatch: nothing is pruned — the entries above a moved head are not
+    this publication's, and pruning before checking let a superseded pass
+    delete the entries a newer one still owed — and, with
+    ``delete_on_mismatch``, the stored certificate is deleted, because the
+    publication just committed is the newest and no stored certificate
+    describes it. ``"fenced"``.
+
+    A missing cache or any ``sqlite3.Error`` rolls back and returns
+    ``"skipped"``; pruning and certification stay recoverable work for the
+    next finalization.
     """
     path = _cctally_core.CACHE_DB_PATH
     if not path.exists():
-        return
+        return "skipped"
     try:
         conn = sqlite3.connect(path)
         try:
             conn.execute("BEGIN IMMEDIATE")
+            live_revision = _cache_module().codex_window_attribution_revision(
+                conn)
+            fenced = (
+                codex_physical_mutation_seq(conn) != sequence
+                or (attribution_revision is not None
+                    and live_revision != int(attribution_revision))
+                or (expected_ledger_high is not None
+                    and _ledger_max_seq(conn) != int(expected_ledger_high))
+                or _cache_module().codex_model_resolution_pending(conn)
+            )
+            if fenced:
+                if delete_on_mismatch:
+                    conn.execute(
+                        "DELETE FROM cache_meta WHERE key=?",
+                        (_DASHBOARD_PROJECTION_CERTIFICATE_KEY,))
+                conn.commit()
+                return "fenced"
             if prune_ledger_through:
                 try:
                     conn.execute(
@@ -833,17 +985,6 @@ def _store_codex_quota_projection_certificate(
                     )
                 except sqlite3.OperationalError:
                     pass  # a cache too old to carry the ledger
-            if codex_physical_mutation_seq(conn) != sequence:
-                conn.commit()
-                return
-            live_revision = _cache_module().codex_window_attribution_revision(
-                conn)
-            if (
-                attribution_revision is not None
-                and live_revision != int(attribution_revision)
-            ):
-                conn.commit()
-                return
             payload = json.dumps({
                 "interpretationVersion": _CODEX_QUOTA_INTERPRETATION_VERSION,
                 "sequence": sequence,
@@ -858,10 +999,17 @@ def _store_codex_quota_projection_certificate(
                 (_DASHBOARD_PROJECTION_CERTIFICATE_KEY, payload),
             )
             conn.commit()
+            return "stored"
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         finally:
             conn.close()
     except sqlite3.Error:
-        return
+        return "skipped"
 
 
 def _stats_projection_signatures_match(
@@ -893,9 +1041,21 @@ def _stats_projection_signatures_match(
         ).fetchall()
     except sqlite3.Error:
         return False
+    return _projection_signatures_match_rows(
+        ((row[0], row[2]) for row in rows), active_roots, cert_sigs)
+
+
+def _projection_signatures_match_rows(
+    rows: "Iterable[tuple[object, object]]",
+    active_roots: "Iterable[str]",
+    cert_sigs: Mapping[str, str],
+) -> bool:
+    """The decision of ``_stats_projection_signatures_match`` over rows already
+    read as ``(source_root_key, physical_signature)`` — the preparation computes
+    it from its witness, so the verdict and the witness are one stats read."""
     by_root: dict[str, set[str]] = {}
-    for row in rows:
-        by_root.setdefault(str(row[0]), set()).add(str(row[2]))
+    for root_key, signature in rows:
+        by_root.setdefault(str(root_key), set()).add(str(signature))
     for root in active_roots:
         stored = by_root.get(root)
         if not stored or len(stored) != 1:
@@ -1021,6 +1181,286 @@ def _log_codex_worker_outcome(
         pass
 
 
+@dataclass(frozen=True)
+class _AlertObligations:
+    """One read of the alert-obligation sidecar (#1070, spec §5.6).
+
+    ``state`` is ``"absent"`` (no request), ``"readable"``, ``"unreadable"``
+    (an ``OSError`` on read, invalid JSON or an invalid request) or
+    ``"unsupported"`` (a ``version`` this binary does not know). The last two
+    are DAMAGED: their bytes are preserved and their contents count as unknown
+    pending work for every applicable root, because stats cannot prove the
+    absence of an obligation — journal replay restores an arming row and its
+    fingerprint even when the activation that wrote them crashed before its
+    historical suppressions (Appendix B round 4).
+    """
+
+    state: str
+    requests: "tuple[dict, ...]" = ()
+
+    @property
+    def damaged(self) -> bool:
+        return self.state in ("unreadable", "unsupported")
+
+
+def _alert_obligations_path():
+    return _cctally_core.APP_DIR / CODEX_QUOTA_ALERT_OBLIGATIONS_NAME
+
+
+def _valid_alert_obligation(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    try:
+        if not isinstance(value["id"], str) or not value["id"]:
+            return False
+        if value["reason"] not in _ALERT_OBLIGATION_REASONS:
+            return False
+        if not isinstance(value["config_fingerprint"], str):
+            return False
+        roots = value["roots"]
+        if not isinstance(roots, list) or not all(
+                isinstance(root, str) and root for root in roots):
+            return False
+        cutoffs = value["cutoffs"]
+        if not isinstance(cutoffs, dict):
+            return False
+        for root, cutoff in cutoffs.items():
+            if not isinstance(root, str) or not root:
+                return False
+            _parse_utc(str(cutoff), "alert obligation cutoff")
+        _parse_utc(str(value["created_at"]), "alert obligation created_at")
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _read_codex_alert_obligations() -> _AlertObligations:
+    """Read the sidecar into one of its three distinct states; never raises."""
+    try:
+        raw = _alert_obligations_path().read_bytes()
+    except FileNotFoundError:
+        return _AlertObligations("absent")
+    except OSError:
+        return _AlertObligations("unreadable")
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return _AlertObligations("unreadable")
+    if not isinstance(document, dict):
+        return _AlertObligations("unreadable")
+    version = document.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return _AlertObligations("unreadable")
+    if version != CODEX_QUOTA_ALERT_OBLIGATIONS_VERSION:
+        return _AlertObligations("unsupported")
+    requests = document.get("requests")
+    if not isinstance(requests, list) or not all(
+            _valid_alert_obligation(request) for request in requests):
+        return _AlertObligations("unreadable")
+    return _AlertObligations(
+        "readable", tuple(dict(request) for request in requests))
+
+
+def _write_codex_alert_obligations(requests: "Iterable[dict]") -> None:
+    """Durably replace the sidecar's request set; raises ``OSError``.
+
+    The order of ``_cctally_journal._atomic_write_json`` — a temporary file in
+    ``APP_DIR``, its fsync, ``os.replace``, then the fsync of ``APP_DIR`` —
+    through the journal's own ``_fsync_dir``. That writer is tied to the
+    account-bound directory, so it is not called. A request is the hand-off's
+    only record of its cutoff: a machine crash after the bounded publication
+    commits must not lose it, so a caller treats ANY failure here as "not
+    recorded" (spec §5.6, Appendix B round 4 P2).
+    """
+    import _cctally_journal as _jr
+
+    app_dir = _cctally_core.APP_DIR
+    app_dir.mkdir(parents=True, exist_ok=True)
+    target = app_dir / CODEX_QUOTA_ALERT_OBLIGATIONS_NAME
+    data = (json.dumps(
+        {"version": CODEX_QUOTA_ALERT_OBLIGATIONS_VERSION,
+         "requests": list(requests)},
+        sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    temporary = app_dir / (
+        f".{CODEX_QUOTA_ALERT_OBLIGATIONS_NAME}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short write to the alert obligation sidecar")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, target)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    _jr._fsync_dir(app_dir)
+
+
+def _cancel_codex_alert_obligations() -> None:
+    """End the delivery generation (a live disarm executed); raises ``OSError``.
+
+    A damaged file is first moved aside to ``<name>.unreadable-<UTC stamp>``
+    (its bytes kept for diagnosis), then the empty request set is written. An
+    absent file stays absent.
+    """
+    state = _read_codex_alert_obligations()
+    if state.state == "absent":
+        return
+    if state.damaged:
+        source = _alert_obligations_path()
+        stamp = dt.datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        os.replace(source, source.with_name(f"{source.name}.unreadable-{stamp}"))
+    elif not state.requests:
+        return
+    _write_codex_alert_obligations(())
+
+
+def _codex_alert_config_fingerprint(alert_config: "QuotaAlertConfig") -> str:
+    """A digest of one resolved alert-configuration snapshot (§5.2): a request
+    belongs to the configuration generation it was recorded under."""
+    global_enabled, quota_enabled, _rules, config = alert_config
+    payload = json.dumps(
+        [bool(global_enabled), bool(quota_enabled), config],
+        sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _alert_obligation_owed_roots(request: dict, applicable) -> "set[str]":
+    """The roots a request owes among ``applicable``: its own roots, or every
+    applicable root for a global request (empty ``roots``)."""
+    roots = request["roots"]
+    return set(applicable) if not roots else set(roots) & set(applicable)
+
+
+def _alert_obligations_newer_than(
+    requests: "Sequence[dict]", fingerprint: str, now_iso: str,
+) -> bool:
+    """Whether a request under another fingerprint was created after
+    ``now_iso``: the leg holding ``now_iso`` is then stale (spec §5.6, Q5).
+    An unparsable instant compares as not newer, which keeps the ordinary
+    supersession (the reader already rejects such a sidecar as damaged)."""
+    try:
+        now = _parse_utc(str(now_iso), "alert obligation now")
+    except (TypeError, ValueError):
+        return False
+    for request in requests:
+        if request["config_fingerprint"] == fingerprint:
+            continue
+        try:
+            created = _parse_utc(
+                str(request["created_at"]), "alert obligation created_at")
+        except (TypeError, ValueError):
+            continue
+        if created > now:
+            return True
+    return False
+
+
+def _merge_codex_alert_obligations(
+    requests: "Sequence[dict]", *, derived, fingerprint: str,
+    observed_roots, now_iso: str,
+) -> "tuple[list[dict], bool]":
+    """Merge one eligible pass's view into the pending requests (spec §5.6).
+
+    ``observed_roots`` are the roots this pass is the eligible observer of.
+    A request recorded under another configuration fingerprint is superseded:
+    a new id, this fingerprint and this pass's ``now`` as every cutoff — a
+    configuration change never borrows the old generation's boundary. An owed
+    root without a cutoff gets this pass's ``now``; an existing cutoff never
+    moves. Each derived ``(reason, roots)`` keeps a matching request (same
+    reason and fingerprint; new roots join it with this cutoff) or creates
+    one. Returns the merged list and whether anything changed.
+
+    A STALE leg changes nothing: one whose ``now`` precedes the creation of
+    a request recorded under another fingerprint was prepared before that
+    configuration existed (Q5 re-reads no configuration in the lock), so its
+    view is older than the request's. Superseding there would replace the
+    newer generation's first validated hand-off with this earlier leg's
+    fingerprint, and the next current hook would supersede again at its own
+    later ``now``: the activation cutoff would move past the first hand-off.
+    The comparison is between parsed instants, because the writers' spellings
+    (``…Z`` against ``….500000+00:00``) do not sort in time order.
+    """
+    observed = set(observed_roots)
+    if _alert_obligations_newer_than(requests, fingerprint, now_iso):
+        return [dict(request) for request in requests], False
+    merged: "list[dict]" = []
+    changed = False
+    for request in requests:
+        request = {**request, "cutoffs": dict(request["cutoffs"])}
+        if request["config_fingerprint"] != fingerprint:
+            request = {
+                **request, "id": secrets.token_hex(16),
+                "config_fingerprint": fingerprint,
+                "cutoffs": {
+                    root: now_iso for root in (
+                        set(request["cutoffs"])
+                        | _alert_obligation_owed_roots(request, observed))},
+                "created_at": now_iso,
+            }
+            changed = True
+        merged.append(request)
+    for reason, roots in derived:
+        roots = sorted(set(roots))
+        target = next(
+            (request for request in merged
+             if request["reason"] == reason
+             and request["config_fingerprint"] == fingerprint
+             and (not request["roots"]) == (not roots)), None)
+        if target is None:
+            merged.append({
+                "id": secrets.token_hex(16), "reason": reason,
+                "config_fingerprint": fingerprint, "roots": roots,
+                "cutoffs": {}, "created_at": now_iso,
+            })
+            changed = True
+        elif roots and not set(roots) <= set(target["roots"]):
+            target["roots"] = sorted(set(target["roots"]) | set(roots))
+            changed = True
+    for request in merged:
+        for root in sorted(_alert_obligation_owed_roots(request, observed)):
+            if root not in request["cutoffs"]:
+                request["cutoffs"][root] = now_iso
+                changed = True
+    return merged, changed
+
+
+def _deferred_alert_obligations(
+    alert_scope, detail: dict, applicable: "frozenset[str]",
+) -> "tuple[tuple[str, frozenset[str]], ...]":
+    """The complete-history alert work a ``"defer"`` pass hands to the worker
+    (spec §5.6, Q15): a delivery-gate enable (including a rebuild's NULL gate),
+    a rule change, an owned scheduled instant and a legacy scalar boundary
+    (``REASON_SCHEDULED_DEFERRED``, which a reporting-only verifier can never
+    discharge). Root-scoped work is narrowed to the roots this pass is the
+    eligible observer of, so a historic root's stale fingerprint can never
+    become an obligation nobody holds a lifecycle lock for."""
+    if alert_scope is None or alert_scope.disarm_all or not applicable:
+        return ()
+    reasons = set(alert_scope.reasons)
+    obligations: "list[tuple[str, frozenset[str]]]" = []
+    if "gate_enabled" in reasons:
+        obligations.append(("gate_enabled", frozenset()))
+    changed = frozenset(detail.get("changed_roots", ())) & applicable
+    if "rule_changed" in reasons and changed:
+        obligations.append(("rule_changed", changed))
+    due = frozenset(detail.get("scheduled_roots") or ()) & applicable
+    if "scheduled" in reasons and due:
+        obligations.append(("scheduled", due))
+    if _axes.REASON_SCHEDULED_DEFERRED in reasons:
+        obligations.append(("scheduled_legacy", frozenset()))
+    return tuple(obligations)
+
+
 def _defer_codex_quota_verification() -> str:
     """Hand the periodic whole-history pass to a detached worker.
 
@@ -1044,19 +1484,38 @@ def _defer_codex_quota_verification() -> str:
     verification.
     """
     marker = _cctally_core.APP_DIR / CODEX_QUOTA_VERIFY_MARKER_NAME
-    try:
-        age = time.time() - marker.stat().st_mtime
-    except OSError:
-        age = None
-    if age is not None and 0 <= age < CODEX_QUOTA_VERIFY_SPAWN_THROTTLE_SECONDS:
-        return "throttled"
+    # #1070 (spec §5.6, Q16): every hook that observes pending alert work
+    # requests the worker, so the marker's check and stamp are serialized by a
+    # non-blocking flock — concurrent hooks reserve ONE spawn, and the loser is
+    # `throttled` without stamping or spawning.
     try:
         _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
-        marker.touch()
+        reservation = os.open(
+            _cctally_core.APP_DIR / CODEX_QUOTA_VERIFY_RESERVATION_NAME,
+            os.O_CREAT | os.O_RDWR, 0o600)
     except OSError:
         _log_codex_worker_outcome(
             "quota-verify-spawn", "failed", "reason=marker_unwritable")
         return "failed"
+    try:
+        try:
+            fcntl.flock(reservation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "throttled"
+        try:
+            age = time.time() - marker.stat().st_mtime
+        except OSError:
+            age = None
+        if age is not None and 0 <= age < CODEX_QUOTA_VERIFY_SPAWN_THROTTLE_SECONDS:
+            return "throttled"
+        try:
+            marker.touch()
+        except OSError:
+            _log_codex_worker_outcome(
+                "quota-verify-spawn", "failed", "reason=marker_unwritable")
+            return "failed"
+    finally:
+        os.close(reservation)  # closing the descriptor releases the flock
     from _cctally_update import _spawn_detached
     if _spawn_detached(CODEX_QUOTA_VERIFY_COMMAND):
         _log_codex_worker_outcome("quota-verify-spawn", "spawned")
@@ -1080,13 +1539,27 @@ def _request_codex_model_resolution() -> None:
 
 
 def cmd_codex_quota_verify_internal(args) -> int:
-    """Hidden ``_codex-quota-verify`` handler: the deferred whole-history pass.
+    """Hidden ``_codex-quota-verify`` handler: the deferred whole-history pass,
+    and (#1070, spec §5.6) the deferred Codex quota alert activation.
 
-    Reporting only — no ``alert_eligible_root_keys``, because alert eligibility
-    belongs to whoever holds the per-root lifecycle lock and this worker holds
-    none. That matches every other off-hook caller of the verification (the
-    dashboard tick, ``codex quota``), which is the point: the worker is one of
-    those callers, moved off the blocking path.
+    It reads the alert-obligation sidecar first. With no request it is
+    reporting only — no ``alert_eligible_root_keys``, because alert eligibility
+    belongs to whoever holds the per-root lifecycle lock — which matches every
+    other off-hook caller of the verification (the dashboard tick,
+    ``codex quota``): the worker is one of those callers, moved off the
+    blocking path.
+
+    With pending requests it is the activation the hook could not afford (a
+    complete-history pass took 32 s against Codex's 30 s hook kill, §4.2 M1):
+    it resolves the configured roots exactly as the hook does, takes the owed
+    roots' REAL lifecycle locks non-blocking and all or nothing
+    (``acquire_due_lifecycle_locks(throttle_seconds=0)``), holds them through
+    evaluation, commit and dispatch, and never calls ``mark_lifecycle_success``
+    (it ran neither the hook's sync nor its budget leg). The pass applies each
+    request's cutoff, and the completed requests are removed after the commit.
+    A partial acquisition releases everything and leaves the requests pending.
+    A damaged sidecar keeps the worker reporting-only, so the projection stays
+    fresh while the activation waits for the disarm that ends its generation.
 
     ``last_full_pass_at`` is stamped inside the pass's own stats transaction, so
     a worker that is killed leaves the deadline due and the next tick retries.
@@ -1099,18 +1572,78 @@ def cmd_codex_quota_verify_internal(args) -> int:
     a bare ``except: pass`` made a persistently failing verification completely
     invisible — and because the deadline only moves when a pass COMMITS, such a
     worker respawns every throttle window forever with nothing to show for it.
+    One aggregate line per invocation (Q16): ``result=success`` only when the
+    verification and every applicable requested alert work item completed.
     """
     started = time.monotonic()
+    # #1076 D5: every reconcile this invocation runs reports the Codex budget
+    # reads its off-hook ingest deferred; the line names the first one.
+    deferrals: "list[str]" = []
 
     def _log(outcome: str, detail: str = "", *, error: str = "") -> None:
         _log_codex_worker_outcome(
             "quota-verify", outcome,
             f"dur_ms={max(0, int((time.monotonic() - started) * 1000))}"
-            + (f" {detail}" if detail else ""),
+            + (f" {detail}" if detail else "")
+            + (f" budget_deferral={deferrals[0]}" if deferrals else ""),
             error=error)
 
+    def _counts(result) -> str:
+        return (
+            f"blocks={int(getattr(result, 'blocks_upserted', 0) or 0)} "
+            f"milestones={int(getattr(result, 'milestones_upserted', 0) or 0)}")
+
+    now = _command_as_of().astimezone(UTC)
+    obligations = _read_codex_alert_obligations()
+    if obligations.damaged:
+        # Reporting-only, and a failed hand-off by definition: the requested
+        # activation cannot even be read, so it cannot have completed.
+        #
+        # NOT `force_full`: the damage keeps alert work pending until a
+        # disarm, so every hook requests this worker again (throttled to
+        # `CODEX_QUOTA_VERIFY_SPAWN_THROTTLE_SECONDS`), and a forced pass
+        # re-materialized the whole history (about 30 s of CPU natively) on
+        # every run. An ordinary inline pass keeps every reason this worker
+        # must run a complete one: the periodic verification once
+        # `_full_verification_due` says so, and every catch-all route of
+        # `_resolve_pass_scope` (an absent, rebuilt or version-stale projector
+        # state, a reset ledger, a missing reverse map, a burst); otherwise it
+        # is bounded or short-circuits. A disarm needs no observations, so it
+        # is never short-circuited away (`has_arming`).
+        try:
+            result = reconcile_codex_quota_projection(
+                now=now, _read_deferrals=deferrals)
+        except Exception as exc:
+            from _cctally_record import _hook_log_error_detail
+            _log("error", "mode=verify projection=alert_obligations_unreadable",
+                 error=_hook_log_error_detail(exc))
+            return 0
+        status = getattr(result, "status", None) or PROJECTION_PUBLISHED
+        after = _read_codex_alert_obligations()
+        if after.damaged or after.requests:
+            _log("error",
+                 f"mode=verify projection=alert_obligations_unreadable "
+                 f"status={status} {_counts(result)} pending=1")
+            return 0
+        # The pass executed a live disarm, which ended the damaged
+        # generation (the file moved aside, an empty request set written):
+        # nothing is owed any more, so this is an ordinary verification.
+        detail = f"mode=verify {_counts(result)} pending=0"
+        if status == PROJECTION_DEFERRED_MODEL:
+            _log("deferred", f"projection=deferred {detail}")
+        elif status not in (PROJECTION_PUBLISHED, PROJECTION_CURRENT):
+            _log("error", f"projection={status} {detail}")
+        else:
+            _log("success", f"projection={status} {detail}")
+        return 0
+    if obligations.requests:
+        return _run_codex_alert_activation(
+            obligations, now=now, log=_log, counts=_counts,
+            read_deferrals=deferrals)
+
     try:
-        result = reconcile_codex_quota_projection(force_full=True)
+        result = reconcile_codex_quota_projection(
+            force_full=True, now=now, _read_deferrals=deferrals)
     except Exception as exc:
         # Same defusing as the lifecycle line, for the same two reasons: the
         # `OSError` family's `str()` carries a rollout path, and the log's
@@ -1120,15 +1653,114 @@ def cmd_codex_quota_verify_internal(args) -> int:
         from _cctally_record import _hook_log_error_detail
         _log("error", error=_hook_log_error_detail(exc))
         return 0
-    if getattr(result, "status", None) == PROJECTION_DEFERRED_MODEL:
+    status = getattr(result, "status", None) or PROJECTION_PUBLISHED
+    if status == PROJECTION_DEFERRED_MODEL:
         # #980 D6: refused until model resolution is established; the drain
         # executor was requested and requests this worker again afterwards.
         _log("deferred", "projection=deferred")
         return 0
-    _log(
-        "success",
-        f"blocks={int(getattr(result, 'blocks_upserted', 0) or 0)} "
-        f"milestones={int(getattr(result, 'milestones_upserted', 0) or 0)}")
+    if status not in (PROJECTION_PUBLISHED, PROJECTION_CURRENT):
+        # #1069 spec §5.4: a contended or unavailable pass (or a deferral a
+        # forced pass should never produce) verified nothing. `success` here
+        # would let Doctor read a failing hand-off as healthy, so it is a
+        # failed hand-off with the status as a fixed token.
+        _log("error", f"projection={status}")
+        return 0
+    _log("success", _counts(result))
+    return 0
+
+
+def _run_codex_alert_activation(obligations, *, now, log, counts,
+                                read_deferrals: "list[str]") -> int:
+    """The worker's activation leg (#1070, spec §5.6, Q14).
+
+    The requests name the owed scope, not eligibility: eligibility is the real
+    lifecycle locks of the roots the HOOK's root resolution configures. A
+    global request owes every configured root; a removed root gets no lock and
+    therefore no dispatch, and a newly configured root inherits nothing a
+    request completed. Locks are held through evaluation, commit and dispatch,
+    which all happen inside the reconcile call.
+
+    ``read_deferrals`` is the invocation's collector (#1076 D5): the Codex
+    budget reads the reconcile's off-hook ingest deferred. The obligation and
+    the budget axes are independent (D6): a recorded deferral never turns a
+    completed activation into anything but ``result=success``.
+    """
+    import _cctally_record
+    from _lib_codex_hooks import (
+        acquire_due_lifecycle_locks,
+        release_lifecycle_locks,
+    )
+
+    try:
+        roots = list(_cctally_record._codex_lifecycle_roots())
+        configured = frozenset(root.source_root_key for root in roots)
+        owed: "set[str]" = set()
+        for request in obligations.requests:
+            owed |= _alert_obligation_owed_roots(request, configured)
+        owed_roots = [root for root in roots if root.source_root_key in owed]
+        locks = acquire_due_lifecycle_locks(
+            _cctally_core.APP_DIR, owed_roots, now=time.time(),
+            throttle_seconds=0)
+    except OSError as exc:
+        # An unreadable root configuration or a lifecycle directory that
+        # cannot be created (an ejected or read-only volume): nothing was
+        # locked or evaluated, so the obligation stays exactly as recorded
+        # and this run still leaves its outcome line for Doctor.
+        from _cctally_record import _hook_log_error_detail
+        log("error",
+            "mode=activation projection=alert_lifecycle_unavailable pending=1",
+            error=_hook_log_error_detail(exc))
+        return 0
+    if len(locks) != len(owed_roots):
+        # All or nothing: a partial set cannot retire a global obligation, and
+        # publishing over part of it would activate the rest late.
+        #
+        # Unlike the damaged-sidecar branch, this returns without the due
+        # verification on purpose: contention is transient (a hook or a
+        # sibling worker holds the locks right now), the obligation stays
+        # pending, and every hook that observes pending work requests this
+        # worker again, so the next spawn retries the activation, whose
+        # complete pass is also the verification.
+        release_lifecycle_locks(locks)
+        log("error",
+            f"mode=activation projection=alert_lifecycle_contended "
+            f"roots={len(owed_roots)} locked={len(locks)} pending=1")
+        return 0
+    try:
+        result = reconcile_codex_quota_projection(
+            force_full=True, now=now,
+            alert_eligible_root_keys=frozenset(
+                lock.root.source_root_key for lock in locks),
+            _alert_activation_roots=configured,
+            _read_deferrals=read_deferrals,
+        )
+    except Exception as exc:
+        from _cctally_record import _hook_log_error_detail
+        log("error", "mode=activation projection=alert_activation_failed "
+            "pending=1", error=_hook_log_error_detail(exc))
+        return 0
+    finally:
+        release_lifecycle_locks(locks)
+    status = getattr(result, "status", None) or PROJECTION_PUBLISHED
+    pending = bool(getattr(result, "alert_work_pending", False))
+    detail = (
+        f"mode=activation {counts(result)} roots={len(locks)} "
+        f"alerts={int(getattr(result, 'alerts_dispatched', 0) or 0)} "
+        f"pending={int(pending)}")
+    if status == PROJECTION_DEFERRED_MODEL:
+        log("deferred", f"projection=deferred {detail}")
+        return 0
+    if status not in (PROJECTION_PUBLISHED, PROJECTION_CURRENT):
+        token = getattr(result, "alert_work_issue", "") or status
+        log("error", f"projection={token} status={status} {detail}")
+        return 0
+    if pending:
+        token = (
+            getattr(result, "alert_work_issue", "") or "alert_activation_failed")
+        log("error", f"projection={token} status={status} {detail}")
+        return 0
+    log("success", f"projection={status} {detail}")
     return 0
 
 
@@ -1268,8 +1900,15 @@ def _resolve_alert_scope(
     stats_conn: sqlite3.Connection, *, ledger_scope: str, now: dt.datetime,
     ledger_state: "dict | None", global_enabled: bool, quota_enabled: bool,
     rules, config, eligible_roots: set[str], defer_scheduled: bool = False,
+    detail: "dict | None" = None,
 ) -> _axes.AlertDirtyScope:
-    """Feed the five-axis kernel from stats.db and the resolved configuration."""
+    """Feed the five-axis kernel from stats.db and the resolved configuration.
+
+    ``detail``, when supplied, receives the roots behind each root-scoped
+    reason — ``changed_roots`` (axis 2) and ``scheduled_roots`` (axis 4's
+    matured owners, ``None`` for legacy ownership) — which the kernel's merged
+    ``roots`` cannot separate (#1070: each becomes its own deferred obligation).
+    """
     armed = _armed_identities(stats_conn)
     stored = {key: fingerprint for key, (_ident, fingerprint) in armed.items()}
     resolved = {}
@@ -1301,6 +1940,11 @@ def _resolve_alert_scope(
                 and now >= _parse_utc(
                     captured_at, "next_evaluation_by_root_json")
             )
+    if detail is not None:
+        detail["changed_roots"] = frozenset(
+            key[1] for key, fingerprint in resolved.items()
+            if stored.get(key) != fingerprint)
+        detail["scheduled_roots"] = scheduled_roots
     return _axes.alert_dirty_scope(
         ledger_groups=(1,) if ledger_scope == _axes.SCOPE_GROUPS else (),
         stored_fingerprints=stored,
@@ -1330,6 +1974,50 @@ def _blocks_missing_reverse_map(stats_conn: sqlite3.Connection) -> bool:
             "SELECT 1 FROM quota_window_blocks "
             " WHERE source='codex' AND physical_group_key IS NULL LIMIT 1"
         ).fetchone())
+    except sqlite3.Error:
+        return True
+
+
+def _codex_projected_rows_present(stats_conn: sqlite3.Connection) -> bool:
+    """True when stats.db holds any Codex block, milestone or threshold event.
+
+    Half of the empty-store test (#1069 Q4); the projection-state half is the
+    witness's own rows. Each probe is one ``source='codex' LIMIT 1`` seek on
+    the table's ``(source, …)`` index, and the scope is the whole Codex
+    projection, every root included: a departed root's rows are exactly what
+    only a complete pass can orphan. Fail-safe toward more work — a read it
+    cannot complete reads as rows present.
+    """
+    try:
+        return (
+            stats_conn.execute(
+                "SELECT 1 FROM quota_window_blocks "
+                " WHERE source='codex' LIMIT 1").fetchone() is not None
+            or stats_conn.execute(
+                "SELECT 1 FROM quota_percent_milestones "
+                " WHERE source='codex' LIMIT 1").fetchone() is not None
+            or stats_conn.execute(
+                "SELECT 1 FROM quota_threshold_events "
+                " WHERE source='codex' LIMIT 1").fetchone() is not None
+        )
+    except sqlite3.Error:
+        return True
+
+
+def _codex_observations_present(
+    cache_conn: sqlite3.Connection, roots: "frozenset[str]",
+) -> bool:
+    """True when the cache holds a Codex quota observation for any of
+    ``roots``: one ``idx_quota_window_source_root`` seek per root. The cache
+    half of the empty-store test (#1069 Q4); fail-safe toward more work."""
+    try:
+        return any(
+            cache_conn.execute(
+                "SELECT 1 FROM quota_window_snapshots "
+                " WHERE source_root_key=? AND source='codex' LIMIT 1",
+                (root,),
+            ).fetchone() is not None
+            for root in sorted(roots))
     except sqlite3.Error:
         return True
 
@@ -2025,8 +2713,10 @@ def codex_attribution_projection_scope(
     and the loader's targeted filter matches RAW stored coordinates. One minute
     of weekly jitter lives in both the limit key and the column, so two raw
     groups can interpret into one window and asking only for the un-snapped
-    spelling would hand the fold a partial population. This inherits the ledger's
-    own helper rather than re-deriving the closure.
+    spelling would hand the fold a partial population. This loads through the
+    same ``codex_unit_loading_closure`` the scoped pass uses rather than
+    re-deriving it, which also reaches a sibling pool's ``modelPool`` spelling
+    of the unit (#1071).
 
     **Prior units, not only current ones.** A retraction, a newly dormant
     assertion and a component split all change which unit a group's rows belong
@@ -2048,20 +2738,16 @@ def codex_attribution_projection_scope(
     )
     if not records:
         return None
-    raw: "set[tuple]" = set()
-    units: "set[str]" = set()
+    unit_tuples: "set[tuple]" = set()
     for record in records:
         anchor = _ledger.normalize_reset(record["canonical_resets_at_utc"])
-        group = (
+        unit_tuples.add(_ledger.loading_unit_from_raw((
             str(record["source_root_key"]),
             str(record["logical_limit_key"]),
             str(record["observed_slot"]),
             int(record["window_minutes"]),
             anchor,
-        )
-        raw.add(group)
-        units.add(_ledger.physical_group_key_text(
-            _ledger.loading_unit_from_raw(group)))
+        )))
     resolutions, _ownership = resolve_codex_window_attributions(
         conn, include_retracted=True)
     for resolution in resolutions:
@@ -2069,28 +2755,25 @@ def codex_attribution_projection_scope(
         if group_key is None:
             continue
         # A resolution's group key is the INTERPRETED one, so its unit is taken
-        # through `loading_unit_from_identity` — the half that strips a
-        # `modelPool` member. `loading_unit_from_raw` applies the length snap
-        # only, so a SUPPRESSED_MODEL_SCOPED resolution fed through it would
-        # produce a unit string no block ever wrote, and the sweep would look for
-        # a key nothing stamped. The raw-coordinate filter below is a different
-        # question and keeps the raw helper: the loader matches STORED columns,
-        # and the stored row is what carries the un-stripped key.
-        raw.add((
-            str(group_key[1]), str(group_key[2]), str(group_key[3]),
-            int(group_key[4]), _ledger.normalize_reset(_utc_iso(group_key[5])),
+        # through `loading_unit_from_identity`; both helpers strip a
+        # `modelPool` member (#1071), so a SUPPRESSED_MODEL_SCOPED resolution
+        # names the same unit its blocks stamp.
+        unit_tuples.add(_ledger.loading_unit_from_identity(
+            source_root_key=str(group_key[1]),
+            logical_limit_key=str(group_key[2]),
+            observed_slot=str(group_key[3]),
+            window_minutes=int(group_key[4]),
+            canonical_reset_iso=_utc_iso(group_key[5]),
         ))
-        units.add(_ledger.physical_group_key_text(
-            _ledger.loading_unit_from_identity(
-                source_root_key=str(group_key[1]),
-                logical_limit_key=str(group_key[2]),
-                observed_slot=str(group_key[3]),
-                window_minutes=int(group_key[4]),
-                canonical_reset_iso=_utc_iso(group_key[5]),
-            )))
+    # The loader matches STORED columns, so each unit is loaded through the
+    # shared closure: every stored key spelling of the unit — the `modelPool`
+    # key a sibling pool sits under included — and every minute spelling. The
+    # assertion matching above (`_codex_attribution_stored_limit_keys`) is a
+    # separate question and is not broadened.
     return {
-        "raw_groups": _ledger.snap_equivalent_raw_groups(raw),
-        "units": frozenset(units),
+        "raw_groups": codex_unit_loading_closure(conn, unit_tuples),
+        "units": frozenset(
+            _ledger.physical_group_key_text(unit) for unit in unit_tuples),
     }
 
 
@@ -3127,7 +3810,15 @@ def _orphan_unseen_scoped(
     return (int(blocks), int(milestones))
 
 
-def _quota_alert_config() -> tuple[bool, bool, tuple[QuotaRule, ...], dict]:
+#: The resolved alert configuration ``_quota_alert_config`` returns: the global
+#: gate, the quota gate, the per-identity rules and the JSON-shaped quota block.
+#: A live reconcile reads it ONCE and hands this snapshot to both scope
+#: selection and ``_evaluate_quota_alerts`` (#1070), so the stored gate, the
+#: disarm decision and every claim come from one read.
+QuotaAlertConfig = tuple[bool, bool, tuple[QuotaRule, ...], dict]
+
+
+def _quota_alert_config() -> QuotaAlertConfig:
     """Resolve global + quota gates and exact JSON-shaped overrides once."""
     c = _cctally()
     config = c.load_config()
@@ -3272,6 +3963,21 @@ def _quota_projection_for_block(
     return forecast.projected_percent
 
 
+def _quota_projection_for_block_at(
+    history: QuotaHistory, block: QuotaBlock, at: dt.datetime,
+) -> float | None:
+    """The projected percent the block had AS OF ``at``, from the evidence
+    captured up to then — the deferred activation's historical suppression is
+    computed as of its cutoff, never from the worker's later forecast (#1070,
+    Q12)."""
+    forecast = forecast_quota(
+        [point for point in history.physical_observations
+         if point.captured_at <= at], at)
+    if forecast.status != "ok" or forecast.resets_at != block.resets_at:
+        return None
+    return forecast.projected_percent
+
+
 def _quota_alert_payload(
     *, identity: QuotaWindowIdentity, resets_at: dt.datetime, threshold: int,
     kind: str, now_iso: str, qualifying_percent: float | None,
@@ -3292,15 +3998,40 @@ def _evaluate_quota_alerts(
     conn: sqlite3.Connection,
     *, observations: tuple[QuotaObservation, ...], alert_eligible_roots: set[str],
     now: dt.datetime, now_iso: str, journal_emit=None, journal_disarm=None,
-    journal_terminal=None,
+    journal_terminal=None, alert_config: "QuotaAlertConfig | None" = None,
+    report: "dict | None" = None,
+    activation_cutoffs: "Mapping[str, dt.datetime] | None" = None,
 ) -> list[dict]:
     """Arm or claim quota alerts within the caller's stats transaction.
 
     A fresh fingerprint writes only terminal backfill suppressions. Later
     eligible observations can claim an alerted row. No non-terminal state is
     stored: the arming boundary plus unique terminal event key is sufficient.
+
+    ``alert_config`` is the caller's one config snapshot (#1070); ``None``
+    reads it here, which keeps the rebuild and rederive paths unchanged.
+    ``report``, when supplied, gets ``report["disarmed"] = True`` when the
+    disabled-delivery disarm executed, so the caller can store the gate that
+    disarm implies.
+
+    ``activation_cutoffs`` (root → cutoff, #1070 spec §5.6) is the deferred
+    activation's: the ``_codex-quota-verify`` worker completing an obligation a
+    hook recorded at its own ``now``. For an identity of such a root that is
+    newly activated, the arming row — and its journal record — carries the
+    CUTOFF as ``activated_at_utc``; thresholds satisfied by evidence captured
+    at or before it (actual, or projected from the evidence up to it) are
+    claimed ``suppressed_backfill``; evidence captured after it goes through
+    the normal alert path, so a crossing between the hook and the worker still
+    alerts. An identity whose matching arming row already carries the cutoff is
+    the retry after a crash between the arming emission and the end of the
+    activation (journal replay restored the row), and it completes the missing
+    pre-cutoff suppressions the same way; any other existing boundary is kept
+    as is (a scheduled evaluation never resets activation time). ``None``
+    keeps the evaluation-time behaviour for rebuild, rederive and inline
+    callers.
     """
-    global_enabled, quota_enabled, rules, config = _quota_alert_config()
+    global_enabled, quota_enabled, rules, config = (
+        _quota_alert_config() if alert_config is None else alert_config)
     # Disabled delivery is entirely inert: it must not leave an arming
     # boundary that could turn disabled-period evidence into a later alert.
     # This gate deliberately precedes the lifecycle-eligibility fast path:
@@ -3312,6 +4043,8 @@ def _evaluate_quota_alerts(
         # live single-flight reconcile supplies the durable disarm emitter.
         if journal_disarm is None:
             return []
+        if report is not None:
+            report["disarmed"] = True
         rows = conn.execute(
             """SELECT source, source_root_key, account_key,
                        logical_limit_key, observed_slot, window_minutes
@@ -3353,8 +4086,16 @@ def _evaluate_quota_alerts(
             identity, resolved, global_enabled=global_enabled,
             quota_enabled=quota_enabled,
         )
+        cutoff = (
+            None if activation_cutoffs is None
+            else activation_cutoffs.get(identity.source_root_key))
         changed, activated_at = _activate_quota_rule(
-            conn, identity, fingerprint, now_iso, journal_emit=journal_emit)
+            conn, identity, fingerprint,
+            now_iso if cutoff is None else _utc_iso(cutoff),
+            journal_emit=journal_emit)
+        # The deferred activation's own boundary: newly armed at the cutoff
+        # now, or by this activation's crashed attempt (replayed row).
+        completing = cutoff is not None and (changed or activated_at == cutoff)
 
         # Future evidence is never a threshold qualifier (including a first
         # activation backfill). A later well-clocked observation creates the
@@ -3370,7 +4111,33 @@ def _evaluate_quota_alerts(
             present = _block_observations_at_or_before(block, now)
             if not present:
                 continue
-            if changed:
+            if completing:
+                before = _block_observations_at_or_before(block, cutoff)
+                if before:
+                    actual_percent = max(point.used_percent for point in before)
+                    projected_percent = _quota_projection_for_block_at(
+                        history, block, cutoff)
+                    for decision in quota_threshold_decisions(
+                        current_percent=actual_percent,
+                        projected_percent=projected_percent,
+                        actual_thresholds=resolved.actual_thresholds,
+                        projected_thresholds=resolved.projected_thresholds,
+                    ):
+                        _insert_quota_terminal_event(
+                            conn, identity=identity, resets_at=block.resets_at,
+                            threshold=decision.threshold, kind=decision.kind,
+                            qualifying_percent=(
+                                actual_percent if decision.kind == "actual"
+                                else None),
+                            projected_percent=(
+                                projected_percent
+                                if decision.kind == "projected" else None),
+                            disposition="suppressed_backfill", now_iso=now_iso,
+                            journal_emit=journal_terminal,
+                        )
+                # Evidence after the cutoff falls through to the normal path
+                # below (`captured_at > activated_at`, the cutoff).
+            elif changed:
                 actual_percent = max(point.used_percent for point in present)
                 projected_percent = _quota_projection_for_block(history, block, now)
                 for decision in quota_threshold_decisions(
@@ -3541,6 +4308,8 @@ def _apply_quota_projection_rows(
     consume_alert_axes=True, reconcile_roots=None,
     schedule_evaluated_roots=frozenset(),
     prune_inactive_schedule=False,
+    alert_config: "QuotaAlertConfig | None" = None,
+    activation_cutoffs=None,
 ):
     """Transaction-neutral quota projection apply (spec §5.3 "projection").
 
@@ -3578,6 +4347,19 @@ def _apply_quota_projection_rows(
     only complete root histories this alert-eligible pass may replace. Group
     passes and reporting-only passes can merge new minima but retire none.
 
+    The stored delivery gate (#1070) is the observed ``alerts_enabled`` when
+    ``consume_alert_axes``; ``False`` when ``_evaluate_quota_alerts`` executed
+    the disabled-delivery disarm, because a pass that deleted every arming row
+    must not leave a ``True`` gate behind (the re-enable would then never widen
+    and the next real crossing would be recorded as a first-activation
+    backfill); otherwise the stored value carried through. ``False`` is always
+    the conservative direction: it can only cause a later widening.
+    ``alert_config`` is the caller's one config snapshot, passed through to
+    ``_evaluate_quota_alerts``, as is ``activation_cutoffs`` (#1070, the
+    deferred activation's per-root cutoffs). ``holder["disarmed"]`` reports
+    whether the disarm executed, which ends the delivery generation's pending
+    alert obligations after the commit.
+
     ``ledger_watermark`` is stamped INSIDE this transaction. That is deliberate:
     ``run_stats_ingest`` is the sole stats writer, so advancing it after the
     commit would need a second cycle — and atomicity is the stronger guarantee
@@ -3609,12 +4391,17 @@ def _apply_quota_projection_rows(
     blocks_orphaned, milestones_orphaned = _orphan_unseen(
         conn, roots_to_reconcile, generation, now_iso, units=dirty_units,
     )
+    alert_report: dict = {}
     queued = _evaluate_quota_alerts(
         conn, observations=observations,
         alert_eligible_roots=alert_eligible_roots & active_roots,
         now=now, now_iso=now_iso, journal_emit=journal_emit,
         journal_disarm=journal_disarm, journal_terminal=journal_terminal,
+        alert_config=alert_config, report=alert_report,
+        activation_cutoffs=activation_cutoffs,
     )
+    if holder is not None:
+        holder["disarmed"] = bool(alert_report.get("disarmed"))
     # The completion stamp is intentionally the final DML in the stats
     # transaction.  A pre-commit failure rolls all projection updates back;
     # a retry sees the prior complete generation or rederives it.
@@ -3629,7 +4416,14 @@ def _apply_quota_projection_rows(
     # retires the right rows — and the DELETE below removes what it no longer
     # names. A root with no blocks at all still stamps one `unattributed` row,
     # byte-stable with the prior behaviour.
-    roots_to_stamp = active_roots & roots_to_reconcile
+    #
+    # #1069: EVERY reconciled root is stamped, historic ones included, so each
+    # publication restamps at least one row with its fresh generation and the
+    # publication witness sees it. A historic root's signature is composed from
+    # its live blocks (the empty composition once they are orphaned). Both
+    # readers of this table iterate the ACTIVE roots only, so the extra rows
+    # change no decision; the certificate below stays active-roots-only.
+    roots_to_stamp = set(roots_to_reconcile)
     for root_key in sorted(roots_to_stamp):
         accounts = _root_accounts(conn, root_key) or {_lib_accounts.UNATTRIBUTED}
         root_signature = _ledger.compose_root_signature(
@@ -3739,7 +4533,9 @@ def _apply_quota_projection_rows(
     _store_ledger_state(
         conn, watermark=0 if ledger_watermark is None else ledger_watermark,
         alerts_enabled=(
-            alerts_enabled if consume_alert_axes else stored_alerts_enabled),
+            alerts_enabled if consume_alert_axes
+            else False if alert_report.get("disarmed")
+            else stored_alerts_enabled),
         next_evaluation_at=None if boundary is None else _utc_iso(boundary),
         next_evaluation_by_root=stored_schedule,
         # Spec §2: EVERY full pass stamps the verification deadline,
@@ -3849,7 +4645,7 @@ def rematerialize_quota_projection_for_rebuild(
     now_iso = _utc_iso(now)
     if bundle is None:
         try:
-            cache = _cache_connection()
+            cache = _cache_connection_owner()
         except (FileNotFoundError, sqlite3.Error):
             return
         try:
@@ -3875,18 +4671,466 @@ def rematerialize_quota_projection_for_rebuild(
     )
 
 
+def _codex_root_stored_limit_keys(
+    cache_conn: sqlite3.Connection, root: str, *, indexed: bool,
+) -> "list[str]":
+    """Every distinct ``logical_limit_key`` stored for one Codex root.
+
+    With ``idx_qws_physical_group`` the keys come from successive
+    ``MIN(logical_limit_key) ... > ?`` seeks over the index's
+    ``(source_root_key, logical_limit_key)`` prefix, never a walk of the root's
+    rows (the real store holds 14 keys over 605,847 rows: 16 ms against 6 s for
+    the ``DISTINCT`` read). The seeks run inside ONE recursive statement — a
+    loose index scan — so a root with many keys costs one seek per key but
+    still one statement, which keeps the bounded-read guards of the routes
+    that call this (the dashboard block detail) independent of the key count.
+    Without the index the ``DISTINCT`` read is slower but complete; neither
+    path ever returns a partial list.
+    """
+    if not indexed:
+        return [
+            str(row[0]) for row in cache_conn.execute(
+                "SELECT DISTINCT logical_limit_key FROM quota_window_snapshots"
+                " WHERE source='codex' AND source_root_key=?"
+                "   AND logical_limit_key IS NOT NULL", (root,))
+        ]
+    return [
+        str(row[0]) for row in cache_conn.execute(
+            "WITH RECURSIVE stored_keys(limit_key) AS ("
+            " SELECT (SELECT MIN(logical_limit_key) FROM quota_window_snapshots"
+            "         INDEXED BY idx_qws_physical_group"
+            "         WHERE source='codex' AND source_root_key=?1"
+            "           AND logical_limit_key > '')"
+            " UNION ALL"
+            " SELECT (SELECT MIN(logical_limit_key) FROM quota_window_snapshots"
+            "         INDEXED BY idx_qws_physical_group"
+            "         WHERE source='codex' AND source_root_key=?1"
+            "           AND logical_limit_key > stored_keys.limit_key)"
+            "   FROM stored_keys WHERE stored_keys.limit_key IS NOT NULL)"
+            " SELECT limit_key FROM stored_keys WHERE limit_key IS NOT NULL",
+            (root,))
+    ]
+
+
+def codex_unit_loading_closure(
+    cache_conn: sqlite3.Connection, units: Iterable[tuple],
+    *, stored_keys: "dict[str, list[str]] | None" = None,
+) -> frozenset[tuple]:
+    """The raw groups holding the COMPLETE population of each loading unit.
+
+    #1071. A loading unit is pool-free (``loading_unit_from_raw`` strips
+    ``modelPool``), but rows are stored under whichever key spelling ingest
+    minted: a Spark row under the ``modelPool`` key, an ordinary row under the
+    plain one, and either with the weekly minute jitter in the key. The loader
+    matches STORED coordinates exactly, so asking for one spelling hands the
+    projector part of a unit — and the sweep, which is keyed by the unit,
+    orphans every block of it the partial load did not re-stamp.
+
+    Per involved root the distinct stored keys are discovered once per call
+    (``_codex_root_stored_limit_keys``), and every key whose snapped,
+    pool-stripped value is the unit's key is kept alongside the unit's own key.
+    Those are closed over the existing minute-column closure
+    (``snap_equivalent_raw_groups``) with the unit's exact root, slot and reset,
+    so a unit no stored key survives in still names itself. The caller supplies
+    the connection, which is what lets discovery and loading share one snapshot.
+    ``stored_keys`` is an optional per-snapshot cache of that discovery, keyed
+    by root, which the interleave closure of the same preparation shares.
+    """
+    by_root: "dict[str, set[tuple]]" = {}
+    for unit in units:
+        root, limit_key, slot, minutes, reset = unit
+        by_root.setdefault(str(root), set()).add(
+            (str(root), str(limit_key), str(slot), int(minutes), str(reset)))
+    if not by_root:
+        return frozenset()
+    indexed = cache_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index'"
+        "   AND name='idx_qws_physical_group'").fetchone() is not None
+    if stored_keys is None:
+        stored_keys = {}
+    groups: "set[tuple]" = set()
+    for root, root_units in by_root.items():
+        if root not in stored_keys:
+            stored_keys[root] = _codex_root_stored_limit_keys(
+                cache_conn, root, indexed=indexed)
+        spellings: "dict[str, set[str]]" = {}
+        for key in stored_keys[root]:
+            spellings.setdefault(
+                _ledger.strip_model_pool(snap_window_minutes(key)),
+                set()).add(key)
+        for _root, unit_key, slot, minutes, reset in root_units:
+            for key in spellings.get(unit_key, set()) | {unit_key}:
+                groups.add((root, key, slot, minutes, reset))
+    return _ledger.snap_equivalent_raw_groups(groups)
+
+
+#: One stored prefix's canonical anchors and the textual capture extrema of
+#: each, all by seeks on ``idx_qws_physical_group`` (#1071 Q20): a loose index
+#: scan over the anchor member (spelled exactly as indexed — any other
+#: spelling buys no seek), then a ``MIN`` and a ``MAX`` of ``captured_at_utc``
+#: — the member after the anchor — per anchor, each one seek. Every statement
+#: here is a literal, so the detector-access call graph reads it as the cache
+#: read it is.
+#:
+#: The fourth column is the per-window spelling probe: whether ANY capture of
+#: the window is outside the spelling ``_lib_quota_ledger._SUPPORTED_CAPTURE``
+#: vouches for (the predicate is that pattern, ASCII digits only, so it can
+#: only flag more). The extrema bound only rows spelled that way: an accepted
+#: non-UTC offset strictly between two well-formed extrema (``…T00:05:00-02:00``
+#: is 02:05 UTC) parses outside their span. Every column the probe reads is an
+#: index member, so it walks index entries only and stops at the first such
+#: row, but a window with none walks all of its entries once (measured about
+#: 113 ms per 300,000-row window on the LAN runner; the extrema alone are
+#: seeks).
+_CODEX_PREFIX_ANCHOR_SPANS_SQL = (
+    "WITH RECURSIVE anchors(epoch) AS ("
+    " SELECT (SELECT MIN(unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc)))"
+    "           FROM quota_window_snapshots INDEXED BY idx_qws_physical_group"
+    "          WHERE source='codex' AND source_root_key=?1"
+    "            AND logical_limit_key=?2 AND observed_slot=?3"
+    "            AND window_minutes=?4"
+    "            AND unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc)) IS NOT NULL)"
+    " UNION ALL"
+    " SELECT (SELECT MIN(unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc)))"
+    "           FROM quota_window_snapshots INDEXED BY idx_qws_physical_group"
+    "          WHERE source='codex' AND source_root_key=?1"
+    "            AND logical_limit_key=?2 AND observed_slot=?3"
+    "            AND window_minutes=?4"
+    "            AND unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc)) > anchors.epoch)"
+    "   FROM anchors WHERE anchors.epoch IS NOT NULL)"
+    " SELECT epoch,"
+    "  (SELECT MIN(captured_at_utc)"
+    "     FROM quota_window_snapshots INDEXED BY idx_qws_physical_group"
+    "    WHERE source='codex' AND source_root_key=?1"
+    "      AND logical_limit_key=?2 AND observed_slot=?3"
+    "      AND window_minutes=?4"
+    "      AND unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc))=anchors.epoch),"
+    "  (SELECT MAX(captured_at_utc)"
+    "     FROM quota_window_snapshots INDEXED BY idx_qws_physical_group"
+    "    WHERE source='codex' AND source_root_key=?1"
+    "      AND logical_limit_key=?2 AND observed_slot=?3"
+    "      AND window_minutes=?4"
+    "      AND unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc))=anchors.epoch),"
+    "  EXISTS (SELECT 1"
+    "     FROM quota_window_snapshots INDEXED BY idx_qws_physical_group"
+    "    WHERE source='codex' AND source_root_key=?1"
+    "      AND logical_limit_key=?2 AND observed_slot=?3"
+    "      AND window_minutes=?4"
+    "      AND unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc))=anchors.epoch"
+    "      AND NOT (substr(captured_at_utc, 1, 19) GLOB"
+    "        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'"
+    "        AND (substr(captured_at_utc, 20) IN ('Z', '+00:00')"
+    "          OR (substr(captured_at_utc, 20, 1) = '.'"
+    "            AND ((substr(captured_at_utc, -1) = 'Z'"
+    "                  AND length(captured_at_utc) > 21"
+    "                  AND rtrim(substr(captured_at_utc, 21,"
+    "                                   length(captured_at_utc) - 21),"
+    "                            '0123456789') = '')"
+    "              OR (substr(captured_at_utc, -6) = '+00:00'"
+    "                  AND length(captured_at_utc) > 26"
+    "                  AND rtrim(substr(captured_at_utc, 21,"
+    "                                   length(captured_at_utc) - 26),"
+    "                            '0123456789') = '')))))"
+    "    LIMIT 1)"
+    "  FROM anchors WHERE epoch IS NOT NULL"
+)
+
+#: Without the index: the same answer for one stored prefix, by a read of its
+#: rows (correct and slower; never a partial list).
+_CODEX_PREFIX_ANCHOR_SPANS_FALLBACK_SQL = (
+    "SELECT unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc)) AS epoch,"
+    "       MIN(captured_at_utc), MAX(captured_at_utc),"
+    "       MAX(NOT (substr(captured_at_utc, 1, 19) GLOB"
+    "        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'"
+    "        AND (substr(captured_at_utc, 20) IN ('Z', '+00:00')"
+    "          OR (substr(captured_at_utc, 20, 1) = '.'"
+    "            AND ((substr(captured_at_utc, -1) = 'Z'"
+    "                  AND length(captured_at_utc) > 21"
+    "                  AND rtrim(substr(captured_at_utc, 21,"
+    "                                   length(captured_at_utc) - 21),"
+    "                            '0123456789') = '')"
+    "              OR (substr(captured_at_utc, -6) = '+00:00'"
+    "                  AND length(captured_at_utc) > 26"
+    "                  AND rtrim(substr(captured_at_utc, 21,"
+    "                                   length(captured_at_utc) - 26),"
+    "                            '0123456789') = ''))))))"
+    "  FROM quota_window_snapshots"
+    " WHERE source='codex' AND source_root_key=? AND logical_limit_key=?"
+    "   AND observed_slot=? AND window_minutes=?"
+    "   AND unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc)) IS NOT NULL"
+    " GROUP BY epoch"
+)
+
+#: Every capture of one window, for a spelling the endpoint shortcut cannot
+#: vouch for (indexed, and without the index).
+_CODEX_ANCHOR_CAPTURES_SQL = (
+    "SELECT captured_at_utc"
+    "  FROM quota_window_snapshots INDEXED BY idx_qws_physical_group"
+    " WHERE source='codex' AND source_root_key=? AND logical_limit_key=?"
+    "   AND observed_slot=? AND window_minutes=?"
+    "   AND unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc))=?"
+)
+_CODEX_ANCHOR_CAPTURES_FALLBACK_SQL = (
+    "SELECT captured_at_utc FROM quota_window_snapshots"
+    " WHERE source='codex' AND source_root_key=? AND logical_limit_key=?"
+    "   AND observed_slot=? AND window_minutes=?"
+    "   AND unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc))=?"
+)
+
+
+def _reset_anchor_node(reset: object) -> object:
+    """The canonical anchor one unit's reset names, as ``unixepoch`` reads it.
+
+    The loader's shards match ``unixepoch(<anchor>) = unixepoch(?)``, so a
+    whole-second epoch is the coordinate two spellings of one window share. A
+    value Python cannot read as an aware instant stays its own text node, so it
+    still compares equal to itself.
+    """
+    try:
+        parsed = dt.datetime.fromisoformat(str(reset).replace("Z", "+00:00"))
+    except ValueError:
+        return ("text", str(reset))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return ("text", str(reset))
+    return int(math.floor(parsed.timestamp()))
+
+
+def _unit_from_key_text(text: str) -> "tuple | None":
+    """Parse a serialized loading unit (``physical_group_key_text``)."""
+    parts = str(text).split("\x1f")
+    if len(parts) != 5:
+        return None
+    try:
+        minutes = int(parts[3])
+    except ValueError:
+        return None
+    return (parts[0], parts[1], parts[2], minutes, parts[4])
+
+
+@dataclass(frozen=True)
+class _CodexHistoricalSpans:
+    """The published interpreted span of every Codex block, by family (#1071).
+
+    Read in the preparation's stats snapshot, beside the witness, so a
+    publication after it is a witness mismatch and the in-lock re-preparation
+    reads them again with the closure. ``by_family`` maps ``(root, pool-free
+    key, slot, minutes)`` to ``{anchor node: spans | None}``; ``None`` marks a
+    previously materialized window whose stored bounds cannot be trusted,
+    which brings its whole family. ``unit_tuples`` names the stored unit of each
+    ``(family, node)``, so a window known only from its blocks is swept under
+    the key its blocks carry. An unreadable read (``readable=False``) knows of
+    no window and brings every affected family whole.
+    """
+
+    readable: bool
+    by_family: "Mapping[tuple, Mapping[object, tuple | None]]"
+    unit_tuples: "Mapping[tuple, frozenset]"
+
+
+def _codex_historical_block_spans(
+    stats_conn: sqlite3.Connection,
+) -> _CodexHistoricalSpans:
+    """Every Codex block's published ``[first, last]`` observed span (#1071 Q19).
+
+    Every account and pool block of a unit and orphans too: a deleted
+    duplicate run keeps an interpreted representative inside its block's span,
+    so any window whose dedup the deletion changes still intersects it. One
+    read of ``quota_window_blocks`` (a row per window and account, not per
+    observation).
+    """
+    try:
+        rows = stats_conn.execute(
+            "SELECT physical_group_key, first_observed_at_utc, "
+            "       last_observed_at_utc FROM quota_window_blocks "
+            " WHERE source='codex'").fetchall()
+    except sqlite3.Error:
+        return _CodexHistoricalSpans(readable=False, by_family={}, unit_tuples={})
+    by_family: "dict[tuple, dict[object, list | None]]" = {}
+    unit_tuples: "dict[tuple, set]" = {}
+    for key_text, first, last in rows:
+        if key_text is None:
+            continue  # `stale_reverse_map` already routes the pass in full
+        unit = _unit_from_key_text(key_text)
+        if unit is None:
+            # A block whose unit cannot be placed in a family could sit in
+            # any of them, so no family's bounds can be trusted.
+            return _CodexHistoricalSpans(
+                readable=False, by_family={}, unit_tuples={})
+        family, node = unit[:4], _reset_anchor_node(unit[4])
+        unit_tuples.setdefault((family, node), set()).add(unit)
+        nodes = by_family.setdefault(family, {})
+        try:
+            start = _parse_utc(str(first), "first_observed_at_utc").timestamp()
+            end = _parse_utc(str(last), "last_observed_at_utc").timestamp()
+        except (TypeError, ValueError):
+            nodes[node] = None
+            continue
+        if start > end:
+            nodes[node] = None
+        elif nodes.get(node, ()) is not None:
+            nodes.setdefault(node, []).append((start, end))
+    return _CodexHistoricalSpans(
+        readable=True,
+        by_family={
+            family: {
+                node: (None if spans is None else tuple(spans))
+                for node, spans in nodes.items()}
+            for family, nodes in by_family.items()},
+        unit_tuples={
+            key: frozenset(units) for key, units in unit_tuples.items()},
+    )
+
+
+def _codex_anchor_complete_span(
+    cache_conn: sqlite3.Connection, prefix: tuple, epoch: int, *, indexed: bool,
+) -> "tuple[float, float] | None":
+    """One window's capture span from every row, for a spelling the
+    endpoint shortcut cannot vouch for (#1071 Q20). Rows Python cannot read
+    are skipped, exactly as the loader skips them."""
+    params = (*prefix, int(epoch))
+    if indexed:
+        rows = cache_conn.execute(_CODEX_ANCHOR_CAPTURES_SQL, params)
+    else:
+        rows = cache_conn.execute(_CODEX_ANCHOR_CAPTURES_FALLBACK_SQL, params)
+    start = end = None
+    for (captured,) in rows:
+        try:
+            instant = _parse_utc(str(captured), "captured_at_utc").timestamp()
+        except (TypeError, ValueError):
+            continue
+        start = instant if start is None else min(start, instant)
+        end = instant if end is None else max(end, instant)
+    return None if start is None else (start, end)
+
+
+def codex_interleave_closure(
+    cache_conn: sqlite3.Connection, seeds: Iterable[tuple], *,
+    historical: "_CodexHistoricalSpans | None",
+    expandable_roots: "set[str] | frozenset[str] | None",
+    limit: int = _MAX_INCREMENTAL_UNITS,
+    stored_keys: "dict[str, list[str]] | None" = None,
+) -> "tuple[frozenset[tuple], int] | None":
+    """The interleave closure of a scoped pass's units (#1071, Q18–Q20).
+
+    ``build_history`` collapses adjacent equal ``logical_value_tuple``s over an
+    identity's WHOLE physical order, and the canonical reset is part of that
+    value, so another window of the identity captured inside a unit's span
+    breaks the unit's duplicate runs. ``force_full`` sees those separators; a
+    scoped load of the dirty unit alone does not, and its block's interpreted
+    endpoint differs. The fix is to load the separators, never to change the
+    dedup.
+
+    Within each seed's family ``(root, pool-free key, slot, minutes)`` — every
+    account and pool, so a superset of the identities it holds — each window's
+    interval is its current capture span (seeks, outward-rounded) united with
+    the published span of each of its blocks; every window connected to a seed
+    through intersecting closed intervals joins, transitively. A previously
+    materialized window with untrustworthy bounds brings its whole family. Only
+    families on ``expandable_roots`` (``None``: every root) are expanded.
+
+    Returns ``(units, nodes)`` — the unit tuples to load and sweep and the
+    number of distinct canonical windows they name — or ``None`` once more
+    than ``limit`` windows are established, before anything is loaded.
+    """
+    seeds = set(seeds)
+    families: "dict[tuple, set[tuple]]" = {}
+    other_nodes: "set[object]" = set()
+    for unit in seeds:
+        if expandable_roots is None or unit[0] in expandable_roots:
+            families.setdefault(tuple(unit[:4]), set()).add(unit)
+        else:
+            other_nodes.add((tuple(unit[:4]), _reset_anchor_node(unit[4])))
+    result: "set[tuple]" = set(seeds)
+    count = len(other_nodes)
+    if count + sum(
+            len({_reset_anchor_node(u[4]) for u in members})
+            for members in families.values()) > limit:
+        return None
+    if historical is None:
+        historical = _CodexHistoricalSpans(readable=True, by_family={},
+                                           unit_tuples={})
+    if stored_keys is None:
+        stored_keys = {}
+    indexed = cache_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index'"
+        "   AND name='idx_qws_physical_group'").fetchone() is not None
+    for family in sorted(families):
+        root, family_key, slot, minutes = family
+        if root not in stored_keys:
+            stored_keys[root] = _codex_root_stored_limit_keys(
+                cache_conn, root, indexed=indexed)
+        keys = {
+            key for key in stored_keys[root]
+            if _ledger.strip_model_pool(snap_window_minutes(key)) == family_key
+        } | {family_key}
+        intervals: "dict[object, list[tuple[float, float]]]" = {}
+        for key in sorted(keys):
+            for raw_minutes in codex_snap_equivalent_window_minutes(minutes):
+                prefix = (root, key, slot, int(raw_minutes))
+                if indexed:
+                    rows = cache_conn.execute(
+                        _CODEX_PREFIX_ANCHOR_SPANS_SQL, prefix).fetchall()
+                else:
+                    rows = cache_conn.execute(
+                        _CODEX_PREFIX_ANCHOR_SPANS_FALLBACK_SQL,
+                        prefix).fetchall()
+                for epoch, low_text, high_text, unvouched in rows:
+                    node = int(epoch)
+                    span = (
+                        None if unvouched
+                        else _ledger.outward_capture_span(low_text, high_text))
+                    if span is None:
+                        span = _codex_anchor_complete_span(
+                            cache_conn, prefix, node, indexed=indexed)
+                    spans = intervals.setdefault(node, [])
+                    if span is not None:
+                        spans.append(span)
+        whole_family = not historical.readable
+        for node, spans in historical.by_family.get(family, {}).items():
+            if spans is None:
+                whole_family = True
+                intervals.setdefault(node, [])
+            else:
+                intervals.setdefault(node, []).extend(spans)
+        seed_nodes = {_reset_anchor_node(unit[4]) for unit in families[family]}
+        selected = (
+            set(intervals) | seed_nodes if whole_family
+            else set(_ledger.interleave_closure(intervals, seed_nodes)))
+        count += len(selected)
+        if count > limit:
+            return None
+        for node in selected:
+            if isinstance(node, int):
+                result.add((root, family_key, slot, minutes,
+                            dt.datetime.fromtimestamp(node, UTC).isoformat()))
+            result.update(historical.unit_tuples.get((family, node), ()))
+    return frozenset(result), count
+
+
 def _resolve_pass_scope(
     cache_conn: sqlite3.Connection, *, force_full: bool,
     ledger_state: "dict | None", ledger_high: "int | None", watermark: int,
     active_roots: set[str], stale_reverse_map: bool,
     verification_due: bool = False,
+    attribution_scope: "dict | None" = None,
+    historical_spans: "_CodexHistoricalSpans | None" = None,
 ) -> "tuple[dict | None, int | None]":
     """Decide between a bounded pass and a whole-history one.
 
     Returns ``(scope, watermark_target)``. ``scope`` is ``None`` for a full pass
     or a dict carrying the exact raw groups to load and the loading units to
-    sweep. ``watermark_target`` is the sequence the pass will stamp, or ``None``
-    when there is no ledger to stamp against.
+    sweep, plus ``seed_unit_count`` (the ledger and attribution units),
+    ``closure_added_unit_count`` and ``final_unit_count`` (#1071: the
+    interleave closure's windows, the number counted against the ceiling).
+    ``watermark_target`` is the sequence the pass will stamp, or ``None`` when
+    there is no ledger to stamp against.
+
+    ``attribution_scope`` (``codex_attribution_projection_scope``) joins the
+    ledger's units as seeds — a union, never a replacement — and
+    ``historical_spans`` are the published block spans (``None``: no block is
+    known), read by the preparation in its stats snapshot beside the witness
+    (#1071 Q20): this routine runs inside the cache query session and reads
+    no stats statement of its own (#787 / #861).
 
     Every branch that is not provably safe takes the full path. In order:
 
@@ -3905,7 +5149,9 @@ def _resolve_pass_scope(
       entirely, nor a milestone on a historic root, so the interval is what
       bounds how long either may survive.
     * More dirty units than ``_MAX_INCREMENTAL_UNITS`` is a burst — a rebuild or
-      a first ingest — where one unbounded scan beats N indexed seeks.
+      a first ingest — where one unbounded scan beats N indexed seeks. Since
+      #1071 the count is the interleave closure's (seeds, vanished seeds and
+      added windows), established before anything is loaded.
     """
     if force_full or ledger_high is None or verification_due:
         return None, ledger_high
@@ -3928,28 +5174,941 @@ def _resolve_pass_scope(
     # ledger entries, stranding those blocks permanently in
     # `_historic_root_keys`, the projection state and the dashboard, which is a
     # regression against the pre-change whole-root `_orphan_unseen`.
-    units = {
-        _ledger.physical_group_key_text(_ledger.loading_unit_from_raw(group))
-        for group in raw_groups
-    }
-    if len(units) > _MAX_INCREMENTAL_UNITS:
+    #
+    # #1071: the units are CANONICAL — snapped and pool-stripped — so two
+    # stored spellings of one window (its ordinary and its `modelPool` key)
+    # are one unit, counted once against the ceiling before any spelling is
+    # expanded for loading.
+    unit_tuples = {_ledger.loading_unit_from_raw(group) for group in raw_groups}
+    attribution_raw_groups: "frozenset[tuple]" = frozenset()
+    if attribution_scope:
+        # Union, never replace: the ledger's own dirty set is still owed.
+        attribution_raw_groups = frozenset(attribution_scope["raw_groups"])
+        for text in attribution_scope["units"]:
+            unit = _unit_from_key_text(text)
+            if unit is not None:
+                unit_tuples.add(unit)
+    seed_units = {_ledger.physical_group_key_text(unit) for unit in unit_tuples}
+    if len(seed_units) > _MAX_INCREMENTAL_UNITS:
         return None, ledger_high
-    load_groups = raw_groups
+    # #1071 (Q18–Q20): the interleave closure. Another window of a unit's
+    # identity captured inside the unit's span breaks its duplicate runs in
+    # `build_history`, so the scope loads and sweeps every window connected to
+    # a seed, counted against the ceiling before any row is loaded.
+    stored_keys: "dict[str, list[str]]" = {}
+    closure = codex_interleave_closure(
+        cache_conn, unit_tuples, historical=historical_spans,
+        expandable_roots=set(active_roots) if active_roots else None,
+        stored_keys=stored_keys)
+    if closure is None:
+        return None, ledger_high
+    closure_units, closure_count = closure
+    units = {_ledger.physical_group_key_text(unit) for unit in closure_units}
+    load_units = closure_units
     if active_roots:
-        load_groups = frozenset(
-            group for group in raw_groups if group[0] in active_roots)
+        load_units = {unit for unit in closure_units if unit[0] in active_roots}
     return (
         {
             # The loader matches RAW stored coordinates, so the request has to
-            # enumerate every spelling that snaps onto a dirty group. One minute
-            # of weekly jitter lives in BOTH the limit key and a column, so two
-            # raw groups can interpret into one window and loading only the
-            # mutated one would hand the fold a PARTIAL population.
-            "raw_groups": _ledger.snap_equivalent_raw_groups(load_groups),
+            # enumerate every spelling stored for a dirty unit: the minute
+            # jitter that lives in BOTH the limit key and a column, and the
+            # `modelPool` key a sibling pool's rows sit under (#1071). Loading
+            # only the mutated spelling would hand the fold a PARTIAL
+            # population and the unit-keyed sweep would orphan the rest.
+            "raw_groups": codex_unit_loading_closure(
+                cache_conn, load_units, stored_keys=stored_keys)
+            | attribution_raw_groups,
             "units": units,
+            "seed_unit_count": len(seed_units),
+            "closure_added_unit_count": max(
+                0, closure_count - len(seed_units)),
+            "final_unit_count": closure_count,
         },
         ledger_high,
     )
+
+
+class _UnreadableWitness:
+    """A publication witness whose read failed (#1069).
+
+    It never compares equal — not even to itself — so a leg holding one always
+    re-prepares rather than trusting a preparation it cannot validate."""
+
+    __slots__ = ()
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    def __ne__(self, other: object) -> bool:
+        return True
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return "_UnreadableWitness()"
+
+
+def _codex_projection_witness(
+    stats_conn: sqlite3.Connection,
+) -> "tuple | _UnreadableWitness":
+    """Everything a Codex quota publication changes in stats.db (#1069, Q2).
+
+    A deterministic tuple of: the raw ``quota_projection_ledger_state`` row for
+    ``source='codex'`` or an explicit absent marker; every
+    ``quota_projection_state`` row ``(source_root_key, account_key, generation,
+    physical_signature)``, ordered; the ``stats_publication_stamp`` rows with the
+    stats ``user_version`` (a rebuild publishes a new stamp); and every Codex
+    ``quota_alert_arming`` row the alert scope reads, ordered.
+
+    Every publication restamps ``quota_projection_state`` with a fresh random
+    generation for every reconciled root, so ANY publication between a
+    preparation and its apply changes this value, including one that wrote
+    semantically identical rows. Any read error yields an unreadable witness
+    that never compares equal.
+    """
+    try:
+        ledger = stats_conn.execute(
+            "SELECT * FROM quota_projection_ledger_state WHERE source='codex'"
+        ).fetchone()
+        state = tuple(
+            tuple(row) for row in stats_conn.execute(
+                "SELECT source_root_key, account_key, generation, "
+                "       physical_signature FROM quota_projection_state "
+                " ORDER BY source_root_key, account_key"))
+        stamps = tuple(
+            tuple(row) for row in stats_conn.execute(
+                "SELECT record_path, started_at_utc, stamped_at_utc "
+                "  FROM stats_publication_stamp ORDER BY rowid"))
+        user_version = int(
+            stats_conn.execute("PRAGMA user_version").fetchone()[0])
+        arming = tuple(
+            tuple(row) for row in stats_conn.execute(
+                "SELECT source_root_key, account_key, logical_limit_key, "
+                "       observed_slot, window_minutes, rule_fingerprint, "
+                "       activated_at_utc FROM quota_alert_arming "
+                " WHERE source='codex' "
+                " ORDER BY source_root_key, account_key, logical_limit_key, "
+                "          observed_slot, window_minutes"))
+    except (sqlite3.Error, TypeError, ValueError):
+        return _UnreadableWitness()
+    return (
+        ("absent",) if ledger is None else ("present", tuple(ledger)),
+        state,
+        (user_version, stamps),
+        arming,
+    )
+
+
+def _codex_witnesses_equal(prepared: object, live: object) -> bool:
+    """The leg's one witness comparison. A module-level seam on purpose: the
+    removed-validation mutation run replaces it to prove the races it guards
+    are real."""
+    return prepared == live
+
+
+def _witness_projection_rows(witness: object):
+    """The ``(source_root_key, physical_signature)`` rows a readable witness
+    holds, or ``None`` for an unreadable one."""
+    if not isinstance(witness, tuple):
+        return None
+    return [(row[0], row[3]) for row in witness[1]]
+
+
+@dataclass(frozen=True)
+class _PreparedPass:
+    """One complete preparation of a Codex quota pass (#1069, spec §5.1).
+
+    Everything the apply and the finalization consume, so a re-preparation
+    replaces ALL of it: the config snapshot, the stats witness and the stats
+    inputs, the cache inputs, the scope, the observations, the watermark, the
+    alert-axis decisions and the requested worker hand-offs.
+
+    ``disposition`` is one of ``"apply"``, ``"current"``, ``"deferred_verify"``,
+    ``"deferred_model"`` and ``"unavailable"`` (the cache could not be
+    opened). ``reconcile_roots`` is ``None`` for the genuine whole-history
+    shape and ``dirty_units`` ``None`` for any complete (non-scoped) pass,
+    exactly as ``_apply_quota_projection_rows`` reads them.
+
+    ``alert_obligations`` (#1070, spec §5.6) is the complete-history alert
+    work a ``"defer"`` pass hands to the worker instead of widening, as
+    ``(reason, roots)`` pairs (empty roots: every applicable root); the leg
+    records them in the sidecar before it applies anything.
+    """
+
+    disposition: str
+    alert_config: "QuotaAlertConfig | None" = None
+    witness: object = None
+    ledger_state: "dict | None" = None
+    has_arming: bool = False
+    stale_reverse_map: bool = True
+    alert_scope: object = None
+    active_roots: "frozenset[str]" = frozenset()
+    physical_seq: int = 0
+    certificate: object = None
+    ledger_high: "int | None" = None
+    attribution_revision: int = 0
+    model_debt: bool = False
+    scope: "dict | None" = None
+    reconcile_roots: "frozenset[str] | None" = None
+    observations: "tuple[QuotaObservation, ...]" = ()
+    watermark_target: "int | None" = None
+    consume_alert_axes: bool = False
+    complete_roots: "frozenset[str]" = frozenset()
+    schedule_evaluated_roots: "frozenset[str]" = frozenset()
+    worker_requests: "tuple[str, ...]" = ()
+    dirty_units: "frozenset[str] | None" = None
+    alert_eligible_roots: "frozenset[str]" = frozenset()
+    prune_inactive_schedule: bool = False
+    alert_obligations: "tuple[tuple[str, frozenset[str]], ...]" = ()
+
+
+def _prepare_codex_quota_pass(
+    *,
+    stats_conn: sqlite3.Connection,
+    source_root_keys,
+    alert_eligible_root_keys: "frozenset[str]",
+    now: dt.datetime,
+    force_full: bool,
+    full_pass: str,
+    in_lock: bool,
+    extra_active_roots: "frozenset[str]" = frozenset(),
+) -> _PreparedPass:
+    """Prepare one Codex quota pass; the optimistic path and the in-lock
+    re-preparation are this one routine (#1069, Q1).
+
+    Order (spec §5.1, Q2), which is what makes the witness sound:
+
+    1. the alert configuration, read ONCE (#1070);
+    2. ONE stats read snapshot: the witness, ``_ledger_state``, ``has_arming``,
+       the reverse-map flag and the alert scope's inputs. Outside the lock it
+       is a read transaction on ``stats_conn`` (the caller's fresh
+       connection); under the lock it is ``ctx.conn`` inside the cycle's own
+       transaction, which this routine never begins, commits or closes;
+    3. ONE cache read snapshot opened after step 2 and held through the
+       metadata, ``_ledger_rows_after``, the attribution scope, the interleave
+       closure and the unit closure, and ``load_codex_quota_observations``,
+       then closed.
+
+    The published block spans the interleave closure reads (#1071 Q20) are
+    part of step 2 too, read beside the witness for every pass that is not
+    ``force_full`` (a complete pass has no closure) and handed into step 3
+    as ``historical_spans``. Step 3 is one cache query session, under
+    ``query`` authority for its whole duration, so no stats statement may run
+    inside it (#787 / #861 R_COVERAGE_USE). The in-lock re-preparation
+    repeats both reads in the cycle's transaction, beside the witness it is
+    validated against.
+
+    A publication landing after step 2 is visible to the leg's validation, and
+    a cache input read in step 3 can only be newer than the stats state the
+    witness describes — later incremental work, which the finalization fences
+    keep owed.
+
+    Every rule the reconcile applied before (the short-circuit, the interval
+    hand-off, the catch-all hand-off, the attribution union, the axis
+    consumption) is kept verbatim, and so is the alert widening under
+    ``"inline"``. Under ``"defer"`` (#1070, spec §5.6, Q11) the alert axes never
+    widen: complete-history alert work becomes ``alert_obligations`` on the
+    bounded pass, so no hook preparation, optimistic or in the lock, loads a
+    complete root history for an alert reason. Worker hand-offs are REQUESTED
+    in ``worker_requests`` and run by the caller after ``run_stats_ingest``
+    returns, never inside a transaction.
+
+    ``extra_active_roots`` joins the cache's roots when ``source_root_keys`` is
+    ``None``: the activation worker's configured roots, so a configured root
+    with no retained observation is still a reconciled root whose obligation
+    the pass can complete (and an empty store still stores the gate).
+    """
+    alert_eligible_roots = frozenset(str(key) for key in alert_eligible_root_keys)
+    # ONE read (#1070): this snapshot decides the alert scope below AND the
+    # apply's disarm, claims and stored gate, so a config change landing
+    # mid-pass cannot split them. A re-preparation reads a new one.
+    alert_config = _quota_alert_config()
+    global_alerts_enabled, quota_alerts_enabled, _rules, _config = alert_config
+    delivery_enabled = global_alerts_enabled and quota_alerts_enabled
+    fields: dict = {
+        "alert_config": alert_config,
+        "alert_eligible_roots": alert_eligible_roots,
+    }
+
+    # ── step 2: the stats snapshot, BEFORE the cache one ────────────────────
+    own_stats_txn = not in_lock and not stats_conn.in_transaction
+    if own_stats_txn:
+        stats_conn.execute("BEGIN")
+    try:
+        witness = _codex_projection_witness(stats_conn)
+        ledger_state = _ledger_state(stats_conn)
+        try:
+            has_arming = bool(stats_conn.execute(
+                "SELECT 1 FROM quota_alert_arming "
+                "WHERE source='codex' LIMIT 1"
+            ).fetchone())
+        except sqlite3.Error:
+            has_arming = True  # fail-safe: never skip a possible disarm
+        stale_reverse_map = _blocks_missing_reverse_map(stats_conn)
+        # #1069 Q4: the stats half of the empty-store test, read in this
+        # snapshot beside the witness. Only a hook (`defer`) pass asks, and
+        # only when the witness already holds no projection-state row, so an
+        # established store never pays for the probes.
+        stats_projection_empty = (
+            full_pass == "defer" and not force_full
+            and _witness_projection_rows(witness) == []
+            and not _codex_projected_rows_present(stats_conn))
+        alert_scope = None
+        scope_detail: dict = {}
+        if alert_eligible_roots:
+            alert_scope = _resolve_alert_scope(
+                stats_conn, ledger_scope=_axes.SCOPE_GROUPS, now=now,
+                ledger_state=ledger_state,
+                global_enabled=global_alerts_enabled,
+                quota_enabled=quota_alerts_enabled,
+                rules=_rules, config=_config,
+                eligible_roots=set(alert_eligible_roots),
+                defer_scheduled=(full_pass == "defer"),
+                detail=scope_detail,
+            )
+        # #1071 (Q20): the closure's published spans, in this snapshot beside
+        # the witness, never inside the cache session below (#787 / #861). A
+        # complete pass has no closure; an unreadable read is
+        # `readable=False`, which brings every affected family whole.
+        historical_spans = (
+            None if force_full else _codex_historical_block_spans(stats_conn))
+    finally:
+        if own_stats_txn:
+            stats_conn.commit()
+    fields.update(
+        witness=witness, ledger_state=ledger_state, has_arming=has_arming,
+        stale_reverse_map=stale_reverse_map, alert_scope=alert_scope)
+
+    # ── step 3: one cache snapshot, held through the observation load ───────
+    try:
+        cache = _cache_connection()
+    except (FileNotFoundError, sqlite3.Error):
+        return _PreparedPass(disposition=PROJECTION_UNAVAILABLE, **fields)
+    try:
+        cache.execute("BEGIN")
+        try:
+            return _prepare_from_cache_snapshot(
+                cache, fields,
+                source_root_keys=source_root_keys,
+                alert_eligible_roots=alert_eligible_roots,
+                delivery_enabled=delivery_enabled,
+                now=now, force_full=force_full, full_pass=full_pass,
+                in_lock=in_lock, scope_detail=scope_detail,
+                extra_active_roots=frozenset(extra_active_roots),
+                stats_projection_empty=stats_projection_empty,
+                historical_spans=historical_spans)
+        finally:
+            cache.commit()
+    except sqlite3.Error:
+        return _PreparedPass(disposition=PROJECTION_UNAVAILABLE, **fields)
+    finally:
+        cache.close()
+
+
+def _prepare_from_cache_snapshot(
+    cache: sqlite3.Connection, fields: dict, *, source_root_keys,
+    alert_eligible_roots: "frozenset[str]", delivery_enabled: bool,
+    now: dt.datetime, force_full: bool, full_pass: str, in_lock: bool,
+    scope_detail: "dict | None" = None,
+    extra_active_roots: "frozenset[str]" = frozenset(),
+    historical_spans: "_CodexHistoricalSpans | None" = None,
+    stats_projection_empty: bool = False,
+) -> _PreparedPass:
+    """Step 3 of ``_prepare_codex_quota_pass``, on its held cache snapshot."""
+    ledger_state = fields["ledger_state"]
+    stale_reverse_map = fields["stale_reverse_map"]
+    alert_scope = fields["alert_scope"]
+    has_arming = fields["has_arming"]
+    worker_requests: "list[str]" = []
+
+    def done(disposition: str, **extra) -> _PreparedPass:
+        return _PreparedPass(
+            disposition=disposition,
+            worker_requests=tuple(worker_requests), **{**fields, **extra})
+
+    active_roots = frozenset(
+        set(_cache_root_keys(cache)) | set(extra_active_roots)
+        if source_root_keys is None else {str(key) for key in source_root_keys}
+    )
+    physical_sequence = codex_physical_mutation_seq(cache)
+    certificate = load_codex_quota_projection_certificate(cache)
+    ledger_high = _ledger_max_seq(cache)
+    # #500 §8.3. An attribution change fires no `quota_window_snapshots`
+    # trigger and writes no ledger entry, so the change ledger cannot see it
+    # and the certificate reader above has already declined a certificate
+    # computed against a different revision. What is left is naming the groups
+    # the pass now owes, which is only worth reading when the revision moved.
+    attribution_revision = (
+        _cache_module().codex_window_attribution_revision(cache))
+    # #980 D6: quota projection requires established model resolution. While
+    # the `model` flag, an unexpanded `full` or a malformed debt record
+    # stands, no projection row and no certificate may be published —
+    # interpreting a still-resolvable NULL `observed_model` would file a Spark
+    # window as account weekly quota (#373).
+    model_pending = _cache_module().codex_model_resolution_pending(cache)
+    # #1070 (spec §5.6): the complete-history alert work this `"defer"` pass
+    # owes, decided before any disposition so every outcome — a deferral or
+    # a model fence included — reports it. `force_full` (no hook caller)
+    # stays a complete inline pass.
+    alert_obligations = (
+        _deferred_alert_obligations(
+            alert_scope, scope_detail or {},
+            alert_eligible_roots & active_roots)
+        if full_pass == "defer" and not force_full else ())
+    fields.update(
+        active_roots=active_roots, physical_seq=physical_sequence,
+        certificate=certificate, ledger_high=ledger_high,
+        attribution_revision=attribution_revision, model_debt=model_pending,
+        alert_obligations=alert_obligations)
+    if model_pending:
+        worker_requests.append("model")
+        return done(PROJECTION_DEFERRED_MODEL)
+    # #1069 Q4: "`current` (certificate-backed nothing owed, or an empty
+    # store)". With no Codex quota observation for any active root in this
+    # cache snapshot and no projected row (projection state, block, milestone
+    # or threshold event, any root) in the stats one, a complete pass would
+    # materialize nothing and orphan nothing, so the hook pass is current.
+    # Without this a fresh install has no projector state, the catch-all below
+    # hands its whole-history pass to the worker as `deferred_verify`, and the
+    # hook withholds lifecycle success on every turn until a worker runs.
+    #
+    # It stamps NOTHING — no watermark, no `last_full_pass_at`, no
+    # interpretation version, no gate — because stamping is a stats write and
+    # this pass applies none. So the store stays never-verified: once an
+    # observation arrives the next pass is not empty and takes exactly the
+    # route it took before this rule (under `defer`, the worker hand-off). A
+    # store whose observations vanished while stats still holds a projected
+    # row is not empty, because only a complete pass can orphan that row.
+    # Alert obligations derived above still stand and still report pending.
+    # `inline` and `force_full` never read as empty (step 2 gates the probe).
+    if stats_projection_empty and not _codex_observations_present(
+            cache, active_roots):
+        return done(PROJECTION_CURRENT)
+    attribution_stale =_certificate_attribution_revision(
+        _codex_quota_projection_certificate_payload(cache)
+    ) != attribution_revision
+    attribution_scope = (
+        codex_attribution_projection_scope(cache) if attribution_stale else None)
+    # The certificate comparison reads the projection-state rows the witness
+    # already holds: one stats read decides both (an unreadable witness is a
+    # mismatch, the fail-safe direction).
+    witness_rows = _witness_projection_rows(fields["witness"])
+    signatures_match = (
+        certificate is not None and witness_rows is not None
+        and _projection_signatures_match_rows(
+            witness_rows, active_roots, certificate[1])
+    )
+
+    watermark = 0 if ledger_state is None else ledger_state["watermark"]
+    # Short-circuit: when nothing is alert-eligible and the certificate
+    # proves the cache physical state is current AND the stats-side
+    # projection still matches it (F1), the ~2.9 s observation load and the
+    # whole reconcile are provably a no-op. Any missed concurrent write
+    # leaves cur_seq != cert_seq (or a stats-signature mismatch) on the next
+    # call, so the scheme is self-healing.
+    #
+    # The unconsumed-ledger clause is the third leg, and it closes a hole
+    # the certificate alone cannot see: a writer that mutates
+    # `quota_window_snapshots` WITHOUT advancing the physical mutation
+    # sequence (migration 028 does exactly this, and the journal cache
+    # applier did too) leaves the certificate reading as current while real
+    # interpretation drift sits unprocessed. The triggers recorded it, so
+    # the ledger knows even when the sequence does not.
+    #
+    # The projector's own state has to be current too. A stale
+    # interpretation version or a block with no reverse map means the next
+    # pass MUST do work, and skipping on the certificate alone would defer
+    # that repair forever — the certificate cannot see either condition.
+    #
+    # The periodic verification joins them for the same reason. A skipped
+    # pass never stamps the deadline, so letting the short-circuit fire
+    # while it is overdue would leave every subsequent tick overdue too —
+    # the interval would never elapse into anything.
+    verification_due = _full_verification_due(ledger_state, now)
+    projector_state_current = (
+        ledger_state is not None
+        and ledger_state["interpretation_version"]
+        == _CODEX_QUOTA_INTERPRETATION_VERSION
+        and not stale_reverse_map
+    )
+    if (
+        verification_due
+        and full_pass == "defer"
+        # The interval alone. When the projector state is otherwise current
+        # this tick can still do its ordinary BOUNDED work after handing the
+        # verification off, which is why this gate is separate from the
+        # catch-all below: deferring here costs nothing, deferring there
+        # costs this tick's incremental progress.
+        and projector_state_current
+        and ledger_high is not None
+        and ledger_high >= watermark
+    ):
+        # The bounded ingest leg made every part of the hook tick bounded
+        # except this one. On a hook-only install the whole-history reconcile
+        # would land on the blocking hook path once a day against Codex's
+        # 30-second timeout, so it is handed to a detached worker — requested
+        # here, spawned by the caller once the ingest has returned (#1069 Q4).
+        #
+        # Skipping it on a failed spawn is deliberate: the deadline is only
+        # stamped by a pass that COMPLETES, so the next tick is still due
+        # and retries (throttled). One missed daily verification is bounded
+        # staleness; a 30-second hook stall is the reported defect.
+        worker_requests.append("verify")
+        verification_due = False
+    ledger_state_current = projector_state_current and not verification_due
+    if (
+        not force_full
+        and not alert_eligible_roots
+        and certificate is not None
+        and ledger_high is not None
+        and ledger_high == watermark
+        and ledger_state_current
+    ):
+        cert_seq, cert_sigs = certificate
+        if physical_sequence == cert_seq and active_roots <= set(cert_sigs):
+            can_skip_delivery = delivery_enabled or not has_arming
+            if can_skip_delivery and signatures_match:
+                return done(PROJECTION_CURRENT)
+
+    # The attribution units are seeds of the same scope (a union, never a
+    # replacement): a bounded pass that then exceeds the incremental ceiling
+    # falls back to whole history, because N indexed seeks stop beating one
+    # scan at the same point however the units were arrived at. Both seed
+    # sets share one interleave closure (#1071).
+    dirty_units, watermark_target = _resolve_pass_scope(
+        cache,
+        force_full=force_full,
+        ledger_state=ledger_state,
+        ledger_high=ledger_high,
+        watermark=watermark,
+        active_roots=set(active_roots),
+        stale_reverse_map=stale_reverse_map,
+        verification_due=verification_due,
+        attribution_scope=attribution_scope,
+        historical_spans=historical_spans,
+    )
+    fields.update(watermark_target=watermark_target)
+    # ``None`` means the genuine whole-history path. A set means complete
+    # histories for only those roots — axis 2 and epoch-1007 axis 4 can both
+    # be satisfied without scanning unrelated roots.
+    reconcile_roots: "set[str] | None" = None
+    if dirty_units is None and full_pass == "defer" and not force_full:
+        # The rule, for every OTHER route into a whole-history pass: an
+        # absent or freshly rebuilt projector state, an interpretation-
+        # version bump, a reset ledger, a block missing its reverse map, a
+        # dirty-unit burst, and a cache too old to carry the change log.
+        #
+        # The rebuilt-state route is the one that matters: every upgrading
+        # install that rebuilds stats.db from the journal would otherwise run
+        # the whole-history pass inline on top of the rebuild, on a path
+        # Codex kills at 30 seconds, so `run_stats_ingest` commits nothing,
+        # `last_full_pass_at` is never stamped, and the next tick repeats it.
+        #
+        # Unlike the interval gate above, this one performs NO projection
+        # work at all: without a trustworthy watermark there is no bounded
+        # pass to fall back to. That leaves the projection transiently
+        # missing rather than merely stale, and it is accepted — the worker
+        # converges it (throttled retry on failure), every non-hook caller
+        # still runs inline, and a 30-second blocking tick is not an option.
+        if "verify" not in worker_requests:
+            worker_requests.append("verify")
+        return done(PROJECTION_DEFERRED_VERIFY, scope=None)
+    # Axis 2/3/4 (spec §3): alert state is not a function of window
+    # dirtiness. A rule change and a delivery-gate ENABLE each require a
+    # semantic pass over the affected identities with no observation having
+    # moved — and activation must write `suppressed_backfill` terminal rows
+    # rather than dispatch history, which it can only do if it actually sees
+    # the blocks. Widening a bounded pass is always safe; missing an
+    # identity is not.
+    #
+    # Axis 4 is root-scoped when epoch-1007 ownership is available. A
+    # scalar-only legacy boundary records `REASON_SCHEDULED_DEFERRED` under
+    # `full_pass="defer"`, because whole history remains its only honest
+    # fallback.
+    #
+    # #1070 (spec §5.6, Q11, Q15): under `"defer"` none of them widens. The
+    # widened pass took 32 s on a production-shaped store against Codex's
+    # 30-second hook kill (§4.2 M1): the killed pass committed nothing, the
+    # gate stayed un-stored and the next hook repeated it — a loop reached by
+    # every first enable, rule change, rebuild NULL gate and re-enable. So the
+    # hook keeps its BOUNDED physical scope, evaluates no threshold for the
+    # deferred requirement, leaves the gate, the fingerprints and the due
+    # boundary as stored, and hands the work to the `_codex-quota-verify`
+    # worker as a durable obligation (recorded by the leg under the lock). An
+    # `"inline"` caller still widens within its own pass.
+    if (dirty_units is not None and alert_scope is not None
+            and full_pass != "defer"):
+        if alert_scope.scope == _axes.SCOPE_ALL:
+            dirty_units = None
+        elif alert_scope.scope == _axes.SCOPE_ROOTS:
+            # Reconcile every alert-invalidated root in full. If physical
+            # ledger work landed on the same tick, promote its roots too so
+            # the watermark can advance without skipping those mutations.
+            reconcile_roots = set(alert_scope.roots)
+            reconcile_roots.update(
+                str(group[0]) for group in dirty_units["raw_groups"])
+            dirty_units = None
+    fields.update(
+        scope=dirty_units,
+        reconcile_roots=(
+            None if reconcile_roots is None else frozenset(reconcile_roots)))
+    if dirty_units is None:
+        observations = load_codex_quota_observations(
+            source_root_keys=(
+                active_roots if reconcile_roots is None
+                else active_roots & reconcile_roots
+            ),
+            cache_conn=cache,
+        )
+        final_units = None
+    else:
+        observations = load_codex_quota_observations(
+            source_root_keys=active_roots, cache_conn=cache,
+            physical_groups=dirty_units["raw_groups"],
+        )
+        # A unit whose members ALL disappeared loads nothing, so the loaded
+        # observations alone would not name it and its blocks would never be
+        # swept. The ledger-derived set is authoritative for the sweep; the
+        # loaded set is unioned in only to cover a stored limit key the raw
+        # snap and the interpreted strip disagree on (reachable by hand
+        # repair, not by ingest).
+        final_units = frozenset(
+            dirty_units["units"]
+            | {_observation_unit_text(o) for o in observations}
+        )
+
+    # A pass may only advance the two non-dirtiness alert axes it stores if it
+    # actually did the work they exist to trigger.
+    #
+    # A REPORTING-ONLY pass (the `_codex-quota-verify` worker, the dashboard
+    # tick, `codex quota`) never reaches a threshold decision —
+    # `_evaluate_quota_alerts` returns at `if not alert_eligible_roots` — yet it
+    # used to stamp both, so a delivery-gate ENABLE landing on the same tick as
+    # a full pass was consumed with no arming row and no `suppressed_backfill`,
+    # and could not re-fire because `gate_before` then read True. Carrying
+    # eligible roots is what excludes it, and nothing else does.
+    #
+    # The second condition asks whether this pass LOOKED, not whether it
+    # intended to. A bounded tick that deferred axis 4 declined to look, so it
+    # must not retire the boundary. A tick that widened to whole-history for
+    # some OTHER reason did look — at every observation of every active root,
+    # and applied over all of them — so retiring it is honest. Gating on the
+    # deferral alone instead was an absorbing state: `alert_dirty_scope` widens
+    # whenever `gate_before is not True`, the hook is the only production
+    # caller that carries eligible roots AND it always defers, so a due
+    # boundary froze `alerts_enabled` at its stored value and every following
+    # tick re-resolved the identical SCOPE_ALL inline on the blocking path.
+    #
+    # A pass that deferred complete-history alert work to the worker (#1070)
+    # did not do it either, so it consumes nothing: the worker that completes
+    # the obligation retires the axes it evaluated.
+    consume_alert_axes = bool(alert_eligible_roots & active_roots) and (
+        not alert_obligations
+    ) and (
+        final_units is None
+        or alert_scope is None
+        or _axes.REASON_SCHEDULED_DEFERRED not in alert_scope.reasons
+    )
+    complete_roots = frozenset(
+        (active_roots if reconcile_roots is None
+         else active_roots & reconcile_roots)
+        if final_units is None else ()
+    )
+    return done(
+        "apply",
+        observations=observations,
+        dirty_units=final_units,
+        consume_alert_axes=consume_alert_axes,
+        complete_roots=complete_roots,
+        schedule_evaluated_roots=frozenset(
+            complete_roots & alert_eligible_roots),
+        prune_inactive_schedule=(
+            source_root_keys is None
+            and final_units is None
+            and reconcile_roots is None),
+    )
+
+
+def _codex_prepared_pass_still_valid(
+    stats_conn: sqlite3.Connection, prepared: _PreparedPass,
+) -> bool:
+    """The leg's validation (#1069, spec §5.1 step 1-2).
+
+    Keeps a prepared pass only when the stats witness read through the cycle's
+    own connection equals the prepared one, the attribution revision is
+    unchanged, no model-resolution debt stands and the ledger was not reset
+    (live high below the prepared high, the existing reset rule). Ordinary
+    advances of the physical sequence, the ledger head or the root inventory do
+    not invalidate it; they stay later incremental work, and the finalization
+    fences keep them owed. Anything unreadable fails validation.
+    """
+    if not _codex_witnesses_equal(
+            prepared.witness, _codex_projection_witness(stats_conn)):
+        return False
+    try:
+        cache = _cache_connection()
+    except (FileNotFoundError, sqlite3.Error):
+        return False
+    try:
+        cache.execute("BEGIN")
+        try:
+            revision = _cache_module().codex_window_attribution_revision(cache)
+            model_debt = _cache_module().codex_model_resolution_pending(cache)
+            ledger_high = _ledger_max_seq(cache)
+        finally:
+            cache.commit()
+    except sqlite3.Error:
+        return False
+    finally:
+        cache.close()
+    if revision != prepared.attribution_revision or model_debt:
+        return False
+    if prepared.ledger_high is not None and (
+            ledger_high is None or ledger_high < prepared.ledger_high):
+        return False
+    return True
+
+
+def _finalize_codex_quota_publication(
+    prepared: _PreparedPass, *, signatures: Mapping[str, str],
+) -> str:
+    """Fenced, best-effort certificate finalization (#1069, spec §5.1, Q3).
+
+    Runs in the ingest cycle's ``post_commit``, after the stats transaction has
+    committed and after the ``_after_stats_commit`` seam, under the same ingest
+    lock hold — so ingest → cache writer flocks → cache transaction, the order
+    ``docs/journal-gotchas.md``'s lock law permits after the stats commit. The
+    global then the Codex cache writer flock are taken non-blocking; when
+    either is unavailable nothing is pruned, certified or deleted, which leaves
+    recoverable work for a later finalization. In the one cache transaction the
+    store helper checks the fences before pruning (physical sequence,
+    attribution revision, ledger head, model debt): all equal prunes through
+    ``watermark_target`` and stores the certificate; any mismatch prunes
+    nothing and deletes the stored certificate.
+
+    NEVER raises: the cycle's alert dispatch runs after this, and a raise from
+    ``post_commit`` would drop a committed notification. Returns ``"stored"``,
+    ``"fenced"`` or ``"skipped"``.
+    """
+    import _lib_cache_writer_lock
+
+    held = None
+    try:
+        held = _lib_cache_writer_lock.acquire_cache_writer_flocks(
+            _cctally_core.CACHE_LOCK_PATH, _cctally_core.CACHE_LOCK_CODEX_PATH,
+            timeout=None)
+        if held is None:
+            return "skipped"
+        outcome = _store_codex_quota_projection_certificate(
+            sequence=prepared.physical_seq, signatures=signatures,
+            prune_ledger_through=prepared.watermark_target,
+            # The revision the pass computed against, not the post-ingest one:
+            # the cycle's own step 3 can materialize an attribution after the
+            # observations were loaded (#500 §8.3).
+            attribution_revision=prepared.attribution_revision,
+            expected_ledger_high=prepared.ledger_high,
+            delete_on_mismatch=True,
+        )
+        return outcome if outcome in ("stored", "fenced") else "skipped"
+    except Exception:  # noqa: BLE001 - best-effort by contract
+        return "skipped"
+    finally:
+        if held:
+            try:
+                _lib_cache_writer_lock.release_cache_writer_flocks(held)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+@dataclass(frozen=True)
+class _AlertLegPlan:
+    """What the leg does about alerts once its pass is final (#1070, §5.6).
+
+    Decided under the ingest lock, after the validation and any
+    re-preparation, and BEFORE ``_apply_quota_projection_rows``: the
+    sidecar's requests are recorded or merged first, so a request survives a
+    rolled-back transaction harmlessly, while a pass whose obligation could not
+    be durably recorded is withheld (it must not consume the dirtiness the
+    request's cutoff describes).
+    """
+
+    evaluate_roots: "frozenset[str]"
+    consume_alert_axes: bool
+    schedule_evaluated_roots: "frozenset[str]"
+    activation_cutoffs: "dict[str, dt.datetime] | None" = None
+    completing_ids: "frozenset[str]" = frozenset()
+    withhold: bool = False
+    pending: bool = False
+    issue: str = ""
+
+
+def _plan_codex_alert_leg(
+    final: _PreparedPass, *, activation_roots: "frozenset[str] | None",
+    now_iso: str,
+) -> _AlertLegPlan:
+    """Record, merge and apply the pending alert obligations (#1070, §5.6).
+
+    A reporting pass (no eligible roots, not the activation) and a pass with
+    delivery off leave alerts exactly as before: the disarm runs inline and
+    ends the generation after the commit. Otherwise the sidecar is read under
+    the lock. A DAMAGED sidecar makes the pass reporting-only for alerts —
+    nothing evaluated, no axis consumed, the physical scope still published —
+    and pending, because stats cannot prove it held no obligation. A readable
+    one is merged with this pass's derived obligations and durably rewritten
+    when anything changed; a failed write withholds the pass. Then:
+
+    * the hook (and any eligible pass that is not the activation) evaluates
+      only roots with no pending obligation — an inline evaluation would
+      activate at this tick's time without the cutoff, or dispatch before the
+      activation — and consumes no axis while any request stands;
+    * the activation (``activation_roots``: the worker's configured roots)
+      evaluates its locked roots with each one's earliest cutoff, completes
+      every request whose owed roots it holds, and consumes the axes only when
+      it evaluated every applicable root and nothing remains.
+    """
+    unchanged = _AlertLegPlan(
+        evaluate_roots=frozenset(final.alert_eligible_roots),
+        consume_alert_axes=final.consume_alert_axes,
+        schedule_evaluated_roots=frozenset(final.schedule_evaluated_roots))
+    if activation_roots is None and not final.alert_eligible_roots:
+        return unchanged
+    config = final.alert_config
+    if config is None or not (config[0] and config[1]):
+        return unchanged
+    eligible = frozenset(final.alert_eligible_roots) & frozenset(final.active_roots)
+    state = _read_codex_alert_obligations()
+    if state.damaged:
+        return _AlertLegPlan(
+            evaluate_roots=frozenset(), consume_alert_axes=False,
+            schedule_evaluated_roots=frozenset(), pending=True,
+            issue="alert_obligations_unreadable")
+    fingerprint = _codex_alert_config_fingerprint(config)
+    merged, changed = _merge_codex_alert_obligations(
+        state.requests, derived=final.alert_obligations,
+        fingerprint=fingerprint, observed_roots=eligible, now_iso=now_iso)
+    if changed:
+        try:
+            _write_codex_alert_obligations(merged)
+        except OSError:
+            return _AlertLegPlan(
+                evaluate_roots=frozenset(), consume_alert_axes=False,
+                schedule_evaluated_roots=frozenset(), withhold=True,
+                pending=True, issue="alert_obligations_unwritable")
+    if not merged:
+        return unchanged
+    if activation_roots is not None:
+        applicable = frozenset(activation_roots) & frozenset(final.active_roots)
+        cutoffs: "dict[str, dt.datetime]" = {}
+        completing: "set[str]" = set()
+        # A request under another fingerprint survives the merge only when
+        # this leg is stale (`_alert_obligations_newer_than`): it belongs to a
+        # newer configuration, so this leg neither evaluates the roots it owes
+        # under the older rules nor completes it.
+        stale_owed: "set[str]" = set()
+        for request in merged:
+            owed = _alert_obligation_owed_roots(request, applicable)
+            if request["config_fingerprint"] != fingerprint:
+                stale_owed |= owed
+                continue
+            if owed <= eligible:
+                completing.add(request["id"])
+            for root in owed & eligible:
+                cutoff = _parse_utc(
+                    request["cutoffs"][root], "alert obligation cutoff")
+                cutoffs[root] = min(cutoffs.get(root, cutoff), cutoff)
+        pending = len(completing) < len(merged)
+        return _AlertLegPlan(
+            evaluate_roots=eligible - stale_owed,
+            consume_alert_axes=(
+                final.consume_alert_axes and not pending
+                and applicable <= eligible),
+            schedule_evaluated_roots=frozenset(final.schedule_evaluated_roots),
+            activation_cutoffs=cutoffs, completing_ids=frozenset(completing),
+            pending=pending)
+    pending_roots: "set[str]" = set()
+    for request in merged:
+        pending_roots |= _alert_obligation_owed_roots(request, eligible)
+    return _AlertLegPlan(
+        evaluate_roots=frozenset(final.alert_eligible_roots) - pending_roots,
+        consume_alert_axes=False,
+        schedule_evaluated_roots=(
+            frozenset(final.schedule_evaluated_roots) - pending_roots),
+        pending=True)
+
+
+def _alert_work_pending_without_leg(
+    prepared: _PreparedPass, *, activation: bool,
+) -> "tuple[bool, str]":
+    """``alert_work_pending`` for a pass whose leg recorded nothing (a
+    deferral, a model fence, contention): its own derived obligations, or the
+    requests a lock-free read of the sidecar shows. Never raises."""
+    if prepared.alert_obligations:
+        return True, ""
+    if not activation and not prepared.alert_eligible_roots:
+        return False, ""
+    config = prepared.alert_config
+    if config is None or not (config[0] and config[1]):
+        return False, ""
+    state = _read_codex_alert_obligations()
+    if state.damaged:
+        return True, "alert_obligations_unreadable"
+    return bool(state.requests), ""
+
+
+def _settle_codex_alert_obligations(holder: dict) -> None:
+    """After the commit, before the dispatch (#1070, spec §5.6): end the
+    generation after a live disarm, or remove the requests the activation just
+    completed. Best-effort under the finalization's contract: an ``OSError``
+    is caught, never raises (the cycle's dispatch runs next, and a raise from
+    ``post_commit`` would drop a committed notification), keeps the requests,
+    keeps the committed status and counts, and leaves alert work pending; the
+    retry is idempotent (its claims already exist), so nothing dispatches
+    twice."""
+    plan = holder.get("plan")
+    try:
+        if holder.get("disarmed"):
+            _cancel_codex_alert_obligations()
+            holder["alert_work_pending"] = False
+            holder["alert_work_issue"] = ""
+        elif plan is not None and plan.completing_ids and holder.get("applied"):
+            state = _read_codex_alert_obligations()
+            if state.state != "readable":
+                return
+            remaining = [
+                request for request in state.requests
+                if request["id"] not in plan.completing_ids]
+            if len(remaining) != len(state.requests):
+                _write_codex_alert_obligations(remaining)
+            holder["alert_work_pending"] = bool(remaining)
+    except OSError:
+        holder["alert_work_pending"] = True
+        holder["alert_work_issue"] = "alert_obligations_unwritable"
+    except Exception:  # noqa: BLE001 - best-effort by contract
+        holder["alert_work_pending"] = True
+
+
+def _run_codex_worker_requests(
+    requests: Iterable[str], *, hold_verify: bool = False,
+) -> None:
+    """Spawn the hand-offs a preparation requested, outside every transaction
+    (#1069 Q4): after ``run_stats_ingest`` has returned, or at once when no
+    ingest runs.
+
+    ``hold_verify`` (#1070, Q13): a hook whose alert work is pending requests
+    the verify worker itself once it has RELEASED its lifecycle locks, so the
+    worker does not start against its parent's locks and lose its throttle
+    window to an ``alert_lifecycle_contended`` run."""
+    seen: set = set()
+    for request in requests:
+        if request in seen:
+            continue
+        seen.add(request)
+        if request == "verify":
+            if hold_verify:
+                continue
+            _defer_codex_quota_verification()
+        elif request == "model":
+            _request_codex_model_resolution()
 
 
 def reconcile_codex_quota_projection(
@@ -3961,6 +6120,8 @@ def reconcile_codex_quota_projection(
     full_pass: str = "inline",
     _before_stats_commit: Callable[[], None] | None = None,
     _after_stats_commit: Callable[[], None] | None = None,
+    _alert_activation_roots: Iterable[str] | None = None,
+    _read_deferrals: "list[str] | None" = None,
 ) -> QuotaProjectionResult:
     """Reconcile every active Codex root into one stats transaction.
 
@@ -3991,32 +6152,50 @@ def reconcile_codex_quota_projection(
     programmatic "do it now" — the equivalence oracle and the rebuild path both
     need it to mean that.
 
-    The spec §3 alert axes also still widen inline, and they ARE reachable here:
-    every hook tick that clears the 15-second lifecycle throttle passes a
-    non-empty ``alert_eligible_root_keys``, so ``alert_scope`` is resolved and
-    the widening branch is live on all of them. That is accepted for axes 2 and
-    3 — a rule change or a delivery-gate ENABLE must write ``suppressed_backfill``
-    terminal rows for already-satisfied blocks rather than dispatch history, and
-    it can only do that by SEEING those blocks; the worker runs reporting-only
-    with no alert-eligible roots, so deferring would break the pass rather than
-    delay it. Both fire on a config change the user just made, so the cost is
-    bounded and attributable.
+    The spec §3 alert axes (a delivery-gate ENABLE, a rule change, an owned or
+    legacy scheduled instant) widen an ``"inline"`` pass, because activation
+    must write ``suppressed_backfill`` terminal rows for already-satisfied
+    blocks rather than dispatch history, and it can only do that by SEEING
+    them. Under ``"defer"`` (#1070, spec §5.6) they never widen: that widened
+    pass took 32 s on a production-shaped store against Codex's 30-second hook
+    kill, so it never committed and every following hook repeated it. The hook
+    keeps its bounded scope and records the complete-history work as a durable
+    obligation (``codex-quota-alert-obligations.json``, cutoff = the hook's
+    ``now``); the ``_codex-quota-verify`` worker completes it under the owed
+    roots' real lifecycle locks (``_alert_activation_roots`` is its configured
+    root set), and ``alert_work_pending`` reports work still owed. A crossing
+    captured after the cutoff alerts when the worker completes; history stays
+    ``suppressed_backfill``.
 
-    Axis 4 fires on wall clock. Epoch 1007 persists its owning roots, so a due
-    hook tick performs complete passes only for the matured roots. A legacy or
-    inconsistent scalar-only boundary still defers under ``"defer"`` because
-    its only honest fallback is whole history.
+    A pass that did the complete-history alert work retires the axes it
+    evaluated (the gate, the matured boundary); a pass that deferred it retires
+    none, so the obligation keeps standing until the worker completes it.
 
-    A tick that widened to whole-history for axis 2 or 3 anyway does retire it,
-    because it did look: at every observation of every active root. Withholding
-    that was an absorbing state rather than a conservative one — the widening
-    routes are exactly the ones that also need to stamp ``alerts_enabled``, so
-    declining both left the same scope standing and repeated the whole-history
-    pass inline on every subsequent tick.
+    #1069: the pass is prepared OPTIMISTICALLY, outside the ingest lock
+    (``_prepare_codex_quota_pass``), and the ``codex_apply`` leg validates that
+    preparation against the cycle's own stats connection before applying it:
+    the publication witness, the attribution revision, model-resolution debt
+    and a ledger reset. A superseded preparation is replaced by ONE complete
+    re-preparation inside the lock, so every schedule of concurrent reconcilers
+    is equivalent to a serial one; the re-preparation routes alert work
+    exactly as the optimistic one does, so it never loads a complete history
+    on the hook either. The
+    certificate and the ledger prune are finalized in ``post_commit``, behind
+    fences, best-effort (``_finalize_codex_quota_publication``). The returned
+    ``status`` is always explicit: ``published``, ``current``,
+    ``deferred_verify``, ``deferred_model``, ``contended`` or ``unavailable``.
 
-    A quiet owned boundary is therefore consumed without broadening the hook to
-    unrelated roots; the following quiet tick returns to the zero-group path.
+    #1076: off the hook (no Codex read policy active) the whole
+    ``run_stats_ingest`` call runs under the defer-only
+    ``off_hook_codex_read_policy()``, so a pending observation's pipeline
+    never syncs Codex or reconciles again inside this ingest; its Codex budget
+    readers defer with ``off_hook_unpinned``. ``_read_deferrals`` is an
+    invocation-owned collector extended with those reasons, even when the
+    reconcile raises. A call nested inside a held ingest returns
+    ``contended`` before any work, or raises when it carries alert authority.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("WRITE", entry="reconcile_codex_quota_projection")
     if full_pass not in ("inline", "defer"):
         raise ValueError(
             "reconcile_codex_quota_projection: full_pass must be "
@@ -4026,371 +6205,102 @@ def reconcile_codex_quota_projection(
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     now_iso = _utc_iso(now)
-
-    alert_eligible_roots = {str(key) for key in alert_eligible_root_keys}
-    global_alerts_enabled, quota_alerts_enabled, _rules, _config = (
-        _quota_alert_config()
-    )
-    delivery_enabled = global_alerts_enabled and quota_alerts_enabled
-
-    try:
-        cache = _cache_connection()
-    except (FileNotFoundError, sqlite3.Error):
-        return QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
-    try:
-        # F2: read active_roots, the physical sequence, and the certificate
-        # inside ONE WAL read snapshot so a concurrent commit cannot interleave
-        # a stale sequence with a fresh certificate.
-        cache.execute("BEGIN")
-        try:
-            active_roots = (
-                _cache_root_keys(cache)
-                if source_root_keys is None else {str(key) for key in source_root_keys}
-            )
-            physical_sequence = codex_physical_mutation_seq(cache)
-            certificate = load_codex_quota_projection_certificate(cache)
-            ledger_high = _ledger_max_seq(cache)
-            # #500 §8.3. An attribution change fires no `quota_window_snapshots`
-            # trigger and writes no ledger entry, so the change ledger cannot
-            # see it and the certificate reader above has already declined a
-            # certificate computed against a different revision. What is left is
-            # naming the groups the pass now owes, which is only worth reading
-            # when the revision actually moved.
-            attribution_revision = (
-                _cache_module().codex_window_attribution_revision(cache))
-            attribution_stale = _certificate_attribution_revision(
-                _codex_quota_projection_certificate_payload(cache)
-            ) != attribution_revision
-            attribution_scope = (
-                codex_attribution_projection_scope(cache)
-                if attribution_stale else None
-            )
-            # #980 D6: quota projection requires established model resolution.
-            # One indexed `cache_meta` read in the same snapshot; while the
-            # `model` flag, an unexpanded `full` or a malformed debt record
-            # stands, no projection row and no certificate may be published —
-            # interpreting a still-resolvable NULL `observed_model` would file a
-            # Spark window as account weekly quota (#373).
-            model_pending = (
-                _cache_module().codex_model_resolution_pending(cache))
-        finally:
-            cache.commit()
-        if model_pending:
-            _request_codex_model_resolution()
-            return QuotaProjectionResult(
-                None, 0, 0, 0, 0, 0, 0, status=PROJECTION_DEFERRED_MODEL)
-        # ONE stats read decides the whole shape of the pass: whether the
-        # short-circuit fires, and if not, whether the pass is bounded.
-        ledger_state = None
-        has_arming = False
-        stale_reverse_map = True
-        alert_scope = None
-        stats_conn = _cctally_core.open_db()
-        try:
-            ledger_state = _ledger_state(stats_conn)
-            has_arming = bool(stats_conn.execute(
-                "SELECT 1 FROM quota_alert_arming "
-                "WHERE source='codex' LIMIT 1"
-            ).fetchone())
-            stale_reverse_map = _blocks_missing_reverse_map(stats_conn)
-            signatures_match = (
-                certificate is not None
-                and _stats_projection_signatures_match(
-                    stats_conn, active_roots, certificate[1])
-            )
-            if alert_eligible_roots:
-                alert_scope = _resolve_alert_scope(
-                    stats_conn, ledger_scope=_axes.SCOPE_GROUPS, now=now,
-                    ledger_state=ledger_state,
-                    global_enabled=global_alerts_enabled,
-                    quota_enabled=quota_alerts_enabled,
-                    rules=_rules, config=_config,
-                    eligible_roots=alert_eligible_roots,
-                    defer_scheduled=(full_pass == "defer"),
-                )
-        finally:
-            stats_conn.close()
-
-        watermark = 0 if ledger_state is None else ledger_state["watermark"]
-        # Short-circuit: when nothing is alert-eligible and the certificate
-        # proves the cache physical state is current AND the stats-side
-        # projection still matches it (F1), the ~2.9 s observation load and the
-        # whole reconcile are provably a no-op. Any missed concurrent write
-        # leaves cur_seq != cert_seq (or a stats-signature mismatch) on the next
-        # call, so the scheme is self-healing.
-        #
-        # The unconsumed-ledger clause is the third leg, and it closes a hole
-        # the certificate alone cannot see: a writer that mutates
-        # `quota_window_snapshots` WITHOUT advancing the physical mutation
-        # sequence (migration 028 does exactly this, and the journal cache
-        # applier did too) leaves the certificate reading as current while real
-        # interpretation drift sits unprocessed. The triggers recorded it, so
-        # the ledger knows even when the sequence does not.
-        #
-        # The projector's own state has to be current too. A stale
-        # interpretation version or a block with no reverse map means the next
-        # pass MUST do work, and skipping on the certificate alone would defer
-        # that repair forever — the certificate cannot see either condition.
-        #
-        # The periodic verification joins them for the same reason. A skipped
-        # pass never stamps the deadline, so letting the short-circuit fire
-        # while it is overdue would leave every subsequent tick overdue too —
-        # the interval would never elapse into anything.
-        verification_due = _full_verification_due(ledger_state, now)
-        projector_state_current = (
-            ledger_state is not None
-            and ledger_state["interpretation_version"]
-            == _CODEX_QUOTA_INTERPRETATION_VERSION
-            and not stale_reverse_map
-        )
-        if (
-            verification_due
-            and full_pass == "defer"
-            # The interval alone. When the projector state is otherwise current
-            # this tick can still do its ordinary BOUNDED work after handing the
-            # verification off, which is why this gate is separate from the
-            # catch-all below: deferring here costs nothing, deferring there
-            # costs this tick's incremental progress.
-            and projector_state_current
-            and ledger_high is not None
-            and ledger_high >= watermark
-        ):
-            # The bounded ingest leg made every part of the hook tick bounded
-            # except this one. The spec's escape hatch — "whichever caller
-            # reaches the deadline first, a dashboard tick or a `codex quota`
-            # invocation" — does not exist for a hook-only install, which is
-            # precisely the reporter's shape, so once a day the whole-history
-            # reconcile would land on the blocking hook path against Codex's
-            # 30-second timeout and fail acceptance criterion 3 for the very
-            # user who reported the bug. Hand it to a detached worker.
-            #
-            # Skipping it on a failed spawn is deliberate: the deadline is only
-            # stamped by a pass that COMPLETES, so the next tick is still due
-            # and retries (throttled). One missed daily verification is bounded
-            # staleness; a 30-second hook stall is the reported defect.
-            _defer_codex_quota_verification()
-            verification_due = False
-        ledger_state_current = projector_state_current and not verification_due
-        if (
-            not force_full
-            and not alert_eligible_roots
-            and certificate is not None
-            and ledger_high is not None
-            and ledger_high == watermark
-            and ledger_state_current
-        ):
-            cert_seq, cert_sigs = certificate
-            if physical_sequence == cert_seq and active_roots <= set(cert_sigs):
-                can_skip_delivery = delivery_enabled or not has_arming
-                if can_skip_delivery and signatures_match:
-                    return QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
-
-        dirty_units, watermark_target = _resolve_pass_scope(
-            cache,
-            force_full=force_full,
-            ledger_state=ledger_state,
-            ledger_high=ledger_high,
-            watermark=watermark,
-            active_roots=active_roots,
-            stale_reverse_map=stale_reverse_map,
-            verification_due=verification_due,
-        )
-        if dirty_units is not None and attribution_scope:
-            # Union, never replace: the ledger's own dirty set is still owed.
-            # A bounded pass that then exceeds the incremental ceiling falls
-            # back to whole history exactly as `_resolve_pass_scope` would,
-            # because N indexed seeks stop beating one scan at the same point
-            # however the units were arrived at.
-            merged_units = (
-                frozenset(dirty_units["units"]) | attribution_scope["units"])
-            if len(merged_units) > _MAX_INCREMENTAL_UNITS:
-                dirty_units = None
-            else:
-                dirty_units = {
-                    "raw_groups": frozenset(dirty_units["raw_groups"])
-                    | attribution_scope["raw_groups"],
-                    "units": merged_units,
-                }
-        # ``None`` means the genuine whole-history path. A set means complete
-        # histories for only those roots — axis 2 and epoch-1007 axis 4 can both
-        # be satisfied without scanning unrelated roots.
-        reconcile_roots: "set[str] | None" = None
-        if dirty_units is None and full_pass == "defer" and not force_full:
-            # The rule, for every OTHER route into a whole-history pass: an
-            # absent or freshly rebuilt projector state, an interpretation-
-            # version bump, a reset ledger, a block missing its reverse map, a
-            # dirty-unit burst, and a cache too old to carry the change log.
-            #
-            # The rebuilt-state route is the one that matters, and it is not
-            # hypothetical: this feature bumps `STATS_INDEX_EPOCH`, so every
-            # upgrading install rebuilds stats.db from the journal on first
-            # open. Measured on a real 211K-observation store that rebuild alone
-            # cost 76.45s of an 82.05s tick. Running the whole-history pass
-            # inline on top of it, on a path Codex kills at 30 seconds, means
-            # `run_stats_ingest` commits nothing, `last_full_pass_at` is never
-            # stamped, and the next tick repeats it — a non-converging
-            # 30-second-per-turn loop, which is the reported defect delivered by
-            # the fix.
-            #
-            # Unlike the interval gate above, this one performs NO projection
-            # work at all: without a trustworthy watermark there is no bounded
-            # pass to fall back to. That leaves the projection transiently
-            # missing rather than merely stale, and it is accepted — the worker
-            # converges it (throttled retry on failure), every non-hook caller
-            # still runs inline, and a 30-second blocking tick is not an option.
-            _defer_codex_quota_verification()
-            return QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
-        # Axis 2/3/4 (spec §3): alert state is not a function of window
-        # dirtiness. A rule change and a delivery-gate ENABLE each require a
-        # semantic pass over the affected identities with no observation having
-        # moved — and activation must write `suppressed_backfill` terminal rows
-        # rather than dispatch history, which it can only do if it actually sees
-        # the blocks. Widening a bounded pass is always safe; missing an
-        # identity is not. Both are driven by a configuration change the user
-        # just made, so the widening is bounded and expected, and it stays
-        # inline even under `defer`.
-        #
-        # Axis 4 is root-scoped when epoch-1007 ownership is available. A
-        # scalar-only legacy boundary still records `REASON_SCHEDULED_DEFERRED`
-        # under `full_pass="defer"`, because whole history remains its only
-        # honest fallback.
-        if dirty_units is not None and alert_scope is not None:
-            if alert_scope.scope == _axes.SCOPE_ALL:
-                dirty_units = None
-            elif alert_scope.scope == _axes.SCOPE_ROOTS:
-                # Reconcile every alert-invalidated root in full. If physical
-                # ledger work landed on the same tick, promote its roots too so
-                # the watermark can advance without skipping those mutations.
-                reconcile_roots = set(alert_scope.roots)
-                reconcile_roots.update(
-                    str(group[0]) for group in dirty_units["raw_groups"])
-                dirty_units = None
-        if dirty_units is None:
-            observations = load_codex_quota_observations(
-                source_root_keys=(
-                    active_roots if reconcile_roots is None
-                    else active_roots & reconcile_roots
-                ),
-                cache_conn=cache,
-            )
-        else:
-            observations = load_codex_quota_observations(
-                source_root_keys=active_roots, cache_conn=cache,
-                physical_groups=dirty_units["raw_groups"],
-            )
-            # A unit whose members ALL disappeared loads nothing, so the loaded
-            # observations alone would not name it and its blocks would never be
-            # swept. The ledger-derived set is authoritative for the sweep; the
-            # loaded set is unioned in only to cover a stored limit key the raw
-            # snap and the interpreted strip disagree on (reachable by hand
-            # repair, not by ingest).
-            dirty_units = frozenset(
-                dirty_units["units"]
-                | {_observation_unit_text(o) for o in observations}
-            )
-    finally:
-        cache.close()
-
-    # A pass may only advance the two non-dirtiness alert axes it stores if it
-    # actually did the work they exist to trigger.
-    #
-    # A REPORTING-ONLY pass (the `_codex-quota-verify` worker, the dashboard
-    # tick, `codex quota`) never reaches a threshold decision —
-    # `_evaluate_quota_alerts` returns at `if not alert_eligible_roots` — yet it
-    # used to stamp both, so a delivery-gate ENABLE landing on the same tick as
-    # a full pass was consumed with no arming row and no `suppressed_backfill`,
-    # and could not re-fire because `gate_before` then read True. Every
-    # upgrading install is in exactly that state right after the epoch rebuild,
-    # and the daily verification puts installs there routinely. Carrying
-    # eligible roots is what excludes it, and nothing else does.
-    #
-    # The second condition asks whether this pass LOOKED, not whether it
-    # intended to. A bounded tick that deferred axis 4 declined to look, so it
-    # must not retire the boundary. A tick that widened to whole-history for
-    # some OTHER reason did look — at every observation of every active root,
-    # and applied over all of them — so it evaluated the matured instant as
-    # surely as a widening for axis 4 itself would have, and retiring it is
-    # honest. Gating on the deferral alone instead was an absorbing state, not a
-    # conservative one: `alert_dirty_scope` widens whenever `gate_before is not
-    # True` (the NULL a rebuild leaves, the False a disable leaves), the hook is
-    # the only production caller that carries eligible roots AND it always
-    # defers, so a due boundary froze `alerts_enabled` at its stored value and
-    # every following tick re-resolved the identical SCOPE_ALL — the
-    # whole-history reconcile inline on the blocking path, on every turn.
-    #
-    # Reaching this line with `dirty_units is None` under `defer` means
-    # precisely "the alert axes widened it": every other route into a
-    # whole-history pass returned at the catch-all above, and no hook caller
-    # passes `force_full`.
-    consume_alert_axes = bool(alert_eligible_roots & active_roots) and (
-        dirty_units is None
-        or alert_scope is None
-        or _axes.REASON_SCHEDULED_DEFERRED not in alert_scope.reasons
-    )
-    complete_roots = (
-        (active_roots if reconcile_roots is None else active_roots & reconcile_roots)
-        if dirty_units is None else set()
-    )
-    schedule_evaluated_roots = frozenset(
-        complete_roots & alert_eligible_roots)
-
-    # ── Apply phase (Task 7 Item 3) ─────────────────────────────────────────
-    # The stats.db writes route through the single-flight ingest cycle instead
-    # of this function opening its own stats connection + BEGIN IMMEDIATE. The
-    # nested `_apply_projection(conn, sink)` is the transaction-neutral chokepoint
-    # (writes on `conn`, no BEGIN/commit; alerts to `sink`) — the ingest cycle's
-    # `codex_apply` seam drives it on the cycle's conn, AFTER the codex flock has
-    # released (the existing after-flock-release rule). The interpreted `quota_*`
-    # tables are mutable projections re-materialized here (spec §5.3), and each
-    # genuine arming activation journals a `quota_alert_arming` evt so the
-    # forward-only boundary survives a stats.db rebuild (Item 5).
-    holder: dict = {
-        "result": QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0),
-        "signatures": None,
+    alert_eligible_roots = frozenset(str(key) for key in alert_eligible_root_keys)
+    prepare_kwargs = {
+        "source_root_keys": (
+            None if source_root_keys is None
+            else frozenset(str(key) for key in source_root_keys)),
+        "alert_eligible_root_keys": alert_eligible_roots,
+        "now": now,
+        "force_full": force_full,
+        "full_pass": full_pass,
+        "extra_active_roots": frozenset(
+            str(key) for key in (_alert_activation_roots or ())),
     }
+    activation_roots = (
+        None if _alert_activation_roots is None
+        else frozenset(str(key) for key in _alert_activation_roots))
+    hold_verify_on_pending = full_pass == "defer"
 
-    def _apply_projection(
-        conn, sink, *, journal_emit=None, journal_disarm=None,
-        journal_terminal=None,
-    ):
-        # No configured roots and no existing interpreted history means there is
-        # no stats work.  This preserves the existing empty-Codex fast path.
-        # Delegates to the shared module-level apply so the live leg and the
-        # rebuild re-materialization pass (Task 8) never drift.
-        _apply_quota_projection_rows(
-            conn, observations=observations, active_roots=active_roots,
-            now=now, now_iso=now_iso, sink=sink,
-            alert_eligible_roots=alert_eligible_roots,
-            journal_emit=journal_emit, journal_disarm=journal_disarm,
-            journal_terminal=journal_terminal,
-            holder=holder, dirty_units=dirty_units,
-            ledger_watermark=watermark_target,
-            alerts_enabled=delivery_enabled,
-            stored_next_evaluation_at=(
-                None if ledger_state is None
-                else ledger_state["next_evaluation_at"]),
-            stored_last_full_pass_at=(
-                None if ledger_state is None
-                else ledger_state["last_full_pass_at"]),
-            stored_alerts_enabled=(
-                None if ledger_state is None
-                else ledger_state["alerts_enabled"]),
-            stored_next_evaluation_by_root=(
-                {} if ledger_state is None
-                else ledger_state["next_evaluation_by_root"]),
-            consume_alert_axes=consume_alert_axes,
-            reconcile_roots=reconcile_roots,
-            schedule_evaluated_roots=schedule_evaluated_roots,
-            prune_inactive_schedule=(
-                source_root_keys is None
-                and dirty_units is None
-                and reconcile_roots is None),
-        )
+    # #1076 D4: a reconcile nested inside a held ingest cycle could only wait
+    # for the ingest lock its own context holds (10 s, then `contended`). It
+    # returns `contended` at once: nothing recorded, no worker requested, no
+    # certificate advanced; the stale certificate makes the next unnested
+    # sync reconcile. Alert authority belongs to the top-level hook and
+    # worker, so a nested call carrying it violates the lifecycle contract.
+    import _cctally_store
+    if _cctally_store.holds_ingest_lock():
+        if alert_eligible_roots or activation_roots is not None:
+            raise RuntimeError(
+                "reconcile_codex_quota_projection: an alert-authorized "
+                "reconcile must not run inside a held stats ingest")
+        return QuotaProjectionResult(
+            None, 0, 0, 0, 0, 0, 0, status=PROJECTION_CONTENDED)
 
+    def _empty(
+        status: str, pending: bool = False, issue: str = "",
+    ) -> QuotaProjectionResult:
+        return QuotaProjectionResult(
+            None, 0, 0, 0, 0, 0, 0, status=status,
+            alert_work_pending=pending, alert_work_issue=issue)
+
+    # ── the optimistic preparation, outside the ingest lock ─────────────────
+    # A fresh stats connection whose read snapshot holds only step 2; it is
+    # closed before the ingest starts, as is the routine's own cache snapshot.
+    stats_conn = _cctally_core.open_db()
+    try:
+        prepared = _prepare_codex_quota_pass(
+            stats_conn=stats_conn, in_lock=False, **prepare_kwargs)
+    finally:
+        stats_conn.close()
+    if prepared.disposition != "apply":
+        # `current`, `deferred_verify`, `deferred_model`, `unavailable`: no
+        # ingest; any hand-off runs now, outside every transaction. Alert work
+        # this pass derived (or the sidecar already holds) stays pending: the
+        # hook requests the worker after releasing its lifecycle locks.
+        pending, issue = _alert_work_pending_without_leg(
+            prepared, activation=activation_roots is not None)
+        _run_codex_worker_requests(
+            prepared.worker_requests,
+            hold_verify=pending and hold_verify_on_pending)
+        return _empty(prepared.disposition, pending, issue)
+
+    # ── apply, under the ingest lock (Task 7 Item 3) ────────────────────────
+    # The stats.db writes route through the single-flight ingest cycle. The
+    # `codex_apply` leg validates the optimistic preparation against the
+    # cycle's own connection and re-prepares ONCE when it was superseded
+    # (#1069): no other quota publication can interleave inside the lock, so
+    # the re-prepared pass cannot itself be superseded. The interpreted
+    # `quota_*` tables are mutable projections re-materialized here (spec
+    # §5.3), and each genuine arming activation journals a
+    # `quota_alert_arming` evt so the forward-only boundary survives a
+    # stats.db rebuild (Item 5).
+    holder: dict = {}
+
+    def _reset_holder() -> None:
+        holder.clear()
+        holder.update({
+            "result": _empty(PROJECTION_CURRENT),
+            "signatures": None,
+            "pass": None,
+            "applied": False,
+            "finalization": None,
+            "plan": None,
+            "withheld": False,
+            "disarmed": False,
+            "alert_work_pending": False,
+            "alert_work_issue": "",
+        })
+
+    _reset_holder()
     import _cctally_journal as _jr
     import _lib_journal as _jl
 
     def _codex_leg(ctx):
+        # The ingest's correction recovery can invoke this twice in one call
+        # (spec §4.1), so every invocation validates from a fresh holder.
+        _reset_holder()
+
         def _emit_arming(identity, fingerprint, activated_at):
             # Item 5: journal the arming state change (`quota_alert_arming` evt).
             # account_key (#341) is part of the qaa state identity (after the
@@ -4461,45 +6371,145 @@ def reconcile_codex_quota_projection(
             ))
             ctx.events_emitted += 1
 
-        _apply_projection(
-            ctx.conn,
-            ctx.pending_alerts,
-            journal_emit=_emit_arming,
-            journal_disarm=_emit_disarm,
-            journal_terminal=_emit_terminal_event,
-        )
+        final = prepared
+        if not _codex_prepared_pass_still_valid(ctx.conn, final):
+            # Once per invocation: the caller's arguments (eligible roots
+            # included), stats through `ctx.conn`, a fresh cache snapshot and
+            # a fresh config snapshot. Never a reconcile, never an ingest.
+            final = _prepare_codex_quota_pass(
+                stats_conn=ctx.conn, in_lock=True, **prepare_kwargs)
+        holder["pass"] = final
+        if final.disposition == "apply":
+            # #1070 §5.6: record or merge the pending alert obligations BEFORE
+            # any projection write; a pass whose obligation could not be
+            # durably recorded is withheld whole.
+            plan = _plan_codex_alert_leg(
+                final, activation_roots=activation_roots, now_iso=now_iso)
+            holder["plan"] = plan
+            holder["alert_work_pending"] = plan.pending
+            holder["alert_work_issue"] = plan.issue
+            if plan.withhold:
+                holder["withheld"] = True
+        else:
+            pending, issue = _alert_work_pending_without_leg(
+                final, activation=activation_roots is not None)
+            holder["alert_work_pending"] = pending
+            holder["alert_work_issue"] = issue
+        if final.disposition == "apply" and not holder["withheld"]:
+            plan = holder["plan"]
+            ledger_state = final.ledger_state
+            # No configured roots and no existing interpreted history means
+            # there is no stats work; the shared module-level apply returns
+            # without a publication, which keeps the empty-Codex fast path.
+            # Delegates to the shared apply so the live leg and the rebuild
+            # re-materialization pass (Task 8) never drift.
+            _apply_quota_projection_rows(
+                ctx.conn, observations=final.observations,
+                active_roots=set(final.active_roots),
+                now=now, now_iso=now_iso, sink=ctx.pending_alerts,
+                alert_eligible_roots=set(plan.evaluate_roots),
+                journal_emit=_emit_arming, journal_disarm=_emit_disarm,
+                journal_terminal=_emit_terminal_event,
+                holder=holder, dirty_units=final.dirty_units,
+                ledger_watermark=final.watermark_target,
+                alerts_enabled=bool(
+                    final.alert_config[0] and final.alert_config[1]),
+                stored_next_evaluation_at=(
+                    None if ledger_state is None
+                    else ledger_state["next_evaluation_at"]),
+                stored_last_full_pass_at=(
+                    None if ledger_state is None
+                    else ledger_state["last_full_pass_at"]),
+                stored_alerts_enabled=(
+                    None if ledger_state is None
+                    else ledger_state["alerts_enabled"]),
+                stored_next_evaluation_by_root=(
+                    {} if ledger_state is None
+                    else ledger_state["next_evaluation_by_root"]),
+                consume_alert_axes=plan.consume_alert_axes,
+                reconcile_roots=(
+                    None if final.reconcile_roots is None
+                    else set(final.reconcile_roots)),
+                schedule_evaluated_roots=plan.schedule_evaluated_roots,
+                prune_inactive_schedule=final.prune_inactive_schedule,
+                alert_config=final.alert_config,
+                activation_cutoffs=plan.activation_cutoffs,
+            )
+            holder["applied"] = holder["signatures"] is not None
         # `_before_stats_commit` fires INSIDE the cycle txn, before COMMIT — a
         # raise rolls the whole cycle back, so the projection updates undo
         # together (the crash-consistency contract the callers test).
         if _before_stats_commit is not None:
             _before_stats_commit()
 
+    def _post_commit():
+        # After the commit, still under the ingest lock and BEFORE the cycle's
+        # alert dispatch: the `_after_stats_commit` seam first (its raising
+        # contract is preserved, and a raise skips finalization and dispatch
+        # exactly as it skipped the certificate and dispatch before), then the
+        # fenced finalization, which never raises.
+        if _after_stats_commit is not None:
+            _after_stats_commit()
+        if holder["applied"]:
+            holder["finalization"] = _finalize_codex_quota_publication(
+                holder["pass"], signatures=holder["signatures"])
+        # #1070: end a disarmed generation's obligations, or remove the ones
+        # this activation completed. Never raises.
+        _settle_codex_alert_obligations(holder)
+
     # AUTHORITATIVE: the reconcile must observe its own write + return the
     # materialized result synchronously; the cycle dispatches the queued alerts
-    # post-commit via the ALERT_DISPATCHER, and `post_commit` runs the
-    # `_after_stats_commit` seam after the commit (before dispatch).
-    _jr.run_stats_ingest(
-        mode="authoritative", codex_apply=_codex_leg,
-        post_commit=_after_stats_commit,
-    )
-
-    # Finalize: the cache-side certificate (self-healing no-op optimization) is
-    # stored only when the apply actually materialized a projection. Ledger
-    # pruning rides the same connection and transaction — it is the only other
-    # cache write this function makes, and folding it in avoids adding a second
-    # unflocked mutator.
-    if holder["signatures"] is not None:
-        # `attribution_revision` is the value read at the top of the pass, and
-        # passing it is what makes the certificate bind THIS pass's inputs: the
-        # ingest cycle above can materialize a pending attribution op, and a
-        # certificate stamped at the post-ingest revision would certify a
-        # projection built from pre-ingest observations (#500 §8.3).
-        _store_codex_quota_projection_certificate(
-            sequence=physical_sequence, signatures=holder["signatures"],
-            prune_ledger_through=watermark_target,
-            attribution_revision=attribution_revision,
-        )
-    return holder["result"]
+    # post-commit via the ALERT_DISPATCHER.
+    #
+    # #1076 D2: off the hook, the whole call (correction recovery's retry,
+    # every pending observation's pipeline, `codex_apply` with its in-lock
+    # re-preparation, and `post_commit`) runs under the defer-only off-hook
+    # Codex read policy. Under the hook's policy (the hook core and #1034's
+    # settlement) nothing changes.
+    import _cctally_cache
+    off_hook = None
+    try:
+        if _cctally_cache._active_codex_read_policy() is None:
+            with _cctally_cache.off_hook_codex_read_policy() as off_hook:
+                ingest = _jr.run_stats_ingest(
+                    mode="authoritative", codex_apply=_codex_leg,
+                    post_commit=_post_commit,
+                )
+        else:
+            ingest = _jr.run_stats_ingest(
+                mode="authoritative", codex_apply=_codex_leg,
+                post_commit=_post_commit,
+            )
+    finally:
+        if off_hook is not None and _read_deferrals is not None:
+            _read_deferrals.extend(off_hook.deferred_reasons)
+    final = holder["pass"]
+    if not getattr(ingest, "ran", False) or final is None:
+        # The ingest never ran (the lock or the index refused it): nothing
+        # was applied. The optimistic preparation's hand-offs still stand.
+        pending, issue = _alert_work_pending_without_leg(
+            prepared, activation=activation_roots is not None)
+        _run_codex_worker_requests(
+            prepared.worker_requests,
+            hold_verify=pending and hold_verify_on_pending)
+        return _empty(PROJECTION_CONTENDED, pending, issue)
+    pending = bool(holder["alert_work_pending"])
+    issue = str(holder["alert_work_issue"])
+    if holder["withheld"]:
+        _run_codex_worker_requests(
+            final.worker_requests, hold_verify=hold_verify_on_pending)
+        return _empty(PROJECTION_UNAVAILABLE, True, issue)
+    _run_codex_worker_requests(
+        final.worker_requests, hold_verify=pending and hold_verify_on_pending)
+    if holder["applied"]:
+        return replace(
+            holder["result"], status=PROJECTION_PUBLISHED,
+            alert_work_pending=pending, alert_work_issue=issue)
+    if final.disposition == "apply":
+        # The shared apply found no root to reconcile: an empty store's early
+        # return, which is not a publication.
+        return _empty(PROJECTION_CURRENT, pending, issue)
+    return _empty(final.disposition, pending, issue)
 
 
 def _load_active_milestones(
@@ -4507,7 +6517,10 @@ def _load_active_milestones(
     *, stats_conn: sqlite3.Connection | None = None,
 ) -> list[sqlite3.Row | tuple[object, ...]]:
     owns_conn = stats_conn is None
-    stats = _cctally_core.open_db() if stats_conn is None else stats_conn
+    # #787 / #861 AD21: an owned read is one query session.
+    import _cctally_store_access as _store_access
+    stats = (_store_access.statement_reader("stats") if stats_conn is None
+             else stats_conn)
     try:
         return list(stats.execute(
             """SELECT percent_threshold, captured_at_utc, source_path, line_offset

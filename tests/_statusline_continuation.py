@@ -56,10 +56,15 @@ class Dispatch:
         return True
 
     def _run(self, kind, fd, argument):
+        import _cctally_core
         try:
             if kind == "worker" and self._gate is not None:
                 self._gate.wait(30)
-            self._sl._run_spawned_continuation(kind, fd, argument)
+            # #787 / #861 spec 5.1: the thread stands in for a detached
+            # `cctally _statusline-continue` process, whose CLI main thread
+            # runs at `process`.
+            with _cctally_core.establish_authority("process"):
+                self._sl._run_spawned_continuation(kind, fd, argument)
         except BaseException as exc:  # noqa: BLE001 — a dead process
             _close(fd)
             with self._lock:

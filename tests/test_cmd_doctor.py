@@ -30,26 +30,8 @@ CCTALLY = REPO / "bin" / "cctally"
 _FREE_SPACE_FLOOR_BYTES = 10 * 1024 ** 3
 
 
-_DISK_USAGE_BOOTSTRAP = """
-import importlib.machinery
-import importlib.util
-import pathlib
-import sys
-import types
-
-script, free_bytes, *argv = sys.argv[1:]
-sys.path.insert(0, str(pathlib.Path(script).parent))
-import _cctally_retention
-_cctally_retention._disk_usage = lambda path: types.SimpleNamespace(
-    free=int(free_bytes))
-loader = importlib.machinery.SourceFileLoader("cctally", script)
-spec = importlib.util.spec_from_loader(loader.name, loader)
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-loader.exec_module(module)
-sys.argv = [script, *argv]
-raise SystemExit(module.main())
-"""
+# Shared with bin/cctally-doctor-test (#947); executed by path, never imported.
+_FREE_DISK_BOOTSTRAP = REPO / "tests" / "fixtures" / "doctor" / "_free_disk_bootstrap.py"
 
 
 def _run(args, env_extra=None, home=None, free_disk_bytes=None):
@@ -62,7 +44,7 @@ def _run(args, env_extra=None, home=None, free_disk_bytes=None):
         env.update(env_extra)
     command = [sys.executable, str(CCTALLY), *args]
     if free_disk_bytes is not None:
-        command = [sys.executable, "-c", _DISK_USAGE_BOOTSTRAP,
+        command = [sys.executable, str(_FREE_DISK_BOOTSTRAP),
                    str(CCTALLY), str(free_disk_bytes), *args]
     return subprocess.run(command,
                           env=env, capture_output=True, text=True)
@@ -110,6 +92,8 @@ def test_doctor_exit_code_two_on_corrupt_config(tmp_path):
     claude/codex environment."""
     cdir = tmp_path / ".local" / "share" / "cctally"
     cdir.mkdir(parents=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(cdir, 0o700)
     (cdir / "config.json").write_text("{not valid json")
     r = _run(["doctor", "--json"], home=tmp_path)
     payload = json.loads(r.stdout)
@@ -142,6 +126,11 @@ def test_doctor_exit_code_zero_when_no_fail(tmp_path):
     # (b) stats DB with a fresh weekly_usage_snapshot row.
     cdir = tmp_path / ".local" / "share" / "cctally"
     cdir.mkdir(parents=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(cdir, 0o700)
+    # #787 AD22: and the stats maintenance lock every owner open creates;
+    # a reader treats a missing lock as an absent store.
+    (cdir / "stats.db.maintenance.lock").touch()
     db_path = cdir / "stats.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute("""
@@ -295,6 +284,9 @@ from conftest import load_script, redirect_paths  # noqa: E402
 
 
 def _valid_sqlite(path):
+    if path.name in ("stats.db", "conversations.db"):
+        # #787 AD22: the maintenance lock every owner open creates.
+        path.with_name(f"{path.name}.maintenance.lock").touch()
     conn = sqlite3.connect(str(path))
     conn.execute("CREATE TABLE t (x INTEGER)")
     conn.commit()
@@ -310,6 +302,8 @@ def _gather(ns, monkeypatch, tmp_path, **kw):
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     return ns["doctor_gather_state"](**kw)
 
 
@@ -318,6 +312,8 @@ def test_gather_deep_false_skips_quick_check(monkeypatch, tmp_path):
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _valid_sqlite(_cctally_core.DB_PATH)
     _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
     _valid_sqlite(_cctally_core.CONVERSATIONS_DB_PATH)
@@ -332,6 +328,8 @@ def test_gather_deep_true_healthy_dbs_ok(monkeypatch, tmp_path):
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _valid_sqlite(_cctally_core.DB_PATH)
     _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
     _valid_sqlite(_cctally_core.CONVERSATIONS_DB_PATH)
@@ -346,6 +344,8 @@ def test_gather_reads_cache_page_and_freelist_counts(monkeypatch, tmp_path):
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _valid_sqlite(_cctally_core.DB_PATH)
 
     _cctally_core.CACHE_DB_PATH.with_name("cache.db.maintenance.lock").touch()
@@ -378,6 +378,8 @@ def test_gather_counts_only_null_codex_reset_anchors(monkeypatch, tmp_path):
 
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _valid_sqlite(_cctally_core.DB_PATH)
     _cctally_core.CACHE_DB_PATH.with_name(
         "cache.db.maintenance.lock").touch()
@@ -432,7 +434,11 @@ def test_gather_reads_conversation_page_and_freelist_counts(monkeypatch, tmp_pat
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _valid_sqlite(_cctally_core.DB_PATH)
+    # #787 AD22: the conversations maintenance lock every owner open creates.
+    _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH.touch()
 
     conn = sqlite3.connect(str(_cctally_core.CONVERSATIONS_DB_PATH))
     conn.execute("CREATE TABLE reclaimable_transcripts (payload BLOB)")
@@ -461,11 +467,462 @@ def test_gather_deep_true_corrupt_stats_reports_nonok(monkeypatch, tmp_path):
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
+    # #787 AD22: the maintenance lock every owner open creates.
+    _cctally_core.STATS_LOCK_MAINTENANCE_PATH.touch()
     _cctally_core.DB_PATH.write_bytes(b"this is not a sqlite database at all")
     _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
     state = ns["doctor_gather_state"](deep=True)
     assert state.stats_db_quick_check is not None
     assert state.stats_db_quick_check != "ok"
+
+
+@pytest.mark.parametrize("refusal", ["wal_header", "non_private"])
+def test_gather_refused_stats_is_unavailable_not_corrupt(
+    monkeypatch, tmp_path, refusal,
+):
+    """#787 AD20/AD22 (spec 5.12, section 12): a stats.db the diagnostic
+    session refuses (a not-yet-converted WAL-header store, a data directory
+    not established as private) is shown in Doctor's existing unavailable
+    state. It is never an open failure: not a FAIL, not the destructive
+    restore/`--purge` remediation, not a corruption result, and not a
+    "quick_check ok" claim for a store that was never checked. Nothing is
+    created beside the store."""
+    ns = load_script()
+    import _cctally_core
+    import _lib_doctor
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(_cctally_core.APP_DIR, 0o700)
+    _seed_real_store()
+    _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
+    _valid_sqlite(_cctally_core.CONVERSATIONS_DB_PATH)
+    _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH.touch()
+    db = _cctally_core.DB_PATH
+    if refusal == "wal_header":
+        conn = sqlite3.connect(str(db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.close()
+        assert db.read_bytes()[18:20] == b"\x02\x02"
+    else:
+        os.chmod(_cctally_core.APP_DIR, 0o755)
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not pathlib.Path(f"{db}{suffix}").exists()
+    state = ns["doctor_gather_state"](deep=True)
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not pathlib.Path(f"{db}{suffix}").exists()
+    file_check = _lib_doctor._check_db_stats_file(state)
+    assert file_check.severity == "warn"
+    assert file_check.summary == "unavailable (stats.db could not be read)"
+    assert file_check.remediation is None
+    assert state.stats_db_quick_check is None
+    integrity = _lib_doctor._check_db_integrity(state)
+    assert integrity.severity != "fail"
+    assert integrity.summary == "unavailable (stats.db could not be read)"
+    assert integrity.remediation == "See the stats.db check."
+    # Checks that could not read the refused store keep their existing text
+    # and report it as a warning, never a FAIL (which would turn Doctor's
+    # exit to 2 for a state the next owner open resolves).
+    assert _lib_doctor._check_data_forked_buckets(state).severity == "warn"
+    if refusal == "non_private":
+        assert _lib_doctor._check_db_cache_file(state).summary == (
+            "unavailable (cache.db could not be read)")
+        assert _lib_doctor._check_data_codex_project_metadata(
+            state).severity != "fail"
+    assert all(r.severity != "fail" or r.id not in (
+        "db.stats.file", "db.cache.file", "db.integrity",
+        "data.forked_buckets", "data.codex_project_metadata")
+        for c in _lib_doctor.run_checks(state).categories for r in c.checks)
+    # AD25: a check that depends on a refused store says so, as a warning,
+    # never a count or a lifecycle claim about data it never read ("0/66
+    # applied", "no cursor yet", "no data", "pre-first-sync", "0 entries
+    # despite JSONL files present" with a rebuild remediation).
+    refused = {"stats.db"} | ({"cache.db"} if refusal == "non_private"
+                              else set())
+    for check, store in (
+            (_lib_doctor._check_db_migrations_applied, "stats.db"),
+            (_lib_doctor._check_journal_index_freshness, "stats.db"),
+            (_lib_doctor._check_data_post_credit_milestones, "stats.db"),
+            (_lib_doctor._check_data_cache_sync_state, "cache.db"),
+            (_lib_doctor._check_data_parse_health, "cache.db")):
+        result = check(state)
+        if store not in refused:
+            continue
+        assert result.severity == "warn", (result.id, result.summary)
+        assert result.summary == f"unavailable ({store} could not be read)", (
+            result.id)
+        assert result.remediation is None, result.id
+    # F3 (SD3, O12): the same for every other check whose data the refused
+    # store holds, on the shallow gather the dashboard and the TUI run.
+    # Detects a lifecycle or health claim about a store Doctor never read:
+    # "usage attribution healthy", "not scanned" as OK, "no registry (fresh
+    # install)", "no validated stats index", "not applicable".
+    shallow = ns["doctor_gather_state"](deep=False)
+    for check, store in (
+            (_lib_doctor._check_data_forked_buckets, "stats.db"),
+            (_lib_doctor._check_accounting_outcome_quarantine, "stats.db"),
+            (_lib_doctor._check_journal_protocol, "stats.db"),
+            (_lib_doctor._check_journal_legacy_writer, "stats.db"),
+            (_lib_doctor._check_accounts_registry, "stats.db"),
+            (_lib_doctor._check_accounts_freshness, "stats.db"),
+            (_lib_doctor._check_accounts_attribution, "stats.db"),
+            (_lib_doctor._check_journal_quota_projection, "stats.db"),
+            (_lib_doctor._check_data_codex_project_metadata, "cache.db")):
+        if store not in refused:
+            continue
+        # The deep gather scans the journal itself, so its protocol and
+        # legacy-writer verdicts are read, not refused; only the shallow one
+        # reads them from stats.db.
+        journal_scanned = check in (_lib_doctor._check_journal_protocol,
+                                    _lib_doctor._check_journal_legacy_writer)
+        for gathered in (shallow,) if journal_scanned else (state, shallow):
+            result = check(gathered)
+            assert (result.severity, result.summary) == (
+                "warn", f"unavailable ({store} could not be read)"), (
+                result.id, result.summary)
+
+
+#: N1 (AD25, O12): every Doctor check whose data a refused store holds, with
+#: the stores it reads (in the order its guard names them) and the store a
+#: seeded WARN lives in (None: not seeded). A seeded WARN proves the check
+#: says something real when the store is read, so its OK in a refused state
+#: was a false claim.
+_REFUSAL_GUARDED_CHECKS = (
+    ("db.migrations.pending", ("stats.db", "cache.db"), "stats.db"),
+    ("db.version_ahead", ("stats.db", "cache.db"), None),
+    ("db.reclaimable", ("cache.db",), "cache.db"),
+    ("db.conversations_reclaimable", ("conversations.db",), None),
+    ("data.codex_cache", ("cache.db",), None),
+    ("data.codex_replay", ("cache.db",), None),
+    ("data.codex_prune_safety", ("cache.db", "conversations.db"), "cache.db"),
+    ("data.codex_ingest_backlog", ("cache.db",), "cache.db"),
+    ("data.codex_quota", ("cache.db",), None),
+    ("accounts.codex_identity", ("cache.db",), "cache.db"),
+    ("accounts.codex_reset_anchors", ("cache.db",), "cache.db"),
+    ("accounts.codex_window_attribution", ("cache.db",), None),
+    ("accounts.claude_cost_attribution", ("cache.db",), None),
+    ("pricing.coverage", ("cache.db",), "cache.db"),
+    ("pricing.conversation_rollup_writer", ("conversations.db", "cache.db"),
+     None),
+)
+
+#: The stores each refused state makes unreadable (#787 introduced each).
+#: A data directory not established as private refuses every store's
+#: diagnostic session, the transcript store's included (AD28).
+_REFUSED_STORES = {
+    "healthy": set(),
+    "wal_header": {"stats.db"},
+    "no_stats_lock": {"stats.db"},
+    "non_private": {"stats.db", "cache.db", "conversations.db"},
+    "no_conversations_lock": {"conversations.db"},
+}
+
+
+def _seed_refusal_sweep_warnings():
+    """Seed one WARN for each check `_REFUSAL_GUARDED_CHECKS` marks seeded:
+    a pending stats migration, an unpriced Claude model, a Codex quota row
+    with no canonical reset anchor, a stuck ingest backlog, a torn-auth
+    deferral, a refused orphan prune and a mostly free cache.db."""
+    import _cctally_core
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ts = (now - _dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    since = (now - _dt.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stats = sqlite3.connect(str(_cctally_core.DB_PATH))
+    try:
+        name = stats.execute(
+            "SELECT name FROM schema_migrations ORDER BY name LIMIT 1"
+        ).fetchone()[0]
+        stats.execute("DELETE FROM schema_migrations WHERE name = ?", (name,))
+        stats.commit()
+    finally:
+        stats.close()
+    cache = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+    try:
+        cache.execute(
+            "INSERT INTO session_entries (source_path, line_offset,"
+            " timestamp_utc, model, input_tokens) VALUES (?,?,?,?,?)",
+            ("/x/a.jsonl", 1, ts, "claude-zz-unknown-9", 100))
+        cache.execute(
+            "INSERT INTO quota_window_snapshots (source, source_root_key,"
+            " source_path, line_offset, captured_at_utc, logical_limit_key,"
+            " window_minutes, used_percent, resets_at_utc) VALUES"
+            " ('codex','root','/x/b.jsonl',1,?,'primary',300,10.0,?)",
+            (ts, ts))
+        for key, value in (
+                ("codex_ingest_backlog",
+                 {"files": 2, "bytes": 10, "since": since}),
+                ("codex_torn_auth_deferred", {"files": 1, "at": since}),
+                ("codex_orphan_prune_refused",
+                 {"store": "cache", "preservedFileCount": 1,
+                  "since": since, "reasons": ["seeded"]})):
+            cache.execute(
+                "INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)",
+                (key, json.dumps(value)))
+        cache.execute("CREATE TABLE zz_free (b BLOB)")
+        cache.executemany("INSERT INTO zz_free VALUES (?)",
+                          [(b"\0" * 4096,) for _ in range(2000)])
+        cache.commit()
+        cache.execute("DROP TABLE zz_free")
+        cache.commit()
+        cache.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("refusal", sorted(_REFUSED_STORES))
+def test_refused_store_checks_never_render_a_false_ok(
+    monkeypatch, tmp_path, refusal,
+):
+    """#787 / #861 AD25, O12 (N1, N7): in every state the branch refuses a
+    store that base read through (a WAL-header stats.db, a missing stats or
+    conversations maintenance lock, a data directory not established as
+    private), each check whose data that store holds renders the warning
+    `unavailable (<store>.db could not be read)`, on the deep and the shallow
+    gather, never OK. Detects the claims these checks made about data Doctor
+    never read: "none pending", "none ahead", "all observed models priced",
+    "Codex reset anchors complete", "no Codex ingest backlog", "below
+    threshold", "no refused prune" and the rest, each of which is a WARN on
+    the same store when it is read. The two window/cost attribution legs
+    read through diagnostic sessions (AD28), so a refused cache is never
+    read raw. Checks whose seeded WARN lives in a store the state does not
+    refuse keep reporting it."""
+    ns = load_script()
+    import _cctally_core
+    import _lib_doctor
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(_cctally_core.APP_DIR, 0o700)
+    _seed_real_store()
+    if not _cctally_core.CACHE_DB_PATH.exists():
+        ns["open_cache_db"]().close()
+    pathlib.Path(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH).touch()
+    _valid_sqlite(_cctally_core.CONVERSATIONS_DB_PATH)
+    _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH.touch()
+    _seed_refusal_sweep_warnings()
+    db = _cctally_core.DB_PATH
+    if refusal == "wal_header":
+        conn = sqlite3.connect(str(db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.close()
+        for suffix in ("-wal", "-shm"):
+            pathlib.Path(f"{db}{suffix}").unlink(missing_ok=True)
+    elif refusal == "no_stats_lock":
+        pathlib.Path(_cctally_core.STATS_LOCK_MAINTENANCE_PATH).unlink()
+    elif refusal == "no_conversations_lock":
+        _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH.unlink()
+    elif refusal == "non_private":
+        os.chmod(_cctally_core.APP_DIR, 0o755)
+    refused = _REFUSED_STORES[refusal]
+    for deep in (True, False):
+        state = ns["doctor_gather_state"](deep=deep)
+        rows = {r.id: r for c in _lib_doctor.run_checks(state).categories
+                for r in c.checks}
+        for check_id, deps, seeded in _REFUSAL_GUARDED_CHECKS:
+            result = rows[check_id]
+            text = (result.severity, result.summary)
+            if seeded is not None and seeded not in refused:
+                # The seeded finding is read and reported, refused or not.
+                assert result.severity == "warn", (deep, check_id, text)
+                assert "could not be read" not in result.summary, (
+                    deep, check_id, text)
+                continue
+            hit = [store for store in deps if store in refused]
+            if hit:
+                assert text == (
+                    "warn", f"unavailable ({hit[0]} could not be read)"), (
+                    deep, check_id, text)
+                assert result.remediation is None, (deep, check_id)
+            else:
+                assert "could not be read" not in result.summary, (
+                    deep, check_id, text)
+
+
+def test_attribution_legs_read_through_diagnostic_sessions(
+    monkeypatch, tmp_path,
+):
+    """#787 / #861 AD28 (N7): the `accounts.codex_window_attribution` and
+    `accounts.claude_cost_attribution` gathers read cache.db through a
+    diagnostic session, so a cache that session refuses (here a data
+    directory not established as private) is reported as refused and never
+    opened raw. Detects a plain `mode=ro` connect from Doctor's own module,
+    which reads a store the diagnostic contract refuses and, beside a WAL
+    store, can create its sidecars."""
+    import types
+    ns = load_script()
+    import _cctally_core
+    import _cctally_doctor as doctor
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(_cctally_core.APP_DIR, 0o700)
+    _seed_real_store()
+    if not _cctally_core.CACHE_DB_PATH.exists():
+        ns["open_cache_db"]().close()
+    pathlib.Path(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH).touch()
+    raw: list = []
+    proxy = types.SimpleNamespace(**{
+        name: getattr(sqlite3, name) for name in dir(sqlite3)
+        if not name.startswith("__")})
+
+    def connect(*args, **kwargs):
+        raw.append(args[0] if args else kwargs.get("database"))
+        return sqlite3.connect(*args, **kwargs)
+
+    proxy.connect = connect
+    monkeypatch.setattr(doctor, "sqlite3", proxy)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    # Readable: both legs read the store (through a session, not raw).
+    assert isinstance(doctor._gather_codex_window_attribution_state(), dict)
+    assert "_refused_store" not in doctor._gather_claude_cost_attribution(now)
+    assert raw == []
+    os.chmod(_cctally_core.APP_DIR, 0o755)
+    assert doctor._gather_codex_window_attribution_state() == {
+        "refused_store": "cache.db"}
+    assert doctor._gather_claude_cost_attribution(now)[
+        "_refused_store"] == "cache.db"
+    assert raw == []
+
+
+def _record_raw_connects(monkeypatch):
+    """Every `sqlite3.connect` that is not a query session's (a session's
+    connection is built by `_connect_ro` with the `_QueryConnection`
+    factory). Patched on the `sqlite3` module, so it sees a connect from any
+    module that reaches it as `sqlite3.connect`."""
+    import _cctally_store_access
+    raw: list = []
+    real = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        if kwargs.get("factory") is not _cctally_store_access._QueryConnection:
+            target = str(args[0] if args else kwargs.get("database"))
+            raw.append(target.rsplit("/", 1)[-1])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    return raw
+
+
+def _stage_codex_leg_stores(ns, monkeypatch, tmp_path):
+    """Owner-established stats, cache and conversations stores, with one
+    Codex quota observation, in a private data directory."""
+    import _cctally_core
+    import _cctally_doctor as doctor
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(_cctally_core.APP_DIR, 0o700)
+    _seed_real_store()
+    if not _cctally_core.CACHE_DB_PATH.exists():
+        ns["open_cache_db"]().close()
+    pathlib.Path(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH).touch()
+    ns["open_conversations_db"]().close()
+    _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH.touch()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ts = (now - _dt.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    resets = (now + _dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    cache = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+    try:
+        cache.execute(
+            "INSERT OR IGNORE INTO codex_source_roots (source_root_key,"
+            " canonical_root_path, first_seen_utc, last_seen_utc)"
+            " VALUES ('root', '/codex/root', ?, ?)", (ts, ts))
+        cache.execute(
+            "INSERT INTO quota_window_snapshots (source, source_root_key,"
+            " source_path, line_offset, captured_at_utc, observed_slot,"
+            " logical_limit_key, limit_id, limit_name, window_minutes,"
+            " used_percent, resets_at_utc, plan_type) VALUES"
+            " ('codex', 'root', '/codex/root/a.jsonl', 1, ?, 'primary',"
+            " 'limit-primary', 'native-primary', 'Primary', 300, 10.0, ?,"
+            " 'pro')", (ts, resets))
+        cache.commit()
+    finally:
+        cache.close()
+    # The probe's population memo is process-wide; start it empty.
+    monkeypatch.setattr(doctor, "_QUOTA_OBSERVATION_MEMO", {})
+
+
+def _gather_rows(ns, deep):
+    import _lib_doctor
+    state = ns["doctor_gather_state"](deep=deep)
+    return state, {r.id: r for c in _lib_doctor.run_checks(state).categories
+                   for r in c.checks}
+
+
+@pytest.mark.parametrize("deep", (True, False))
+def test_doctor_gather_opens_no_raw_sqlite_connection(
+    monkeypatch, tmp_path, deep,
+):
+    """#787 / #861 AD28: every database-reading leg of the Doctor gather
+    reads through a diagnostic query session. Detects a leg that still opens
+    a plain `mode=ro` connection (the Codex quota probe's dependency signal,
+    the compressed-rollout census, the transcript store's guarded reader):
+    such a read bypasses the diagnostic admission, so it reads a store the
+    sibling checks report as unreadable and, beside a WAL store, can create
+    its sidecars."""
+    ns = load_script()
+    _stage_codex_leg_stores(ns, monkeypatch, tmp_path)
+    raw = _record_raw_connects(monkeypatch)
+    _gather_rows(ns, deep)
+    assert raw == [], raw
+
+
+def test_codex_legs_read_nothing_from_a_refused_store(monkeypatch, tmp_path):
+    """#787 / #861 AD25, AD28, O12: when the diagnostic contract refuses a
+    store, the Codex quota and compressed-rollout legs read nothing from it
+    and their checks say `unavailable (<store>.db could not be read)`.
+    Detects the quota probe serving the observations it read before the
+    refusal (its dependency signal read the refused cache raw, so the memo
+    still matched) and the census reporting counts and an all-clear from a
+    cache or transcript store Doctor was not allowed to read. A healthy
+    store keeps its readings."""
+    ns = load_script()
+    import _cctally_core
+    _stage_codex_leg_stores(ns, monkeypatch, tmp_path)
+    state, rows = _gather_rows(ns, deep=False)
+    assert state.codex_quota_windows, "the healthy store's window was not read"
+    assert "could not be read" not in rows["data.codex_quota"].summary
+    assert rows["data.codex_compressed_rollouts"].summary == (
+        "All compressed Codex rollouts are readable and verified.")
+    raw = _record_raw_connects(monkeypatch)
+
+    os.chmod(_cctally_core.APP_DIR, 0o755)
+    state, rows = _gather_rows(ns, deep=False)
+    assert state.codex_quota_windows == []
+    for check_id in ("data.codex_quota", "data.codex_compressed_rollouts"):
+        result = rows[check_id]
+        assert (result.severity, result.summary) == (
+            "warn", "unavailable (cache.db could not be read)"), check_id
+    os.chmod(_cctally_core.APP_DIR, 0o700)
+
+    _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH.unlink()
+    state, rows = _gather_rows(ns, deep=False)
+    assert state.codex_quota_windows, "a transcript refusal hid the quota"
+    result = rows["data.codex_compressed_rollouts"]
+    assert (result.severity, result.summary) == (
+        "warn", "unavailable (conversations.db could not be read)")
+    assert raw == [], raw
+
+
+def test_gather_refused_conversations_rollup_is_unavailable(
+    monkeypatch, tmp_path,
+):
+    """AD25: with conversations.db refused (its maintenance lock missing,
+    which the read-only admission never creates), the conversation rollup
+    check reports the store as unreadable instead of claiming "no data"."""
+    ns = load_script()
+    import _cctally_core
+    import _lib_doctor
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(_cctally_core.APP_DIR, 0o700)
+    _seed_real_store()
+    _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
+    _valid_sqlite(_cctally_core.CONVERSATIONS_DB_PATH)
+    _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH.unlink(missing_ok=True)
+    state = ns["doctor_gather_state"](deep=False)
+    result = _lib_doctor._check_data_conversation_sessions_rollup(state)
+    assert result.severity == "warn"
+    assert result.summary == "unavailable (conversations.db could not be read)"
+    assert not _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH.exists()
 
 
 def test_gather_deep_true_corrupt_conversations_reports_nonok(
@@ -475,8 +932,12 @@ def test_gather_deep_true_corrupt_conversations_reports_nonok(
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _valid_sqlite(_cctally_core.DB_PATH)
     _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
+    # #787 AD22: the conversations maintenance lock every owner open creates.
+    _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH.touch()
     _cctally_core.CONVERSATIONS_DB_PATH.write_bytes(
         b"this is not a sqlite transcript database"
     )
@@ -492,6 +953,8 @@ def test_gather_conversations_declines_during_recovery(monkeypatch, tmp_path):
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _valid_sqlite(_cctally_core.DB_PATH)
     _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
     _valid_sqlite(_cctally_core.CONVERSATIONS_DB_PATH)
@@ -516,6 +979,8 @@ def test_gather_reports_durable_conversation_recovery_as_incomplete(
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _valid_sqlite(_cctally_core.DB_PATH)
     _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
     recovery = _cctally_core.CONVERSATIONS_DB_PATH.with_name(
@@ -547,6 +1012,8 @@ def test_gather_head_guard_survives_repo_root_raise(monkeypatch, tmp_path):
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
 
     def _boom():
         raise RuntimeError("repo-root-blew-up")
@@ -568,6 +1035,8 @@ def test_gather_lock_probe_creates_no_files_on_fresh_dir(monkeypatch, tmp_path):
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     # No lock files exist. The probe must report them free/absent WITHOUT
     # creating them (doctor read-only contract, Codex P2-6).
     state = ns["doctor_gather_state"](deep=True)
@@ -589,6 +1058,8 @@ def test_gather_statusline_pipeline_is_read_only_and_marks_invalid_authority(
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     # #825/#832 section 7: the current spool and fences live under the
     # account-bound root, partitioned by account and (fences) by window.
     account_dir = (_cctally_core.STATUSLINE_ACCOUNT_BOUND_DIR / "accounts"
@@ -629,6 +1100,11 @@ def test_doctor_exit_zero_with_a_refused_pricing_write_recorded(tmp_path):
     }))
     cdir = tmp_path / ".local" / "share" / "cctally"
     cdir.mkdir(parents=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(cdir, 0o700)
+    # #787 AD22: and the stats maintenance lock every owner open creates;
+    # a reader treats a missing lock as an absent store.
+    (cdir / "stats.db.maintenance.lock").touch()
     conn = sqlite3.connect(str(cdir / "stats.db"))
     conn.execute("""
         CREATE TABLE weekly_usage_snapshots (
@@ -661,6 +1137,8 @@ def test_doctor_exit_zero_with_a_refused_pricing_write_recorded(tmp_path):
     conn.commit()
     conn.close()
 
+    # #787 AD22: the conversations maintenance lock every owner open creates.
+    (cdir / "conversations.db.maintenance.lock").touch()
     conn = sqlite3.connect(str(cdir / "conversations.db"))
     try:
         db._apply_conversations_schema(conn)
@@ -748,6 +1226,8 @@ def scripted_store(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     import _cctally_store as store
     clock = _FakeClock()
     flock = _ScriptedFlock(clock)
@@ -869,6 +1349,8 @@ def test_gather_pending_quarantine_is_never_resumed(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _seed_real_store()
     import _cctally_db
     import _cctally_store as store
@@ -912,6 +1394,8 @@ def test_interrupted_inspection_reads_the_high_water_lock_free(
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _seed_real_store()
     _move_stats_into_completed_incident()
     import _cctally_journal
@@ -991,6 +1475,8 @@ def test_doctor_cli_reports_held_stats_maintenance_promptly(
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _seed_real_store()
     env = _cli_env(tmp_path)
     with _held_exclusive(_cctally_core.STATS_LOCK_MAINTENANCE_PATH):
@@ -1047,12 +1533,17 @@ def test_gather_maintenance_released_within_the_allowance_opens_normally(
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _seed_real_store()
     import _cctally_store as store
     lock_path = _cctally_core.STATS_LOCK_MAINTENANCE_PATH
     with _held_exclusive(lock_path) as holder:
         hook = _ReleaseOnFirstRefusal(holder, lock_path)
         monkeypatch.setattr(store, "fcntl", hook)
+        # #787: Doctor's stats reads admit through diagnostic sessions.
+        import _cctally_store_access as access
+        monkeypatch.setattr(access, "fcntl", hook)
         state = ns["doctor_gather_state"](deep=False)
     assert hook.refusals == 1, "the gather never contended with the holder"
     assert hook.allowance is not None, "the refusal ran outside the scope"
@@ -1073,13 +1564,18 @@ def test_gather_reports_held_cache_maintenance_promptly(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _valid_sqlite(_cctally_core.DB_PATH)
     _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
     result = {}
 
     def _run_gather():
         start = _time.monotonic()
-        result["state"] = ns["doctor_gather_state"](deep=False)
+        # #787 / #861 spec 5.1: `doctor` runs on the CLI main thread at
+        # `process`; the thread this test starts establishes it.
+        with _cctally_core.establish_authority("process"):
+            result["state"] = ns["doctor_gather_state"](deep=False)
         result["elapsed"] = _time.monotonic() - start
 
     worker = threading.Thread(target=_run_gather, daemon=True)
@@ -1118,6 +1614,8 @@ def test_gather_interrupted_inspection_error_is_never_a_fresh_install(
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     _seed_real_store()
     _move_stats_into_completed_incident()
     real_getsize = os.path.getsize
@@ -1181,6 +1679,8 @@ def test_gather_absent_stats_with_maintenance_evidence_is_never_a_fresh_install(
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     lock_path = _cctally_core.STATS_LOCK_MAINTENANCE_PATH
     with _absent_stats_evidence(evidence):
         assert lock_path.exists() is lock_present
@@ -1204,6 +1704,8 @@ def _current_store(ns, monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     conn = _sys.modules["cctally"].open_db()
     conn.close()
 
@@ -1389,6 +1891,10 @@ def test_freshness_gather_pre_index_store_falls_back_to_snapshots(
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
+    # #787 AD22: the maintenance lock every owner open creates.
+    _cctally_core.STATS_LOCK_MAINTENANCE_PATH.touch()
     conn = sqlite3.connect(str(_cctally_core.DB_PATH))
     conn.execute("CREATE TABLE weekly_usage_snapshots "
                  "(id INTEGER PRIMARY KEY, captured_at_utc TEXT NOT NULL)")
@@ -1411,6 +1917,8 @@ def test_freshness_gather_fresh_install_still_fails_never(
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     state = ns["doctor_gather_state"](now_utc=_T7_NOW)
     assert not _cctally_core.DB_PATH.exists()
     assert state.freshness_unavailable_reason is None
@@ -2036,3 +2544,131 @@ def test_deep_scan_index_is_untouched_by_a_shallow_gather(
     assert not stale.exists()
     assert all(os.path.lexists(p) for p in kept)
     assert index.exists()
+
+
+# ── #787 / #861 store authority (spec 5.12, AD6, round 3 F9) ─────────────
+
+def _owner_stores(ns, monkeypatch, tmp_path):
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core
+    cache = _sys.modules["_cctally_cache"]
+    with _cctally_core.establish_authority("process"):
+        _cctally_core.open_db().close()
+        cache.open_cache_db().close()
+        cache.open_conversations_db().close()
+    os.chmod(_cctally_core.APP_DIR, 0o700)
+    return _cctally_core
+
+
+def test_doctor_gather_uses_diagnostic_sessions(monkeypatch, tmp_path):
+    """Doctor's plain read-write cache connects could create a store, run a
+    checkpoint or drop sidecars from a diagnostic. The gather's cache reads
+    now run in diagnostic sessions: no STARTUP or MAINTENANCE capability is
+    exercised during the gather, and the cache legs still read their data."""
+    ns = load_script()
+    core = _owner_stores(ns, monkeypatch, tmp_path)
+    events = []
+    core.CAPABILITY_OBSERVERS.append(events.append)
+    sessions = []
+    access = _sys.modules.get("_cctally_store_access") or __import__(
+        "_cctally_store_access")
+    real = access.QueryService.session
+
+    def spy(primary, **kw):
+        sessions.append((primary, kw.get("policy")))
+        return real(primary, **kw)
+
+    monkeypatch.setattr(access.QueryService, "session", staticmethod(spy))
+    try:
+        with core.establish_authority("process"):
+            state = ns["doctor_gather_state"](deep=True)
+    finally:
+        core.CAPABILITY_OBSERVERS.remove(events.append)
+    assert not [e for e in events
+                if e.capability in ("MAINTENANCE", "STARTUP")], events
+    assert ("cache", "diagnostic") in sessions
+    assert state.cache_entries_count == 0
+    assert state.cache_db_quick_check == "ok"
+
+
+def _legacy_cache_reads(monkeypatch, ns):
+    """Today's doctor cache connector: a plain read-write connect."""
+    import _cctally_core
+    doctor = _sys.modules["_cctally_doctor"]
+
+    class _Plain:
+        def __init__(self):
+            self.conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+
+    def legacy():
+        stack = contextlib.ExitStack()
+        s = _Plain()
+        stack.callback(s.conn.close)
+        return s, stack
+
+    monkeypatch.setattr(doctor, "_doctor_cache_session", legacy)
+
+
+@pytest.mark.parametrize("cache_state", ["current", "behind"])
+def test_doctor_field_parity_current_and_behind(monkeypatch, tmp_path,
+                                                cache_state):
+    """Round 3 F9: doctor `--json` output through diagnostic sessions equals
+    the output through today's plain cache connects, on a current store and
+    on a store one cache version behind (a diagnostic session admits a behind
+    cache read-only and the legs report missing structures as before)."""
+    ns = load_script()
+    core = _owner_stores(ns, monkeypatch, tmp_path)
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-11-13T12:00:00Z")
+    if cache_state == "behind":
+        db = _sys.modules["_cctally_db"]
+        conn = sqlite3.connect(str(core.CACHE_DB_PATH))
+        conn.execute(f"PRAGMA user_version = {len(db._CACHE_MIGRATIONS) - 1}")
+        conn.commit()
+        conn.close()
+    # Imported, not looked up: whether an earlier test on this worker already
+    # loaded the kernel depends on xdist's distribution.
+    import _lib_doctor as lib
+
+    def report():
+        with core.establish_authority("process"):
+            state = ns["doctor_gather_state"](deep=True)
+        return json.dumps(lib.serialize_json(lib.run_checks(state)),
+                          sort_keys=True)
+
+    import types as _types
+    retention = _sys.modules["_cctally_retention"]
+    monkeypatch.setattr(retention, "_disk_usage", lambda path: _types.SimpleNamespace(
+        total=2 * 1024 ** 4, used=1024 ** 4, free=1024 ** 4))
+    report()                       # warm the disposable scan cache
+    through_sessions = report()
+    with monkeypatch.context() as m:
+        _legacy_cache_reads(m, ns)
+        legacy = report()
+    assert through_sessions == legacy
+
+
+def test_metadata_reader_serves_only_db_status(monkeypatch, tmp_path,
+                                               capsys):
+    """Spec 5.12: the restricted metadata reader serves `db status` (all
+    three legs, the conversations status read included) and nothing in the
+    doctor gather."""
+    ns = load_script()
+    core = _owner_stores(ns, monkeypatch, tmp_path)
+    access = _sys.modules.get("_cctally_store_access") or __import__(
+        "_cctally_store_access")
+    callers = []
+    real = access.QueryService.metadata
+
+    def spy(store):
+        callers.append((store, _sys._getframe(1).f_code.co_name))
+        return real(store)
+
+    monkeypatch.setattr(access.QueryService, "metadata", staticmethod(spy))
+    with core.establish_authority("process"):
+        ns["doctor_gather_state"](deep=False)
+    assert callers == []
+    assert ns["main"](["db", "status", "--json"]) == 0
+    capsys.readouterr()
+    assert sorted(callers) == [("cache", "_db_status_for"),
+                               ("conversations", "_db_status_for"),
+                               ("stats", "_db_status_for")]

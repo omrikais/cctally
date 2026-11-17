@@ -271,6 +271,55 @@ def test_a_missing_store_is_an_establishment_failure(tmp_path, monkeypatch):
     assert exc.value.code == "store_unavailable"
 
 
+def _corrupt_store_file(path) -> None:
+    for suffix in ("-wal", "-shm", "-journal"):
+        try:
+            os.unlink(f"{path}{suffix}")
+        except FileNotFoundError:
+            pass
+    with open(path, "wb") as handle:
+        handle.write(b"not a database " * 512)
+
+
+@pytest.mark.parametrize("kind", ["stats", "cache"])
+def test_a_corrupt_store_is_refused_and_its_readers_see_what_base_raised(
+        claude_store, monkeypatch, kind):
+    """Accuracy (#787 / #861, spec 5.8: where today's path raised on
+    `corrupt`, the caller keeps its exception path). Base opened the store
+    lazily, so a corrupt file raised `sqlite3.DatabaseError` at each reader's
+    first statement and only that reader's facts were withheld. The query
+    session still refuses the store at admission and no connection to it
+    stays open, but the bundle must not turn that refusal into a whole-
+    provider establishment failure: each statement raises base's exception,
+    SQLite's own type and text."""
+    sources = _sources()
+    path = sources._store_path(kind)
+    _corrupt_store_file(path)
+    connects = []
+    real_connect = sqlite3.connect
+
+    def counting_connect(database, *args, **kwargs):
+        connects.append(str(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", counting_connect)
+    scope = _scope()
+    bundle = sources.StoreBundle(scope, _plan(scope))
+    try:
+        conn = bundle.connection(kind)
+        assert not isinstance(conn, sqlite3.Connection)
+        for _ in range(2):
+            with pytest.raises(sqlite3.DatabaseError) as raised:
+                conn.execute("SELECT 1")
+            assert type(raised.value) is sqlite3.DatabaseError
+            assert str(raised.value) == "file is not a database"
+    finally:
+        bundle.close()
+    if kind == "stats":
+        # The header check refuses before any connection exists.
+        assert not [c for c in connects if str(path) in c], connects
+
+
 # --- generation ---------------------------------------------------------
 
 def test_generation_retry_predicate_fires_once_then_raises(claude_store,
@@ -991,11 +1040,15 @@ def test_all_uses_the_portable_isolated_worker_when_fork_is_unavailable(
         monkeypatch):
     sources = _sources()
     events = []
+    handoffs = []
 
-    def _isolated(args):
+    # #787 / #861 (d1e45a8dc): the worker is handed the authority of the
+    # thread it builds for, as its second argument.
+    def _isolated(args, handoff):
         scope, visible = args
         assert scope.source == "codex"
         assert visible is True
+        handoffs.append(handoff)
         events.append("isolated:codex")
         return "codex"
 
@@ -1011,10 +1064,68 @@ def test_all_uses_the_portable_isolated_worker_when_fork_is_unavailable(
         sources.kernel, "build_report",
         lambda measured_at, window, results: list(results),
     )
-    assert sources.build_diagnosis(
-        _scope(source="all"), transcripts_visible=True
-    ) == ["claude", "codex"]
+    core = sources._cctally_core
+    with core.establish_authority("query"):
+        expected = core.authority_handoff()
+        assert sources.build_diagnosis(
+            _scope(source="all"), transcripts_visible=True
+        ) == ["claude", "codex"]
     assert sorted(events) == ["build:claude", "isolated:codex"]
+    # The caller's own authority, never a wider one or none.
+    assert expected is not None and handoffs == [expected]
+
+
+def test_the_isolated_worker_is_launched_under_the_handed_over_authority(
+        monkeypatch):
+    """#787 / #861 AD32 (revision 31, R30-1). `build_diagnosis` off a main
+    thread hands the Codex half to `_build_isolated_provider` on a launcher
+    thread, which starts with no authority (spec 5.1). The launcher works on
+    the building thread's behalf, so it establishes the handed-over
+    authority before it starts the pool: the worker's start is then a
+    process creation in the route's query scope, held to AD32's lifecycle
+    exception. Detects a launch from a thread with no authority, which no
+    query-scope rule judges, and a launcher that keeps the authority after
+    it returns."""
+    import concurrent.futures
+    import threading
+
+    sources = _sources()
+    core = sources._cctally_core
+    seen = {}
+
+    class _Pool:
+        def __init__(self, *args, **kwargs):
+            a = core.current_authority()
+            seen["start"] = (a.kind, a.policy) if a is not None else None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            a = core.current_authority()
+            seen["retire"] = (a.kind, a.policy) if a is not None else None
+            return False
+
+        def submit(self, fn, *args):
+            future = concurrent.futures.Future()
+            future.set_result(("codex", ()))
+            return future
+
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", _Pool)
+    monkeypatch.setattr(sources, "_worker_initargs", lambda: ())
+
+    def _launch():
+        seen["result"] = sources._build_isolated_provider(
+            (None, True), ("query", "interactive", None))
+        seen["after"] = core.current_authority()
+
+    t = threading.Thread(target=_launch)
+    t.start()
+    t.join(30)
+    assert seen["result"] == "codex"
+    assert seen["start"] == ("query", "interactive")
+    assert seen["retire"] == ("query", "interactive")
+    assert seen["after"] is None
 
 
 def test_build_diagnosis_publishes_the_generation_on_each_result(claude_store):

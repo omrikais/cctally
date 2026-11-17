@@ -97,6 +97,27 @@ class _TrackedHandlerThreads(list):
         pass
 
 
+def inert_startup_heap_freeze(monkeypatch, dash):
+    """Stub `cmd_dashboard`'s `_StartupHeapFreeze` (#787 / #861 revision 34
+    L1) for a test that runs the real `cmd_dashboard` in process.
+
+    The real worker runs `gc.collect()` + `gc.freeze()` after the first
+    coherent publication. Inside a pytest worker that freezes earlier
+    tests' cyclic garbage into the permanent generation for the rest of the
+    worker's life, and each such test freezes again. The stub keeps the
+    class's trigger (`observe`) and thread wiring and makes the collection
+    and the freeze no-ops. Call it after the script is loaded, on the module
+    `cmd_dashboard` will run (each `load_script()` registers a fresh one).
+    The heap-freeze tests themselves keep the real class."""
+    real = dash._StartupHeapFreeze
+
+    class _InertStartupHeapFreeze(real):
+        def __init__(self, **_kwargs):
+            super().__init__(collect=lambda *a, **k: 0, freeze=lambda: None)
+
+    monkeypatch.setattr(dash, "_StartupHeapFreeze", _InertStartupHeapFreeze)
+
+
 def start(server):
     """Start `server`'s accept loop on a daemon thread and return the thread.
 

@@ -370,7 +370,7 @@ test('mobile onboarding toast does not cover an open Current Usage dialog', asyn
   await expect(onboarding).toBeVisible();
 });
 
-test('desktop onboarding toast stays visible beside an open Current Usage dialog', async ({ page }) => {
+test('desktop onboarding toast stays displayed, beneath the backdrop, while Current Usage is open', async ({ page }) => {
   await serveDecoratedFixture(page);
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto('/');

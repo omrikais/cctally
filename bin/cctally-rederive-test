@@ -10,6 +10,8 @@ case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=bin/_lib-hold.sh
+. "$REPO_ROOT/bin/_lib-hold.sh"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/cctally-rederive-XXXXXX")" || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
 export REPO_ROOT
@@ -81,6 +83,7 @@ spec = importlib.util.spec_from_loader("cctally", loader)
 mod = importlib.util.module_from_spec(spec)
 sys.modules["cctally"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 import _cctally_journal as runtime
 import _cctally_core as core
@@ -376,14 +379,18 @@ else
 fi
 
 rebuild_pause_marker="$SCRATCH/rederive-apply-paused.pid"
-(
-    CCTALLY_TEST_STATS_REBUILD_PAUSE_AT=rebuild_fold_started \
-    CCTALLY_TEST_STATS_REBUILD_MARKER="$rebuild_pause_marker" \
+# Each concurrent apply is the held child of a child-scope holder (#1087),
+# which resumes it (hold_cont) and stops it (hold_stop) while it holds it
+# unreaped, so this harness never signals a process number. The apply that
+# pauses itself is that held child: the pause runs in-process in the
+# rebuild's fold, and the marker carries its own pid.
+apply_hold_1="$SCRATCH/apply-1.hold"
+CCTALLY_TEST_STATS_REBUILD_PAUSE_AT=rebuild_fold_started \
+CCTALLY_TEST_STATS_REBUILD_MARKER="$rebuild_pause_marker" \
+    hold_start "$apply_hold_1" child -- \
     "$REPO_ROOT/bin/cctally" db rederive --family claude-usage --yes --json \
-        >"$SCRATCH/apply-1.json" 2>"$SCRATCH/apply-1.err"
-    echo "$?" >"$SCRATCH/apply-1.rc"
-) &
-apply_pid_1=$!
+    >"$SCRATCH/apply-1.json" 2>"$SCRATCH/apply-1.err"
+apply_holder_1=$HOLD_PID
 
 rebuild_paused=0
 for _ in $(seq 1 200); do
@@ -391,73 +398,71 @@ for _ in $(seq 1 200); do
         rebuild_paused=1
         break
     fi
-    if ! kill -0 "$apply_pid_1" 2>/dev/null; then
+    if ! hold_alive "$apply_holder_1"; then
         break
     fi
     sleep 0.05
 done
 
-(
+apply_hold_2="$SCRATCH/apply-2.hold"
+hold_start "$apply_hold_2" child -- \
     "$REPO_ROOT/bin/cctally" db rederive --family claude-usage --yes --json \
-        >"$SCRATCH/apply-2.json" 2>"$SCRATCH/apply-2.err"
-    echo "$?" >"$SCRATCH/apply-2.rc"
-) &
-apply_pid_2=$!
+    >"$SCRATCH/apply-2.json" 2>"$SCRATCH/apply-2.err"
+apply_holder_2=$HOLD_PID
 
 # The pause hook writes the marker and only THEN stops itself, so a continue
 # sent between the two is lost and the job would stay stopped forever (a full
-# run once waited 3 h 14 min on it). Until the paused job exits, continue the
-# recorded process whenever it shows stopped; give up after a bound, record
-# it, and kill the job so the harness always terminates.
-release_paused_until_exit() {
-    local job="$1" n=0 pid
-    while kill -0 "$job" 2>/dev/null && [ "$n" -lt 2400 ]; do
+# run once waited 3 h 14 min on it). Until the paused apply exits, ask its
+# holder to continue it whenever the marker's process shows stopped; give up
+# after a bound, record it, and have the holder stop it so the harness always
+# terminates. Leaves the apply's settlement in the HOLD_* variables.
+release_paused_until_exit() {   # $1 holder pid, $2 holder directory
+    local holder="$1" dir="$2" n=0 pid
+    while hold_alive "$holder" && [ "$n" -lt 2400 ]; do
         pid="$(sed -n '1p' "$rebuild_pause_marker" 2>/dev/null)"
         case "$pid" in
             ''|*[!0-9]*) ;;
             *)
                 case "$(ps -o stat= -p "$pid" 2>/dev/null)" in
-                    *T*) kill -CONT "$pid" 2>/dev/null ;;
+                    *T*) hold_cont "$dir" ;;
                 esac
                 ;;
         esac
         n=$((n + 1))
         sleep 0.05
     done
-    if kill -0 "$job" 2>/dev/null; then
+    if hold_alive "$holder"; then
         fail 4 job-vanished
-        pid="$(sed -n '1p' "$rebuild_pause_marker" 2>/dev/null)"
-        case "$pid" in
-            ''|*[!0-9]*) ;;
-            *) kill -KILL "$pid" 2>/dev/null ;;
-        esac
+        hold_stop "$holder" "$dir"
+    else
+        hold_wait "$holder" "$dir"
     fi
 }
 
+hold_wait "$apply_holder_2" "$apply_hold_2"
+apply_rc_2=$HOLD_RC
 if [ "$rebuild_paused" -eq 1 ]; then
-    wait "$apply_pid_2"
     paused_pid="$(sed -n '1p' "$rebuild_pause_marker")"
     case "$paused_pid" in
         ''|*[!0-9]*)
             fail 4 malformed-output
             ;;
         *)
-            kill -CONT "$paused_pid" 2>/dev/null || \
-                fail 4 job-vanished
+            hold_cont "$apply_hold_1"
             ;;
     esac
-    release_paused_until_exit "$apply_pid_1"
-    wait "$apply_pid_1"
+    release_paused_until_exit "$apply_holder_1" "$apply_hold_1"
+    # The process that paused is the held apply itself, not some other pid.
+    if [ "$paused_pid" != "$HOLD_CHILD" ]; then
+        fail 4 record-diverged
+    fi
 else
     fail 4 outcome-record-missing
-    wait "$apply_pid_2"
-    release_paused_until_exit "$apply_pid_1"
-    wait "$apply_pid_1"
+    release_paused_until_exit "$apply_holder_1" "$apply_hold_1"
 fi
+apply_rc_1=$HOLD_RC
 apply_json_1="$(cat "$SCRATCH/apply-1.json")"
 apply_json_2="$(cat "$SCRATCH/apply-2.json")"
-apply_rc_1="$(cat "$SCRATCH/apply-1.rc")"
-apply_rc_2="$(cat "$SCRATCH/apply-2.rc")"
 retry_slot="$(
     APPLY_JSON_1="$apply_json_1" APPLY_JSON_2="$apply_json_2" \
     APPLY_RC_1="$apply_rc_1" APPLY_RC_2="$apply_rc_2" python3 - <<'PY'
@@ -579,6 +584,7 @@ spec = importlib.util.spec_from_loader("cctally", loader)
 mod = importlib.util.module_from_spec(spec)
 sys.modules["cctally"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 import _cctally_journal as runtime
 import _cctally_core as core
 
@@ -724,6 +730,48 @@ else
     fail 6 record-diverged
     sed -n '1,160p' "$SCRATCH/verify.log"
 fi
+
+# Case 7 (#1087): the bound above ends in hold_stop on an apply that is still
+# stopped. The holder must end it there too, reap it and report the
+# settlement complete, whether its TERM ends the stopped process (Darwin and
+# Linux both deliver a fatal default-action signal to one) or the KILL after
+# its 1 s grace does. A stand-in stops itself the way the pause hook does.
+stopped_hold="$SCRATCH/stopped.hold"
+hold_start "$stopped_hold" child --grace 1 -- python3 -c '
+import os, signal, sys
+with open(sys.argv[1] + ".tmp", "w") as fh:
+    fh.write("%d\n" % os.getpid())
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+os.kill(os.getpid(), signal.SIGSTOP)
+' "$SCRATCH/stopped.pid" >/dev/null 2>"$SCRATCH/stopped.err"
+stopped_holder=$HOLD_PID
+stopped_state=""
+for _ in $(seq 1 200); do
+    stopped_pid="$(sed -n '1p' "$SCRATCH/stopped.pid" 2>/dev/null)"
+    case "$stopped_pid" in
+        ''|*[!0-9]*) ;;
+        *) stopped_state="$(ps -o stat= -p "$stopped_pid" 2>/dev/null)" ;;
+    esac
+    case "$stopped_state" in *T*) break ;; esac
+    hold_alive "$stopped_holder" || break
+    sleep 0.05
+done
+hold_stop "$stopped_holder" "$stopped_hold"
+case "$stopped_state" in
+    *T*)
+        if [ "$HOLD_COMPLETE" = 1 ] && [ "$HOLD_TERMED" = 1 ] \
+            && { [ "$HOLD_RC" = 143 ] || [ "$HOLD_RC" = 137 ]; } \
+            && [ "$HOLD_CHILD" = "$stopped_pid" ] \
+            && [ -z "$(ps -o stat= -p "$stopped_pid" 2>/dev/null)" ]; then
+            pass 7
+        else
+            fail 7 outcome-mismatch
+        fi
+        ;;
+    *)
+        fail 7 outcome-record-missing
+        ;;
+esac
 
 echo "passed: $pass_count  failed: $fail_count"
 [ "$fail_count" -eq 0 ]

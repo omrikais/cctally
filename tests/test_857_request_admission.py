@@ -287,13 +287,14 @@ def test_http_diagnosis_recovers_after_nonterminating_process_is_retired(
 ):
     """A timed-out physical producer cannot consume the sole slot forever.
 
-    The first request's diagnosis process never returns: it is really killed
-    and reaped at the 1.5 s deadline. The second request is sent only once
-    that process is retired and the admission slot is free again (#1007):
-    on a loaded runner the reap outlasted a whole recovery deadline, and a
-    second request sent at once timed out waiting for the slot. How fast the
-    recovered request's real build runs is measured and printed, not asserted
-    against the 1.5 s deadline.
+    The first request's diagnosis process never returns: at the 1.5 s
+    deadline the parent sends its stop frame and the worker stops its own
+    group (#1087: the parent signals nothing). The second request is sent
+    only once that process is retired and the admission slot is free again
+    (#1007): on a loaded runner the retirement outlasted a whole recovery
+    deadline, and a second request sent at once timed out waiting for the
+    slot. How fast the recovered request's real build runs is measured and
+    printed, not asserted against the 1.5 s deadline.
     """
     import os
 
@@ -310,31 +311,31 @@ def test_http_diagnosis_recovers_after_nonterminating_process_is_retired(
     monkeypatch.setattr(dash, "_DIAGNOSIS_ADMISSION", admission)
     sources = ns["_load_sibling"]("_cctally_diagnosis_sources")
     real_bounded = sources.build_diagnosis_bounded
-    real_terminate = sources._terminate_process_group
+    real_await = sources._await_retirement
     retired = threading.Event()
-    killed = []
+    sessions = []
     calls = 0
 
-    def recorded_terminate(process):
-        killed.append(process.pid)
-        real_terminate(process)
+    def recorded_await(process, sid, seconds):
+        sessions.append(sid)
+        return real_await(process, sid, seconds)
 
-    def first_process_never_returns(*args, timeout_seconds, **kwargs):
+    def first_process_never_returns(*args, timeout_seconds, retirement=None, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
             try:
                 return sources._run_process_with_deadline(
                     _nonterminating_diagnosis_worker, (),
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=timeout_seconds, retirement=retirement,
                 )
             finally:
                 retired.set()
         return real_bounded(
-            *args, timeout_seconds=timeout_seconds, **kwargs,
+            *args, timeout_seconds=timeout_seconds, retirement=retirement, **kwargs,
         )
 
-    monkeypatch.setattr(sources, "_terminate_process_group", recorded_terminate)
+    monkeypatch.setattr(sources, "_await_retirement", recorded_await)
     monkeypatch.setattr(
         sources, "build_diagnosis_bounded", first_process_never_returns,
     )
@@ -354,15 +355,16 @@ def test_http_diagnosis_recovers_after_nonterminating_process_is_retired(
             timeout=PRESENCE_BACKSTOP_SECONDS,
         ), "the retired producer never released the diagnosis slot"
         admission._admission.release()
-        # The process was really killed and reaped: no process, no zombie.
-        assert killed and killed[0] is not None, killed
+        # The slot is free only once the worker's group was shown gone: no
+        # process, no zombie is left in it.
+        assert sessions and sessions[0] is not None, sessions
         try:
-            os.kill(killed[0], 0)
+            os.killpg(sessions[0], 0)
         except ProcessLookupError:
             pass
         else:
             raise AssertionError(
-                f"diagnosis process {killed[0]} was not reaped")
+                f"diagnosis process group {sessions[0]} outlived the slot")
         # Recovery through the same admission. Its deadline is widened only
         # for this request, so a slow real build on a loaded host cannot
         # turn a recovery into a timeout.

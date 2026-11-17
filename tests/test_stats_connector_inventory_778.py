@@ -298,17 +298,21 @@ def assert_connector_forwards_the_keyword(source: str, name: str, label: str):
 #: one module and one class. Changing a count here is a deliberate act: a new
 #: route must be declared, and a removed one must be un-declared.
 _FROZEN_ROUTES = {
-    ("_cctally_alerts.py", "custom"): 2,
-    ("_cctally_config.py", "custom"): 1,
+    # #787 / #861 Task 2: alerts' two label/account reads and config's
+    # account-budget normalization left their guarded stats opens for query
+    # statement readers (`cached_statements=0` inside the session), so their
+    # routes are deleted.
     ("_cctally_core.py", "default"): 2,
-    ("_cctally_dashboard.py", "custom"): 1,
+    # #787 / #861 Task 3 (314a3a673): the dashboard's guarded stats open
+    # (`custom` connector) left for query sessions, so its route is deleted.
     ("_cctally_db.py", "custom"): 2,
-    ("_cctally_doctor.py", "custom"): 1,
-    ("_cctally_doctor.py", "default"): 2,
+    # #787 / #861 5.12: Doctor's three stats opens (the quick_check and
+    # freshness legs and `_stats_ro_guarded`) now read through diagnostic
+    # query sessions, which open with `cached_statements=0` themselves.
     ("_cctally_journal.py", "custom"): 1,
-    # #825/#832 fix round K13: the wait-token read opens stats.db with a
-    # zero busy timeout and forwards every opener keyword (`**kwargs`).
-    ("_cctally_statusline.py", "custom"): 1,
+    # #787 / #861 Task 2: the #825/#832 K13 wait-token read (zero busy
+    # timeout, `**kwargs` forwarded) is now a query statement reader, so its
+    # statusline route is deleted.
 }
 
 

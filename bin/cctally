@@ -1131,6 +1131,7 @@ cmd_db_repair = _cctally_db.cmd_db_repair
 cmd_db_backup = _cctally_db.cmd_db_backup
 cmd_db_checkpoint = _cctally_db.cmd_db_checkpoint
 cmd_db_vacuum = _cctally_db.cmd_db_vacuum
+cmd_db_reindex_search = _cctally_db.cmd_db_reindex_search
 
 
 # Session-entry cache subsystem (Claude + Codex) — read-through delta
@@ -1183,9 +1184,6 @@ AccountAttributionUnavailable = _cctally_cache.AccountAttributionUnavailable
 open_cache_db = _cctally_cache.open_cache_db
 open_conversations_db = _cctally_cache.open_conversations_db
 open_conversations_db_readonly = _cctally_cache.open_conversations_db_readonly
-probe_conversations_maintenance_free = (
-    _cctally_cache.probe_conversations_maintenance_free
-)
 ConversationReaderUnavailable = _cctally_cache.ConversationReaderUnavailable
 MaintenanceInProgress = _cctally_cache.MaintenanceInProgress
 SchemaBehind = _cctally_cache.SchemaBehind
@@ -1195,6 +1193,7 @@ scope_conversations_db_to_account = (
     _cctally_cache.scope_conversations_db_to_account
 )
 sync_claude_conversations = _cctally_cache.sync_claude_conversations
+sync_claude_rollup = _cctally_cache.sync_claude_rollup
 sync_codex_conversations = _cctally_cache.sync_codex_conversations
 _reset_orphan_warning_throttle = _cctally_cache._reset_orphan_warning_throttle
 cmd_cache_sync = _cctally_cache.cmd_cache_sync
@@ -2125,8 +2124,16 @@ def _sum_cost_and_tokens_for_range(
     """
     total = 0.0
     tokens = 0
-    for entry in get_entries(start, end, project=project, skip_sync=skip_sync,
-                             account_key=account_key):
+    import _cctally_store_access as _store_access
+    if _store_access.reads_through_query():
+        # #787 / #861 spec 5.11: a query caller (the narrowed snapshot build)
+        # never reaches the owner facade; one query session, no sync.
+        entries = _cctally_cache.query_entries(
+            "entries", start, end, project=project, account_key=account_key)
+    else:
+        entries = get_entries(start, end, project=project,
+                              skip_sync=skip_sync, account_key=account_key)
+    for entry in entries:
         total += _calculate_entry_cost(
             entry.model,
             entry.usage,
@@ -2589,7 +2596,8 @@ def _select_last_known_snapshot() -> dict | None:
     freshness without re-querying.
     """
     try:
-        conn = open_db()
+        import _cctally_store_access as _store_access  # #787 AD21
+        conn = _store_access.statement_reader("stats")
         try:
             # `weekly_observation_held = 0` (#769 S11, #824). The payload this
             # builds is ONE observation with ONE capture instant, and
@@ -3419,7 +3427,8 @@ def _newest_snapshot_age_seconds(now_utc: dt.datetime | None = None) -> float | 
     if now_utc is None:
         now_utc = dt.datetime.now(dt.timezone.utc)
     try:
-        conn = open_db()
+        import _cctally_store_access as _store_access  # #787 AD21
+        conn = _store_access.statement_reader("stats")
         try:
             # `weekly_observation_held = 0` (#769 S11, #824). This age gates the
             # hook's OAuth fetch, and the question it answers is how recently a
@@ -3648,6 +3657,51 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         eprint(f"cctally: {exc}")
         return 2
+    # #787 / #861 (spec 5.1, AD5, AD7): the CLI main thread runs at the
+    # `process` authority inside one `cli` operation boundary. The command is
+    # classified BEFORE the authority is established: an internal owner
+    # (a detached worker, `hook-tick`, `record-usage`) keeps today's
+    # unbounded owner-side maintenance wait, and every other command bounds
+    # each cache/conversations guarded open at `_CLI_OWNER_MAINTENANCE_WAIT_S`.
+    # A recorded authority violation refuses exit 0 (spec 5.2).
+    with _cctally_core.establish_authority(
+            "process",
+            owner_wait_s=_cli_owner_wait_s(getattr(args, "command", None))):
+        with _cctally_core.operation_boundary("cli"):
+            rc = _dispatch_parsed_command(args)
+            if rc == 0:
+                _cctally_core.check_publishable()
+            return rc
+
+
+#: AD7 (O5): the internal owner commands whose owner-side maintenance wait
+#: stays unbounded, besides every `_`-prefixed command (the detached workers,
+#: which re-execute the CLI through `_spawn_detached_pid`). `hook-tick` is the
+#: Claude and Codex hook owner (every hook `setup` installs runs it), and
+#: `record-usage` is the status-line and hook writer.
+_OWNER_WAIT_EXEMPT_COMMANDS = frozenset({"hook-tick", "record-usage"})
+
+
+def _owner_wait_exempt(command: "str | None") -> bool:
+    """True for an internal owner command (AD7): every `_`-prefixed command
+    and each member of `_OWNER_WAIT_EXEMPT_COMMANDS`."""
+    if not command:
+        return False
+    return command.startswith("_") or command in _OWNER_WAIT_EXEMPT_COMMANDS
+
+
+def _cli_owner_wait_s(command: "str | None") -> "float | None":
+    """The AD7 owner-side maintenance bound for `command`: None (unbounded)
+    for an internal owner, else `_cctally_core._CLI_OWNER_MAINTENANCE_WAIT_S`
+    read at call time."""
+    if _owner_wait_exempt(command):
+        return None
+    return _cctally_core._CLI_OWNER_MAINTENANCE_WAIT_S
+
+
+def _dispatch_parsed_command(args) -> int:
+    """The parsed command's dispatch, its exit mapping and the post-command
+    hooks, under the authority `main` established."""
     _print_migration_error_banner_if_needed(args)
     try:
         rc = int(args.func(args))
@@ -3721,7 +3775,9 @@ def main(argv: list[str] | None = None) -> int:
                 "unhandled exception in %r",
                 getattr(args, "command", None), exc_info=True,
             )
-        eprint(f"Error: {exc}")
+        # #787 / #861 Q-W1: a query-layer refusal names only the existing
+        # sentence; its detail is in the debug log above.
+        eprint(f"Error: {_cctally_core.store_refusal_text(exc)}")
         rc = 1
     except Exception as exc:  # pragma: no cover
         # #279 S2 F2: CCTALLY_DEBUG=1 surfaces the full traceback on stderr

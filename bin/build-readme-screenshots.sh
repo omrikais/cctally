@@ -99,12 +99,21 @@ fi
 # can use them and so the trap covers more of the run. Nothing between the old
 # and new positions touches scratch state.
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/cctally-readme-XXXXXX")" || exit 1
+# The dashboard runs under a child-scope holder (issue #1087), which stops it
+# while it holds it unreaped; this script never signals a process number.
+# shellcheck source=bin/_lib-hold.sh
+. "$REPO_ROOT/bin/_lib-hold.sh"
 DASH_PID=""
-cleanup() {
+DASH_HOLD="$SCRATCH/dashboard.hold"
+stop_dashboard() {
     if [[ -n "$DASH_PID" ]]; then
-        kill -TERM "$DASH_PID" 2>/dev/null || true
-        wait "$DASH_PID" 2>/dev/null || true
+        hold_stop "$DASH_PID" "$DASH_HOLD"
+        DASH_PID=""
     fi
+    return 0
+}
+cleanup() {
+    stop_dashboard
     rm -rf "$SCRATCH"
 }
 trap cleanup EXIT INT TERM
@@ -122,7 +131,8 @@ dump_dashboard_log() {
 }
 
 # Launch the dashboard on $DASHBOARD_PORT (0 = kernel picks), then read the
-# port it actually bound out of its own startup banner. Sets DASH_PID and
+# port it actually bound out of its own startup banner. Sets DASH_PID (the
+# dashboard's holder) and
 # DASHBOARD_URL; exits 1 with the captured log on any failure. (Issue #367.)
 start_dashboard() {
     # Create the log BEFORE forking. The child applies its redirect after the
@@ -130,9 +140,10 @@ start_dashboard() {
     # does not exist yet — under `set -e` that aborts the whole script with a
     # bare "No such file or directory" instead of retrying.
     : > "$SCRATCH/dashboard.log"
-    "$CCTALLY_BIN" dashboard --host 127.0.0.1 --port "$DASHBOARD_PORT" --no-browser \
-        > "$SCRATCH/dashboard.log" 2>&1 &
-    DASH_PID=$!
+    hold_start "$DASH_HOLD" child -- \
+        "$CCTALLY_BIN" dashboard --host 127.0.0.1 --port "$DASHBOARD_PORT" --no-browser \
+        > "$SCRATCH/dashboard.log" 2>&1
+    DASH_PID=$HOLD_PID
 
     # `dashboard: serving http://localhost:<port>/ — Ctrl-C to stop`
     #
@@ -151,7 +162,7 @@ start_dashboard() {
         bound=$(sed -nE '/^dashboard: serving https?:\/\//{ s#^dashboard: serving https?://[^/]*:([0-9]+)/.*#\1#p; q; }' \
                     "$SCRATCH/dashboard.log")
         [[ -n $bound ]] && break
-        kill -0 "$DASH_PID" 2>/dev/null || break     # child died — stop waiting
+        hold_alive "$DASH_PID" || break     # dashboard (and its holder) gone — stop waiting
         sleep 0.1
     done
     if [[ -z $bound ]]; then
@@ -171,7 +182,7 @@ start_dashboard() {
             ready=1
             break
         fi
-        kill -0 "$DASH_PID" 2>/dev/null || break
+        hold_alive "$DASH_PID" || break
         sleep 0.1
     done
     if [[ $ready -ne 1 ]]; then
@@ -341,9 +352,7 @@ start_dashboard
 PYTHONPATH="$ORIGINAL_USER_SITE${PYTHONPATH:+:$PYTHONPATH}" \
     "$REPO_ROOT/bin/_capture_dashboard.py" --url "$DASHBOARD_URL" --out-dir "$OUT_DIR"
 
-kill -TERM "$DASH_PID" 2>/dev/null || true
-wait "$DASH_PID" 2>/dev/null || true
-DASH_PID=""
+stop_dashboard
 
 # 7. Verify all 11 outputs exist and are non-empty.
 echo "[5/5] Verifying outputs"

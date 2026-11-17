@@ -77,37 +77,119 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+class _DiagnosticStatsConnection:
+    """A diagnostic stats session's connection whose ``close()`` ends the
+    session (rollback, detach, close, authority restored, admission budget
+    disposed of when this session created it)."""
+
+    def __init__(self, session, stack):
+        self._conn = session.conn
+        self._stack = stack
+        self.session = session
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def close(self) -> None:
+        self._stack.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.close()
+        return False
+
+
+def _diagnostic_refusal(exc: BaseException) -> bool:
+    """#787 / #861 AD20/AD22: whether a store's diagnostic open failed as a
+    typed refusal the next owner open resolves (``unavailable``: a WAL-header
+    stats.db, a data directory not established as private; ``absent``: a
+    missing maintenance lock), which Doctor shows as unavailable, never as an
+    open failure. Corruption, contention and maintenance keep today's
+    open-failure rendering."""
+    return (isinstance(exc, _cctally_core.StoreUnavailable)
+            and exc.reason in ("unavailable", "absent"))
+
+
+def _note_store_refusal(status: dict, exc: BaseException) -> None:
+    """#787 / #861 Q-W1: keep a query-layer refusal's reason and detail on the
+    store's status (``_open_refusal``) for the checks' JSON details only;
+    the text shows ``_open_error``, the existing sentence."""
+    record = _cctally_core.store_refusal_record(exc)
+    if record is not None:
+        status["_open_refusal"] = record
+
+
 def _stats_ro_guarded():
-    """A `mode=ro` stats connection that participates in the #386 opener protocol.
+    """Doctor's stats.db reader (#787 / #861 spec 5.12): a diagnostic query
+    session, ``mode=ro`` under diagnostic admission with recovery suppressed.
 
-    Read-only does not mean side-effect-free: measured on this platform, a
-    `mode=ro` connection to a WAL database with absent sidecars CREATES
-    `stats.db-shm` and `stats.db-wal`. Spec §3.1's third clause therefore
-    covers these diagnostics, and both callers already degrade on
-    `sqlite3.Error` (which `StatsDbMaintenanceError` is).
+    It used to be `stats_open_guarded` with its default
+    ``recover_interruptions=True``, so a diagnostic could resume a stats
+    recovery. The session refuses a repair marker or pending quarantine
+    before connect, admits rebuild artifacts and a publication marker
+    read-only, and refuses the WAL family or a ``-journal`` (5.4). A
+    maintenance refusal is today's `StatsDbMaintenanceError`; every refusal
+    is a `sqlite3.Error`, which each caller already degrades on.
     """
-    import _cctally_store
+    import _cctally_store_access
 
-    return _cctally_store.stats_open_guarded(
-        _cctally_core.DB_PATH,
-        # #778: forward the opener's `cached_statements=0`.
-        connect=lambda p, **kw: sqlite3.connect(
-            f"file:{p}?mode=ro", uri=True, **kw),
-    )
+    stack = contextlib.ExitStack()
+    try:
+        session = stack.enter_context(
+            _cctally_store_access.QueryService.session(
+                "stats", policy="diagnostic"))
+    except _cctally_core.StoreUnavailable as exc:
+        stack.close()
+        mapped = _cctally_store_access._command_unavailable(exc)
+        if mapped is None:
+            raise
+        raise mapped from exc
+    except BaseException:
+        stack.close()
+        raise
+    return _DiagnosticStatsConnection(session, stack)
 
 
+@contextlib.contextmanager
 def _conversation_ro_guarded(*, timeout: float):
     """Bounded read-only transcript handle participating in #415 recovery.
 
-    #1000 §5.10: the admission now lives in
-    ``_cctally_cache.conversation_ro_guarded``, shared with `db status` and
-    the `explain` reader. Doctor keeps this name for its call sites (and the
-    tests that patch it), and reaches the sibling call-time, as its other
-    sibling imports do (F1), because doctor loads before `_cctally_cache`.
+    #787 / #861 AD28: a diagnostic conversations query session (``mode=ro``
+    under the shared maintenance admission, recovery suppressed, the
+    diagnostic wait budget), never the plain ``mode=ro`` connect of
+    ``_cctally_cache.conversation_ro_guarded``, which `db status` and the
+    `explain` reader keep. Doctor keeps this name and its contract for its
+    call sites (and the tests that patch it): no handle (``None``) when the
+    main file is absent or when maintenance excludes readers (the lock held
+    past the budget, a repair marker, a pending quarantine, a recovery
+    record); a refusal the next owner open resolves (a missing maintenance
+    lock, a data directory not established as private) raises the typed
+    `StoreUnavailable`, which each call site reports as unreadable. The
+    session's admission, not ``timeout``, bounds the wait; the argument
+    stays for the call sites' signature.
     """
-    import _cctally_cache
+    import _cctally_store_access
 
-    return _cctally_cache.conversation_ro_guarded(timeout=timeout)
+    if not pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH).exists():
+        yield None
+        return
+    stack = contextlib.ExitStack()
+    try:
+        session = stack.enter_context(
+            _cctally_store_access.QueryService.session(
+                "conversations", policy="diagnostic"))
+    except _cctally_core.StoreUnavailable as exc:
+        stack.close()
+        if exc.reason != "maintenance":
+            raise
+        session = None
+    except BaseException:
+        stack.close()
+        raise
+    with stack:
+        yield None if session is None else session.conn
 
 
 def _journal_heal_incident(kind: str, name: str, now_utc: dt.datetime) -> dict:
@@ -1512,14 +1594,21 @@ def _gather_codex_window_attribution_state() -> "dict | None":
     incarnation row nor any account row is what makes that condition visible
     instead of silent, and it is computed only when this store carries an
     assertion at all — the restore path is the only thing it can affect.
+
+    #787 / #861 AD28: read through a diagnostic cache session, never a raw
+    ``mode=ro`` connect. A store that session refuses as unreadable is
+    reported as ``{"refused_store": "cache.db"}``, which the kernel renders
+    as unavailable (AD25), and is never read.
     """
     if not _cctally_core.CACHE_DB_PATH.exists():
         return None
     try:
-        conn = sqlite3.connect(
-            f"file:{_cctally_core.CACHE_DB_PATH}?mode=ro", uri=True)
-    except sqlite3.Error:
+        session, stack = _doctor_cache_session()
+    except sqlite3.Error as exc:
+        if _diagnostic_refusal(exc):
+            return {"refused_store": "cache.db"}
         return None
+    conn = session.conn
     try:
         import _cctally_cache
         import _cctally_quota
@@ -1630,7 +1719,7 @@ def _gather_codex_window_attribution_state() -> "dict | None":
     except Exception:
         return None
     finally:
-        conn.close()
+        stack.close()
 
 
 def _journal_protocol_violation_rows(conn: sqlite3.Connection) -> list:
@@ -1691,7 +1780,11 @@ def _gather_claude_cost_attribution(
     their links (#944 F4): for a week after an upgrade that is every
     existing row (~700K measured), and probing each one's link cost ~2.8 s of
     SQL on every doctor run, while every export links the row it records.
-    Never raises; an absent or unreadable cache.db yields the empty shape."""
+    Never raises; an absent or unreadable cache.db yields the empty shape.
+    #787 / #861 AD28: read through a diagnostic cache session; a store that
+    session refuses as unreadable also carries ``_refused_store``, which the
+    accounts gather lifts out so the check renders it as unavailable
+    (AD25)."""
     import _lib_claude_attribution as K
     end_us = K.us_from_iso(
         now_utc.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
@@ -1713,9 +1806,12 @@ def _gather_claude_cost_attribution(
     if not cache_probe_allowed or not path.exists():
         return out
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.0)
-    except sqlite3.Error:
+        session, stack = _doctor_cache_session()
+    except sqlite3.Error as exc:
+        if _diagnostic_refusal(exc):
+            out["_refused_store"] = "cache.db"
         return out
+    conn = session.conn
     try:
         import _cctally_claude_attribution as G
         if not G.schema_present(conn):
@@ -1789,7 +1885,7 @@ def _gather_claude_cost_attribution(
     except sqlite3.Error:
         return out
     finally:
-        conn.close()
+        stack.close()
     return out
 
 
@@ -1815,6 +1911,10 @@ def _gather_accounts_state(now_utc: "dt.datetime", *,
     # return; the check is always present.
     state["claude_cost_attribution"] = _gather_claude_cost_attribution(
         now_utc, cache_probe_allowed=cache_probe_allowed)
+    refused_store = state["claude_cost_attribution"].pop(
+        "_refused_store", None)
+    if refused_store is not None:
+        state["claude_cost_attribution_refused_store"] = refused_store
     if not _cctally_core.DB_PATH.exists():
         return state
     try:
@@ -1962,19 +2062,21 @@ def _codex_quota_observation_signal() -> "tuple | None":
         stat = path.stat()
     except OSError:
         return None
+    # #787 / #861 AD28: a diagnostic cache session, never a plain `mode=ro`
+    # connect. A refused store yields no signal, so the probe takes its cold
+    # path, which the same refusal stops: a memo filled before the refusal is
+    # never served from a store Doctor may not read.
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        session, stack = _doctor_cache_session()
     except sqlite3.Error:
         return None
-    try:
+    with stack:
         # #857: the two ledger legs are stated once, in the snapshot-cache
         # kernel, and shared with the dashboard's Codex quota-dependency
         # identity rather than restated here.
         legs = _cctally()._load_sibling(
             "_lib_snapshot_cache"
-        ).codex_quota_observation_legs(conn)
-    finally:
-        conn.close()
+        ).codex_quota_observation_legs(session.conn)
     if legs is None:
         return None
     return (str(path), stat.st_dev, stat.st_ino, *legs)
@@ -1988,11 +2090,22 @@ def _load_codex_quota_observations_for_doctor(*, force_cold: bool = False):
         cached = _QUOTA_OBSERVATION_MEMO.get(signal)
         if cached is not None:
             return cached
-    loaded = tuple(
-        c._cctally_quota.load_codex_quota_observations(
-            latest_per_identity=True,
+    # #787 / #861: Doctor reads at the diagnostic policy (5.3, 5.12), which
+    # admits a schema-behind cache the command policy of the shared
+    # `_cache_connection()` would refuse.
+    if not _cctally_core.CACHE_DB_PATH.exists():
+        return ()
+    import _cctally_store_access as _store_access
+    cache_conn = _store_access.statement_reader(
+        "cache", row_factory=sqlite3.Row, startup=False, policy="diagnostic")
+    try:
+        loaded = tuple(
+            c._cctally_quota.load_codex_quota_observations(
+                latest_per_identity=True, cache_conn=cache_conn,
+            )
         )
-    )
+    finally:
+        cache_conn.close()
     if signal is not None:
         # Replace rather than accumulate: the bound is one entry.
         _QUOTA_OBSERVATION_MEMO.clear()
@@ -2193,7 +2306,14 @@ def _freshness_read_transaction(conn):
     publication or delete between them could empty J1's group, and the
     fallback would then wrongly treat it as all-future. Always ended here, so
     no shared lock outlives the selection into the connection's later probes.
+
+    A diagnostic query session (#787 / #861 5.13) already holds one snapshot
+    transaction for its whole life, which is the single read view this
+    selection needs; it is the session's to end, never this helper's.
     """
+    if conn.in_transaction:
+        yield
+        return
     conn.execute("BEGIN")
     try:
         yield
@@ -2541,7 +2661,17 @@ def _gather_codex_container_state(c, *, now_utc, cache_probe_allowed):
         if path.exists():
             if not cache_probe_allowed:
                 return None, decoder, None, None
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.0)
+            # #787 / #861 AD28: a diagnostic cache session, never a plain
+            # `mode=ro` connect. A store it refuses is read not at all; the
+            # check says it could not be read (AD25, O12).
+            try:
+                cache_session, cache_stack = _doctor_cache_session()
+            except sqlite3.Error as exc:
+                if _diagnostic_refusal(exc):
+                    return (None, decoder, {"refused_store": "cache.db"},
+                            None)
+                raise
+            conn = cache_session.conn
             try:
                 conn.row_factory = sqlite3.Row
                 cursor_exists = table_exists(conn, "codex_session_files")
@@ -2587,10 +2717,11 @@ def _gather_codex_container_state(c, *, now_utc, cache_probe_allowed):
                 if count:
                     deletion_starts.append(since)
             finally:
-                conn.close()
+                cache_stack.close()
         else:
             census["neverIngested"] = len(selected)
         maintenance_coverage = "complete"
+        conversations_refused = False
         if _cctally_core.CONVERSATIONS_DB_PATH.exists():
             # An unavailable second store cannot erase the first store's known
             # counts or ages. Its missing contribution remains explicitly unknown.
@@ -2603,8 +2734,9 @@ def _gather_codex_container_state(c, *, now_utc, cache_probe_allowed):
                         deletions += count
                         if count:
                             deletion_starts.append(since)
-            except Exception:
+            except Exception as exc:
                 maintenance_coverage = "partial"
+                conversations_refused = _diagnostic_refusal(exc)
         record = status or {}
         starts = list(deletion_starts)
         if verifications:
@@ -2627,10 +2759,44 @@ def _gather_codex_container_state(c, *, now_utc, cache_probe_allowed):
                     olderThan24h=old)
         if maintenance_coverage != "complete":
             debt["coverage"] = maintenance_coverage
+        if conversations_refused:
+            # AD25: the transcript store's share of the debt was refused,
+            # not merely contended; the check names the store when it has
+            # nothing else to report.
+            debt["refused_store"] = "conversations.db"
         return census, decoder, status, debt
     except Exception:
         return None, None, None, None
 
+
+
+def _doctor_cache_session():
+    """Doctor's cache.db data reads (#787 / #861 spec 5.12): a diagnostic
+    query session, ``mode=ro`` under diagnostic admission with recovery
+    suppressed, in place of a plain read-write connect that could create a
+    store, take part in a WAL checkpoint or remove sidecars at close. It
+    admits a behind/ahead/fenced cache read-only, so each leg still reports
+    missing structures as it did; a refused state (absent, maintenance once
+    the #1005 allowance is spent, corrupt) raises, which the legs' existing
+    handlers report as before. Returns ``(session, stack)``."""
+    import _cctally_store_access
+    stack = contextlib.ExitStack()
+    try:
+        session = stack.enter_context(
+            _cctally_store_access.QueryService.session(
+                "cache", policy="diagnostic"))
+    except BaseException:
+        stack.close()
+        raise
+    return session, stack
+
+
+@contextlib.contextmanager
+def _doctor_cache_conn():
+    """`_doctor_cache_session` as a connection context manager."""
+    session, stack = _doctor_cache_session()
+    with stack:
+        yield session.conn
 
 def _doctor_gather_state_impl(
     *,
@@ -2787,11 +2953,15 @@ def _doctor_gather_state_impl(
                     "migrations": [],
                 }
             else:
+                # #787 / #861 5.12, AD22: a diagnostic session, not the
+                # `mode=rw` guarded open that created the lock and
+                # materialized a WAL-header store's sidecars.
                 stats_db_status = c._db_status_for(
                     _cctally_core.DB_PATH,
                     c._STATS_MIGRATIONS,
                     "stats.db",
                     recover_interrupted_stats=False,
+                    diagnostic_session=True,
                 )
             if not _cctally_core.DB_PATH.exists():
                 stats_db_status["_file_exists"] = False
@@ -2800,7 +2970,12 @@ def _doctor_gather_state_impl(
         except sqlite3.Error as exc:
             stats_db_status = {"path": str(_cctally_core.DB_PATH), "user_version": 0,
                                "registry_size": len(c._STATS_MIGRATIONS),
-                               "migrations": [], "_open_error": str(exc)}
+                               "migrations": [],
+                               "_open_error": (
+                                   _cctally_core.store_refusal_text(exc))}
+            _note_store_refusal(stats_db_status, exc)
+            if _diagnostic_refusal(exc):
+                stats_db_status["_open_refused"] = True
         if interrupted_inspection_error is not None:
             stats_db_status["_interrupted_inspection_error"] = (
                 interrupted_inspection_error
@@ -2816,6 +2991,7 @@ def _doctor_gather_state_impl(
                     _cctally_core.CACHE_DB_PATH,
                     c._CACHE_MIGRATIONS,
                     "cache.db",
+                    diagnostic_session=True,
                 )
                 if not _cctally_core.CACHE_DB_PATH.exists():
                     cache_db_status["_file_exists"] = False
@@ -2825,8 +3001,11 @@ def _doctor_gather_state_impl(
                     "user_version": 0,
                     "registry_size": len(c._CACHE_MIGRATIONS),
                     "migrations": [],
-                    "_open_error": str(exc),
+                    "_open_error": _cctally_core.store_refusal_text(exc),
                 }
+                _note_store_refusal(cache_db_status, exc)
+                if _diagnostic_refusal(exc):
+                    cache_db_status["_open_refused"] = True
         else:
             cache_db_status = {
                 "path": str(_cctally_core.CACHE_DB_PATH),
@@ -2856,7 +3035,8 @@ def _doctor_gather_state_impl(
                 # what the clause requires.
                 import _cctally_store as _store_mod
                 try:
-                    conn = _store_mod.stats_open_guarded(_cctally_core.DB_PATH)
+                    # #787 / #861 5.12: the diagnostic stats session.
+                    conn = _stats_ro_guarded()
                 except _store_mod._cctally_db.StatsDbMaintenanceError:
                     # #1018 C6: neither source can be read, which is not
                     # silence; the check reports it as unavailable.
@@ -3009,7 +3189,8 @@ def _doctor_gather_state_impl(
         cache_rollup_pricing_observation = None
         try:
             if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
-                conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+                _cache_s, _cache_stack = _doctor_cache_session()
+                conn = _cache_s.conn
                 try:
                     try:
                         row = conn.execute("PRAGMA page_count").fetchone()
@@ -3037,7 +3218,7 @@ def _doctor_gather_state_impl(
                 except sqlite3.OperationalError:
                     pass  # table missing — treat as zero
                 finally:
-                    conn.close()
+                    _cache_stack.close()
         except Exception:
             pass
 
@@ -3070,6 +3251,7 @@ def _doctor_gather_state_impl(
         conversation_rollup_pricing_refusal: "dict | None" = None
         conversation_rollup_pricing_fp: "str | None" = None
         conversation_rollup_pricing_observation = None
+        conversations_db_refused = False
         try:
             if _cctally_core.CONVERSATIONS_DB_PATH.exists():
                 # This gather also runs inside dashboard snapshot precompute. A
@@ -3171,6 +3353,10 @@ def _doctor_gather_state_impl(
                         conv_rollup_sync_in_progress = True  # held ⇒ writer mid-flight
                     finally:
                         lock_fh.close()
+        except _cctally_core.StoreUnavailable as exc:
+            # #787 / #861 AD25: a refused read-only admission (a missing
+            # maintenance lock) is unreadable, which the rollup check says.
+            conversations_db_refused = _diagnostic_refusal(exc)
         except Exception:
             pass
 
@@ -3191,7 +3377,8 @@ def _doctor_gather_state_impl(
         codex_null_reset_anchors = 0
         try:
             if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
-                conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+                _cache_s, _cache_stack = _doctor_cache_session()
+                conn = _cache_s.conn
                 try:
                     row = conn.execute(
                         "SELECT COUNT(*), MAX(timestamp_utc) FROM codex_session_entries"
@@ -3247,7 +3434,7 @@ def _doctor_gather_state_impl(
                     # cache result, while the new health check fails explicitly.
                     codex_project_metadata_error = type(exc).__name__
                 finally:
-                    conn.close()
+                    _cache_stack.close()
         except Exception as exc:
             codex_project_metadata_error = type(exc).__name__
 
@@ -3408,7 +3595,8 @@ def _doctor_gather_state_impl(
             _deferred_key = "codex_replay_from_zero_deferred"
         try:
             if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
-                conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+                _cache_s, _cache_stack = _doctor_cache_session()
+                conn = _cache_s.conn
                 try:
                     for _key in ("parse_health_claude", "parse_health_codex",
                                  "codex_torn_auth_deferred", _blocked_key,
@@ -3446,7 +3634,7 @@ def _doctor_gather_state_impl(
                     except sqlite3.OperationalError:
                         pass
                 finally:
-                    conn.close()
+                    _cache_stack.close()
         except Exception:
             pass
 
@@ -3454,6 +3642,7 @@ def _doctor_gather_state_impl(
         # ── Integrity (deep only — #279 S2 F5b) ──────────────────────────
         stats_db_quick_check = cache_db_quick_check = None
         conversations_db_quick_check = None
+        db_quick_check_unavailable: "list[str]" = []
         if deep:
             for _label, _path in (("stats", _cctally_core.DB_PATH),
                                   ("cache", _cctally_core.CACHE_DB_PATH),
@@ -3479,13 +3668,10 @@ def _doctor_gather_state_impl(
                         # protocol. The cache leg keeps its own opener.
                         if _label == "stats":
                             import _cctally_store as _store_mod
-                            _conn_ctx = contextlib.closing(
-                                _store_mod.stats_open_guarded(_path)
-                            )
+                            _conn_ctx = _stats_ro_guarded()
                         elif _label == "cache":
-                            _conn_ctx = contextlib.closing(
-                                sqlite3.connect(str(_path))
-                            )
+                            # #787 / #861 5.12: a diagnostic cache session.
+                            _conn_ctx = _doctor_cache_conn()
                         else:
                             _conn_ctx = _conversation_ro_guarded(timeout=2.0)
                         with _conn_ctx as _conn:
@@ -3503,6 +3689,19 @@ def _doctor_gather_state_impl(
                                 ).exists()
                             ):
                                 _result = "recovery in progress"
+                except _cctally_core.StoreUnavailable as exc:
+                    # #787 AD20/AD22: a store the diagnostic contract cannot
+                    # read (a data directory not established as private, a
+                    # WAL-header stats.db, a missing maintenance lock) is
+                    # unreadable, not corrupt: the leg reports it as not
+                    # checked, never as an Integrity FAIL. Corruption and
+                    # contention keep today's "open failed" result.
+                    if exc.reason in ("unavailable", "absent"):
+                        _result = None
+                        db_quick_check_unavailable.append(f"{_label}.db")
+                    else:
+                        _result = ("open failed: "
+                                   + _cctally_core.store_refusal_text(exc))
                 except sqlite3.DatabaseError as exc:
                     _result = f"open failed: {exc}"
                 except Exception:
@@ -4221,6 +4420,8 @@ def _doctor_gather_state_impl(
         stats_db_quick_check=stats_db_quick_check,
         cache_db_quick_check=cache_db_quick_check,
         conversations_db_quick_check=conversations_db_quick_check,
+        db_quick_check_unavailable=tuple(db_quick_check_unavailable),
+        conversations_db_refused=conversations_db_refused,
         locks_held=locks_held,
         # #297: cache.db WAL size backstop (gathered outside the deep branch).
         cache_db_wal_bytes=cache_db_wal_bytes,

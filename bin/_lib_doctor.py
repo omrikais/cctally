@@ -279,6 +279,15 @@ class DoctorState:
     stats_db_quick_check: Optional[str] = None
     cache_db_quick_check: Optional[str] = None
     conversations_db_quick_check: Optional[str] = None
+    # #787 / #861 AD20/AD22: the stores ("stats.db", "cache.db",
+    # "conversations.db") whose deep quick_check the diagnostic session
+    # refused as unavailable (never corruption): their result above is None,
+    # and the integrity check reports them as unread, not as checked.
+    db_quick_check_unavailable: tuple = ()
+    # #787 / #861 AD25: the gather's read-only conversations admission was
+    # refused as unavailable (e.g. its maintenance lock is missing), so the
+    # checks that read conversations.db report it as unreadable.
+    conversations_db_refused: bool = False
     # #279 S2 (F5c): non-blocking flock probes on the two sync lock files
     # (name -> True held / False free / None unreadable). Probe never
     # creates files (doctor never changes your data). None = probe errored.
@@ -899,12 +908,24 @@ def _db_file_check(label_id: str, label_title: str, status: Optional[dict],
                 "interrupted_rebuild": interrupted,
             },
         )
+    if status.get("_open_error") and status.get("_open_refused"):
+        # #787 / #861 AD20/AD22: the diagnostic session refused the store as
+        # unavailable (a WAL-header stats.db the next owner open converts, a
+        # data directory not established as private, a missing maintenance
+        # lock). Not an open failure: no FAIL and no restore remediation.
+        return CheckResult(
+            id=label_id, title=label_title,
+            severity="warn",
+            summary=f"unavailable ({label_title} could not be read)",
+            remediation=None,
+            details=_open_error_details(status),
+        )
     if status.get("_open_error"):
         return CheckResult(
             id=label_id, title=label_title,
             severity="fail", summary=f"could not open: {status['_open_error']}",
             remediation=rebuild_hint,
-            details={"exception": status["_open_error"], "path": status["path"]},
+            details=_open_error_details(status),
         )
     if interrupted and interrupted.get("live") is False:
         return CheckResult(
@@ -979,6 +1000,10 @@ def _migrations_by_status(status: Optional[dict]) -> dict[str, list[str]]:
 
 
 def _check_db_migrations_applied(s: DoctorState) -> CheckResult:
+    refused = _refused_dependency(s, "stats.db", "cache.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "db.migrations.applied", "Migrations", refused)
     both = {}
     for db_label, st in (("stats.db", s.stats_db_status), ("cache.db", s.cache_db_status)):
         both[db_label] = _migrations_by_status(st)
@@ -1020,6 +1045,10 @@ def _check_db_migrations_pending(s: DoctorState) -> CheckResult:
                            ("cache.db", s.cache_db_status))}
     pending = [(d, n) for d, info in both.items() for n in info["pending"]]
     if not pending:
+        refused = _refused_dependency(s, "stats.db", "cache.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "db.migrations.pending", "Pending migrations", refused)
         return CheckResult(
             id="db.migrations.pending", title="Pending migrations",
             severity="ok", summary="none pending",
@@ -1117,6 +1146,10 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             remediation="Auto-heals on next command, or run `cctally db recover --db cache`",
             details=details,
         )
+    refused = _refused_dependency(s, "stats.db", "cache.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "db.version_ahead", "Version ahead", refused)
     return CheckResult(
         id="db.version_ahead", title="Version ahead", severity="ok",
         summary="none ahead", remediation=None, details=details,
@@ -1524,6 +1557,10 @@ def _check_statusline_pipeline(s: DoctorState) -> CheckResult:
 
 
 def _check_data_cache_sync_state(s: DoctorState) -> CheckResult:
+    refused = _refused_dependency(s, "cache.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "data.cache_sync_state", "Claude cache", refused)
     count = s.cache_entries_count or 0
     if count == 0:
         if s.claude_jsonl_present:
@@ -1564,6 +1601,11 @@ def _check_data_cache_sync_state(s: DoctorState) -> CheckResult:
 
 def _check_data_codex_cache(s: DoctorState) -> CheckResult:
     count = s.codex_entries_count or 0
+    if count == 0:
+        refused = _refused_dependency(s, "cache.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "data.codex_cache", "Codex cache", refused)
     if count == 0 and not s.codex_jsonl_present:
         return CheckResult(
             id="data.codex_cache", title="Codex cache",
@@ -1665,6 +1707,12 @@ def _check_data_codex_replay(s: DoctorState) -> CheckResult:
     stays `ok`; one that has stood for over an hour means the hand-off is not
     landing and is the only signal that the install is frozen.
     """
+    if (not s.codex_replay_pending and not s.codex_replay_blocked
+            and not s.codex_replay_deferred):
+        refused = _refused_dependency(s, "cache.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "data.codex_replay", "Codex transcript replay", refused)
     blocked = s.codex_replay_blocked or {}
     deferred = s.codex_replay_deferred or {}
     at = blocked.get("at")
@@ -1732,6 +1780,13 @@ def _check_data_codex_compressed_rollouts(s: DoctorState) -> CheckResult:
     no compressed rollout is unread, pending or unverified. Never FAIL: a
     missing optional decoder is an environment limitation.
     """
+    refused = (s.codex_container_status or {}).get("refused_store")
+    if refused:
+        # #787 / #861 AD25, O12: the census's cache.db read was refused, so
+        # nothing it would count was read.
+        return _refused_dependency_result(
+            "data.codex_compressed_rollouts", "Compressed Codex rollouts",
+            refused)
     if s.codex_compressed_census is None:
         return CheckResult(
             id="data.codex_compressed_rollouts", title="Compressed Codex rollouts",
@@ -1793,6 +1848,11 @@ def _check_data_codex_compressed_rollouts(s: DoctorState) -> CheckResult:
     elif pending:
         severity = "ok"
         summary = "Codex history maintenance is continuing in the background."
+    elif maintenance_partial and debt.get("refused_store"):
+        # AD25, O12: the transcript store's debt was refused, not contended.
+        return _refused_dependency_result(
+            "data.codex_compressed_rollouts", "Compressed Codex rollouts",
+            debt["refused_store"])
     elif maintenance_partial:
         severity = "warn"
         summary = "unavailable (compressed Codex rollout census)"
@@ -1816,6 +1876,10 @@ def _check_data_codex_prune_safety(s: DoctorState) -> CheckResult:
         if isinstance(record, dict)
     ]
     if not records:
+        refused = _refused_dependency(s, "cache.db", "conversations.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "data.codex_prune_safety", "Codex orphan pruning", refused)
         return CheckResult(
             id="data.codex_prune_safety",
             title="Codex orphan pruning",
@@ -1933,12 +1997,66 @@ def _check_data_codex_quota_verification(s: DoctorState) -> CheckResult:
     )
 
 
+def _open_error_details(status: dict) -> dict:
+    """The file check's details for an open error; a query-layer refusal's
+    reason and detail ride along as the additive ``refusal`` key (#787 /
+    #861 Q-W1: the specific reason reaches only `--json`)."""
+    details = {"exception": status["_open_error"], "path": status["path"]}
+    if status.get("_open_refusal"):
+        details["refusal"] = dict(status["_open_refusal"])
+    return details
+
+
+def _store_refused(status: Optional[dict]) -> bool:
+    """#787 / #861 AD20/AD22: the gather's diagnostic open of this store was
+    refused as unavailable (``_open_refused``), so a check that could not
+    read it reports that as a WARN with its existing text, never a FAIL."""
+    return bool(status and status.get("_open_refused"))
+
+
+def _refused_dependency(s: DoctorState, *stores: str) -> Optional[str]:
+    """#787 / #861 AD25: the first of ``stores`` (``stats.db``, ``cache.db``,
+    ``conversations.db``) whose diagnostic open was refused, or None. A
+    hand-built state that omits a store's status (a kernel test's minimal
+    namespace) refused nothing."""
+    for label in stores:
+        if label == "stats.db" and _store_refused(
+                getattr(s, "stats_db_status", None)):
+            return label
+        if label == "cache.db" and _store_refused(
+                getattr(s, "cache_db_status", None)):
+            return label
+        if label == "conversations.db" and getattr(
+                s, "conversations_db_refused", False):
+            return label
+    return None
+
+
+def _refused_dependency_result(check_id: str, title: str,
+                               store: str) -> CheckResult:
+    """AD25: a check whose store was refused shows the existing unreadable
+    sentence as a warning, never a count or a lifecycle claim about data it
+    never read."""
+    return CheckResult(
+        id=check_id, title=title, severity="warn",
+        summary=f"unavailable ({store} could not be read)",
+        remediation=None, details={"refused_store": store},
+    )
+
+
 def _check_data_codex_project_metadata(s: DoctorState) -> CheckResult:
     """Report the identity-safe all-history Codex metadata partition."""
     if s.codex_project_metadata_error is not None:
+        refused = _refused_dependency(s, "cache.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "data.codex_project_metadata", "Codex project metadata",
+                refused)
         return CheckResult(
             id="data.codex_project_metadata", title="Codex project metadata",
-            severity="fail", summary="metadata health could not be read",
+            severity=("warn" if _store_refused(s.cache_db_status)
+                      else "fail"),
+            summary="metadata health could not be read",
             remediation="Run `cctally doctor --verbose` after checking cache.db.",
             details={"error": s.codex_project_metadata_error},
         )
@@ -1988,6 +2106,10 @@ def _check_data_codex_quota(s: DoctorState) -> CheckResult:
     """Report local physical Codex quota evidence without fabricating a window."""
     raw_windows = s.codex_quota_windows or []
     if not raw_windows:
+        refused = _refused_dependency(s, "cache.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "data.codex_quota", "Codex quota", refused)
         has_unsafe_corpus = bool(s.codex_jsonl_present)
         return CheckResult(
             id="data.codex_quota", title="Codex quota",
@@ -2335,9 +2457,15 @@ def _check_data_forked_buckets(s: DoctorState) -> CheckResult:
     """
     counts = s.forked_bucket_counts
     if counts is None:
+        refused = _refused_dependency(s, "stats.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "data.forked_buckets", "Forked week buckets", refused)
         return CheckResult(
             id="data.forked_buckets", title="Forked week buckets",
-            severity="fail", summary="state unavailable",
+            severity=("warn" if _store_refused(s.stats_db_status)
+                      else "fail"),
+            summary="state unavailable",
             remediation="Check stats.db opens (`cctally db status`)",
             details={"reason": "gather returned None"},
         )
@@ -2387,6 +2515,10 @@ def _check_data_post_credit_milestones(s: DoctorState) -> CheckResult:
         OR latest_weekly_percent < 1.0 (= "new segment not started yet,
         which is expected on a fresh credit").
     """
+    refused = _refused_dependency(s, "stats.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "data.post_credit_milestones", "Post-credit milestones", refused)
     weeks = s.credited_weeks
     if weeks is None:
         # Gather failed (stats.db open error). Don't double-warn; the
@@ -2456,6 +2588,10 @@ def _check_data_conversation_sessions_rollup(s: DoctorState) -> CheckResult:
     Informational only (no remediation): the next conversation sync re-derives
     the rollup via its incremental DELETE+INSERT.
     """
+    refused = _refused_dependency(s, "conversations.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "data.conversation_sessions_rollup", "Conversation rollup", refused)
     rollup = s.conv_sessions_rollup_count
     distinct = s.conv_messages_distinct_sessions
     if rollup is None or distinct is None:
@@ -2801,6 +2937,10 @@ def _check_pricing_conversation_rollup_writer(s: DoctorState) -> CheckResult:
                 "first_refused_at_utc": record.get("first_refused_at_utc"),
             },
         )
+    refused = _refused_dependency(s, "conversations.db", "cache.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "pricing.conversation_rollup_writer", "Rollup writer", refused)
     return CheckResult(
         id="pricing.conversation_rollup_writer", title="Rollup writer",
         severity="ok",
@@ -2832,6 +2972,10 @@ def _check_pricing_coverage(s: DoctorState) -> CheckResult:
     """
     gaps = s.pricing_coverage
     if not gaps:
+        refused = _refused_dependency(s, "cache.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "pricing.coverage", "Coverage", refused)
         return CheckResult(
             id="pricing.coverage", title="Coverage",
             severity="ok",
@@ -3137,6 +3281,10 @@ _PARSE_HEALTH_RECENCY_DAYS = 7
 
 
 def _check_data_parse_health(s: DoctorState) -> CheckResult:
+    refused = _refused_dependency(s, "cache.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "data.parse_health", "Ingest parse health", refused)
     details = {"claude": s.parse_health_claude, "codex": s.parse_health_codex}
     recent, historical_total = [], 0
     for label, ph in (("claude", s.parse_health_claude),
@@ -3238,6 +3386,20 @@ def _check_db_integrity(s: DoctorState) -> CheckResult:
                 "conversations.db is re-derivable — run "
                 "`cctally cache-sync --rebuild`."
             ),
+            details=details,
+        )
+    unread = [label for label in ("stats.db", "cache.db", "conversations.db")
+              if label in (s.db_quick_check_unavailable or ())]
+    if unread:
+        # #787 / #861 AD22: a store the diagnostic session refused was never
+        # checked, so neither "quick_check ok" nor the fast-gather note is
+        # true; the first such store is named, as the freshness leg does.
+        return CheckResult(
+            id="db.integrity", title="Integrity", severity="warn",
+            summary=f"unavailable ({unread[0]} could not be read)",
+            # Only stats.db and cache.db have a file check to point at.
+            remediation=(f"See the {unread[0]} check."
+                         if unread[0] != "conversations.db" else None),
             details=details,
         )
     if (
@@ -3362,6 +3524,11 @@ def _check_db_reclaimable(s: DoctorState) -> CheckResult:
         "cache_db_free_ratio": ratio,
         "warn_ratio": DOCTOR_RECLAIMABLE_WARN_RATIO,
     }
+    if ratio is None:
+        refused = _refused_dependency(s, "cache.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "db.reclaimable", "Reclaimable cache space", refused)
     if ratio is not None and ratio >= DOCTOR_RECLAIMABLE_WARN_RATIO:
         return CheckResult(
             id="db.reclaimable", title="Reclaimable cache space",
@@ -3401,6 +3568,12 @@ def _check_db_conversations_reclaimable(s: DoctorState) -> CheckResult:
     geometry = (
         _conv_retention.StoreGeometry(page_count, freelist_count, page_size)
         if measured else None)
+    if geometry is None:
+        refused = _refused_dependency(s, "conversations.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "db.conversations_reclaimable",
+                "Reclaimable transcript space", refused)
     record = (s.conversations_reclaim_pending
               if isinstance(s.conversations_reclaim_pending, dict) else None)
     episode = bool(record and record.get("eligible") is True)
@@ -3827,6 +4000,10 @@ def _check_journal_integrity(s: DoctorState) -> CheckResult:
 def _check_journal_index_freshness(s: DoctorState) -> CheckResult:
     """The stats index cursor vs. the journal high-water. A large unconsumed gap
     → WARN; a small gap or caught-up cursor → OK (with the gap shown)."""
+    refused = _refused_dependency(s, "stats.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "journal.index_freshness", "Journal index", refused)
     if not s.journal_present or s.journal_cursor_lag_bytes is None:
         return CheckResult(
             id="journal.index_freshness", title="Journal index", severity="ok",
@@ -4213,6 +4390,10 @@ def _legacy_writer_count_result(s: DoctorState) -> CheckResult:
         # without one the leg is unavailable, never zero.
         sidecar = _lw.from_document((data or {}).get("evidence"))
         if sidecar is None or sidecar.excluded_count <= 0:
+            refused = _refused_dependency(s, "stats.db")
+            if refused is not None:
+                return _refused_dependency_result(
+                    "journal.legacy_writer", "Legacy writer", refused)
             return CheckResult(
                 id="journal.legacy_writer", title="Legacy writer",
                 severity="ok",
@@ -4458,6 +4639,10 @@ def _check_accounting_outcome_quarantine(s: DoctorState) -> CheckResult:
     data = s.outcome_quarantine
     title = "Outcome quarantine"
     if not data or not data.get("available"):
+        refused = _refused_dependency(s, "stats.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "accounting.outcome_quarantine", title, refused)
         return CheckResult(
             id="accounting.outcome_quarantine", title=title, severity="warn",
             summary="unavailable (no validated stats index)",
@@ -4516,6 +4701,10 @@ def _check_journal_protocol(s: DoctorState) -> CheckResult:
         and s.journal_protocol_violations is None
         and s.journal_protocol_acknowledged is None
     ):
+        refused = _refused_dependency(s, "stats.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "journal.protocol", "Journal protocol", refused)
         return CheckResult(
             id="journal.protocol", title="Journal protocol", severity="ok",
             summary="not scanned", remediation=None,
@@ -4646,6 +4835,10 @@ def _check_journal_quota_projection(s: DoctorState) -> CheckResult:
             severity="ok", summary="complete", remediation=None,
             details=details,
         )
+    refused = _refused_dependency(s, "stats.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "journal.quota_projection", "Quota projection", refused)
     return CheckResult(
         id="journal.quota_projection", title="Quota projection",
         severity="ok", summary="not applicable", remediation=None,
@@ -4688,6 +4881,12 @@ def _check_accounts_identity(s: DoctorState) -> CheckResult:
 def _check_accounts_registry(s: DoctorState) -> CheckResult:
     """Is the accounts registry consistent? A row lacking a provider is corrupt
     (WARN → rebuild)."""
+    # AD25: the registry fields are stats.db's; a refused read leaves them at
+    # the gather's empty shape, which is not "no accounts".
+    refused = _refused_dependency(s, "stats.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "accounts.registry", "Account registry", refused)
     st = s.accounts_state
     if st is None:
         return CheckResult(
@@ -4720,6 +4919,10 @@ def _check_accounts_registry(s: DoctorState) -> CheckResult:
 def _check_accounts_freshness(s: DoctorState) -> CheckResult:
     """Attribution freshness — how recently any account was last seen. Purely
     informational (always OK); a stale value just reports the age."""
+    refused = _refused_dependency(s, "stats.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "accounts.freshness", "Account attribution freshness", refused)
     st = s.accounts_state or {}
     age = st.get("freshest_last_seen_age_s")
     if age is None:
@@ -4761,6 +4964,11 @@ def _check_accounts_codex_identity(s: DoctorState) -> CheckResult:
     except (TypeError, ValueError):
         files = 0
     details = {"files": files, "at": st.get("at")}
+    if files <= 0:
+        refused = _refused_dependency(s, "cache.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "accounts.codex_identity", "Codex account identity", refused)
     if files > 0:
         return CheckResult(
             id="accounts.codex_identity", title="Codex account identity",
@@ -4809,6 +5017,10 @@ def _check_data_codex_ingest_backlog(s: DoctorState) -> CheckResult:
     details = {"files": files, "bytes": pending_bytes, "since": since_text,
                "age_s": age_s}
     if files <= 0:
+        refused = _refused_dependency(s, "cache.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "data.codex_ingest_backlog", "Codex ingest backlog", refused)
         return CheckResult(
             id="data.codex_ingest_backlog", title="Codex ingest backlog",
             severity="ok", summary="no Codex ingest backlog",
@@ -4838,6 +5050,10 @@ def _check_accounts_attribution(s: DoctorState) -> CheckResult:
     resolved active account (the stamping pipeline is broken), or while the
     identity is torn. This is the runtime complement to the structural
     writer-audit backstop for the account_key DEFAULT."""
+    refused = _refused_dependency(s, "stats.db")
+    if refused is not None:
+        return _refused_dependency_result(
+            "accounts.attribution", "Account attribution", refused)
     st = s.accounts_state or {}
     recent_unattr = int(st.get("recent_unattributed") or 0)
     recent_attr = int(st.get("recent_attributed") or 0)
@@ -4891,6 +5107,15 @@ def _check_accounts_claude_cost_attribution(s: DoctorState) -> CheckResult:
     m = int(d.get("totalRows") or 0)
     n = int(d.get("fallbackRows") or 0)
     real = int(d.get("fallbackRealAccountRows") or 0)
+    # AD25: the counts come from cache.db, and whether a real-account
+    # fallback warns comes from the stats.db registry (R8 decoration).
+    refused = st.get("claude_cost_attribution_refused_store")
+    if not refused and real > 0:
+        refused = _refused_dependency(s, "stats.db")
+    if refused:
+        return _refused_dependency_result(
+            "accounts.claude_cost_attribution", "Claude cost attribution",
+            refused)
     pres = d.get("preservation") or {}
     state = pres.get("state")
     saved = int(pres.get("saved") or 0)
@@ -4937,6 +5162,11 @@ def _check_accounts_codex_reset_anchors(s: DoctorState) -> CheckResult:
     except (TypeError, ValueError):
         null_rows = 0
     details = {"null_anchor_rows": null_rows}
+    if null_rows == 0:
+        refused = _refused_dependency(s, "cache.db")
+        if refused is not None:
+            return _refused_dependency_result(
+                "accounts.codex_reset_anchors", "Codex reset anchors", refused)
     if null_rows > 0:
         return CheckResult(
             id="accounts.codex_reset_anchors",
@@ -4982,6 +5212,10 @@ def _check_accounts_codex_window_attribution(s: DoctorState) -> CheckResult:
     one is silently indistinguishable from "no decision was ever made".
     """
     st = (s.accounts_state or {}).get("codex_window_attribution")
+    if isinstance(st, dict) and st.get("refused_store"):
+        return _refused_dependency_result(
+            "accounts.codex_window_attribution", "Codex window attribution",
+            st["refused_store"])
     if not isinstance(st, dict):
         # No cache.db, a cache too old to carry the derived table, or a probe
         # this run declined. Nothing to under-apply, so nothing to report.

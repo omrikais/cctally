@@ -267,6 +267,10 @@ _CONVERSATION_PENDING_META_KEYS = (
     "conversation_background_mcp_reingest_pending",
     "codex_conversation_replay_from_zero_pending",
     "codex_find_projection_backfill_pending",
+    # #1072 §4.4/§4.5: a rollup traversal in progress and the durable set of
+    # sessions whose messages a writer deleted. Either forces a full pass.
+    "conversation_sessions_rederive_cursor",
+    "conversation_sessions_rederive_pending",
 )
 
 

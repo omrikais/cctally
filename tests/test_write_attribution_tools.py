@@ -1189,12 +1189,120 @@ def test_catchup_admits_a_drained_clone_and_refuses_an_expired_deadline(
     assert [r["counts"]["consumed"] for r in stability["receipts"]] == [2, 2]
     assert stability["deferred"] == []
     assert receipt["footprintPeakBytes"] is None or receipt["footprintPeakBytes"] > 0
+    # #937 image mode end to end on the drained clone: a manifest of its
+    # files and a passing identity receipt admit a no-op drain through the
+    # real `run()`; without the receipt the same drain is INVALID.
+    import hashlib
+    catchup = _load("catchup")
+    canonical = os.path.realpath(root)
+    inventory = {}
+    for walk_root, _dirs, names in os.walk(canonical):
+        for name in names:
+            st = os.stat(os.path.join(walk_root, name))
+            inventory[os.path.relpath(os.path.join(walk_root, name),
+                                      canonical)] = [st.st_ino, st.st_size,
+                                                     st.st_mtime_ns]
+    manifest = catchup.image_manifest(inventory, {
+        "canonical": canonical,
+        "claude": [f"{canonical}/scratch/claude/projects"],
+        "codex": [f"{canonical}/scratch/codex/sessions"]})
+    assert len(manifest["entries"]) == 2
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    blob = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+    (evidence / "p2-manifest.json").write_bytes(blob)
+    (evidence / "identity-receipt.json").write_text(json.dumps({
+        "passed": True, "problems": [],
+        "manifestSha256": hashlib.sha256(blob).hexdigest()}))
+    image_env = {**env, "WRITE_ATTRIBUTION_INPUTS":
+                 f"image:{evidence / 'p2-manifest.json'}"}
+    admitted = _sp.run([_sys.executable, str(TOOLS / "catchup.py"), "--tree",
+                        str(TOOLS.parent.parent), "--out", str(out)],
+                       env=image_env, capture_output=True, text=True, timeout=50)
+    image_receipt = json.loads(out.read_text())
+    assert admitted.returncode == 0, image_receipt["problems"]
+    assert image_receipt["inputMode"] == "image"
+    assert image_receipt["frontier"]["mode"] == "image"
+    assert image_receipt["frontier"]["membershipProblems"] == []
+    (evidence / "identity-receipt.json").unlink()
+    refused = _sp.run([_sys.executable, str(TOOLS / "catchup.py"), "--tree",
+                       str(TOOLS.parent.parent), "--out", str(out)],
+                      env=image_env, capture_output=True, text=True, timeout=50)
+    assert refused.returncode == 2
+    assert any("identity-equality receipt" in p
+               for p in json.loads(out.read_text())["problems"])
     expired = _sp.run([_sys.executable, str(TOOLS / "catchup.py"), "--tree",
                        str(TOOLS.parent.parent), "--out", str(out),
                        "--deadline-s", "0"],
                       env=env, capture_output=True, text=True, timeout=50)
     assert expired.returncode == 2
     assert "admission deadline" in json.loads(out.read_text())["problems"][-1]
+
+
+
+#: A pre-barrier tree's CLI as catchup.py drives it, with no store: the
+#: sibling modules a round calls and a `cmd_cache_sync` that calls them.
+_STUB_TREE_CLI = """
+import types
+
+def _module(name, **attrs):
+    module = types.ModuleType(name)
+    module.__dict__.update(attrs)
+    return module
+
+_SYNCS = ("sync_cache", "sync_codex_cache", "sync_claude_conversations",
+          "sync_codex_conversations")
+_SIBLINGS = {
+    "_cctally_cache": _module("_cctally_cache", **{
+        n: (lambda *a, **k: None) for n in _SYNCS}),
+    "_cctally_journal": _module("_cctally_journal", run_stats_ingest=(
+        lambda **k: types.SimpleNamespace(ran=False, consumed=0, malformed=0,
+                                          error=None))),
+    "_lib_ingest_frontier": _module(
+        "_lib_ingest_frontier",
+        provider_sync_certifiable=lambda *a: False,
+        conversation_sync_certifiable=lambda *a: False),
+    "_cctally_update": _module("_cctally_update"),
+}
+
+def _load_sibling(name):
+    return _SIBLINGS[name]
+
+def cmd_cache_sync(args):
+    for name in _SYNCS:
+        getattr(_SIBLINGS["_cctally_cache"], name)()
+    return 0
+"""
+
+
+def test_catchup_drains_a_pre_barrier_tree_past_its_missing_leaves(tmp_path):
+    """`catchup.py --tree 56e66f07a` crashed in `frontier.load_libs` with
+    ModuleNotFoundError before any round, so no reference, P1 or oracle
+    drain of the baseline could run; its receipt must name the stand-ins."""
+    root = tmp_path / "clone"
+    _seed_roots(root)
+    tree = _leaf_tree(tmp_path / "tree-pre-barrier")
+    (tree / "bin" / "cctally").write_text(_STUB_TREE_CLI)
+    for store in ("cache.db", "conversations.db"):
+        (root / "data" / store).write_bytes(b"")   # empty: no tables
+    env = {**os.environ, "HOME": str(tmp_path),
+           "CCTALLY_DATA_DIR": str(root / "data"),
+           "CLAUDE_CONFIG_DIR": str(root / "scratch" / "claude"),
+           "CODEX_HOME": str(root / "scratch" / "codex"),
+           "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
+    out = tmp_path / "catchup.json"
+    child = _catchup(["--tree", str(tree), "--out", str(out),
+                      "--round-limit", "2", "--deadline-s", "60"], env,
+                     timeout=120)
+    assert out.exists(), child.stderr[-2000:]
+    receipt = json.loads(out.read_text())
+    assert receipt["leafProvenance"] == {"rc": "harness", "barrier": "harness",
+                                         "ident": "tree"}
+    assert len(receipt["stability"]["rounds"]) == 2
+    frontier = json.loads((tmp_path / "frontier.json").read_text())
+    assert frontier["counts"] == {"claude": 1, "codex": 1}
+    # The stub has no stores: never admitted.
+    assert child.returncode == 2 and receipt["admitted"] is False
 
 
 def _catchup(args, env, timeout=240):
@@ -3545,6 +3653,35 @@ def test_selftest_rows_ignore_the_ingest_clock_of_either_tree(tmp_path):
     c = st.table_rows(store(tmp_path / "c", "2026-10-05T10:29:42Z", 2))
     assert a == b
     assert a != c
+
+
+def test_selftest_byte_classes_tolerate_the_quota_index_clock_width(tmp_path):
+    """#1042: #1080's quota-index sidecar meta records epoch floats whose repr
+    width varies between two identical launches (a float drops trailing
+    zeros), so the frozen-versus-control byte comparison refused five of six
+    runs on a current tree by one byte. That file is compared within a small
+    bound; every other class still compares exactly, and a sidecar written on
+    one side only still fails."""
+    st = _load("frozen_selftest")
+
+    def classes(name, paths):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "w.1.exit").write_text(json.dumps({"paths": paths}) + "\n")
+        return st.byte_classes(d / "w")
+
+    meta = "/d/journal/.quota-observation-keys.meta.tmp-1-2"
+    base = {"/d/cache.db-wal": [4096, 1], "/d/update.log": [94, 2]}
+    control = classes("control", {**base, meta: [367, 1]})
+    assert st.byte_classes_equal(classes("frozen", {**base, meta: [366, 1]}),
+                                 control)
+    assert not st.byte_classes_equal(
+        classes("other", {**base, "/d/update.log": [95, 2], meta: [366, 1]}),
+        control)
+    assert not st.byte_classes_equal(classes("absent", base), control)
+    assert not st.byte_classes_equal(
+        classes("far", {**base, meta: [367 + st.VARIABLE_WIDTH_SLACK + 1, 1]}),
+        control)
 
 
 def _entry(manifest, path):
@@ -6434,6 +6571,177 @@ def test_frozen_drain_still_refuses_other_work_on_a_two_table_file(mutate, fragm
     problems = catchup.relocation_problems(
         before, after, catchup.row_suffixes(_frozen_manifest(), before))
     assert any(fragment in p for p in problems), problems
+
+
+# ── #937: image admission mode (write-budget preparation v2, P2) ──────────
+
+_IC = "/i/canonical"
+_IA = f"{_IC}/codex-a/sessions/2026/a.jsonl"
+_IB = f"{_IC}/claude/projects/-p/b.jsonl"
+_IMAGE_INVENTORY = {
+    "codex-a/sessions/2026/a.jsonl": [11, 300, 6],
+    "claude/projects/-p/b.jsonl": [12, 200, 5],
+    "data/cache.db": [1, 4096, 7],
+}
+_IMAGE_ROOTS = {"canonical": _IC, "claude": [f"{_IC}/claude/projects"],
+                "codex": [f"{_IC}/codex-a/sessions"]}
+
+
+def _image_before():
+    """A fully ingested image: every manifest file has its row in each
+    family that tracks it, at its full length."""
+    return _state(
+        _row("codex_session_files", _IA, last_byte_offset=300, size_bytes=300,
+             inode=11, source_root_key="rk", account_key="acct"),
+        _row("codex_conversation_source_files", _IA, last_byte_offset=300,
+             size_bytes=300, inode=11, source_root_key="rk"),
+        _row("session_files", _IB, last_byte_offset=200, size_bytes=200),
+        _row("conversation_source_files", _IB, last_byte_offset=200,
+             size_bytes=200, inode=12, source_incarnation_id="inc-b",
+             committed_prefix_sha256="d"),
+        roots={"rk": f"{_IC}/codex-a/sessions"}, incarnations={"fk-a": 1})
+
+
+def _image_inputs(catchup, tmp_path, *, receipt=True, passed=True,
+                  digest=None):
+    manifest = catchup.image_manifest(_IMAGE_INVENTORY, _IMAGE_ROOTS)
+    blob = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+    path = tmp_path / "p2-manifest.json"
+    path.write_bytes(blob)
+    if receipt:
+        import hashlib
+        (tmp_path / "identity-receipt.json").write_text(json.dumps({
+            "passed": passed, "problems": [] if passed else ["device mismatch"],
+            "manifestSha256": digest or hashlib.sha256(blob).hexdigest()}))
+    return catchup.image_admission_inputs(path)
+
+
+def _image_judge(catchup, inputs, before, after):
+    return catchup.image_mode_judgement(inputs, before, after, after, after)
+
+
+def test_catchup_image_mode_admits_a_no_op_drain(tmp_path, monkeypatch):
+    """Spec §5.5 step 4: `WRITE_ATTRIBUTION_INPUTS=image:<manifest>` selects
+    the image mode, and on a fully ingested fixture (every suffix 0) the
+    correct admission is a no-op drain with no problem at all; refusing it
+    would make every relocated arm INVALID."""
+    catchup = _load("catchup")
+    monkeypatch.setenv("WRITE_ATTRIBUTION_INPUTS", f"image:{tmp_path}/m.json")
+    assert catchup._input_mode() == ("image", f"{tmp_path}/m.json")
+    inputs = _image_inputs(catchup, tmp_path)
+    assert inputs["problems"] == []
+    assert sorted(e["logical"] for e in inputs["manifest"]["entries"]) == [_IB, _IA]
+    before = _image_before()
+    receipt, problems = _image_judge(catchup, inputs, before, _image_before())
+    assert problems == []
+    assert receipt["mode"] == "image" and receipt["membershipProblems"] == []
+    assert receipt["expectedRowSuffixBytes"] == 0
+    assert receipt["qualified"] is True
+
+
+@pytest.mark.parametrize("mutate, fragment", [
+    (lambda a: a["rows"][f"conversation_source_files\t{_IB}"].update(
+        source_incarnation_id="inc-new"), "replay"),
+    (lambda a: a["rows"][f"codex_session_files\t{_IA}"].update(inode=99),
+     "replay"),
+    (lambda a: a["rows"][f"session_files\t{_IB}"].update(last_byte_offset=0),
+     "reset"),
+    (lambda a: a["rows"].pop(f"codex_conversation_source_files\t{_IA}"),
+     "pruned"),
+    (lambda a: a["rows"][f"conversation_source_files\t{_IB}"].update(
+        committed_prefix_sha256="e"), "unexplained work"),
+])
+def test_catchup_image_mode_refuses_a_replay(tmp_path, mutate, fragment):
+    """An admission receipt must never pass after a replay: a new Claude
+    incarnation, an inode change, a reset offset, a pruned row, or any work on
+    a row that had no suffix (every row of a fully ingested image). There is
+    no device exemption, because P2's device equals the seal's."""
+    catchup = _load("catchup")
+    inputs = _image_inputs(catchup, tmp_path)
+    before = _image_before()
+    after = _image_before()
+    mutate(after)
+    _receipt, problems = _image_judge(catchup, inputs, before, after)
+    assert any(fragment in p for p in problems), problems
+
+
+def test_catchup_image_mode_judges_every_round(tmp_path):
+    """#937 F9: the image mode judged relocation on the final round's state
+    only, so a replay a later round masked (an inode change whose cursor a
+    later round restored) was admitted. Every round is judged against the
+    pre-drain state; a replay seen only in an intermediate round names its
+    round, and a clean drain over several rounds stays clean."""
+    catchup = _load("catchup")
+    inputs = _image_inputs(catchup, tmp_path)
+    before, final = _image_before(), _image_before()
+    middle = _image_before()
+    middle["rows"][f"codex_session_files\t{_IA}"].update(inode=99)
+    _receipt, problems = catchup.image_mode_judgement(
+        inputs, before, final, final, final, rounds=[middle, final])
+    assert any(p.startswith("round 0: ") and "replay" in p
+               for p in problems), problems
+    _receipt, clean = catchup.image_mode_judgement(
+        inputs, before, final, final, final, rounds=[_image_before(), final])
+    assert clean == []
+
+
+@pytest.mark.parametrize("case", ["missing", "not-passing"])
+def test_catchup_image_mode_without_a_passing_identity_receipt_is_invalid(
+    tmp_path, case,
+):
+    """Image mode replaces the freeze qualification with the arm's
+    identity-equality receipt; a missing or failing receipt is INVALID even
+    when the drain itself was clean."""
+    catchup = _load("catchup")
+    inputs = _image_inputs(catchup, tmp_path, receipt=case != "missing",
+                           passed=case != "not-passing")
+    assert any("identity-equality receipt" in p for p in inputs["problems"])
+    _receipt, problems = _image_judge(catchup, inputs, _image_before(),
+                                      _image_before())
+    assert any("identity-equality receipt" in p for p in problems), problems
+
+
+def test_catchup_image_membership_rows_outside_the_manifest(tmp_path):
+    """`relocation_problems` ignores rows of unlisted files, so a cursor row
+    whose path the manifest lacks - before or after the drain - must itself
+    be INVALID, or unlisted rows escape the replay check."""
+    catchup = _load("catchup")
+    inputs = _image_inputs(catchup, tmp_path)
+    for side in ("before", "after"):
+        before, after = _image_before(), _image_before()
+        (before if side == "before" else after)["rows"].update(
+            _row("session_files", "/elsewhere/x.jsonl", last_byte_offset=5,
+                 size_bytes=5))
+        problems = catchup.image_membership_problems(
+            inputs["manifest"], before, after)
+        assert any("/elsewhere/x.jsonl" in p and side in p for p in problems), problems
+        _receipt, judged = _image_judge(catchup, inputs, before, after)
+        assert any("/elsewhere/x.jsonl" in p for p in judged)
+
+
+def test_catchup_image_membership_files_without_cursor_rows(tmp_path):
+    """A manifest file must have its row in every family that tracks it
+    (spec §5.3 step 6); a file missing one would be admitted without its
+    cursor ever being checked."""
+    catchup = _load("catchup")
+    inputs = _image_inputs(catchup, tmp_path)
+    before, after = _image_before(), _image_before()
+    for state in (before, after):
+        state["rows"].pop(f"conversation_source_files\t{_IB}")
+    problems = catchup.image_membership_problems(inputs["manifest"], before, after)
+    assert any("conversation_source_files" in p and _IB in p for p in problems), problems
+
+
+def test_catchup_image_membership_manifest_digest_mismatch(tmp_path):
+    """The manifest the drain checks must be the one the identity receipt
+    vouched for; a manifest whose digest differs from the receipt's is
+    INVALID."""
+    catchup = _load("catchup")
+    inputs = _image_inputs(catchup, tmp_path, digest="0" * 64)
+    assert any("digest" in p for p in inputs["problems"]), inputs["problems"]
+    _receipt, problems = _image_judge(catchup, inputs, _image_before(),
+                                      _image_before())
+    assert any("digest" in p for p in problems)
 
 
 _LA = "/h/.codex/sessions/live/a.jsonl"
@@ -9729,6 +10037,105 @@ def test_d6_capture_canonicalizes_rollouts_and_ends_at_complete_records(
     twin = _d6_entry(frontier, _d6_rollout(3))
     assert twin["container"]["kind"] == "plain"
     assert twin["completeEnd"] == len(_D6_RECORD)
+
+
+
+#: The leaves `frontier.load_libs` takes from the tested tree (#939 D6).
+_D6_LEAVES = ("_lib_codex_rollout_container", "_lib_source_identity",
+              "_lib_codex_publication_barrier")
+_HARNESS_BIN = TOOLS.parent.parent / "bin"
+
+
+def _isolate_leaves(monkeypatch):
+    """A fresh import of every leaf with the harness's bin/ off sys.path (the
+    test process has it on, catchup.py's process never does)."""
+    for name in _D6_LEAVES:
+        monkeypatch.setitem(sys.modules, name, None)
+        del sys.modules[name]
+    harness = os.path.realpath(_HARNESS_BIN)
+    monkeypatch.setattr(sys, "path", [p for p in sys.path
+                                      if os.path.realpath(p) != harness])
+
+
+def _leaf_tree(root, *, own=False, ident=True):
+    """A tested tree's bin/: `_lib_source_identity` only (as `56e66f07a`,
+    which predates the container and barrier leaves), its own marked copies
+    of both (`own`), or neither identity leaf (`ident=False`)."""
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True)
+    names = (_D6_LEAVES if own else ("_lib_source_identity",)) if ident else ()
+    for name in names:
+        (bin_dir / f"{name}.py").write_text(
+            (_HARNESS_BIN / f"{name}.py").read_text()
+            + f"\nTREE_MARK = {root.name!r}\n")
+    return root
+
+
+def test_load_libs_uses_harness_leaves_only_for_a_tree_that_predates_them(
+        tmp_path, monkeypatch):
+    """A catch-up drain against a pre-barrier tree (`56e66f07a`) raised
+    ModuleNotFoundError before any round; a fallback that shadowed a leaf
+    the tree has would judge its stores with another tree's semantics."""
+    fr = _load("frontier")
+    _isolate_leaves(monkeypatch)
+    old = _leaf_tree(tmp_path / "tree-pre-barrier")
+    libs = fr.load_libs(old)
+    assert libs.provenance == {"rc": "harness", "barrier": "harness",
+                               "ident": "tree"}
+    for module, name in ((libs.rc, "_lib_codex_rollout_container"),
+                         (libs.barrier, "_lib_codex_publication_barrier")):
+        assert os.path.realpath(module.__file__) == os.path.realpath(
+            _HARNESS_BIN / f"{name}.py")
+        # Later bare imports resolve to the same stand-in.
+        assert sys.modules[name] is module
+    assert libs.ident.TREE_MARK == old.name
+    assert (libs.barrier.READY, None) in libs.pairs
+
+    _isolate_leaves(monkeypatch)
+    own = _leaf_tree(tmp_path / "tree-own-leaves", own=True)
+    libs = fr.load_libs(own)
+    assert libs.provenance == {"rc": "tree", "barrier": "tree", "ident": "tree"}
+    assert {m.TREE_MARK for m in (libs.rc, libs.barrier, libs.ident)} == {
+        own.name}
+
+    _isolate_leaves(monkeypatch)
+    with pytest.raises(ImportError):
+        fr.load_libs(_leaf_tree(tmp_path / "tree-no-identity", ident=False))
+
+
+@pytest.mark.parametrize("kind", ["compressed", "archived"])
+def test_frontier_capture_refuses_compressed_or_archived_inputs_under_harness_leaves(
+        tmp_path, monkeypatch, kind):
+    """A tree that predates compressed and archived rollouts reads neither;
+    judging them with the harness's leaves would hold its drain to input its
+    product never sees (or drop it silently)."""
+    from _codex_zstd_fixtures import zstd_bytes
+
+    fr = _load("frontier")
+    home = tmp_path / "home"
+    day = home / ".codex" / "sessions" / "2026" / "07" / "20"
+    day.mkdir(parents=True)
+    (day / _d6_rollout(0)).write_bytes(_D6_RECORD)
+    if kind == "compressed":
+        odd = day / (_d6_rollout(2) + ".zst")
+        odd.write_bytes(zstd_bytes(_D6_RECORD))
+    else:
+        archive = home / ".codex" / "archived_sessions"
+        archive.mkdir()
+        odd = archive / _d6_rollout(1)
+        odd.write_bytes(_D6_RECORD)
+    roots = fr.env_roots({"HOME": str(home)})
+    _isolate_leaves(monkeypatch)
+    old = _leaf_tree(tmp_path / "tree-pre-barrier")
+    with pytest.raises(fr.LeafRefusal) as refused:
+        fr.capture(roots, fr.load_libs(old))
+    assert old.name in str(refused.value) and odd.name in str(refused.value)
+
+    _isolate_leaves(monkeypatch)
+    frontier = fr.capture(roots, fr.load_libs(TOOLS.parent.parent))
+    assert frontier["counts"]["codex"] == 2
+    assert any(e["container"]["path"].endswith(odd.name)
+               for e in frontier["entries"])
 
 
 def _d6_stores(data):

@@ -1,0 +1,89 @@
++-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x100000b41, registered, matched, active, busy 0 (0 ms), retain 6>
+    {
+      "IOPropertyMatch" = {"device-type"="Generic"}
+      "CFBundleIdentifier" = "com.apple.iokit.IOStorageFamily"
+      "IOProviderClass" = "IOBlockStorageDevice"
+      "IOClass" = "IOBlockStorageDriver"
+      "IOPersonalityPublisher" = "com.apple.iokit.IOStorageFamily"
+      "CFBundleIdentifierKernel" = "com.apple.iokit.IOStorageFamily"
+      "IOProbeScore" = 0
+      "IOMatchedAtBoot" = Yes
+      "Statistics" = {"Operations (Write)"=0,"Latency Time (Write)"=0,"Bytes (Read)"=0,"Errors (Write)"=0,"Total Time (Read)"=0,"Latency Time (Read)"=0,"Retries (Read)"=0,"Errors (Read)"=0,"Total Time (Write)"=0,"Bytes (Write)"=0,"Operations (Read)"=0,"Retries (Write)"=0}
+      "IOMatchCategory" = "IODefaultMatchCategory"
+      "IOPowerManagement" = {"CapabilityFlags"=0,"CurrentPowerState"=0}
+    }
+
++-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x100000bdc, registered, matched, active, busy 0 (33 ms), retain 8>
+  | {
+  |   "IOClass" = "IOBlockStorageDriver"
+  |   "CFBundleIdentifier" = "com.apple.iokit.IOStorageFamily"
+  |   "IOProviderClass" = "IOBlockStorageDevice"
+  |   "IOPropertyMatch" = {"device-type"="Generic"}
+  |   "IOPowerManagement" = {"CapabilityFlags"=0,"CurrentPowerState"=0}
+  |   "IOProbeScore" = 0
+  |   "IOMatchedAtBoot" = Yes
+  |   "IOGeneralInterest" = "IOCommand is not serializable"
+  |   "IOMatchCategory" = "IODefaultMatchCategory"
+  |   "Statistics" = {"Operations (Write)"=29149220,"Latency Time (Write)"=0,"Bytes (Read)"=1189242883072,"Errors (Write)"=0,"Total Time (Read)"=19613793943633,"Latency Time (Read)"=0,"Retries (Read)"=0,"Errors (Read)"=0,"Total Time (Write)"=62807693720075,"Bytes (Write)"=5952809230336,"Operations (Read)"=69484117,"Retries (Write)"=0}
+  |   "IOPersonalityPublisher" = "com.apple.iokit.IOStorageFamily"
+  |   "CFBundleIdentifierKernel" = "com.apple.iokit.IOStorageFamily"
+  | }
+  | 
+  +-o @MEDIA_MODEL@ Media  <class IOMedia, id 0x100000bf1, registered, matched, active, busy 0 (33 ms), retain 12>
+    | {
+    |   "Content" = "GUID_partition_scheme"
+    |   "Removable" = No
+    |   "Whole" = Yes
+    |   "Leaf" = No
+    |   "BSD Name" = "@PHYSICAL_DISK@"
+    |   "Ejectable" = No
+    |   "Preferred Block Size" = 512
+    |   "BSD Minor" = 24
+    |   "IOGeneralInterest" = "IOCommand is not serializable"
+    |   "Writable" = Yes
+    |   "BSD Major" = 1
+    |   "Size" = 1000171323904
+    |   "IOBusyInterest" = "IOCommand is not serializable"
+    |   "Open" = Yes
+    |   "Content Hint" = ""
+    |   "BSD Unit" = 6
+    | }
+    |
+
++-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x100000a80, registered, matched, active, busy 0 (35 ms), retain 8>
+  | {
+  |   "IOClass" = "IOBlockStorageDriver"
+  |   "CFBundleIdentifier" = "com.apple.iokit.IOStorageFamily"
+  |   "IOProviderClass" = "IOBlockStorageDevice"
+  |   "IOPropertyMatch" = {"device-type"="Generic"}
+  |   "IOPowerManagement" = {"CapabilityFlags"=0,"CurrentPowerState"=0}
+  |   "IOProbeScore" = 0
+  |   "IOMatchedAtBoot" = Yes
+  |   "IOGeneralInterest" = "IOCommand is not serializable"
+  |   "IOMatchCategory" = "IODefaultMatchCategory"
+  |   "Statistics" = {"Operations (Write)"=35202503,"Latency Time (Write)"=0,"Bytes (Read)"=694468722688,"Errors (Write)"=0,"Total Time (Read)"=8355139768943,"Latency Time (Read)"=0,"Retries (Read)"=0,"Errors (Read)"=0,"Total Time (Write)"=2681207831956,"Bytes (Write)"=909754843136,"Operations (Read)"=46929771,"Retries (Write)"=0}
+  |   "IOPersonalityPublisher" = "com.apple.iokit.IOStorageFamily"
+  |   "CFBundleIdentifierKernel" = "com.apple.iokit.IOStorageFamily"
+  | }
+  | 
+  +-o APPLE SSD AP1024R Media  <class IOMedia, id 0x100000a81, registered, matched, active, busy 0 (35 ms), retain 12>
+    | {
+    |   "Content" = "GUID_partition_scheme"
+    |   "Removable" = No
+    |   "Whole" = Yes
+    |   "Leaf" = No
+    |   "BSD Name" = "disk0"
+    |   "Ejectable" = No
+    |   "Preferred Block Size" = 4096
+    |   "IOMediaIcon" = {"IOBundleResourceFile"="Internal.icns","CFBundleIdentifier"="com.apple.iokit.IOStorageFamily"}
+    |   "BSD Minor" = 0
+    |   "IOGeneralInterest" = "IOCommand is not serializable"
+    |   "Writable" = Yes
+    |   "BSD Major" = 1
+    |   "Size" = 1000555581440
+    |   "IOBusyInterest" = "IOCommand is not serializable"
+    |   "Open" = Yes
+    |   "Content Hint" = ""
+    |   "BSD Unit" = 0
+    | }
+    |

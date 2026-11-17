@@ -36,7 +36,7 @@ import pytest
 import _cctally_core
 import _cctally_store
 
-from conftest import load_script, redirect_paths
+from conftest import as_process_owner, load_script, redirect_paths
 
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
@@ -111,6 +111,7 @@ def test_open_db_write_waits_for_concurrent_holder(ns):
     result: dict[str, object] = {}
     insert_started = threading.Event()
 
+    @as_process_owner  # a concurrent writer process (#787 / #861)
     def worker() -> None:
         try:
             with _thread_write_scope():
@@ -180,6 +181,7 @@ def test_concurrent_writers_no_lock_error(ns):
     errors: list[Exception] = []
     barrier = threading.Barrier(n_workers)
 
+    @as_process_owner  # a concurrent writer process (#787 / #861)
     def worker(worker_id: int) -> None:
         try:
             conn = ns["open_db"]()
@@ -250,6 +252,7 @@ def test_concurrent_milestone_crossing_keeps_exactly_one_row(ns):
     errors: list[Exception] = []
     barrier = threading.Barrier(n_workers)
 
+    @as_process_owner  # a concurrent writer process (#787 / #861)
     def worker() -> None:
         try:
             conn = ns["open_db"]()

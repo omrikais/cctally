@@ -259,6 +259,7 @@ loader = SourceFileLoader("cctally", os.path.join(BINDIR, "cctally"))
 spec = ilu.spec_from_loader("cctally", loader)
 mod = ilu.module_from_spec(spec); sys.modules["cctally"] = mod
 loader.exec_module(mod)
+sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
 
 import _cctally_cache as cache
 import _lib_cache_report as cr

@@ -91,6 +91,13 @@ SCENARIOS = {
     # one builds a current, validated store through the real bound recording
     # kernel with no legacy write, so both legs are OK.
     "40-account-bound-clear":       "account_bound_clear",
+    # #947: the golden harness's only detector of the default policy's free-space
+    # floor through the real retention gather. Ordinary scenarios are pinned
+    # at the floor by bin/cctally-doctor-test; this one is pinned one byte
+    # below it (FREE_DISK_BYTES), so `db.retained_artifacts` FAILs on
+    # `min_free_bytes` and doctor exits 2. It is also the harness's detector
+    # of a lost pin on a host above the floor.
+    "43-retained-artifacts-below-free-floor": "all_ok",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -105,6 +112,16 @@ CODEX_HOMES = {
 }
 
 
+# #947: per-scenario free-disk readings for bin/cctally-doctor-test, written
+# as `.free-disk-bytes` (one decimal integer). A scenario absent here gets
+# the harness's default pin, the default policy's 10 GiB floor. A scenario
+# that needs another free-space value is listed here, never given a product
+# seam.
+FREE_DISK_BYTES = {
+    "43-retained-artifacts-below-free-floor": 10737418239,  # floor - 1
+}
+
+
 def _common_setup_preamble() -> str:
     return textwrap.dedent("""\
         #!/usr/bin/env bash
@@ -113,7 +130,13 @@ def _common_setup_preamble() -> str:
         : "${HARNESS_FAKE_HOME:?HARNESS_FAKE_HOME must be set}"
         : "${REPO_ROOT:?REPO_ROOT must be set}"
         mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally"
+        # Every install's data dir is 0700 (ensure_dirs), and query sessions
+        # read only a private data dir (#787 / #861 spec 5.4).
+        chmod 700 "$HARNESS_FAKE_HOME/.local/share/cctally"
         touch "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db.maintenance.lock"
+        # Every owner open creates the stats maintenance lock; a diagnostic
+        # reader treats a missing one as an absent store (#787 AD22).
+        touch "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db.maintenance.lock"
         mkdir -p "$HARNESS_FAKE_HOME/.claude"
         mkdir -p "$HARNESS_FAKE_HOME/.local/bin"
         # The harness sets CCTALLY_AS_OF before invoking doctor, so all
@@ -456,6 +479,12 @@ def main():
             homes_path.write_text("\n".join(homes) + "\n")
         elif homes_path.exists():
             homes_path.unlink()
+        free_path = d / ".free-disk-bytes"
+        free = FREE_DISK_BYTES.get(dir_name)
+        if free is not None:
+            free_path.write_text(f"{free}\n")
+        elif free_path.exists():
+            free_path.unlink()
     print(f"Scaffolded {len(SCENARIOS)} scenarios under {root}")
 
 
@@ -581,6 +610,8 @@ def _emit_account_bound(home: pathlib.Path) -> None:
     sys.modules["cctally"] = cctally
     loader.exec_module(cctally)
     import _cctally_core as core
+    # #787 / #861 spec 5.1: this script's thread is a process owner.
+    core.establish_script_owner()
     core._init_paths_from_env()
     import _cctally_journal as jr
     import _cctally_statusline as sl
@@ -639,7 +670,10 @@ def _emit_snapshot(slug: str, db_path: pathlib.Path) -> None:
     import os
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA journal_mode=WAL")
+    # A production-shaped stats.db is a rollback-journal index
+    # (docs/fixtures-gotchas.md "WAL parity"); the #787 query sessions
+    # Doctor reads through refuse a WAL-mode stats header.
+    conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS weekly_usage_snapshots (
             id INTEGER PRIMARY KEY,

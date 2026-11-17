@@ -1,0 +1,4 @@
+p@HOLDER_PID@
+cPython
+f3
+n@MOUNTPOINT@/held.txt

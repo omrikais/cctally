@@ -33,6 +33,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pathlib
 import signal
@@ -72,10 +73,11 @@ _QUOTA_DEDUP_INDEX_NAME = ".quota-observation-keys"
 _QUOTA_DEDUP_DIR: str | None = None
 _QUOTA_DEDUP_KEYS: set[str] = set()
 _QUOTA_DEDUP_LOADED = False
-# #977 C3: the loaded keys file's `(dev, ino, consumed_bytes)`. Re-statted
-# before every dedupe check, so a replaced, removed or shrunk keys file
-# discards the set and growth by another process is read incrementally.
-_QUOTA_DEDUP_IDENTITY: "tuple[int, int, int] | None" = None
+# #977 C3: the loaded keys file's `(dev, ino, birth, volume, consumed_bytes)`
+# (#1080: compared by `_quota_same_file`). Re-statted before every dedupe
+# check, so a replaced, removed or shrunk keys file discards the set and
+# growth by another process is read incrementally.
+_QUOTA_DEDUP_IDENTITY: "tuple | None" = None
 # #977 C1: the coverage sidecar every publish by this binary writes. Without
 # it (a legacy index, or a crash between the two renames) the index is invalid.
 _QUOTA_DEDUP_META_NAME = ".quota-observation-keys.meta"
@@ -325,6 +327,218 @@ def _quota_key_lines(data: bytes) -> "list[str] | None":
     return keys
 
 
+# #1080 — the quota index's file identity `(dev, ino, birth, volume)`.
+#
+# A file is the recorded one iff its inode is equal; not (both births known
+# and different); and, when both volume UUIDs are known, the volumes are equal
+# (the device is ignored), otherwise the devices are equal. A remount that
+# only renumbers the device keeps the volume UUID, so it no longer invalidates
+# a valid index; another volume — beside the original, or alone and reusing
+# the recorded device number — has another UUID. The device stays the volume
+# identity where no UUID is known (Linux, a legacy sidecar, an error). This is
+# deliberately NOT `source_identity_replaced`'s inode-only rule: a false
+# acceptance here would suppress a durable quota observation.
+
+#: A test sets it, as `_lib_clone_copy._PLATFORM` is set.
+_QUOTA_PLATFORM = sys.platform
+_QUOTA_ZERO_VOLUME = "00000000-0000-0000-0000-000000000000"
+#: `getattrlist` attribute list: ATTR_BIT_MAP_COUNT, ATTR_VOL_INFO|ATTR_VOL_UUID.
+_QUOTA_ATTR_BIT_MAP_COUNT = 5
+_QUOTA_ATTR_VOL_INFO_UUID = 0x80000000 | 0x00040000
+_QUOTA_VOLUME_REPLY_BYTES = 64
+#: The reply: a uint32 length, then the 16-byte volume UUID.
+_QUOTA_VOLUME_REPLY_MIN = 20
+_QUOTA_LIBC_UNBOUND = object()
+_QUOTA_LIBC_BINDING = _QUOTA_LIBC_UNBOUND
+
+
+def _quota_stat(path):
+    """The quota index's only path stat (a test seam)."""
+    return os.stat(path)
+
+
+def _quota_fstat(fd):
+    """The quota index's only descriptor stat (a test seam)."""
+    return os.fstat(fd)
+
+
+class _QuotaVolumeBinding:
+    __slots__ = ("attrlist", "getattrlist", "fgetattrlist")
+
+    def __init__(self, attrlist, getattrlist, fgetattrlist):
+        self.attrlist = attrlist
+        self.getattrlist = getattrlist
+        self.fgetattrlist = fgetattrlist
+
+
+def _quota_libc():
+    """The Darwin `getattrlist`/`fgetattrlist` binding, or ``None``.
+
+    Bound once per process, lazily, from the LP64 prototypes
+    ``int getattrlist(const char*, void*, void*, size_t, unsigned int)`` and
+    ``int fgetattrlist(int, void*, void*, size_t, unsigned int)``; a failure to
+    bind is cached too, so every later lookup reports no volume.
+    """
+    global _QUOTA_LIBC_BINDING
+    if _QUOTA_LIBC_BINDING is not _QUOTA_LIBC_UNBOUND:
+        return _QUOTA_LIBC_BINDING
+    binding = None
+    try:
+        import ctypes
+
+        class _AttrList(ctypes.Structure):
+            _fields_ = [
+                ("bitmapcount", ctypes.c_ushort),
+                ("reserved", ctypes.c_uint16),
+                ("commonattr", ctypes.c_uint32),
+                ("volattr", ctypes.c_uint32),
+                ("dirattr", ctypes.c_uint32),
+                ("fileattr", ctypes.c_uint32),
+                ("forkattr", ctypes.c_uint32),
+            ]
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        getattrlist = libc.getattrlist
+        getattrlist.argtypes = [
+            ctypes.c_char_p, ctypes.POINTER(_AttrList), ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_uint]
+        getattrlist.restype = ctypes.c_int
+        fgetattrlist = libc.fgetattrlist
+        fgetattrlist.argtypes = [
+            ctypes.c_int, ctypes.POINTER(_AttrList), ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_uint]
+        fgetattrlist.restype = ctypes.c_int
+        attrlist = _AttrList()
+        attrlist.bitmapcount = _QUOTA_ATTR_BIT_MAP_COUNT
+        attrlist.volattr = _QUOTA_ATTR_VOL_INFO_UUID
+        binding = _QuotaVolumeBinding(attrlist, getattrlist, fgetattrlist)
+    except (OSError, AttributeError, ImportError):
+        binding = None
+    _QUOTA_LIBC_BINDING = binding
+    return binding
+
+
+def _quota_volume_of(target):
+    """The volume UUID (lowercase canonical) holding ``target``, or ``None``.
+
+    ``target`` is a path or an open descriptor (an ``int`` that is not a
+    ``bool``); a path is followed through symlinks, as ``os.stat`` follows it.
+    ``None`` off Darwin (the binding is never touched there), when the binding
+    is unavailable, on a non-zero return, a reply length outside
+    ``20..64`` (a short buffer returns 0 with a truncated length) or the
+    all-zero UUID. Never raises.
+    """
+    if _QUOTA_PLATFORM != "darwin":
+        return None
+    try:
+        binding = _quota_libc()
+        if binding is None:
+            return None
+        import ctypes
+        import uuid
+        buf = ctypes.create_string_buffer(_QUOTA_VOLUME_REPLY_BYTES)
+        if isinstance(target, int) and not isinstance(target, bool):
+            rc = binding.fgetattrlist(target, binding.attrlist, buf, len(buf), 0)
+        else:
+            rc = binding.getattrlist(
+                os.fsencode(target), binding.attrlist, buf, len(buf), 0)
+        if rc != 0:
+            return None
+        reply = buf.raw
+        length = int.from_bytes(reply[:4], sys.byteorder)
+        if not _QUOTA_VOLUME_REPLY_MIN <= length <= len(reply):
+            return None
+        volume = str(uuid.UUID(bytes=reply[4:20]))
+    except Exception:
+        return None
+    return None if volume == _QUOTA_ZERO_VOLUME else volume
+
+
+def _usable_quota_birth(value) -> bool:
+    """A birth time: a bool-free ``int`` in ``(0, 2**53]`` or a finite float
+    above 0. Integers never reach ``math.isfinite`` (``10**400`` raises)."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0 < value <= 2**53
+    if isinstance(value, float):
+        return math.isfinite(value) and value > 0
+    return False
+
+
+def _canonical_quota_volume(value) -> bool:
+    """A lowercase canonical UUID string other than the all-zero one."""
+    if not isinstance(value, str) or value == _QUOTA_ZERO_VOLUME:
+        return False
+    import uuid
+    try:
+        return str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def _quota_birth_of(st):
+    birth = getattr(st, "st_birthtime", None)
+    return birth if _usable_quota_birth(birth) else None
+
+
+def _quota_identity(path=None, fd=None):
+    """``(st, (dev, ino, birth, volume))`` from ONE stat of ``path`` or ``fd``
+    and the volume of that same path or descriptor."""
+    if fd is not None:
+        st = _quota_fstat(fd)
+        volume = _quota_volume_of(fd)
+    else:
+        st = _quota_stat(path)
+        volume = _quota_volume_of(path)
+    return st, (st.st_dev, st.st_ino, _quota_birth_of(st), volume)
+
+
+def _quota_same_file(recorded, st, volume) -> bool:
+    """Whether ``st`` (with current ``volume``) is the ``recorded``
+    ``(dev, ino, birth, volume)`` file, by the #1080 rule above. Births and
+    volumes compare exactly (a stored birth is the float's JSON round trip)."""
+    dev, ino, birth, recorded_volume = recorded
+    if st.st_ino != ino:
+        return False
+    current_birth = _quota_birth_of(st)
+    if (_usable_quota_birth(birth) and current_birth is not None
+            and current_birth != birth):
+        return False
+    if recorded_volume is not None and volume is not None:
+        return recorded_volume == volume
+    return st.st_dev == dev
+
+
+def _quota_recorded_identity(holder, prefix=""):
+    """The ``(dev, ino, birth, volume)`` a sidecar entry records; an absent
+    optional field is ``None``."""
+    return (holder[prefix + "dev"], holder[prefix + "ino"],
+            holder.get(prefix + "birth"), holder.get(prefix + "volume"))
+
+
+def _quota_identity_fields(identity, prefix=""):
+    """The sidecar fields for ``identity``; birth and volume only when known."""
+    dev, ino, birth, volume = identity
+    fields = {prefix + "dev": dev, prefix + "ino": ino}
+    if birth is not None:
+        fields[prefix + "birth"] = birth
+    if volume is not None:
+        fields[prefix + "volume"] = volume
+    return fields
+
+
+def _quota_optional_identity_ok(holder, prefix="") -> bool:
+    """A present birth or volume must be usable (#1080 §5.2)."""
+    if prefix + "birth" in holder and not _usable_quota_birth(
+            holder[prefix + "birth"]):
+        return False
+    if prefix + "volume" in holder and not _canonical_quota_volume(
+            holder[prefix + "volume"]):
+        return False
+    return True
+
+
 def _nonnegative_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
@@ -343,6 +557,8 @@ def _read_quota_index_meta(journal_dir) -> "dict | None":
             return None
     if meta["index_bytes"] != meta["key_count"] * _QUOTA_KEY_LINE_BYTES:
         return None
+    if not _quota_optional_identity_ok(meta, "index_"):
+        return None
     coverage = meta.get("coverage")
     if not isinstance(coverage, list):
         return None
@@ -356,29 +572,34 @@ def _read_quota_index_meta(journal_dir) -> "dict | None":
             return None
         if not all(_nonnegative_int(entry.get(k)) for k in ("dev", "ino", "extent")):
             return None
+        if not _quota_optional_identity_ok(entry):
+            return None
         seen.add(segment)
     return meta
 
 
 def _quota_index_validation(journal_dir):
-    """``(meta, keys_stat)`` when the index is valid by the C1 rules, else None.
+    """``(meta, keys_stat, keys_identity)`` when the index is valid by the C1
+    rules, else None.
 
-    Valid only when the sidecar parses with a known version; the keys file's
-    ``(dev, ino)`` match it; the keys file is at least ``index_bytes`` long,
-    has grown since only by whole 19-byte lines and ends with a newline; every
-    covered segment exists with the same ``(dev, ino)`` and at least its covered
-    extent; and every segment absent from coverage sorts after every covered
-    one. Loading costs one read of the sidecar and stats of the keys file and
-    of each covered segment — never a segment read.
+    Valid only when the sidecar parses with a known version; the keys file is
+    the file it records (``_quota_same_file``, #1080); the keys file is at
+    least ``index_bytes`` long, has grown since only by whole 19-byte lines
+    and ends with a newline; every covered segment exists, is the file its
+    coverage entry records and holds at least its covered extent; and every
+    segment absent from coverage sorts after every covered one. Loading costs
+    one read of the sidecar and stats (and volume lookups) of the keys file
+    and of each covered segment — never a segment read. ``keys_identity`` is
+    the identity that one observation of the keys file returned.
     """
     meta = _read_quota_index_meta(journal_dir)
     if meta is None:
         return None
     keys_path = journal_dir / _QUOTA_DEDUP_INDEX_NAME
     try:
-        keys_stat = os.stat(keys_path)
-        if (keys_stat.st_dev, keys_stat.st_ino) != (
-                meta["index_dev"], meta["index_ino"]):
+        keys_stat, keys_identity = _quota_identity(path=keys_path)
+        if not _quota_same_file(_quota_recorded_identity(meta, "index_"),
+                                keys_stat, keys_identity[3]):
             return None
         size = keys_stat.st_size
         if size < meta["index_bytes"]:
@@ -392,8 +613,10 @@ def _quota_index_validation(journal_dir):
                     return None
         covered = []
         for entry in meta["coverage"]:
-            seg_stat = os.stat(journal_dir / entry["segment"])
-            if (seg_stat.st_dev, seg_stat.st_ino) != (entry["dev"], entry["ino"]):
+            seg_stat, seg_identity = _quota_identity(
+                path=journal_dir / entry["segment"])
+            if not _quota_same_file(_quota_recorded_identity(entry),
+                                    seg_stat, seg_identity[3]):
                 return None
             if seg_stat.st_size < entry["extent"]:
                 return None
@@ -409,7 +632,7 @@ def _quota_index_validation(journal_dir):
                     return None
     except OSError:
         return None
-    return meta, keys_stat
+    return meta, keys_stat, keys_identity
 
 
 def quota_index_valid(journal_dir=None) -> bool:
@@ -429,30 +652,30 @@ def _catch_up_loaded_quota_keys(keys_path) -> bool:
     global _QUOTA_DEDUP_IDENTITY
     if _QUOTA_DEDUP_IDENTITY is None:
         return False
-    dev, ino, consumed = _QUOTA_DEDUP_IDENTITY
+    *recorded, consumed = _QUOTA_DEDUP_IDENTITY
     try:
         fd = os.open(str(keys_path), os.O_RDONLY)
     except OSError:
         return False
     try:
-        st = os.fstat(fd)
-        if (st.st_dev, st.st_ino) != (dev, ino) or st.st_size < consumed:
+        st, identity = _quota_identity(fd=fd)
+        if (not _quota_same_file(tuple(recorded), st, identity[3])
+                or st.st_size < consumed):
             return False
-        if st.st_size == consumed:
-            return True
-        grown = os.pread(fd, st.st_size - consumed, consumed)
+        grown = (os.pread(fd, st.st_size - consumed, consumed)
+                 if st.st_size > consumed else b"")
     except OSError:
         return False
     finally:
         os.close(fd)
     complete = grown[:grown.rfind(b"\n") + 1]
-    if not complete:
-        return True
-    keys = _quota_key_lines(complete)
-    if keys is None:
-        return False
-    _QUOTA_DEDUP_KEYS.update(keys)
-    _QUOTA_DEDUP_IDENTITY = (dev, ino, consumed + len(complete))
+    if complete:
+        keys = _quota_key_lines(complete)
+        if keys is None:
+            return False
+        _QUOTA_DEDUP_KEYS.update(keys)
+    # The same file, perhaps renumbered by a remount: follow its identity now.
+    _QUOTA_DEDUP_IDENTITY = (*identity, consumed + len(complete))
     return True
 
 
@@ -483,12 +706,12 @@ def _load_quota_dedup_keys() -> None:
     if validation is None:
         raise QuotaIndexUnavailable(
             "the Codex quota natural-key index is missing or invalid")
-    meta, keys_stat = validation
+    meta, _keys_stat, keys_identity = validation
     try:
         fd = os.open(str(keys_path), os.O_RDONLY)
         try:
-            st = os.fstat(fd)
-            if (st.st_dev, st.st_ino) != (keys_stat.st_dev, keys_stat.st_ino):
+            st, identity = _quota_identity(fd=fd)
+            if not _quota_same_file(keys_identity, st, identity[3]):
                 raise QuotaIndexUnavailable(
                     "the Codex quota natural-key index was replaced")
             data = os.pread(fd, st.st_size, 0) if st.st_size else b""
@@ -503,7 +726,7 @@ def _load_quota_dedup_keys() -> None:
         raise QuotaIndexUnavailable(
             "the Codex quota natural-key index is malformed")
     _QUOTA_DEDUP_KEYS.update(keys)
-    _QUOTA_DEDUP_IDENTITY = (st.st_dev, st.st_ino, len(complete))
+    _QUOTA_DEDUP_IDENTITY = (*identity, len(complete))
     _QUOTA_DEDUP_LOADED = True
 
 
@@ -543,6 +766,9 @@ def ensure_quota_index(*, budgeted: bool, producer_locked: bool = False) -> None
     unbudgeted sync that called this before its producer locks never rebuilds
     under them, even when this attempt failed.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    if not budgeted:
+        _cctally_core.require_capability("MAINTENANCE", entry="ensure_quota_index")
     dir_key = str(_cctally_core.JOURNAL_DIR)
     if _QUOTA_DEDUP_DIR != dir_key:
         _reset_quota_dedup_state(dir_key)
@@ -599,18 +825,20 @@ def _quota_index_rebuild_state_path() -> pathlib.Path:
 
 
 def _scan_quota_keys_range(segment_path, start: int, end: int,
-                           identity: "tuple[int, int]") -> "list[str]":
+                           identity: tuple) -> "list[str]":
     """Natural keys of the complete lines in ``segment_path[start:end]``.
 
     ``start`` and ``end`` are complete-line boundaries. The open handle must
-    still be the captured inode, or the segment was replaced (C7 step 5).
+    still be the captured ``(dev, ino, birth, volume)`` file
+    (``_quota_same_file``), or the segment was replaced (C7 step 5).
     """
     if end <= start:
         return []
     keys = []
     with _open_segment_for_read(segment_path) as handle:
-        st = os.fstat(handle.fileno())
-        if (st.st_dev, st.st_ino) != tuple(identity) or st.st_size < end:
+        st, current = _quota_identity(fd=handle.fileno())
+        if (not _quota_same_file(tuple(identity), st, current[3])
+                or st.st_size < end):
             raise _QuotaSegmentChanged(str(segment_path))
         handle.seek(start)
         remaining = end - start
@@ -635,13 +863,14 @@ def _scan_quota_keys_range(segment_path, start: int, end: int,
     return keys
 
 
-def _capture_quota_segments(journal_dir) -> "dict[str, tuple[int, int, int]]":
-    """``name -> (dev, ino, complete-line extent)`` for every segment."""
+def _capture_quota_segments(journal_dir) -> "dict[str, tuple]":
+    """``name -> (dev, ino, birth, volume, complete-line extent)`` for every
+    segment, each from one observation."""
     out = {}
     for name in list_segments():
         path = journal_dir / name
-        st = os.stat(path)
-        out[name] = (st.st_dev, st.st_ino, _complete_line_offset(path, st.st_size))
+        st, identity = _quota_identity(path=path)
+        out[name] = (*identity, _complete_line_offset(path, st.st_size))
     return out
 
 
@@ -651,7 +880,10 @@ def _quota_uncovered(journal_dir, coverage, *, complete: bool):
     Raises ``_QuotaSegmentChanged`` when a covered segment was replaced,
     removed or shrunk below its covered extent. ``complete`` measures to the
     complete-line extent (what a scan may cover); otherwise to the raw size
-    (the conservative "remaining suffix" of C7 step 3).
+    (the conservative "remaining suffix" of C7 step 3). Coverage and targets
+    are ``(dev, ino, birth, volume, extent)`` and
+    ``(dev, ino, birth, volume, start, end)``; a covered segment keeps the
+    identity recorded at capture (a remount does not rewrite it).
     """
     targets = {}
     uncovered = 0
@@ -663,20 +895,21 @@ def _quota_uncovered(journal_dir, coverage, *, complete: bool):
     for name in current:
         path = journal_dir / name
         try:
-            st = os.stat(path)
+            st, observed = _quota_identity(path=path)
         except FileNotFoundError as exc:
             raise _QuotaSegmentChanged(name) from exc
         if name in coverage:
-            dev, ino, extent = coverage[name]
-            if (st.st_dev, st.st_ino) != (dev, ino) or st.st_size < extent:
+            *identity, extent = coverage[name]
+            if (not _quota_same_file(tuple(identity), st, observed[3])
+                    or st.st_size < extent):
                 raise _QuotaSegmentChanged(name)
         else:
-            dev, ino, extent = st.st_dev, st.st_ino, 0
+            identity, extent = observed, 0
         end = (_complete_line_offset(path, st.st_size) if complete
                else st.st_size)
         if end < extent:
             raise _QuotaSegmentChanged(name)
-        targets[name] = (dev, ino, extent, end)
+        targets[name] = (*identity, extent, end)
         uncovered += end - extent
     return targets, uncovered
 
@@ -685,13 +918,13 @@ def _scan_quota_targets(journal_dir, targets, coverage, written, tmp_fd) -> None
     """Scan every target range, append NEW keys to the temporary keys file,
     and advance ``coverage``. The caller fsyncs."""
     fresh = []
-    for name, (dev, ino, start, end) in targets.items():
+    for name, (*identity, start, end) in targets.items():
         for natural_key in _scan_quota_keys_range(
-                journal_dir / name, start, end, (dev, ino)):
+                journal_dir / name, start, end, tuple(identity)):
             if natural_key not in written:
                 written.add(natural_key)
                 fresh.append(natural_key)
-        coverage[name] = (dev, ino, end)
+        coverage[name] = (*identity, end)
     if fresh:
         _write_all(tmp_fd, "".join(f"{k}\n" for k in fresh).encode("ascii"))
 
@@ -741,16 +974,16 @@ def _record_quota_index_rebuild_outcome(outcome: str, reason: str = "") -> None:
 def _quota_index_publish(journal_dir, tmp_path, tmp_fd, coverage, written) -> None:
     """C7 step 4's tail, under the leaf lock: sidecar, two renames, dir fsync."""
     global _QUOTA_DEDUP_LOADED, _QUOTA_DEDUP_IDENTITY
-    st = os.fstat(tmp_fd)
+    st, identity = _quota_identity(fd=tmp_fd)
     meta = {
         "v": _QUOTA_DEDUP_META_VERSION,
-        "index_dev": st.st_dev,
-        "index_ino": st.st_ino,
+        **_quota_identity_fields(identity, "index_"),
         "index_bytes": st.st_size,
         "key_count": len(written),
         "coverage": [
-            {"segment": name, "dev": dev, "ino": ino, "extent": extent}
-            for name, (dev, ino, extent) in sorted(
+            {"segment": name, **_quota_identity_fields(tuple(recorded)),
+             "extent": extent}
+            for name, (*recorded, extent) in sorted(
                 coverage.items(),
                 key=lambda item: _lib_journal.segment_sort_key(item[0]))
         ],
@@ -778,7 +1011,7 @@ def _quota_index_publish(journal_dir, tmp_path, tmp_fd, coverage, written) -> No
     # Adopt the published set: this process now holds exactly the index.
     _reset_quota_dedup_state(str(journal_dir))
     _QUOTA_DEDUP_KEYS.update(written)
-    _QUOTA_DEDUP_IDENTITY = (st.st_dev, st.st_ino, st.st_size)
+    _QUOTA_DEDUP_IDENTITY = (*identity, st.st_size)
     _QUOTA_DEDUP_LOADED = True
 
 
@@ -789,8 +1022,8 @@ def rebuild_quota_index(*, suffix_bound: int = 4 * 1024 * 1024,
     The worker ``_quota-index-rebuild`` and the unbudgeted inline path share
     this implementation, single-flight through the rebuild lock.
 
-    1. Under a short leaf-lock hold, record each segment's ``(dev, ino)`` and
-       complete-line extent.
+    1. Under a short leaf-lock hold, record each segment's
+       ``(dev, ino, birth, volume)`` and complete-line extent.
     2. Without the leaf lock, scan those prefixes into a temporary keys file in
        the journal directory and fsync it.
     3. Without the leaf lock, catch up growth (new complete lines, new
@@ -870,12 +1103,13 @@ def _rebuild_quota_index_locked(journal_dir, suffix_bound, max_attempts):
         try:
             # Step 2.
             written: set[str] = set()
-            coverage: "dict[str, tuple[int, int, int]]" = {}
+            #: name -> (dev, ino, birth, volume, extent) (#1080).
+            coverage: "dict[str, tuple]" = {}
             try:
-                for name, (dev, ino, extent) in captured.items():
+                for name, (*identity, extent) in captured.items():
                     written.update(_scan_quota_keys_range(
-                        journal_dir / name, 0, extent, (dev, ino)))
-                    coverage[name] = (dev, ino, extent)
+                        journal_dir / name, 0, extent, tuple(identity)))
+                    coverage[name] = (*identity, extent)
             except _QuotaSegmentChanged as exc:
                 reason = f"segment changed: {exc}"
                 continue
@@ -960,6 +1194,8 @@ def request_quota_index_rebuild() -> bool:
     of the last spawn is throttled. A failed spawn removes the marker, so the
     next request retries at once. Returns False only when the spawn failed.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("LAUNCH", entry="request_quota_index_rebuild")
     try:
         pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
         admission_fd = os.open(
@@ -1317,7 +1553,7 @@ def _append_quota_dedup_key(natural_key: str) -> None:
     try:
         _write_all(fd, f"{natural_key}\n".encode("ascii"))
         os.fsync(fd)
-        st = os.fstat(fd)
+        st, identity = _quota_identity(fd=fd)
     except BaseException:
         _reset_quota_dedup_state(str(_cctally_core.JOURNAL_DIR))
         raise
@@ -1325,10 +1561,10 @@ def _append_quota_dedup_key(natural_key: str) -> None:
         os.close(fd)
     _QUOTA_DEDUP_KEYS.add(natural_key)
     if _QUOTA_DEDUP_IDENTITY is not None:
-        dev, ino, consumed = _QUOTA_DEDUP_IDENTITY
-        if ((st.st_dev, st.st_ino) == (dev, ino)
+        *recorded, consumed = _QUOTA_DEDUP_IDENTITY
+        if (_quota_same_file(tuple(recorded), st, identity[3])
                 and st.st_size == consumed + _QUOTA_KEY_LINE_BYTES):
-            _QUOTA_DEDUP_IDENTITY = (dev, ino, st.st_size)
+            _QUOTA_DEDUP_IDENTITY = (*identity, st.st_size)
 
 
 def append_record(
@@ -11451,6 +11687,8 @@ def run_stats_ingest(
     the caller owns the set — and surfaces the same signal with the same manual
     remedy rather than inventing a second recovery path.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("WRITE", entry="run_stats_ingest")
     # #797/#823/#840 spec 4.6 B2: ingest is an authoritative decision, so
     # the revision-2 boundary is in the journal before it interprets it.
     establish_revision_before_decision()
@@ -13790,6 +14028,23 @@ def _cache_writer_flocks_available() -> bool:
     return True
 
 
+def quota_projection_incomplete_flag(conn: sqlite3.Connection) -> bool:
+    """Read-only twin of `reconcile_incomplete_quota_projection` (#787 5.5).
+
+    Whether the durable incomplete-quota-projection flag is set, as the
+    `quota_projection_incomplete` readiness obligation. One read; never
+    reconciles, takes no lock and needs no capability. Fails CLOSED like
+    `assert_projection_readable`: a flag that cannot be read reports set, so
+    the obligation stays visible to the owner rather than vanishing."""
+    try:
+        row = conn.execute(
+            "SELECT incomplete FROM stats_quota_projection_state WHERE id = 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return True
+    return row is not None and bool(int(row[0] or 0))
+
+
 def reconcile_incomplete_quota_projection(conn) -> bool:
     """Resume cache recovery and re-materialize a gated quota projection.
 
@@ -13820,6 +14075,8 @@ def reconcile_incomplete_quota_projection(conn) -> bool:
     sets or clears this flag itself; reconciling underneath it would run a
     second recovery inside its transaction.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("WRITE", entry="reconcile_incomplete_quota_projection")
     import _cctally_db
     import _cctally_store
     if conn is None or _cctally_store.holds_ingest_lock():
@@ -14875,6 +15132,8 @@ def rebuild_stats_index(
 
     See `_rebuild_stats_index_locked` for the rebuild itself.
     """
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("MAINTENANCE", entry="rebuild_stats_index")
     if complete_derivation:
         if target_path is not None:
             raise ValueError(
@@ -15828,6 +16087,13 @@ def _rebuild_stats_index_locked(
             "statsQuotaProjectionIncomplete": stats_projection_incomplete,
         },
     )
+    if target_path is None:
+        # #787 / #861 AD22: a query reads stats.db only beside its
+        # maintenance lock (a missing lock is `absent`), so the owner that
+        # publishes the live index leaves the lock it would have opened.
+        _lock = os.open(_cctally_core.STATS_LOCK_MAINTENANCE_PATH,
+                        os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.close(_lock)
     phase_seconds["publication"] = round(
         time.monotonic() - publication_started, 6)
 
@@ -16318,6 +16584,8 @@ def run_cutover(conn, *, now_utc: dt.datetime | None = None) -> "str | None":
     the retry's export genuinely differs, no digest matches and a new segment is
     minted after every published bootstrap, including after a backward clock
     step (#509)."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    _cctally_core.require_capability("STARTUP", entry="run_cutover")
     if now_utc is None:
         now_utc = dt.datetime.now(dt.timezone.utc)
     epoch = _cctally_core.STATS_INDEX_EPOCH

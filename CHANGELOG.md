@@ -5,6 +5,83 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.120.0] - 2026-11-16
+
+### Added
+- `cctally db reindex-search` checks the conversation search indexes against their messages and rebuilds any that disagree; `--check` only reports.
+
+### Changed
+- Commands you run now stop waiting on `cache.db` or `conversations.db` maintenance after 5 seconds, as they already did for `stats.db`. Hooks, the status-line writer (`record-usage`) and background work keep waiting.
+- `cctally db status` now only reads your databases: it no longer resumes an interrupted stats rebuild; the next command that shows or records usage, such as `report` or the status line, finishes it instead.
+- On a large usage history, the `dashboard` no longer pauses for most of a second every few seconds while it refreshes, so pages and live updates respond more evenly. It costs about 30 MB more memory.
+- While `cache.db` is being repaired, the `dashboard` no longer reads it: conversation search and the reader, Explain and project detail are unavailable until the repair ends, and the Projects panel keeps the data it already shows.
+- The `dashboard` no longer updates or repairs databases while answering a page: a block detail reads stored usage, or your session files during a rebuild, and the dashboard's background work fixes what a page finds.
+- Right after an upgrade, `db status` and `doctor` show a `stats.db` from an older version as not readable until the next command converts it.
+- After a gap without a running `cctally dashboard`, its transcript catch-up writes about 9% less to `conversations.db`. Search results are unchanged.
+- When the Codex hooks that `cctally setup` installs are enabled, the first Codex turn after deleted Codex sessions are cleaned up no longer redoes that cleanup's quota work, so it stays fast.
+- With an account selected, the `dashboard` Conversation Viewer and `transcript` commands respond much faster: they reuse the conversation summaries they can verify instead of rebuilding the account's whole list. Results are unchanged.
+- The first cache build after installing, and `cache-sync --rebuild`, now write about half as much to disk and finish sooner on large histories. Usage and cost results are unchanged.
+- Title search in the `dashboard` Conversation Viewer and `transcript search --kind title` no longer reads every stored message, so it stays fast however large the transcript history is. Results are unchanged.
+
+### Fixed
+- When `cache.db` exists but cannot be read, `cctally pricing-check` no longer says every observed model is priced: it reports `Coverage: unavailable (cache.db could not be read).` and a degraded check (`cache` in `--json`).
+- When `cache.db` is found corrupt while an upgrade runs its database steps, cctally no longer deletes it; the next command quarantines a copy and rebuilds it through the normal recovery.
+- On macOS, remounting the external drive or disk image that holds the data folder no longer makes the next sync rebuild the Codex quota index.
+- Codex quota blocks, milestones and alerts stay accurate when updates overlap, Spark windows keep their `dashboard` block detail, and re-enabled alerts notify again. Turning alerts on or changing their rules no longer stalls Codex turns.
+- After an upgrade, the `dashboard` Conversation Viewer re-checks its stored session summaries a few at a time, so a session cost that had fallen behind its usage records is corrected.
+- On Linux, the stats rebuild memory peak that `cctally doctor` and `cctally db status` report no longer includes the peak of the process that started the rebuild, which could raise a false 2 GiB memory warning.
+- With an account selected, a `dashboard` Conversation Viewer model chip and `transcript search --account` with `--model` no longer fail; they list that account's conversations that used the chosen model family, and the search hits in them.
+- The `dashboard` Conversation Viewer's session costs, cost filter and sort, and cache-rebuild counts now update when usage records change or are removed without a transcript change, and after an interrupted sync.
+- `cache-sync --prune-orphans` no longer fails when a removed session continues in another project, and neither a pricing refresh of the session list nor `cache-sync --rebuild` blocks the conversation store for minutes.
+- With a Codex budget alert set, Codex commands, the `dashboard` and Claude usage recording no longer occasionally stall for about 10 seconds.
+- The `dashboard` first-run hint now sits behind any open dialog or sheet, so on a phone it no longer covers the bottom of the Doctor dialog or blocks taps there.
+- Long same-name project names in the `dashboard` Projects panel, its Projects window and a Codex project's detail now shorten the name itself, keeping the `(…)` part that tells them apart and, on All, the provider prefix visible.
+- In the `dashboard` Codex block and project details, `+N more` now shows the extra rows in the dialog itself instead of in a small inner scroll box whose hidden scrollbar made the button look as if it did nothing.
+- A timed-out `cctally dashboard` diagnosis no longer risks signalling an unrelated process; a new diagnosis starts only after the previous worker and everything it started have exited.
+- Transcript search no longer misses messages an earlier SQLite build tokenized differently or leaves orphaned entries: the dashboard and `cache-sync` check the search indexes after an upgrade and every 30 days, rebuilding any that disagree.
+- `diff --help` and its reference page no longer say `--sync` runs `sync-week`; it refreshes the selected providers' cached usage data.
+- When the `stats.db` maintenance lock cannot be locked because of a file system error, cctally now names that error instead of saying maintenance is in progress.
+- When `stats.db` is busy, being upgraded or cannot be read, `cctally explain` with a week `--window` now reports the store as unavailable (exit 3, or 503 in the `dashboard`) instead of saying no subscription-week anchor is available.
+- In the `dashboard` Projects panel at window widths of about 1200 to 1440 px, the heading's project count or status no longer runs under the `partial` chip; the chip moves to its own line.
+
+## [1.119.0] - 2026-11-16
+
+### Added
+- `cctally db reindex-search` checks the conversation search indexes against their messages and rebuilds any that disagree; `--check` only reports.
+
+### Changed
+- Commands you run now stop waiting on `cache.db` or `conversations.db` maintenance after 5 seconds, as they already did for `stats.db`. Hooks, the status-line writer (`record-usage`) and background work keep waiting.
+- `cctally db status` now only reads your databases: it no longer resumes an interrupted stats rebuild; the next command that shows or records usage, such as `report` or the status line, finishes it instead.
+- On a large usage history, the `dashboard` no longer pauses for most of a second every few seconds while it refreshes, so pages and live updates respond more evenly. It costs about 30 MB more memory.
+- While `cache.db` is being repaired, the `dashboard` no longer reads it: conversation search and the reader, Explain and project detail are unavailable until the repair ends, and the Projects panel keeps the data it already shows.
+- The `dashboard` no longer updates or repairs databases while answering a page: a block detail reads stored usage, or your session files during a rebuild, and the dashboard's background work fixes what a page finds.
+- Right after an upgrade, `db status` and `doctor` show a `stats.db` from an older version as not readable until the next command converts it.
+- After a gap without a running `cctally dashboard`, its transcript catch-up writes about 9% less to `conversations.db`. Search results are unchanged.
+- When the Codex hooks that `cctally setup` installs are enabled, the first Codex turn after deleted Codex sessions are cleaned up no longer redoes that cleanup's quota work, so it stays fast.
+- With an account selected, the `dashboard` Conversation Viewer and `transcript` commands respond much faster: they reuse the conversation summaries they can verify instead of rebuilding the account's whole list. Results are unchanged.
+- The first cache build after installing, and `cache-sync --rebuild`, now write about half as much to disk and finish sooner on large histories. Usage and cost results are unchanged.
+- Title search in the `dashboard` Conversation Viewer and `transcript search --kind title` no longer reads every stored message, so it stays fast however large the transcript history is. Results are unchanged.
+
+### Fixed
+- When `cache.db` exists but cannot be read, `cctally pricing-check` no longer says every observed model is priced: it reports `Coverage: unavailable (cache.db could not be read).` and a degraded check (`cache` in `--json`).
+- When `cache.db` is found corrupt while an upgrade runs its database steps, cctally no longer deletes it; the next command quarantines a copy and rebuilds it through the normal recovery.
+- On macOS, remounting the external drive or disk image that holds the data folder no longer makes the next sync rebuild the Codex quota index.
+- Codex quota blocks, milestones and alerts stay accurate when updates overlap, Spark windows keep their `dashboard` block detail, and re-enabled alerts notify again. Turning alerts on or changing their rules no longer stalls Codex turns.
+- After an upgrade, the `dashboard` Conversation Viewer re-checks its stored session summaries a few at a time, so a session cost that had fallen behind its usage records is corrected.
+- On Linux, the stats rebuild memory peak that `cctally doctor` and `cctally db status` report no longer includes the peak of the process that started the rebuild, which could raise a false 2 GiB memory warning.
+- With an account selected, a `dashboard` Conversation Viewer model chip and `transcript search --account` with `--model` no longer fail; they list that account's conversations that used the chosen model family, and the search hits in them.
+- The `dashboard` Conversation Viewer's session costs, cost filter and sort, and cache-rebuild counts now update when usage records change or are removed without a transcript change, and after an interrupted sync.
+- `cache-sync --prune-orphans` no longer fails when a removed session continues in another project, and neither a pricing refresh of the session list nor `cache-sync --rebuild` blocks the conversation store for minutes.
+- With a Codex budget alert set, Codex commands, the `dashboard` and Claude usage recording no longer occasionally stall for about 10 seconds.
+- The `dashboard` first-run hint now sits behind any open dialog or sheet, so on a phone it no longer covers the bottom of the Doctor dialog or blocks taps there.
+- Long same-name project names in the `dashboard` Projects panel, its Projects window and a Codex project's detail now shorten the name itself, keeping the `(…)` part that tells them apart and, on All, the provider prefix visible.
+- In the `dashboard` Codex block and project details, `+N more` now shows the extra rows in the dialog itself instead of in a small inner scroll box whose hidden scrollbar made the button look as if it did nothing.
+- A timed-out `cctally dashboard` diagnosis no longer risks signalling an unrelated process; a new diagnosis starts only after the previous worker and everything it started have exited.
+- Transcript search no longer misses messages an earlier SQLite build tokenized differently or leaves orphaned entries: the dashboard and `cache-sync` check the search indexes after an upgrade and every 30 days, rebuilding any that disagree.
+- `diff --help` and its reference page no longer say `--sync` runs `sync-week`; it refreshes the selected providers' cached usage data.
+- When the `stats.db` maintenance lock cannot be locked because of a file system error, cctally now names that error instead of saying maintenance is in progress.
+- When `stats.db` is busy, being upgraded or cannot be read, `cctally explain` with a week `--window` now reports the store as unavailable (exit 3, or 503 in the `dashboard`) instead of saying no subscription-week anchor is available.
+
 ## [1.118.2] - 2026-11-07
 
 ### Changed

@@ -1,0 +1,2 @@
+/dev/@BACKING_DEVICE@ on @BACKING_VOLUME@ (apfs, local, nodev, nosuid, journaled, noowners)
+/dev/@VOLUME_SLICE@ on @MOUNTPOINT@ (apfs, local, nodev, nosuid, journaled, nobrowse, mounted by @USER@)

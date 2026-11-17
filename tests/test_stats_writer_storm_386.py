@@ -178,6 +178,8 @@ import sys
 sys.path.insert(0, sys.argv[1])
 import _cctally_core as core
 import _cctally_store as store
+# #787 / #861 spec 5.1: this child is a process owner, like a CLI command.
+core.establish_script_owner()
 
 print(
     "dev_autodetect_suppressed="
@@ -1596,8 +1598,11 @@ import sys
 import time
 
 sys.path.insert(0, sys.argv[1])
+import _cctally_core
 import _cctally_store as store
 
+# #787 / #861 spec 5.1: this child is a process owner, like a CLI command.
+_cctally_core.establish_script_owner()
 db = pathlib.Path(sys.argv[2])
 commits = int(sys.argv[3])
 pad = "x" * 400
@@ -2044,6 +2049,9 @@ _loader.exec_module(_mod)
 
 import _cctally_core, _cctally_journal
 
+# #787 / #861 spec 5.1: this child is a process owner, like a CLI command.
+_cctally_core.establish_script_owner()
+
 fd = _cctally_journal._acquire_maintenance_shared("authoritative", 10.0)
 assert fd is not None, "child could not take maintenance shared"
 print("SHARED-HELD", flush=True)
@@ -2116,3 +2124,165 @@ def test_nested_open_under_held_maintenance_does_not_self_deadlock(tmp_path):
     )
     assert "DONE" in out, (out, err)
     assert child.returncode == 0, (child.returncode, out, err)
+
+
+def test_db_status_does_not_recover(tmp_path, monkeypatch, capsys):
+    """#787 / #861 RED D5: `cctally db status` resumed stats recovery from a
+    read-only command (`_db_status_for(recover_interrupted_stats=True)` over a
+    `mode=rw` connect). It now reads through the restricted metadata reader:
+    an interrupted-rebuild artifact stays in place, recovery never runs, and
+    the stats leg still reports its version and migrations."""
+    from conftest import load_script, redirect_paths
+    import os as _os
+    import json as _json
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    core = sys.modules["_cctally_core"]
+    cache = sys.modules["_cctally_cache"]
+    store = sys.modules["_cctally_store"]
+    with core.establish_authority("process"):
+        core.open_db().close()
+        cache.open_cache_db().close()
+        cache.open_conversations_db().close()
+    _os.chmod(core.APP_DIR, 0o700)
+    path = pathlib.Path(core.DB_PATH)
+    artifact = path.with_name(path.name + ".rebuilding-20260101T000000_000000")
+    artifact.write_bytes(b"")
+    monkeypatch.setattr(store, "_pending_stats_publication_never_replaced",
+                        lambda _p: True)
+    capsys.readouterr()
+    assert ns["main"](["db", "status", "--json"]) == 0
+    payload = _json.loads(capsys.readouterr().out)
+    assert artifact.exists(), "db status recovered an interrupted rebuild"
+    stats = payload["databases"]["stats.db"]
+    assert "_open_error" not in stats
+    assert stats["user_version"] == core.STATS_INDEX_EPOCH
+    assert payload["databases"]["cache.db"]["user_version"] > 0
+
+
+def _owner_stores_787(tmp_path, monkeypatch):
+    from conftest import load_script, redirect_paths
+    import os as _os
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    core = sys.modules["_cctally_core"]
+    cache = sys.modules["_cctally_cache"]
+    with core.establish_authority("process"):
+        core.open_db().close()
+        cache.open_cache_db().close()
+        cache.open_conversations_db().close()
+    _os.chmod(core.APP_DIR, 0o700)
+    return ns, core
+
+
+def _wal_header_stats(core, *, drop_lock):
+    """A not-yet-converted stats.db: its main header declares WAL and no
+    side file is present (a store last closed before the #538 WAL
+    retirement); a pre-cutover install often has no maintenance lock."""
+    import sqlite3 as _sq
+    path = pathlib.Path(core.DB_PATH)
+    conn = _sq.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.close()
+    assert path.read_bytes()[18:20] == b"\x02\x02"
+    if drop_lock:
+        pathlib.Path(core.STATS_LOCK_MAINTENANCE_PATH).unlink()
+    return path
+
+
+def _stats_family(core):
+    path = pathlib.Path(core.DB_PATH)
+    lock = pathlib.Path(core.STATS_LOCK_MAINTENANCE_PATH)
+    return {p.name: p.read_bytes() for p in (
+        path, lock, pathlib.Path(f"{path}-wal"), pathlib.Path(f"{path}-shm"))
+        if p.exists()}
+
+
+@pytest.mark.parametrize("drop_lock", [False, True],
+                         ids=["lock_present", "lock_missing"])
+def test_db_status_and_doctor_refuse_wal_header_stats(tmp_path, monkeypatch,
+                                                      capsys, drop_lock):
+    """#787 AD22: a WAL-header stats.db is refused by every diagnostic open,
+    whatever its epoch, and a missing maintenance lock is `absent`. `db
+    status` shows the stats leg in its existing unreadable state and Doctor
+    never reports it as an Integrity FAIL; neither creates the lock or a
+    side file (today's `db status` opened it `mode=rw` and Doctor's guarded
+    reader materialized `-shm`/`-wal`). The next owner open converts it."""
+    import json as _json
+    ns, core = _owner_stores_787(tmp_path, monkeypatch)
+    _wal_header_stats(core, drop_lock=drop_lock)
+    before = _stats_family(core)
+    capsys.readouterr()
+    assert ns["main"](["db", "status", "--json"]) == 0
+    stats = _json.loads(capsys.readouterr().out)["databases"]["stats.db"]
+    assert "_open_error" in stats, stats
+    assert ns["main"](["db", "status"]) == 0
+    text = capsys.readouterr().out
+    assert "stats.db" in text and "(not readable: " in text
+    lib = sys.modules["_lib_doctor"]
+    with core.establish_authority("process"):
+        state = ns["doctor_gather_state"](deep=True)
+    report = lib.serialize_json(lib.run_checks(state))
+    checks = {c["id"]: c for cat in report["categories"]
+              for c in cat["checks"]}
+    assert checks["db.integrity"]["severity"] != "fail", checks["db.integrity"]
+    assert state.stats_db_quick_check is None
+    assert _stats_family(core) == before
+    # The next owner open converts it (#538).
+    with core.establish_authority("process"):
+        core.open_db().close()
+    assert pathlib.Path(core.DB_PATH).read_bytes()[18:20] == b"\x01\x01"
+    assert ns["main"](["db", "status", "--json"]) == 0
+    stats = _json.loads(capsys.readouterr().out)["databases"]["stats.db"]
+    assert "_open_error" not in stats
+
+
+@pytest.mark.parametrize("opener", ["query", "diagnostic", "metadata"])
+def test_missing_stats_lock_races_owner_start(tmp_path, monkeypatch, opener):
+    """#787 AD22: a missing maintenance lock is `absent` for every query and
+    diagnostic open, even when an owner creates the lock and takes it
+    exclusively in the gap after the reader looked. No reader creates the
+    lock, connects, or proceeds without shared admission (detects a
+    missing-lock tolerance that lets a read run beside an owner start)."""
+    import fcntl as _fcntl
+    import os as _os
+    import sqlite3 as _sq
+    _ns, core = _owner_stores_787(tmp_path, monkeypatch)
+    import _cctally_store_access as access
+    lock = pathlib.Path(core.STATS_LOCK_MAINTENANCE_PATH)
+    lock.unlink()
+    owner = []
+    real_open = access.os.open
+
+    def racing_open(target, flags, *a, **kw):
+        try:
+            return real_open(target, flags, *a, **kw)
+        except FileNotFoundError:
+            if _os.fspath(target) == str(lock) and not owner:
+                # The owner starts in the gap: creates the lock, holds it EX.
+                fh = open(lock, "a+")
+                _fcntl.flock(fh, _fcntl.LOCK_EX)
+                owner.append(fh)
+            raise
+
+    connects = []
+    real_connect = _sq.connect
+    monkeypatch.setattr(access.os, "open", racing_open)
+    monkeypatch.setattr(_sq, "connect", lambda *a, **k: connects.append(a)
+                        or real_connect(*a, **k))
+    try:
+        with pytest.raises(core.StoreUnavailable) as info:
+            if opener == "metadata":
+                with access.QueryService.metadata("stats"):
+                    pass  # pragma: no cover
+            else:
+                with access.QueryService.session(
+                        "stats", policy="command" if opener == "query"
+                        else "diagnostic"):
+                    pass  # pragma: no cover
+        assert info.value.reason == "absent"
+        assert owner, "the reader never looked for the lock"
+        assert connects == []
+    finally:
+        for fh in owner:
+            fh.close()

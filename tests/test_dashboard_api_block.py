@@ -959,3 +959,188 @@ def test_blocks_panel_serves_a_frozen_block_the_facts_the_modal_serves(
         assert abs(panel_model["cost_usd"] - modal_model["cost_usd"]) < 1e-9
     # The footer total the React panel reconciles against follows the rows.
     assert abs(view.total_cost_usd - _FROZEN_COST) < 1e-9, view.total_cost_usd
+
+
+# ── #787 / #861 I3b: block detail is a query read with no sync (AD10) ───────
+
+import fcntl
+
+import pytest
+
+
+@pytest.mark.parametrize("state", ["retained", "maintenance", "live_repair",
+                                   "absent"])
+def test_block_detail_states(tmp_path, monkeypatch, state):
+    """Detects a block-detail click that ingests on the request thread (it
+    synced before #787, holding the cache writer behind a click), that 404s
+    during a cache rebuild instead of falling back to the direct JSONL parse,
+    or that recreates a missing store from a request thread.
+
+    ``retained``: a sync-mode dashboard whose JSONL grew (a replaced file)
+    serves the retained rows and runs no ingest. ``maintenance``: contention
+    uses the direct-JSONL fallback. ``live_repair`` (R32-1): a live owner's
+    cache.db repair marker is maintenance too, as `main`'s owner open
+    reported it, so the click reads the transcripts instead of a 503. ``absent``: a not-ready store answers the
+    degraded 503, the owner is told and resolves it, and the route serves."""
+    ns = load_script()
+    srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
+    core = ns["_cctally_core"]
+    cache_module = ns["_cctally_cache"]
+    dash = sys.modules["_cctally_dashboard"]
+    handler = ns["DashboardHTTPHandler"]
+    monkeypatch.setattr(handler, "no_sync", False, raising=False)
+    synced, fallback, notified, events = [], [], [], []
+    for name in ("sync_cache", "sync_codex_cache"):
+        monkeypatch.setattr(cache_module, name,
+                            lambda *a, _n=name, **k: synced.append(_n))
+    block_start = dt.datetime(2026, 4, 22, 14, 0, tzinfo=dt.timezone.utc)
+
+    def direct(range_start, range_end, *, project=None):
+        fallback.append((range_start, range_end))
+        return [_make_entry(ns, ts=block_start + dt.timedelta(minutes=m),
+                            model="claude-opus-4-5-20251101")
+                for m in (5, 20)]
+
+    monkeypatch.setattr(cache_module, "_collect_entries_direct", direct)
+    monkeypatch.setattr(core, "CAPABILITY_OBSERVERS", [events.append])
+    unregister = core.register_owner_attention(
+        lambda store, r: notified.append((store, r.reason)))
+    held = None
+    if state == "retained":
+        grown = pathlib.Path(core.CLAUDE_PROJECTS_DIR) / "p" / "grown.jsonl"
+        grown.parent.mkdir(parents=True, exist_ok=True)
+        grown.write_text('{"type":"assistant"}\n')
+    elif state == "maintenance":
+        held = open(core.CACHE_LOCK_MAINTENANCE_PATH, "a")
+        fcntl.flock(held, fcntl.LOCK_EX)
+    elif state == "live_repair":
+        db = sys.modules["_cctally_db"]
+        cache_path = pathlib.Path(core.CACHE_DB_PATH)
+        claim, why = db._claim_repair_marker(cache_path)
+        assert claim is not None, why
+        held = ("marker", cache_path, claim)
+    else:
+        for suffix in ("", "-wal", "-shm"):
+            pathlib.Path(f"{core.CACHE_DB_PATH}{suffix}").unlink(
+                missing_ok=True)
+    encoded = urllib.parse.quote("2026-04-22T14:00:00+00:00", safe="")
+    port = srv.server_address[1]
+
+    def get():
+        c = HTTPConnection("127.0.0.1", port,
+                           timeout=PRESENCE_BACKSTOP_SECONDS)
+        try:
+            c.request("GET", f"/api/block/{encoded}")
+            r = c.getresponse()
+            return r.status, json.loads(r.read() or b"null"), r.getheaders()
+        finally:
+            c.close()
+
+    try:
+        status, body, headers = get()
+        if state == "absent":
+            assert not pathlib.Path(core.CACHE_DB_PATH).exists(), (
+                "a request thread recreated the cache store")
+            dash._reset_schema_wake_state()
+            unregister_owner = core.register_owner_attention(
+                dash._dashboard_owner_attention)
+            monkeypatch.setattr(core, "_OWNER_ATTENTION_COALESCE_S", 0.0)
+            try:
+                # Re-report the route's notification (the recorder heard the
+                # first) so the dashboard owner hears it.
+                core.notify_owner("cache", core.Readiness(
+                    "cache", False, "absent", frozenset()))
+                dash._join_schema_wake_thread()
+            finally:
+                unregister_owner()
+            retry_status, retry_body, _h = get()
+    finally:
+        unregister()
+        if isinstance(held, tuple):
+            sys.modules["_cctally_db"]._release_repair_marker(*held[1:])
+        elif held is not None:
+            fcntl.flock(held, fcntl.LOCK_UN)
+            held.close()
+        stop(srv, srv._test_thread)
+
+    assert synced == [], synced
+    request_events = [e for e in events if e.authority == "query"]
+    assert all(e.permitted for e in request_events), [
+        (e.entry, e.capability) for e in request_events if not e.permitted]
+    if state == "retained":
+        assert status == 200, body
+        assert body["entries_count"] == 5, body
+        assert fallback == []
+    elif state in ("maintenance", "live_repair"):
+        assert status == 200, body
+        assert body["entries_count"] == 2, body
+        assert len(fallback) == 1, fallback
+    else:
+        assert status == 503, body
+        assert body == {"error": "block detail unavailable"}, body
+        assert dict(headers).get("Retry-After") == "1", headers
+        assert ("cache", "absent") in notified, notified
+        assert pathlib.Path(core.CACHE_DB_PATH).exists(), (
+            "the owner did not resolve the absent store")
+        assert retry_status != 503, retry_body
+
+
+def _reaped_pid() -> int:
+    """A PID that names no process: a child that has exited and been reaped."""
+    import subprocess
+    child = subprocess.Popen(["true"])
+    child.wait()
+    return child.pid
+
+
+@pytest.mark.parametrize("state", ["recovery_pending", "corrupt"])
+def test_session_detail_answers_unavailability_like_block_detail(
+        tmp_path, monkeypatch, state):
+    """#787 / #861 spec 5.11 ("detail routes never turn unavailability into
+    not found"), Task C acceptance P3: under a pending cache recovery the session
+    modal's route answered a generic 500 ("session detail failed") while the
+    block route answered its typed 503. Detects a session route that reports
+    a store the owner is resolving as a server fault (or as not found),
+    instead of the retryable 503 with ``Retry-After`` the block route sends;
+    a refusal for corruption keeps today's 500."""
+    ns = load_script()
+    srv = _start_dashboard_server(ns, tmp_path, monkeypatch)
+    core = ns["_cctally_core"]
+    db = sys.modules["_cctally_db"]
+    cache_path = pathlib.Path(core.CACHE_DB_PATH)
+    claim = None
+    if state == "recovery_pending":
+        # A dead owner's marker (R32-1): the owner recovers it; a live
+        # owner's is maintenance instead.
+        claim = db._repair_marker_path(cache_path)
+        claim.write_text(json.dumps({
+            "version": db._REPAIR_OWNER_VERSION, "pid": _reaped_pid(),
+            "process_start": "proc:1", "claim_id": "test-dead"}))
+    else:
+        def corrupt(*_a, **_k):
+            raise core.StoreUnavailable("file is not a database",
+                                        store="cache", reason="corrupt")
+
+        # The handler resolves the builder through the cctally module.
+        monkeypatch.setattr(sys.modules["cctally"],
+                            "_tui_build_session_detail", corrupt)
+    port = srv.server_address[1]
+    try:
+        c = HTTPConnection("127.0.0.1", port,
+                           timeout=PRESENCE_BACKSTOP_SECONDS)
+        try:
+            c.request("GET", "/api/session/some-session")
+            r = c.getresponse()
+            status, raw, headers = r.status, r.read(), dict(r.getheaders())
+        finally:
+            c.close()
+    finally:
+        if claim is not None:
+            claim.unlink(missing_ok=True)
+        stop(srv, srv._test_thread)
+    if state == "recovery_pending":
+        assert status == 503, (status, raw)
+        assert json.loads(raw) == {"error": "session detail unavailable"}
+        assert headers.get("Retry-After") == "1", headers
+    else:
+        assert status == 500, (status, raw)

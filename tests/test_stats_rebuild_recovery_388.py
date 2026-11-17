@@ -75,6 +75,7 @@ spec = importlib.util.spec_from_loader("cctally", loader)
 module = importlib.util.module_from_spec(spec)
 sys.modules["cctally"] = module
 loader.exec_module(module)
+sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
 import _cctally_db
 _cctally_db._would_block_prod_stats = lambda _path: True
 raise SystemExit(module.main(argv))
@@ -207,6 +208,7 @@ spec = importlib.util.spec_from_loader("cctally", loader)
 module = importlib.util.module_from_spec(spec)
 sys.modules["cctally"] = module
 loader.exec_module(module)
+sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
 import _cctally_journal
 import _cctally_store
 with _cctally_store.stats_write_scope("test-independent-rebuild"):
@@ -241,6 +243,7 @@ spec = importlib.util.spec_from_loader("cctally", loader)
 module = importlib.util.module_from_spec(spec)
 sys.modules["cctally"] = module
 loader.exec_module(module)
+sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
 import _cctally_core
 conn = _cctally_core.open_db(_target_path=target)
 conn.close()

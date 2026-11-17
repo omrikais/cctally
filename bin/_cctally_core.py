@@ -11,8 +11,10 @@ and the only legal monkeypatch target for the 23 promoted globals listed
 below. See docs/superpowers/specs/2026-05-22-cctally-core-data-globals.md.
 """
 from __future__ import annotations
+import contextlib
 import contextvars
 import datetime as dt
+import errno
 import math
 import os
 import pathlib
@@ -954,6 +956,9 @@ def ensure_dirs() -> None:
         os.chmod(APP_DIR, 0o700)
     except OSError as exc:
         eprint(f"[core] could not chmod data dir 0700 ({exc}); continuing")
+        _record_data_dir_access_after_chmod(exc)
+    else:
+        _record_data_dir_access_after_chmod(None)
     # #496 S6 §9.4: LOG_DIR was created at the umask and was drwxr-xr-x, the
     # same class of defect as the 0644 stats family. It holds corruption
     # forensics bundles and rebuild records, which name paths and carry damage
@@ -962,6 +967,142 @@ def ensure_dirs() -> None:
         os.chmod(LOG_DIR, 0o700)
     except OSError as exc:
         eprint(f"[core] could not chmod log dir 0700 ({exc}); continuing")
+
+
+#: AD20 (#787 / #861 spec revision 16): the owner's record that this data
+#: directory's filesystem did not take the 0700 mode (exFAT, FAT, SMB).
+DATA_DIR_ACCESS_RECORD_NAME = "data-dir-access.json"
+_DATA_DIR_ACCESS_FIELDS = ("st_dev", "st_ino", "st_mode", "st_uid")
+#: The ``chmod`` errnos by which a filesystem refuses modes outright (AD20
+#: revision 20); ENOTSUP and EOPNOTSUPP are one value on Linux, two on macOS.
+_DATA_DIR_MODE_REFUSED_ERRNOS = frozenset(
+    getattr(errno, name) for name in ("EPERM", "ENOTSUP", "EOPNOTSUPP")
+    if hasattr(errno, name))
+
+
+def data_dir_access_record_path() -> pathlib.Path:
+    return APP_DIR / DATA_DIR_ACCESS_RECORD_NAME
+
+
+def _record_data_dir_access_after_chmod(chmod_error: "OSError | None") -> None:
+    """The AD20 minting rule (revision 20) for an owner that just tried
+    ``chmod(APP_DIR, 0o700)``: ``chmod_error`` is what it raised, or ``None``.
+
+    Linux ``vfat``/``exfat`` mounted without ``quiet`` refuse mode changes
+    with ``EPERM``/``ENOTSUP``/``EOPNOTSUPP``, which on a user-owned
+    directory shows the filesystem does not enforce modes (on an enforcing
+    one the owner gets ``EPERM`` only from an immutable flag or a sandbox,
+    neither of which lets another user loosen it), so the record is decided
+    as after a successful ``chmod``. Any other ``OSError`` (``EIO``,
+    ``EACCES``, ...) is an ordinary hardening failure: nothing is minted or
+    removed, so query sessions keep refusing the directory."""
+    if chmod_error is None or chmod_error.errno in _DATA_DIR_MODE_REFUSED_ERRNOS:
+        _record_data_dir_access()
+
+
+def _record_data_dir_access() -> None:
+    """The owner half of the AD20 access policy, run by `ensure_dirs()` after
+    its ``chmod(0o700)`` returned success or raised ``EPERM``, ``ENOTSUP`` or
+    ``EOPNOTSUPP`` (any other ``chmod`` error mints nothing).
+
+    It re-stats the data directory. A user-owned directory that still
+    carries group or other bits after that ``chmod`` is on a filesystem
+    that ignores or refuses modes, so the owner records the directory's ``st_dev``, ``st_ino``,
+    ``st_mode`` and ``st_uid`` in `data-dir-access.json` (user-owned, 0600,
+    atomic replace); query sessions accept that directory only while the
+    record still matches it. A directory whose mode took gets any such
+    record removed. Best-effort like the chmod: an OSError is reported and
+    the owner continues (a missing record only makes queries refuse, and the
+    next owner start retries)."""
+    import json
+
+    record = data_dir_access_record_path()
+    try:
+        st = os.stat(APP_DIR)
+    except OSError:
+        return
+    if st.st_uid != os.geteuid():
+        return
+    if (st.st_mode & 0o077) == 0:
+        try:
+            record.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            eprint(f"[core] could not remove {record.name} ({exc}); "
+                   "continuing")
+        return
+    payload = {name: getattr(st, name) for name in _DATA_DIR_ACCESS_FIELDS}
+    try:
+        with open(record, "rb") as fh:
+            if json.loads(fh.read(4096)) == payload:
+                return
+    except (OSError, ValueError):
+        pass
+    tmp = record.with_name(f".{record.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                     | getattr(os, "O_CLOEXEC", 0), 0o600)
+        try:
+            os.write(fd, json.dumps(payload, sort_keys=True).encode())
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+        os.replace(tmp, record)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        eprint(f"[core] could not record data dir access ({exc}); "
+               "continuing")
+
+
+def data_dir_access_ok() -> bool:
+    """The query half of AD20 (spec 5.4): whether a reader-created sidecar
+    is acceptable in the data directory. Accepted when the directory is
+    user-owned with no group or other bits, or user-owned with a user-owned
+    `data-dir-access.json` whose ``st_dev``, ``st_ino`` and ``st_mode``
+    equal the directory's now. The record is judged through its opened
+    descriptor (``O_RDONLY | O_NOFOLLOW``, then ``fstat`` on that
+    descriptor: a user-owned regular file), so a symlink or a file swapped
+    in after a path check is never trusted. Effect-free: ``os.stat`` calls
+    and one small read, no chmod and no write."""
+    import json
+    import stat as _stat
+
+    try:
+        st = os.stat(APP_DIR)
+    except OSError:
+        return False
+    if not _stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        return False
+    if (st.st_mode & 0o077) == 0:
+        return True
+    record = data_dir_access_record_path()
+    try:
+        # O_NONBLOCK: a FIFO planted at the path must not hang the check
+        # (it has no effect on the regular file the check accepts).
+        fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return False
+    try:
+        rst = os.fstat(fd)
+        if not _stat.S_ISREG(rst.st_mode) or rst.st_uid != os.geteuid():
+            return False
+        data = json.loads(os.read(fd, 4096))
+    except (OSError, ValueError):
+        return False
+    finally:
+        os.close(fd)
+    if not isinstance(data, dict):
+        return False
+    return all(data.get(name) == getattr(st, name)
+               for name in ("st_dev", "st_ino", "st_mode"))
 
 
 # === stats.db maintenance-hold tracking (#386) ======================
@@ -1157,6 +1298,903 @@ def note_attribution_apply_cache_flocks_released() -> None:
     """Clamped at zero, for the reason the maintenance twin above states."""
     _ATTRIBUTION_APPLY_CACHE_FLOCKS_HELD.set(
         max(0, _ATTRIBUTION_APPLY_CACHE_FLOCKS_HELD.get() - 1))
+
+
+# === #787 / #861 store authority (spec 5.1–5.5) ===========================
+#
+# Query, writer, startup and maintenance authority over stats.db, cache.db
+# and conversations.db are separated by a capability check at every owner
+# entry point (`require_capability`) and by a composed authorizer on every
+# query connection (`_cctally_store_access`). The state lives HERE, in the
+# kernel, for the reason the #386 sanction above states: `load_script()`
+# reloads every sibling but never this module, so a scope entered before a
+# reload keeps its authority.
+#
+# An authority is bound to the process id AND the thread ident that
+# established it (spec 5.1, AD16, plan D1). A new thread or a forked child
+# therefore sees no authority even where contexts are inherited
+# (`Thread(context=…)`, free-threaded builds, a fork without exec), and an
+# at-fork handler additionally clears all three ContextVars in the child.
+
+CAPABILITIES = frozenset({
+    "READ", "METADATA", "INGEST_CURRENT", "WRITE", "STARTUP",
+    "MAINTENANCE", "LAUNCH",
+})
+
+#: The 5.1 table. `writer`, `startup` and `maintenance` stay defined as
+#: narrowing scopes, but nothing narrows to them in this work: a full
+#: opener's branches need several capabilities at once.
+AUTHORITY_CAPABILITIES = {
+    "query": frozenset({"READ"}),
+    "diagnostic": frozenset({"READ", "METADATA"}),
+    "request_writer": frozenset({"READ", "INGEST_CURRENT"}),
+    "writer": frozenset({"READ", "INGEST_CURRENT", "WRITE"}),
+    "startup": frozenset({"READ", "STARTUP"}),
+    "maintenance": frozenset({"READ", "MAINTENANCE", "LAUNCH"}),
+    "process": CAPABILITIES,
+}
+
+#: AD7 / O5: a user command's owner-side cache/conversations maintenance
+#: admission is bounded per open by this many seconds. The dispatcher's
+#: classification and the guarded openers' use of it land in part 2.
+_CLI_OWNER_MAINTENANCE_WAIT_S = 5.0
+
+#: Unspecified authority (`None`) was permitted through landing parts 1–2 and
+#: raises from landing part 3 (spec 5.1, AD5): a thread or process that has
+#: established no authority can reach no owner entry and open no query
+#: session. Read at call time.
+UNSPECIFIED_AUTHORITY_RAISES = True
+
+#: Plan D2: guard-event observers. Empty in production; the Task C recorder
+#: and tests append. Each is called before the decision; an observer's own
+#: exception is swallowed (and reported once) so it never changes it.
+CAPABILITY_OBSERVERS: list = []
+
+#: Admission budgets per policy, in seconds (spec 5.3). Diagnostic uses an
+#: active `bounded_diagnostic_waits` allowance when one is open, else #1005's
+#: 0.5 s Doctor allowance.
+_QUERY_ADMISSION_BUDGET_S = {
+    "interactive": 0.5,
+    "command": 5.0,
+    "diagnostic": 0.5,
+}
+
+STORE_REASONS = (
+    "absent", "maintenance", "schema_behind", "schema_ahead",
+    "recovery_pending", "corrupt", "legacy_bridge_pending", "busy",
+    "unavailable",
+)
+
+#: The refusal reasons today's full opener resolved inline (spec 5.11): an
+#: absent store, a schema behind or ahead, a pending recovery or legacy
+#: bridge. They are the owner's: a query caller tells it (`notify_owner`), a
+#: publisher keeps its last coherent frame and a detail route answers the
+#: retryable 503. Every other reason is one a facade raised before the query
+#: layer (`_cctally_cache._QUERY_READER_FALLBACK_REASONS`), which keeps its
+#: exception path; the two sets partition `STORE_REASONS`.
+OWNER_RESOLVED_REASONS = frozenset({
+    "absent", "schema_behind", "schema_ahead", "recovery_pending",
+    "legacy_bridge_pending",
+})
+
+READINESS_OBLIGATIONS = frozenset({
+    "quota_projection_incomplete", "content_revision_missing",
+    "legacy_migration_pending", "migration_error_sentinel",
+    "codex_maintenance_debt",
+})
+
+
+@dataclass(frozen=True)
+class Authority:
+    kind: str
+    capabilities: frozenset
+    policy: "str | None"
+    pid: int
+    thread_ident: int
+    owner_wait_s: "float | None" = None   # AD7: None = unbounded
+
+
+@dataclass(frozen=True)
+class CapabilityEvent:
+    entry: str
+    capability: str
+    authority: "str | None"
+    permitted: bool
+
+
+class StoreUnavailable(sqlite3.DatabaseError):
+    """A typed refusal of a store (spec 5.5).
+
+    A `sqlite3.DatabaseError`, so every existing handler and the CLI's
+    uncaught-DatabaseError exit keep catching it. The class-level defaults
+    let subclasses (the conversations reader family) keep their one-argument
+    constructors.
+    """
+
+    store: str = "unknown"
+    reason: str = "unavailable"
+
+    def __init__(self, message: str = "", *, store: "str | None" = None,
+                 reason: "str | None" = None):
+        super().__init__(message)
+        if store is not None:
+            self.store = store
+        if reason is not None:
+            self.reason = reason
+
+
+def store_refusal_text(exc: BaseException) -> str:
+    """How a human-readable surface names a store refusal (#787 / #861
+    Q-W1): a refusal the query layer minted renders only the existing
+    sentence ``<store>.db could not be read``. Corruption keeps its text
+    (SQLite's own), maintenance keeps its existing sentence, and a refusal
+    that carries SQLite's own text (``sqlite_text``) keeps it. Every other
+    exception renders as before (``str(exc)``). The specific reason and
+    detail go to the debug log here, and to ``--json`` through
+    `store_refusal_record`."""
+    if (isinstance(exc, StoreUnavailable)
+            and getattr(exc, "query_refusal", False)
+            and exc.reason not in ("corrupt", "maintenance")
+            and not getattr(exc, "sqlite_text", False)):
+        try:
+            import _lib_log
+            if _lib_log.debug_enabled():
+                _lib_log.get_logger("store").debug(
+                    "%s.db refused (%s): %s", exc.store, exc.reason, exc)
+        except Exception:  # noqa: BLE001 — logging never changes the text
+            pass
+        return f"{exc.store}.db could not be read"
+    return str(exc)
+
+
+def store_refusal_record(exc: BaseException) -> "dict | None":
+    """The additive ``--json`` record of a query-layer refusal (Q-W1):
+    ``{"store", "reason", "detail"}``, or None for any other exception."""
+    if (isinstance(exc, StoreUnavailable)
+            and getattr(exc, "query_refusal", False)):
+        return {"store": exc.store, "reason": exc.reason, "detail": str(exc)}
+    return None
+
+
+class QueryAuthorityViolation(BaseException):
+    """An owner operation reached without the capability it needs (AD4).
+
+    A BaseException, like `StatsEpochRebuildDeferred`, so an `except
+    Exception` around a facade can never turn it into an empty success.
+    """
+
+    def __init__(self, entry: str, capability: str,
+                 authority: "str | None"):
+        super().__init__(
+            f"{entry} requires {capability}; current authority is "
+            f"{authority or 'unspecified'}")
+        self.entry = entry
+        self.capability = capability
+        self.authority = authority
+
+
+@dataclass(frozen=True)
+class Readiness:
+    store: str
+    readable: bool
+    reason: "str | None"          # a STORE_REASONS value when not readable
+    obligations: frozenset        # owner work outstanding on a readable store
+
+
+class ViolationLatch:
+    """One operation's record of capability refusals and authorizer denials.
+
+    A nested boundary forwards every record to its enclosing latch, so a
+    publication around a nested unit (an HTTP response around a snapshot
+    build) still refuses.
+    """
+
+    __slots__ = ("name", "_events", "_parent", "_lock")
+
+    def __init__(self, name: str, parent: "ViolationLatch | None" = None):
+        import threading as _threading
+        self.name = name
+        self._events: list = []
+        self._parent = parent
+        self._lock = _threading.Lock()
+
+    @property
+    def violated(self) -> bool:
+        return bool(self._events)
+
+    @property
+    def events(self) -> tuple:
+        with self._lock:
+            return tuple(self._events)
+
+    def record(self, event: CapabilityEvent) -> None:
+        with self._lock:
+            self._events.append(event)
+        if self._parent is not None:
+            self._parent.record(event)
+
+
+_STORE_AUTHORITY = contextvars.ContextVar("cctally_store_authority",
+                                          default=None)
+_STORE_DEADLINE = contextvars.ContextVar("cctally_store_deadline",
+                                         default=None)
+_VIOLATION_LATCH = contextvars.ContextVar("cctally_violation_latch",
+                                          default=None)
+#: The current read unit's admission budget (5.3, AD29), an
+#: `AdmissionBudget` owned by the thread and process that created it.
+_ADMISSION_BUDGET = contextvars.ContextVar("cctally_admission_budget",
+                                           default=None)
+#: The admission running in this context (AD29), an `_ActiveAdmission`: a
+#: nested admission on its owning thread uses its absolute deadline and
+#: debits nothing.
+_ADMISSION_ACTIVE = contextvars.ContextVar("cctally_admission_active",
+                                           default=None)
+
+
+_REQUEST_INGEST = contextvars.ContextVar("cctally_request_ingest",
+                                         default=None)
+
+
+#: Scope exits whose token was made in another context (F5), newest last:
+#: the variable's name. Bounded; read by tests and diagnostics.
+CROSS_CONTEXT_RESETS: list = []
+_CROSS_CONTEXT_RESETS_MAX = 64
+
+
+def _reset_scope_var(var: "contextvars.ContextVar", token) -> None:
+    """Restore `var` on a scope's exit. A token made in another context (a
+    scope entered inside a copied context, or on another thread, and exited
+    here) cannot be reset in this one; writing None would clear a value this
+    scope never set (another scope's authority, latch, deadline or request
+    scope). The current value is left as it is and the event is recorded."""
+    try:
+        var.reset(token)
+    except ValueError:
+        if len(CROSS_CONTEXT_RESETS) >= _CROSS_CONTEXT_RESETS_MAX:
+            del CROSS_CONTEXT_RESETS[0]
+        CROSS_CONTEXT_RESETS.append(var.name)
+        try:
+            import _lib_log
+            if _lib_log.debug_enabled():
+                _lib_log.get_logger("store").debug(
+                    "%s: scope exited outside the context it was entered "
+                    "in; value left unchanged", var.name)
+        except Exception:  # noqa: BLE001 — recording never changes the exit
+            pass
+
+
+def _clear_store_context() -> None:
+    """At-fork child handler (AD16, AD29): a forked child starts with no
+    authority, no deadline, no admission budget, no latch and no
+    request-ingest scope."""
+    _STORE_AUTHORITY.set(None)
+    _STORE_DEADLINE.set(None)
+    _ADMISSION_BUDGET.set(None)
+    _ADMISSION_ACTIVE.set(None)
+    _VIOLATION_LATCH.set(None)
+    _REQUEST_INGEST.set(None)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_clear_store_context)
+
+
+def current_authority() -> "Authority | None":
+    """The authority this thread of this process established, or None (D1)."""
+    import threading as _threading
+    a = _STORE_AUTHORITY.get()
+    if a is None:
+        return None
+    if a.pid != os.getpid() or a.thread_ident != _threading.get_ident():
+        return None
+    return a
+
+
+def _record_violation(event: CapabilityEvent) -> None:
+    latch = _VIOLATION_LATCH.get()
+    if latch is not None:
+        latch.record(event)
+
+
+def record_authorizer_denial(session_tag: str, action: str) -> None:
+    """Record a query-authorizer denial in the operation's latch (5.2).
+
+    Called from inside the SQLite authorizer callback, before SQLite turns the
+    denial into `sqlite3.DatabaseError: not authorized`.
+    """
+    a = current_authority()
+    _record_violation(CapabilityEvent(
+        entry=session_tag, capability="WRITE",
+        authority=a.kind if a is not None else None, permitted=False))
+
+
+_OBSERVER_FAILURE_REPORTED = False
+
+
+def _notify_capability_observers(event: CapabilityEvent) -> None:
+    global _OBSERVER_FAILURE_REPORTED
+    for observer in list(CAPABILITY_OBSERVERS):
+        try:
+            observer(event)
+        except Exception as exc:
+            if not _OBSERVER_FAILURE_REPORTED:
+                _OBSERVER_FAILURE_REPORTED = True
+                try:
+                    print(f"cctally: capability observer failed: {exc}",
+                          file=sys.stderr)
+                except Exception:
+                    pass
+
+
+def require_capability(capability: str, *, entry: str) -> None:
+    """Refuse `entry` before any side effect unless the current authority
+    holds `capability` (spec 5.1, 5.2).
+
+    Called in the entry point's own frame. With no authority established it
+    permits while `UNSPECIFIED_AUTHORITY_RAISES` is False (landing parts 1–2).
+    A refusal is recorded in the operation's violation latch before raising.
+    """
+    if capability not in CAPABILITIES:
+        raise ValueError(f"unknown store capability {capability!r}")
+    a = current_authority()
+    if a is None:
+        permitted = not UNSPECIFIED_AUTHORITY_RAISES
+    else:
+        permitted = capability in a.capabilities
+    event = CapabilityEvent(entry=entry, capability=capability,
+                            authority=a.kind if a is not None else None,
+                            permitted=permitted)
+    _notify_capability_observers(event)
+    if not permitted:
+        _record_violation(event)
+        raise QueryAuthorityViolation(entry, capability, event.authority)
+
+
+def has_capability(capability: str) -> bool:
+    """Effect-free predicate twin of `require_capability`: no observer call,
+    no latch record. For branch classification before a guarded branch."""
+    a = current_authority()
+    if a is None:
+        return not UNSPECIFIED_AUTHORITY_RAISES
+    return capability in a.capabilities
+
+
+def _tighter_wait(outer: "float | None", inner: "float | None"):
+    if outer is None:
+        return inner
+    if inner is None:
+        return outer
+    return min(outer, inner)
+
+
+class _AuthorityScope:
+    """Context manager behind `establish_authority` / `authority_scope`."""
+
+    def __init__(self, kind, policy, owner_wait_s, establish):
+        if kind not in AUTHORITY_CAPABILITIES:
+            raise ValueError(f"unknown store authority {kind!r}")
+        self._kind = kind
+        self._policy = policy
+        self._owner_wait_s = owner_wait_s
+        self._establish = establish
+        self._token = None
+
+    def __enter__(self) -> Authority:
+        import threading as _threading
+        caps = AUTHORITY_CAPABILITIES[self._kind]
+        cur = current_authority()
+        wait = self._owner_wait_s
+        if cur is not None:
+            base = cur.capabilities
+            wait = _tighter_wait(cur.owner_wait_s, self._owner_wait_s)
+        elif self._establish or not UNSPECIFIED_AUTHORITY_RAISES:
+            base = CAPABILITIES
+        else:
+            base = frozenset()
+        if not caps <= base:
+            missing = sorted(caps - base)[0]
+            event = CapabilityEvent(
+                entry=f"authority_scope({self._kind})", capability=missing,
+                authority=cur.kind if cur is not None else None,
+                permitted=False)
+            _record_violation(event)
+            raise QueryAuthorityViolation(event.entry, missing,
+                                          event.authority)
+        authority = Authority(
+            kind=self._kind, capabilities=caps, policy=self._policy,
+            pid=os.getpid(), thread_ident=_threading.get_ident(),
+            owner_wait_s=wait)
+        self._token = _STORE_AUTHORITY.set(authority)
+        return authority
+
+    def __exit__(self, *exc) -> bool:
+        if self._token is not None:
+            _reset_scope_var(_STORE_AUTHORITY, self._token)
+            self._token = None
+        return False
+
+
+def establish_authority(kind: str, *, policy: "str | None" = None,
+                        owner_wait_s: "float | None" = None):
+    """Establish `kind` at a thread or process entry (spec 5.1).
+
+    On a thread that already holds an authority it behaves exactly as
+    `authority_scope` (narrowing only)."""
+    return _AuthorityScope(kind, policy, owner_wait_s, establish=True)
+
+
+def establish_script_owner() -> None:
+    """A maintainer script (a fixture builder, a bench, a measurement tool)
+    that path-loads ``bin/cctally`` and calls its functions in-process is a
+    process owner, exactly like the CLI main thread (spec 5.1): establish
+    ``process`` on the calling thread for the rest of its life. A thread that
+    already holds an authority (a test under the D5 fixture) is left as it
+    is."""
+    if current_authority() is None:
+        establish_authority("process").__enter__()
+
+
+def authority_handoff() -> "tuple[str, str | None, float | None] | None":
+    """The current authority as a picklable ``(kind, policy, owner_wait_s)``
+    for a thread or child process that works on this one's behalf (spec 5.1
+    "New threads and forked children start empty"), or ``None``."""
+    a = current_authority()
+    return None if a is None else (a.kind, a.policy, a.owner_wait_s)
+
+
+def establish_handoff(handoff):
+    """Establish, at a helper thread's or child process's entry, the
+    authority `authority_handoff()` captured on the thread it works for:
+    the same kind, never a wider one. ``None`` establishes nothing, so the
+    helper stays unspecified exactly like its originator."""
+    if handoff is None:
+        return contextlib.nullcontext()
+    kind, policy, owner_wait_s = handoff
+    return establish_authority(kind, policy=policy, owner_wait_s=owner_wait_s)
+
+
+def authority_scope(kind: str, *, policy: "str | None" = None,
+                    owner_wait_s: "float | None" = None):
+    """Narrow to `kind` and restore the enclosing authority on exit.
+
+    A widening raises `QueryAuthorityViolation`. `owner_wait_s` may tighten
+    the AD7 bound (None is unbounded), never loosen it."""
+    return _AuthorityScope(kind, policy, owner_wait_s, establish=False)
+
+
+class _OperationBoundary:
+    def __init__(self, name: str):
+        self._name = name
+        self._token = None
+
+    def __enter__(self) -> ViolationLatch:
+        latch = ViolationLatch(self._name, parent=_VIOLATION_LATCH.get())
+        self._token = _VIOLATION_LATCH.set(latch)
+        return latch
+
+    def __exit__(self, *exc) -> bool:
+        if self._token is not None:
+            _reset_scope_var(_VIOLATION_LATCH, self._token)
+            self._token = None
+        return False
+
+
+def operation_boundary(name: str):
+    """Bind a fresh `ViolationLatch` for one operation (an HTTP request, a
+    snapshot build, a CLI phase, a live-tail cycle, a worker unit)."""
+    return _OperationBoundary(name)
+
+
+def check_publishable() -> None:
+    """Refuse publication when the current operation recorded a violation.
+
+    Called by the HTTP response writer, snapshot publication, share rendering
+    and the CLI dispatcher before exit 0 (spec 5.2)."""
+    latch = _VIOLATION_LATCH.get()
+    if latch is None or not latch.violated:
+        return
+    first = latch.events[0]
+    raise QueryAuthorityViolation(
+        f"publication after {first.entry}", first.capability,
+        first.authority)
+
+
+def _policy_admission_s(policy: str) -> float:
+    """A policy's whole admission allowance (5.3): the table's value, or for
+    diagnostic an open `bounded_diagnostic_waits` allowance's remainder."""
+    if policy not in _QUERY_ADMISSION_BUDGET_S:
+        raise ValueError(f"unknown admission policy {policy!r}")
+    if policy == "diagnostic":
+        allowance = _STATS_DIAGNOSTIC_WAIT_ALLOWANCE.get()
+        if allowance is not None:
+            return max(0.0, float(allowance.remaining_s))
+    return _QUERY_ADMISSION_BUDGET_S[policy]
+
+
+class _OperationDeadline:
+    """An absolute caller deadline (5.3: a tighter caller deadline wins)."""
+
+    def __init__(self, policy: str):
+        if policy not in _QUERY_ADMISSION_BUDGET_S:
+            raise ValueError(f"unknown admission policy {policy!r}")
+        self._policy = policy
+        self._token = None
+
+    def __enter__(self) -> float:
+        import time as _time
+        mine = _time.monotonic() + _policy_admission_s(self._policy)
+        cur = _STORE_DEADLINE.get()
+        if cur is not None and cur <= mine:
+            return cur              # nested: never extended
+        self._token = _STORE_DEADLINE.set(mine)
+        return mine                 # outermost, or a tighter caller deadline
+
+    def __exit__(self, *exc) -> bool:
+        if self._token is not None:
+            _reset_scope_var(_STORE_DEADLINE, self._token)
+            self._token = None
+        return False
+
+
+def operation_deadline(policy: str):
+    """An absolute `time.monotonic()` caller deadline over admission (5.3).
+
+    The outermost entry starts it; a nested entry reuses it and never extends
+    it, and a tighter nested budget wins. Every admission inside it fixes its
+    own deadline no later than this one (AD29)."""
+    return _OperationDeadline(policy)
+
+
+def _owned_here(owner, pid) -> bool:
+    import threading as _threading
+    return pid == os.getpid() and owner is _threading.current_thread()
+
+
+class AdmissionBudget:
+    """One read unit's admission budget (5.3, AD29): the seconds its
+    admissions may still spend. Only admission debits it; statements and the
+    caller's computation never do. It belongs to the thread (and process)
+    that created it: another thread, a context copied onto one, or a forked
+    child that finds it treats it as absent and starts its own."""
+
+    __slots__ = ("policy", "total_s", "_spent_s", "_owner", "_pid")
+
+    def __init__(self, policy: str, total_s: float):
+        import threading as _threading
+        self.policy = policy
+        self.total_s = float(total_s)
+        self._spent_s = 0.0
+        self._owner = _threading.current_thread()
+        self._pid = os.getpid()
+
+    def owned(self) -> bool:
+        return _owned_here(self._owner, self._pid)
+
+    @property
+    def spent_s(self) -> float:
+        return self._spent_s
+
+    @property
+    def remaining_s(self) -> float:
+        return max(0.0, self.total_s - self._spent_s)
+
+    def debit(self, seconds: float) -> None:
+        self._spent_s += max(0.0, float(seconds))
+
+
+def _owned_budget() -> "AdmissionBudget | None":
+    cur = _ADMISSION_BUDGET.get()
+    if isinstance(cur, AdmissionBudget) and cur.owned():
+        return cur
+    return None
+
+
+class _OperationBudget:
+    def __init__(self, policy: str):
+        if policy not in _QUERY_ADMISSION_BUDGET_S:
+            raise ValueError(f"unknown admission policy {policy!r}")
+        self._policy = policy
+        self._token = None
+
+    def __enter__(self) -> AdmissionBudget:
+        cur = _owned_budget()
+        if cur is not None:
+            return cur              # inside a read unit: drawn on, not reset
+        budget = AdmissionBudget(self._policy,
+                                 _policy_admission_s(self._policy))
+        self._token = _ADMISSION_BUDGET.set(budget)
+        return budget
+
+    def __exit__(self, *exc) -> bool:
+        if self._token is not None:
+            _reset_scope_var(_ADMISSION_BUDGET, self._token)
+            self._token = None
+        return False
+
+
+def operation_budget(policy: str):
+    """The read unit's admission budget (5.3, AD29). The outermost query
+    session entered with no budget of its own thread creates one (500 ms
+    interactive, 5 s command, #1005's allowance for diagnostic) and disposes
+    of it at its exit; a session or per-statement reader opened inside the
+    unit draws on it and never resets or extends it. Sequential units each
+    create their own."""
+    return _OperationBudget(policy)
+
+
+def admission_budget() -> "AdmissionBudget | None":
+    """This thread's current read-unit admission budget, or None."""
+    return _owned_budget()
+
+
+class _ActiveAdmission:
+    __slots__ = ("deadline", "_owner", "_pid")
+
+    def __init__(self, deadline: float):
+        import threading as _threading
+        self.deadline = deadline
+        self._owner = _threading.current_thread()
+        self._pid = os.getpid()
+
+    def owned(self) -> bool:
+        return _owned_here(self._owner, self._pid)
+
+
+class _AdmissionScope:
+    def __init__(self, policy: str):
+        if policy not in _QUERY_ADMISSION_BUDGET_S:
+            raise ValueError(f"unknown admission policy {policy!r}")
+        self._policy = policy
+        self._nested = False
+        self._started = None
+        self._budget = None
+        self._active_token = None
+
+    def __enter__(self) -> float:
+        import time as _time
+        active = _ADMISSION_ACTIVE.get()
+        if isinstance(active, _ActiveAdmission) and active.owned():
+            # Inside another admission of this thread (a session opened
+            # while one admits): its absolute deadline, and no debit.
+            self._nested = True
+            return active.deadline
+        now = _time.monotonic()
+        budget = _owned_budget()
+        allowance = _policy_admission_s(self._policy)
+        if budget is not None:
+            allowance = min(allowance, budget.remaining_s)
+        deadline = now + allowance
+        caller = _STORE_DEADLINE.get()
+        if caller is not None and caller < deadline:
+            deadline = caller       # a tighter caller deadline wins
+        self._budget = budget
+        self._started = now
+        self._active_token = _ADMISSION_ACTIVE.set(_ActiveAdmission(deadline))
+        return deadline
+
+    def __exit__(self, *exc) -> bool:
+        import time as _time
+        if self._nested:
+            return False
+        try:
+            if self._budget is not None and self._started is not None:
+                self._budget.debit(_time.monotonic() - self._started)
+        finally:
+            if self._active_token is not None:
+                _reset_scope_var(_ADMISSION_ACTIVE, self._active_token)
+                self._active_token = None
+        return False
+
+
+def admission_scope(policy: str):
+    """One admission (5.3, AD29). Its effective absolute deadline is fixed at
+    entry as the earlier of now plus the read unit's remaining budget and
+    any tighter caller deadline (`operation_deadline`), and every lock
+    attempt, retry sleep, connect, readiness read, AD19 probe and AD23
+    journal wait inside it reads that deadline. Its elapsed time is debited
+    once, at exit, to the budget captured at entry, whether it succeeded or
+    failed. An admission nested inside another on the same thread uses the
+    enclosing deadline and debits nothing."""
+    return _AdmissionScope(policy)
+
+
+def admission_deadline() -> "float | None":
+    """The absolute `time.monotonic()` deadline every wait reads (5.3, AD29):
+    the effective deadline of the admission this thread is running, or
+    outside one an absolute caller deadline (`operation_deadline`), or None.
+    A caller deadline entered inside a running admission tightens it, never
+    loosens it: the earlier of the two is returned. A foreign admission (one
+    a copied context carried from another thread or a parent process) is no
+    admission here."""
+    caller = _STORE_DEADLINE.get()
+    active = _ADMISSION_ACTIVE.get()
+    if isinstance(active, _ActiveAdmission) and active.owned():
+        if caller is not None and caller < active.deadline:
+            return caller
+        return active.deadline
+    return caller
+
+
+def remaining_deadline() -> "float | None":
+    """Seconds left on `admission_deadline()`, or None when there is none."""
+    import time as _time
+    d = admission_deadline()
+    if d is None:
+        return None
+    return max(0.0, d - _time.monotonic())
+
+
+def _immutable_header_probe(path) -> "tuple[str, int | None]":
+    """``("absent" | "invalid" | "ok", user_version)`` of a store's main file.
+
+    Read through an ``immutable=1`` SQLite connection, never a raw descriptor:
+    the unix VFS defers closing its descriptor while another connection of
+    this process holds a lock on the same inode, so the probe releases no
+    POSIX lock, and an immutable open creates no sidecar."""
+    p = pathlib.Path(path)
+    try:
+        if not p.exists():
+            return ("absent", None)
+    except OSError:
+        return ("invalid", None)
+    try:
+        probe = sqlite3.connect(p.resolve().as_uri() + "?mode=ro&immutable=1",
+                                uri=True)
+    except sqlite3.Error:
+        return ("invalid", None)
+    try:
+        version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+        probe.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        return ("ok", version)
+    except (sqlite3.Error, TypeError, ValueError):
+        return ("invalid", None)
+    finally:
+        probe.close()
+
+
+def full_open_branch_capability(store: str, path, *, head: int,
+                                recovery_paths=()) -> "str | None":
+    # ``recovery_paths`` may be a zero-argument callable, evaluated only when
+    # an authority is established, so the unauthorized hot path lists nothing.
+    """The capability a full opener's branch will need, decided effect-free
+    BEFORE the opener's first file effect (spec 5.1, Task 1).
+
+    Returns None when no authority is established and unspecified authority
+    is permitted, so landing parts 1–2 pay no probe and behave byte for byte
+    as before. Otherwise: an absent store or one behind/ahead of head is a
+    STARTUP branch, a repair/recovery artifact or an unreadable header a
+    MAINTENANCE branch, a post-legacy non-current stats epoch the LAUNCH
+    (epoch deferral) branch, and a current store the WRITE steady state. The
+    opener re-checks in-branch, so a race only ever narrows to a refusal."""
+    if current_authority() is None and not UNSPECIFIED_AUTHORITY_RAISES:
+        return None
+    if callable(recovery_paths):
+        recovery_paths = recovery_paths()
+    for candidate in recovery_paths:
+        try:
+            if pathlib.Path(candidate).exists():
+                return "MAINTENANCE"
+        except OSError:
+            return "MAINTENANCE"
+    state, version = _immutable_header_probe(path)
+    if state == "absent":
+        return "STARTUP"
+    if state == "invalid":
+        return "MAINTENANCE"
+    if store == "stats":
+        if version == STATS_INDEX_EPOCH:
+            return "WRITE"
+        if version > LEGACY_STATS_HEAD:
+            return "LAUNCH"
+        return "STARTUP"
+    return "WRITE" if version == head else "STARTUP"
+
+
+class RequestIngestState:
+    """One request entry's scope (spec 5.9): the full sync it delegates to
+    checks INGEST_CURRENT instead of WRITE, and every owner duty that sync
+    would otherwise perform (a worker request, a retention prune after a
+    from-zero replay, the quota-index rebuild request) is recorded here as a
+    pending reason for the owner instead."""
+
+    __slots__ = ("entry", "pending")
+
+    def __init__(self, entry: str):
+        self.entry = entry
+        self.pending: set = set()
+
+
+class _RequestIngestScope:
+    def __init__(self, entry: str):
+        self._entry = entry
+        self._token = None
+
+    def __enter__(self) -> RequestIngestState:
+        state = RequestIngestState(self._entry)
+        self._token = _REQUEST_INGEST.set(state)
+        return state
+
+    def __exit__(self, *exc) -> bool:
+        if self._token is not None:
+            _reset_scope_var(_REQUEST_INGEST, self._token)
+            self._token = None
+        return False
+
+
+def request_ingest_scope(entry: str):
+    """Entered only by a request entry point after its own INGEST_CURRENT
+    check; `entry` names the full sync it delegates to."""
+    return _RequestIngestScope(entry)
+
+
+def current_request_ingest(entry: str) -> "RequestIngestState | None":
+    """The active request scope delegating to `entry`, or None."""
+    state = _REQUEST_INGEST.get()
+    if state is None or state.entry != entry:
+        return None
+    return state
+
+
+def sync_capability(entry: str) -> str:
+    """WRITE for a full sync; INGEST_CURRENT when `entry` runs as the
+    restricted body of a request entry point (spec 5.9)."""
+    return "INGEST_CURRENT" if current_request_ingest(entry) else "WRITE"
+
+
+# Owner attention (plan D3, spec 5.5 Notification). In-memory only: the
+# dashboard registers its wake callbacks; CLI, TUI and hooks register none,
+# so `notify_owner` is a no-op there (their own startup/refresh drains).
+_OWNER_ATTENTION_CALLBACKS: list = []
+_OWNER_ATTENTION_LAST: dict = {}
+_OWNER_ATTENTION_COALESCE_S = 0.25
+
+
+def register_owner_attention(cb) -> "Any":
+    """Register `cb(store, readiness)`; returns an unregister function."""
+    _OWNER_ATTENTION_CALLBACKS.append(cb)
+
+    def unregister() -> None:
+        try:
+            _OWNER_ATTENTION_CALLBACKS.remove(cb)
+        except ValueError:
+            pass
+    return unregister
+
+
+#: AD28 (#787 / #861 spec rev 25): the Doctor-only owner obligation. Not a
+#: store obligation (no store's readiness ever carries it): the envelope's
+#: backstop reports it under this pseudo-store when it meets a snapshot with
+#: no Doctor block outside an owner, and the dashboard's owners recompute
+#: the block (the next build; under `--no-sync`, the obligation thread).
+DOCTOR_OWNER_STORE = "doctor"
+DOCTOR_OWNER_OBLIGATION = "doctor_payload_pending"
+
+
+def notify_owner(store: str, readiness: Readiness) -> None:
+    """Bounded, coalesced, in-memory owner notification (spec 5.5).
+
+    Never raises into the caller: a query that reports a not-readable state
+    must not fail because a callback did. Identical notifications inside the
+    coalescing window are dropped; every callback is idempotent anyway."""
+    import time as _time
+    if not _OWNER_ATTENTION_CALLBACKS:
+        return
+    key = (store, readiness.readable, readiness.reason,
+           readiness.obligations)
+    now = _time.monotonic()
+    last = _OWNER_ATTENTION_LAST.get(key)
+    if last is not None and now - last < _OWNER_ATTENTION_COALESCE_S:
+        return
+    _OWNER_ATTENTION_LAST[key] = now
+    for cb in list(_OWNER_ATTENTION_CALLBACKS):
+        try:
+            cb(store, readiness)
+        except Exception as exc:
+            try:
+                print(f"cctally: owner attention callback failed: {exc}",
+                      file=sys.stderr)
+            except Exception:
+                pass
 
 
 # === Alerts validation cluster ======================================
@@ -2296,6 +3334,24 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     import importlib
     _cctally_store = importlib.import_module("_cctally_store")
 
+    # #787 spec 5.1: the full opener checks its capability per branch. The
+    # branch is classified effect-free here, before `ensure_dirs()` or any
+    # connect, so a refused open leaves no file effect; each branch below
+    # re-checks in this frame. With no authority established (landing parts
+    # 1-2) the classification is skipped and nothing changes.
+    _branch_cap = full_open_branch_capability(
+        "stats", db_path, head=STATS_INDEX_EPOCH,
+        recovery_paths=lambda: (
+            _cctally_store._stats_repair_marker(db_path),
+            importlib.import_module("_cctally_db")._quarantine_pending_path(
+                db_path),
+            _cctally_store._stats_publication_marker(db_path),
+            *_cctally_store._stats_rebuild_artifact_bases(db_path),
+        ),
+    )
+    if _branch_cap is not None:
+        require_capability(_branch_cap, entry="open_db")
+
     # Alternate targets are private scratch indexes. A rederive preview may
     # open one while the live data directory has never had a logs/ directory;
     # creating that directory would violate the preview's zero-write contract.
@@ -2315,6 +3371,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         and _cctally_store.stats_epoch_enabled()
         and _cctally_store.stats_epoch_rebuild_pending(db_path)
     ):
+        require_capability("LAUNCH", entry="open_db")
         outcome = _cctally_store.defer_stats_epoch_rebuild()
         raise c.StatsEpochRebuildDeferred(outcome)
     # #386: the opener half of the physical-replacement protocol. This replaces
@@ -2373,6 +3430,8 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         heal_enabled = (
             os.environ.get("CCTALLY_TEST_DISABLE_STATS_AUTO_HEAL") != "1"
         )
+        if _target_path is None and heal is not None and heal_enabled:
+            require_capability("MAINTENANCE", entry="open_db")
         if (
             _target_path is None
             and heal is not None
@@ -2436,6 +3495,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             # index published by an older binary (or never installed) gets
             # its content-revision objects here, without an epoch bump.
             _ensure_stats_content_revision(conn, live=_target_path is None)
+            require_capability("WRITE", entry="open_db")
             return conn
         if _target_path is None:
             if _uv > LEGACY_STATS_HEAD:
@@ -2446,6 +3506,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                 # fail promptly; explicit maintenance and the worker itself call
                 # that resolver directly. Corruption/legacy paths stay disjoint.
                 conn.close()
+                require_capability("LAUNCH", entry="open_db")
                 outcome = _cctally_store.defer_stats_epoch_rebuild()
                 raise c.StatsEpochRebuildDeferred(outcome)
             # _uv <= LEGACY_STATS_HEAD → a pre-journal install: cut over below. A
@@ -2483,6 +3544,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     # It is BELOW the epoch gate deliberately: the steady-state open returns
     # at `_uv == STATS_INDEX_EPOCH` above and never reaches here, so the hot
     # path takes no exclusive lock at all.
+    require_capability("STARTUP", entry="open_db")
     with _cctally_store.stats_open_time_guard(live=_target_path is None):
         # Another opener can win the exclusive guard after this connection's
         # pre-lock epoch read, initialize/cut over the index, and stamp the
@@ -3967,6 +5029,8 @@ def _ensure_stats_content_revision(conn, *, live: bool) -> str:
     """#1050: install or repair stats.db's content-revision objects (the pure
     kernel `_lib_stats_content_revision`, a proven leaf). A `current` store is
     two reads; contention leaves the store as it is for the next open."""
+    # #787 spec 5.1: owner entry, guarded in its own frame.
+    require_capability("STARTUP", entry="_ensure_stats_content_revision")
     import _lib_stats_content_revision
     return _lib_stats_content_revision.ensure_stats_content_revision(
         conn, live=live)

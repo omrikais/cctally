@@ -31,6 +31,7 @@ import ast
 import base64
 import contextlib
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import importlib.machinery
@@ -42,6 +43,7 @@ import random
 import shutil
 import sqlite3
 import sys
+import tempfile
 from typing import NamedTuple
 
 # Three real ids in CLAUDE_MODEL_PRICING (model diversity for the reconcile
@@ -802,6 +804,7 @@ def load_cctally():
     codebase's sibling-load idiom. Reused if already loaded."""
     cached = sys.modules.get("cctally")
     if cached is not None:
+        sys.modules["_cctally_core"].establish_script_owner()
         return cached
     path = pathlib.Path(__file__).resolve().parent / "cctally"
     loader = importlib.machinery.SourceFileLoader("cctally", str(path))
@@ -809,6 +812,8 @@ def load_cctally():
     mod = importlib.util.module_from_spec(spec)
     sys.modules["cctally"] = mod
     loader.exec_module(mod)
+    # #787 / #861 spec 5.1: this script's thread is a process owner.
+    sys.modules["_cctally_core"].establish_script_owner()
     return mod
 
 
@@ -1006,7 +1011,8 @@ PRODUCER_SOURCE_EXCLUSIONS = (
 #: and staleness-proof kernels to 165, and #944's Claude cost attribution
 #: kernel and glue to 167, and #1015's correction-lineage kernel to 168, and
 #: #939's Codex worker attempt records to 169, and #1054's deep-scan
-#: checkpoint kernel to 172 entries (counted on the tuple below).
+#: checkpoint kernel to 172, and #1094's conversation FTS integrity kernel
+#: to 173 entries (counted on the tuple below).
 #: The cost is
 #: independent of corpus scale. Roughly a quarter of recent commits
 #: touch one of these files, and each such change rebuilds any corpus root
@@ -1059,6 +1065,7 @@ PRODUCER_SOURCES = (
     "bin/_cctally_source_analytics.py",
     "bin/_cctally_statusline.py",
     "bin/_cctally_store.py",
+    "bin/_cctally_store_access.py",
     "bin/_cctally_sync_week.py",
     "bin/_cctally_telemetry.py",
     "bin/_cctally_transcript.py",
@@ -1108,6 +1115,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_conversation_anon.py",
     "bin/_lib_conversation_dispatch.py",
     "bin/_lib_conversation_export.py",
+    "bin/_lib_conversation_fts_integrity.py",
     "bin/_lib_conversation_query.py",
     "bin/_lib_conversation_retention.py",
     "bin/_lib_conversation_watch.py",
@@ -1494,14 +1502,66 @@ def _marker_payload(cctally, *, seed, scale, identity_root=None) -> dict:
 _ROOT_SENTINEL = ".bench-fixture-root"
 
 
+_ROOT_SENTINEL_BYTES = (
+    b"Built by bin/build-bench-fixtures.py. This file marks the directory "
+    b"as generator-owned; the builder refuses to build into, or clear, a "
+    b"root that lacks it.\n")
+
+
+def _sentinel_staging_dir(root: pathlib.Path) -> pathlib.Path:
+    """Where the sentinel is staged before its rename: the root's PHYSICAL parent.
+
+    The rename must stay on the root's own filesystem and outside the tree a
+    fingerprint reads. The lexical parent is neither for a symlinked root (it
+    can sit on another filesystem, where `os.replace` fails with EXDEV) nor for
+    `.` (whose lexical parent is the root itself). A root at the top of its
+    filesystem, a mount point, has no such parent, so it is refused before
+    anything is written. A boundary `ismount` cannot see, such as a Linux bind
+    mount of a directory from the same filesystem, is refused by
+    `_write_root_sentinel` when the rename reports EXDEV (#1088).
+    """
+    real = pathlib.Path(root).resolve()
+    if os.path.ismount(real):
+        raise ValueError(
+            f"refusing to build into {root}: it is the top of its own filesystem "
+            f"(a mount point), so its {_ROOT_SENTINEL} sentinel cannot be published "
+            "by a rename from outside it. Point --out at a directory inside it.")
+    return real.parent
+
+
 def _write_root_sentinel(root: pathlib.Path) -> None:
-    # The content must stay CONSTANT. A reuse rewrites this file inside a root
-    # other workers have already fingerprinted, so any varying byte would make
-    # the corpus fingerprint report a change on every worker but the last.
-    (root / _ROOT_SENTINEL).write_text(
-        "Built by bin/build-bench-fixtures.py. This file marks the directory "
-        "as generator-owned; the builder refuses to build into, or clear, a "
-        "root that lacks it.\n")
+    # The content must stay CONSTANT: every build and reuse calls this inside a
+    # root other workers have already fingerprinted. A root that already holds
+    # it is left untouched, because an in-place rewrite truncates first and a
+    # fingerprint taken mid-write reads an empty file (#1088). Otherwise it is
+    # written in the root's physical parent, which no fingerprint reads, and
+    # renamed into place, so no reader sees a partial file.
+    path = root / _ROOT_SENTINEL
+    try:
+        if path.read_bytes() == _ROOT_SENTINEL_BYTES:
+            return
+    except FileNotFoundError:
+        pass
+    stage = _sentinel_staging_dir(root)
+    fd, tmp = tempfile.mkstemp(prefix=f".{root.resolve().name}{_ROOT_SENTINEL}.", dir=stage)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(_ROOT_SENTINEL_BYTES)
+        os.chmod(tmp, 0o644)
+        try:
+            os.replace(tmp, path)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            raise ValueError(
+                f"refusing to build into {root}: it is on a different mount than "
+                f"its parent (a bind mount), so its {_ROOT_SENTINEL} sentinel "
+                "cannot be published by a rename from outside it. Point --out at "
+                "a directory inside it.") from exc
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
 
 
 def require_generator_owned(root) -> None:

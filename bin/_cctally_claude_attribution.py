@@ -787,7 +787,7 @@ def _greedy_batches(members, build):
 
 def append_decisions(conn, decisions: Sequence, *, journal_hw,
                      closing_capture: "K.ClosingCapture | None",
-                     evidence: list) -> list:
+                     evidence: list, appended: "list | None" = None) -> list:
     """Make ``decisions`` durable, journal first: append their
     ``claude_cost_account`` batches in ONE ``append_records`` call (fsync),
     then insert them into ``claude_cost_decisions`` on the caller's open
@@ -802,7 +802,12 @@ def append_decisions(conn, decisions: Sequence, *, journal_hw,
     basis, reason, account and closing capture.
 
     Raises ``AttributionJournalUnavailable`` when the append fails; nothing
-    is inserted then."""
+    is inserted then.
+
+    ``appended`` (#1042), when given, receives ``(payload, segment, offset)``
+    for every op once it is durable and before its rows are inserted, so a
+    caller whose transaction later discards those rows can restore them with
+    ``restore_decision_ops``."""
     if not decisions:
         return []
     import _cctally_journal as jr
@@ -832,11 +837,16 @@ def append_decisions(conn, decisions: Sequence, *, journal_hw,
         raise AttributionJournalUnavailable(
             f"the journal could not be written: {exc}") from exc
     start = end - sum(lengths)
-    conflicts = 0
+    ops = []
     for (record, _members), length in zip(batches, lengths):
-        conflicts += _insert_decision_items(
-            conn, record["payload"], segment, start)
+        ops.append((record["payload"], segment, start))
         start += length
+    if appended is not None:
+        appended.extend(ops)
+    conflicts = 0
+    for payload, op_segment, op_offset in ops:
+        conflicts += _insert_decision_items(
+            conn, payload, op_segment, op_offset)
     if conflicts:
         _bump_counter(conn, CONFLICTS_KEY, conflicts, decided_at)
     stored = {}
@@ -848,6 +858,27 @@ def append_decisions(conn, decisions: Sequence, *, journal_hw,
             "WHERE decision_key=?", (key,)).fetchone()
         stored[key] = _stored(row)
     return [stored[key] for key in order]
+
+
+def restore_decision_ops(conn, ops: Sequence) -> int:
+    """Re-apply durable ``claude_cost_account`` ops whose decision rows a
+    rollback discarded (#1042, spec 6.3): each ``(payload, segment, offset)``
+    that ``append_decisions(..., appended=...)`` reported is inserted
+    first-wins through the replay's own insertion, so the restored rows are
+    exactly the rows the next sync's replay would restore. Conflicts are
+    counted as ``append_decisions`` counts them (the rollback discarded that
+    count too) and returned. Runs on the caller's transaction and never
+    commits."""
+    conflicts = 0
+    last_at = None
+    for payload, segment, offset in ops:
+        found = _insert_decision_items(conn, payload, segment, offset)
+        if found:
+            conflicts += found
+            last_at = payload["decided_at"]
+    if conflicts:
+        _bump_counter(conn, CONFLICTS_KEY, conflicts, last_at)
+    return conflicts
 
 
 # --------------------------------------------------------------------------
@@ -926,7 +957,8 @@ def _unlinked_remaining(conn, *, source_paths, after_id) -> bool:
 
 def preserve_unlinked_rows(conn, *, journal_hw,
                            source_paths: "Sequence[str] | None" = None,
-                           after_id: int = 0, limit: "int | None" = None
+                           after_id: int = 0, limit: "int | None" = None,
+                           appended: "list | None" = None
                            ) -> PreserveResult:
     """Link every unlinked ``session_entries`` row (``id > after_id``, at
     most ``limit``, optionally only those of ``source_paths``) in ``id``
@@ -941,7 +973,8 @@ def preserve_unlinked_rows(conn, *, journal_hw,
     Runs on the caller's transaction and never commits, so the caller
     commits the links with whatever progress it records. Raises
     ``AttributionJournalUnavailable`` when an append fails; the caller rolls
-    back, and decisions already appended are recovered by the next replay."""
+    back, and decisions already appended are recovered by the next replay.
+    ``appended`` is passed to ``append_decisions``."""
     if source_paths is not None:
         source_paths = list(source_paths)
         if not source_paths:
@@ -978,7 +1011,8 @@ def preserve_unlinked_rows(conn, *, journal_hw,
                     K.preserved_stamp(row["account_key"]),
                     K.BASIS_PRESERVED, None, False), None)
                  for row, identity in to_export],
-                journal_hw=hw, closing_capture=None, evidence=[])
+                journal_hw=hw, closing_capture=None, evidence=[],
+                appended=appended)
             for (row, _identity), decision in zip(to_export, stored):
                 if decision.account_key == K.preserved_stamp(
                         row["account_key"]):

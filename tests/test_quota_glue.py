@@ -47,6 +47,19 @@ def glue(store):
     return store._load_sibling("_cctally_quota_model")
 
 
+def _fail_query_sessions(monkeypatch):
+    """#787 / #861: the population reads through query sessions, which never
+    call `open_db` on a ready store, so an unopenable store is injected at the
+    session too."""
+    import _cctally_store_access
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(_cctally_store_access.QueryService, "session",
+                        staticmethod(boom))
+
+
 def _stats(ns):
     return _cctally_core.open_db()
 
@@ -184,6 +197,7 @@ def test_an_unopenable_store_is_unavailable_not_an_exception(
         raise sqlite3.OperationalError("unable to open database file")
 
     monkeypatch.setattr(_cctally_core, "open_db", boom)
+    _fail_query_sessions(monkeypatch)
     result = glue.load_population(None, since=None,
                                   now=dt.datetime(2026, 8, 5, tzinfo=UTC),
         era=glue.select_era(dt.datetime(2026, 8, 5, tzinfo=UTC)))
@@ -670,6 +684,7 @@ def test_a_store_failure_withholds_at_exit_three(store, glue, monkeypatch,
         raise sqlite3.OperationalError("unable to open database file")
 
     monkeypatch.setattr(_cctally_core, "open_db", boom)
+    _fail_query_sessions(monkeypatch)
     assert _run(store, glue, "--json") == 3
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "unavailable"

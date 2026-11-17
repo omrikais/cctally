@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import pytest
+import sqlite3
 import pathlib
 import shutil
 import socket as _socket
@@ -106,6 +108,13 @@ def _boot_codex(ns, tmp_path, monkeypatch, *, scenario="modern-full",
     finally:
         conn.close()
     srv = _wire_handler(ns, monkeypatch, no_sync=no_sync)  # loads dashboard + conv
+    # #787 / #861 spec 5.9: the stats cutover invalidates the Codex quota
+    # index (#977 C2), and a live-tail request writer never rebuilds it. The
+    # dashboard's owner sync rebuilds it on its first tick; this harness runs
+    # no sync thread, so it settles the index the same way here.
+    import _cctally_journal as jr
+    with ns["_cctally_core"].establish_authority("process"):
+        jr.ensure_quota_index(budgeted=False)
     if fast:
         _speed_up(monkeypatch)
     return srv, provider_root, rollout, key
@@ -390,6 +399,273 @@ def test_codex_child_discovery_emits_tail(tmp_path, monkeypatch):
                    "child.jsonl") in paths
     finally:
         stop(srv, srv._test_thread)
+
+
+def test_codex_child_discovery_ingests_through_the_request_writer(
+        tmp_path, monkeypatch):
+    """Detects child discovery writing through the stream's reader (#787 /
+    #861 item 1, reproduced): with a read-only reader, the transcript ingest
+    discovery ran on the READER, every write failed (``files_failed``), and the
+    child never joined the watch. Discovery's ingest must run in the writer
+    phase, through the request entry at the request_writer ceiling."""
+    ns = load_script()
+    srv, provider_root, _rollout, parent_key = _boot_codex(
+        ns, tmp_path, monkeypatch, scenario="nested-parent", fast=True)
+    core = ns["_cctally_core"]
+    cache = sys.modules["_cctally_cache"]
+    access = sys.modules["_cctally_store_access"]
+    child = provider_root / "sessions" / "2026" / "07" / "15" / "child.jsonl"
+    calls = []
+    real = cache.sync_codex_conversations
+
+    def recording(conn, **kwargs):
+        if str(child) in set(kwargs.get("only_paths") or ()):
+            a = core.current_authority()
+            calls.append((
+                isinstance(conn, access._QueryConnection),
+                a.kind if a else None,
+                core.current_request_ingest("sync_codex_conversations")
+                is not None))
+        return real(conn, **kwargs)
+
+    monkeypatch.setattr(cache, "sync_codex_conversations", recording)
+    try:
+        s = _open_sse(srv.server_address[1], _events_path(parent_key))
+        try:
+            read_event(s, marker="event: baselined")
+            shutil.copyfile(CORPUS / "nested-child.jsonl", child)
+            read_event(s, marker="event: tail")
+        finally:
+            s.close()
+    finally:
+        stop(srv, srv._test_thread)
+    assert calls, "the child was never ingested"
+    assert all(c == (False, "request_writer", True) for c in calls), calls
+
+
+# ── #787 / #861 spec 5.9: pending owner work, then recovery ─────────────────
+
+_QUOTA_LINE_TEMPLATE = json.loads(
+    (CORPUS / "modern-full.jsonl").read_text().splitlines()[2])
+
+
+def _quota_line():
+    row = json.loads(json.dumps(_QUOTA_LINE_TEMPLATE))
+    row["timestamp"] = "2026-07-15T13:30:00Z"
+    row["payload"]["info"]["rate_limits"]["primary"]["used_percent"] = 61.5
+    return json.dumps(row) + "\n"
+
+
+def _quota_observed(ns):
+    conn = sqlite3.connect(str(ns["_cctally_core"].CACHE_DB_PATH))
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM quota_window_snapshots "
+            "WHERE used_percent=61.5").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
+def _pending_case(case, ns):
+    """Seed ``case``; returns ``(append_line, blocks, drain)``."""
+    core = ns["_cctally_core"]
+    cache = sys.modules["_cctally_cache"]
+    import _cctally_journal as jr
+    if case == "quota_index_missing":
+        # Accounting work only: the transcript tail is not the accounting
+        # cursor's, so it keeps tailing (as on the base), while the quota
+        # observation waits, unlost, for the owner's rebuild and sync.
+        journal = pathlib.Path(core.JOURNAL_DIR)
+        for name in (jr._QUOTA_DEDUP_INDEX_NAME, jr._QUOTA_DEDUP_META_NAME):
+            (journal / name).unlink(missing_ok=True)
+
+        def drain():
+            assert not _quota_observed(ns), "the request rebuilt the index"
+            jr.ensure_quota_index(budgeted=False)
+            c = ns["open_cache_db"]()
+            try:
+                ns["sync_codex_cache"](c)
+            finally:
+                c.close()
+            assert _quota_observed(ns), "the deferred observation was lost"
+        return _quota_line(), False, drain
+    if case == "codex_contract_pending":
+        conn = ns["open_conversations_db"]()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_meta(key,value) VALUES"
+                "('codex_conversation_contract_version','0-stale')")
+            conn.commit()
+        finally:
+            conn.close()
+
+        def drain():
+            ns["open_conversations_db"]().close()
+        return _APPEND_LINE, True, drain
+    if case == "codex_maintenance_debt":
+        conn = sqlite3.connect(str(core.CACHE_DB_PATH))
+        try:
+            conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+                         "VALUES(?, '1')", (cache.CODEX_REPLAY_FROM_ZERO_KEY,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        def drain():
+            c = ns["open_cache_db"]()
+            try:
+                ns["sync_codex_cache"](c)
+            finally:
+                c.close()
+            c = ns["open_conversations_db"]()
+            try:
+                ns["sync_codex_conversations"](c)
+            finally:
+                c.close()
+        return _APPEND_LINE, True, drain
+    if case == "incompatible_stats":
+        # Stats owner work (an epoch rebuild) is never the tail's: the tail
+        # keeps tailing while the stats state stays the owner's.
+        conn = sqlite3.connect(str(core.DB_PATH))
+        try:
+            epoch = int(core.STATS_INDEX_EPOCH)
+            conn.execute(f"PRAGMA user_version={epoch + 1}")
+            conn.commit()
+        finally:
+            conn.close()
+
+        def drain():
+            return None
+        return _APPEND_LINE, False, drain
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case", [
+    "quota_index_missing", "incompatible_stats", "codex_contract_pending",
+    "codex_maintenance_debt"])
+def test_live_tail_pending_and_recovered(tmp_path, monkeypatch, case):
+    """Detects a live-tail request that drains owner work itself (an inline
+    quota-index rebuild, an epoch rebuild, a contract replay, a from-zero
+    replay) or that loses the growth it could not ingest: the cycle reports
+    the work to the owner and emits nothing it has not ingested, and once the
+    owner drains it the same growth is tailed."""
+    ns = load_script()
+    srv, _root, rollout, key = _boot_codex(ns, tmp_path, monkeypatch, fast=True)
+    core = ns["_cctally_core"]
+    events = []
+    notified = []
+    monkeypatch.setattr(core, "CAPABILITY_OBSERVERS", [events.append])
+    unregister = core.register_owner_attention(
+        lambda store, r: notified.append((store, r.obligations)))
+    stats_before = None
+    try:
+        s = _open_sse(srv.server_address[1], _events_path(key))
+        try:
+            read_event(s, marker="event: baselined")
+            line, blocks, drain = _pending_case(case, ns)
+            if case == "incompatible_stats":
+                stats_before = pathlib.Path(core.DB_PATH).read_bytes()
+            with open(rollout, "a", encoding="utf-8") as fh:
+                fh.write(line)
+            if blocks:
+                read_no_event(s, marker="event: tail", window=3.0)
+                assert notified, "the pending work never reached the owner"
+                with core.establish_authority("process"):
+                    drain()
+            read_event(s, marker="event: tail")
+            if not blocks:
+                with core.establish_authority("process"):
+                    drain()
+        finally:
+            s.close()
+    finally:
+        unregister()
+        stop(srv, srv._test_thread)
+    assert all(e.permitted for e in events), [
+        (e.entry, e.capability) for e in events if not e.permitted]
+    request_events = [e for e in events if e.authority == "request_writer"]
+    assert {e.capability for e in request_events} <= {
+        "READ", "INGEST_CURRENT"}, sorted(
+            {(e.entry, e.capability) for e in request_events})
+    if case == "incompatible_stats":
+        assert pathlib.Path(core.DB_PATH).read_bytes() == stats_before
+        assert notified and {s for s, _o in notified} >= {"stats"}, notified
+    else:
+        assert any("codex_maintenance_debt" in o for _s, o in notified), notified
+
+
+@pytest.mark.parametrize("case", [
+    "quota_index_missing", "codex_contract_pending", "codex_maintenance_debt"])
+def test_live_tail_pending_woken_owner_resolves(tmp_path, monkeypatch, case):
+    """#787 / #861 I3b: the dashboard's owner attention closes the loop the
+    test above drives by hand. Detects a sync-mode dashboard in which the
+    pending owner work a live tail reports (a missing quota index, a stale
+    Codex contract, a from-zero replay) is never drained, because the request
+    thread no longer runs the owner work and no owner is woken: the real
+    `_dashboard_owner_attention` wakes the sync loop (and, for Codex debt,
+    the conversations schema owner), no test call drains anything, and the
+    same growth is then tailed.
+
+    The sync loop's iteration here is the owner work the sync thread's build
+    performs for the state (the case's own drain); the conversations half is
+    the real `_wake_schema_writer`."""
+    ns = load_script()
+    srv, _root, rollout, key = _boot_codex(ns, tmp_path, monkeypatch, fast=True)
+    core = ns["_cctally_core"]
+    dash = sys.modules["_cctally_dashboard"]
+    event = threading.Event()
+    monkeypatch.setattr(dash, "_OWNER_ATTENTION_EVENT", event)
+    monkeypatch.setattr(dash, "_OWNER_ATTENTION_NO_SYNC", False)
+    monkeypatch.setattr(dash, "_SCHEMA_WAKE_RUN_DERIVATIONS", True)
+    # Notifications coalesce process-wide; the test above sends the same ones.
+    monkeypatch.setattr(core, "_OWNER_ATTENTION_LAST", {})
+    dash._reset_schema_wake_state()
+    armed = {}
+    passes = []
+    drained = []
+
+    def owner_iteration():
+        passes.append(core.current_authority().kind)
+        drain = armed.get("drain")
+        if drain is not None and case != "codex_contract_pending":
+            drain()
+            drained.append(case)
+
+    stop_loop = threading.Event()
+    loop = threading.Thread(target=dash._owner_thread_target(
+        lambda: dash._dashboard_sync_loop(
+            stop=stop_loop, interval=3600.0, run_iteration=owner_iteration,
+            attention=event)), daemon=True)
+    unregister = core.register_owner_attention(dash._dashboard_owner_attention)
+    loop.start()
+    try:
+        s = _open_sse(srv.server_address[1], _events_path(key))
+        try:
+            read_event(s, marker="event: baselined")
+            line, _blocks, drain = _pending_case(case, ns)
+            armed["drain"] = drain
+            with open(rollout, "a", encoding="utf-8") as fh:
+                fh.write(line)
+            read_event(s, marker="event: tail")
+            # A quota-index deferral does not hold the transcript tail; the
+            # owner still has to be woken to recover the observation.
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline and not (
+                    len(passes) >= 2
+                    and (drained or case == "codex_contract_pending")):
+                time.sleep(0.05)
+        finally:
+            s.close()
+    finally:
+        unregister()
+        stop_loop.set()
+        loop.join(timeout=10)
+        dash._join_schema_wake_thread()
+        stop(srv, srv._test_thread)
+    assert len(passes) >= 2, "the owner was never woken (interval is 1 h)"
+    assert set(passes) == {"process"}, passes
+    if case != "codex_contract_pending":
+        assert drained, "the woken owner did not drain the pending work"
 
 
 # ── dispatch-level preflight unit (all three statuses, no server) ────────────

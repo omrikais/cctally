@@ -2895,6 +2895,12 @@ class _DashboardUpdateCheckThread(threading.Thread):
         self._sync_lock = sync_lock
 
     def run(self) -> None:
+        # #787 / #861 spec 5.1: a dashboard owner thread establishes
+        # `process` at its target entry (a new thread has no authority).
+        with _cctally_core.establish_authority("process"):
+            self._run_loop()
+
+    def _run_loop(self) -> None:
         c = _cctally()
         while not self._stop_event.is_set():
             try:
@@ -2921,7 +2927,7 @@ class _DashboardUpdateCheckThread(threading.Thread):
                     c._do_update_check()
                     if self._hub is not None and self._ref is not None:
                         self._republish_with_fresh_envelope()
-            except Exception as e:
+            except (Exception, _cctally_core.QueryAuthorityViolation) as e:
                 # Log but never propagate — this thread must keep
                 # ticking so a transient registry hiccup doesn't
                 # silently disable the polling cadence for the rest

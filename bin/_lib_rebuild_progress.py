@@ -18,9 +18,16 @@ a detached worker's state file hangs off (spec D9):
 A sink that raises is ignored: progress never fails a rebuild.
 
 ``peak_resident_bytes`` is the process-lifetime peak the rebuild record and the
-worker state report as ``peakResidentBytes`` (spec D11). ``peakHeapBytes``, a
-``tracemalloc`` peak that is zero unless tracing, never saw the memory that
-pushed that rebuild into hours of compression.
+worker state report as ``peakResidentBytes`` (spec D11): this process's own
+resident peak since its exec. macOS reports ``ru_maxrss`` in bytes. Linux
+reads ``VmHWM`` from ``/proc/self/status`` (#1017), the peak of the address
+space created at ``execve``, because Linux's ``ru_maxrss`` also keeps the
+peak of the address space the exec replaced, so a detached worker would
+report the peak of the process that launched it. Without a usable ``VmHWM``,
+Linux falls back to ``ru_maxrss`` in KiB, which can still include an
+ancestor's peak. ``peakHeapBytes``, a ``tracemalloc`` peak that is zero unless
+tracing, never saw the memory that pushed that rebuild into hours of
+compression.
 
 Stdlib only, and importable on its own.
 """
@@ -110,12 +117,49 @@ def waiting(lock: str):
             _emit(True)
 
 
-def peak_resident_bytes() -> int:
-    """``getrusage(RUSAGE_SELF).ru_maxrss`` in bytes.
+#: Where Linux reports this process's ``VmHWM`` (a constant so a test can
+#: point it at an excerpt).
+_PROC_SELF_STATUS = "/proc/self/status"
 
-    macOS reports bytes and Linux reports KiB; the unit is decided per call
-    from ``sys.platform`` so a test can exercise both branches.
+
+def _vm_hwm_bytes() -> "int | None":
+    """``VmHWM`` from ``_PROC_SELF_STATUS`` in bytes, or None when unusable.
+
+    The line must read ``VmHWM: <unsigned decimal> kB`` (three tokens; any
+    spacing and leading zeros). A missing line or any other shape answers
+    None, so missing data never becomes zero; ``0`` itself is a reading.
     """
+    try:
+        with open(_PROC_SELF_STATUS, "rb") as handle:
+            for line in handle:
+                fields = line.split()
+                if not fields or fields[0] != b"VmHWM:":
+                    continue
+                if (len(fields) != 3 or not fields[1].isdigit()
+                        or fields[2] != b"kB"):
+                    return None
+                return int(fields[1]) * 1024
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def peak_resident_bytes() -> int:
+    """This process's own resident peak since its exec, in bytes.
+
+    macOS: ``getrusage(RUSAGE_SELF).ru_maxrss``, which is in bytes. Linux:
+    ``VmHWM``, the high-water mark of the address space created at
+    ``execve``; ``ru_maxrss`` would also carry the pre-exec peak, which for a
+    detached rebuild worker is its launcher's (#1017). When ``VmHWM`` is
+    unavailable or malformed, Linux falls back to ``ru_maxrss`` in KiB, which
+    can still include an ancestor's peak. Elsewhere ``ru_maxrss`` is taken as
+    KiB. The platform is decided per call from ``sys.platform`` so a test can
+    exercise every branch.
+    """
+    if sys.platform.startswith("linux"):
+        hwm = _vm_hwm_bytes()
+        if hwm is not None:
+            return hwm
     peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     if sys.platform == "darwin":
         return peak

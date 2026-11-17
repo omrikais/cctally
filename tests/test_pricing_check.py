@@ -449,6 +449,8 @@ def _seed_cache_with_models(home, claude_models=(), codex_models=(), age_days=1,
     import sqlite3
     cache_path = home / ".local" / "share" / "cctally" / "cache.db"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    cache_path.parent.chmod(0o700)
     cache_path.with_name("cache.db.maintenance.lock").touch()
     anchor = (dt.datetime.now(dt.timezone.utc) if as_of is None
               else dt.datetime.fromisoformat(str(as_of).replace("Z", "+00:00")))
@@ -679,6 +681,41 @@ def test_pricing_check_offline_clean_exit0(tmp_path):
     assert doc["status"] in ("ok", "degraded")
     # --offline must not even attempt the network legs.
     assert doc["existence"]["status"] == "skipped"
+
+
+@pytest.mark.parametrize("cache_state", ["absent", "corrupt"])
+def test_pricing_check_offline_reports_an_unreadable_cache_as_degraded(
+        tmp_path, cache_state):
+    """Accuracy (#787 / #861): a cache.db that exists but cannot be read must
+    not be reported as "all observed models priced"; the coverage leg is
+    unavailable and the check is degraded, with the exit code unchanged. An
+    absent cache has no usage to assess and stays a clean run."""
+    if cache_state == "corrupt":
+        app_dir = tmp_path / ".local" / "share" / "cctally"
+        app_dir.mkdir(parents=True)
+        for d in (tmp_path / ".local", tmp_path / ".local" / "share", app_dir):
+            d.chmod(0o700)
+        (app_dir / "cache.db").write_bytes(b"not a database " * 512)
+    env = {"CCTALLY_AS_OF": _PINNED_AS_OF}
+    js = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path,
+                      extra_env=env)
+    txt = _run_cctally(["pricing-check", "--offline"], home=tmp_path,
+                       extra_env=env)
+    assert (js.returncode, txt.returncode) == (0, 0), (js.stderr, txt.stderr)
+    doc = _json.loads(js.stdout)
+    assert doc["coverage"] == []
+    if cache_state == "corrupt":
+        assert doc["status"] == "degraded", doc
+        assert doc["degraded_components"] == ["cache"], doc
+        assert ("status: degraded \u2014 incomplete check (cache unavailable)"
+                in txt.stdout), txt.stdout
+        assert ("Coverage: unavailable (cache.db could not be read)."
+                in txt.stdout), txt.stdout
+        assert "all observed models priced" not in txt.stdout
+    else:
+        assert doc["status"] == "ok", doc
+        assert doc["degraded_components"] == [], doc
+        assert "Coverage: all observed models priced." in txt.stdout
 
 
 def test_pricing_check_offline_does_not_mutate_fresh_home(tmp_path):

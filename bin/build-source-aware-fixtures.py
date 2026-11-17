@@ -258,6 +258,26 @@ def _legacy_fixture_dependencies(module, command: str, *, populated: bool):
     def usage_entries(start, end, **_kwargs):
         return [entry for entry in usage if start <= entry.timestamp <= end]
 
+    def inject_stats_reader(target):
+        """#787 / #861 AD21: `cmd_report` and `cmd_project` read stats.db
+        through a statement reader instead of `open_db`, so the fixture store
+        is injected at that seam too, on the command module's own binding
+        only. Without it the reader's startup phase runs the real owner
+        opener against the home data directory."""
+        real_access = target._store_access
+
+        class _FixtureAccess:
+            def __getattr__(self, name):
+                return getattr(real_access, name)
+
+            @staticmethod
+            def statement_reader(store, *args, **kwargs):
+                if store == "stats":
+                    return _fixture_db()
+                return real_access.statement_reader(store, *args, **kwargs)
+
+        replace(target, "_store_access", _FixtureAccess())
+
     replace(module, "get_claude_session_entries", joined_entries)
     replace(module, "get_entries", usage_entries)
     replace(module, "_load_claude_config_for_args", lambda _args: {"display": {"tz": "utc"}})
@@ -270,6 +290,7 @@ def _legacy_fixture_dependencies(module, command: str, *, populated: bool):
         )
         replace(module, "_compute_subscription_weeks", lambda *_args, **_kwargs: (subweek,))
         replace(module._cctally_project, "open_db", _fixture_db)
+        inject_stats_reader(module._cctally_project)
         # `**_kwargs` absorbs `account_key` (#620 S1), the same shape the
         # `_compute_subscription_weeks` stub above already uses.
         replace(
@@ -315,6 +336,7 @@ def _legacy_fixture_dependencies(module, command: str, *, populated: bool):
                 lambda *_args, **_kw: [week_ref] if populated else [])  # **_kw: #341 account_key=
         replace(module, "build_trend_view", lambda *_args, **_kwargs: module.TrendView(rows=trend_rows))
         replace(module._cctally_forecast, "open_db", _fixture_db)
+        inject_stats_reader(module._cctally_forecast)
     try:
         yield
     finally:

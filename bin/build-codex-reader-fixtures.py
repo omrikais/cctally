@@ -419,6 +419,7 @@ def _load_cctally():
     """
     cached = sys.modules.get("cctally")
     if cached is not None:
+        sys.modules["_cctally_core"].establish_script_owner()
         return cached
     path = BIN_DIR / "cctally"
     loader = importlib.machinery.SourceFileLoader("cctally", str(path))
@@ -426,6 +427,8 @@ def _load_cctally():
     mod = importlib.util.module_from_spec(spec)
     sys.modules["cctally"] = mod
     loader.exec_module(mod)
+    # #787 / #861 spec 5.1: this script's thread is a process owner.
+    sys.modules["_cctally_core"].establish_script_owner()
     return mod
 
 

@@ -452,7 +452,7 @@ def build_codex_task_a(out: pathlib.Path) -> dict:
         for value in values:
             normalize_native_limits(value)
             if value.get("type") == "session_meta":
-                value["payload"]["cwd"] = f"/synthetic/{parent}/repo"
+                value["payload"]["cwd"] = f"/synthetic/{parent}/customer-analytics-pipeline-service"
         path = target / f"{scenario}.jsonl"
         path.write_text("".join(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n" for value in values))
         current_files[scenario] = str(path.resolve())

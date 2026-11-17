@@ -2023,6 +2023,8 @@ def test_doctor_admits_an_acknowledgement_appended_at_its_checkpoint(
 
     journal_dir = _cctally_core.JOURNAL_DIR
     journal_dir.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     segment = journal_dir / "observations-2026-07.jsonl"
     records = [
         *(_irrelevant_obs(1.0 + index / 1_000) for index in range(20)),

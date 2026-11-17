@@ -2455,8 +2455,10 @@ def _read_duration_leg(path):
 # pytest's own exit statuses over a session whose recorded population is
 # WHOLE: 0 (all passed), 1 (tests failed — an ordinary, complete run) and 5
 # (nothing collected). Every other status — 2 interrupted, 3 internal error,
-# 4 usage error — means the session stopped before it ran what it collected,
-# so the leg's records cover fewer tests than the run intended.
+# 4 usage error — means the session did not finish normally: it may have
+# stopped with items unrun, or ended in an internal error after every test had
+# reported (for example the worker-death outcome gate of tests/_xdist_recovery.py,
+# #1086), so complete coverage cannot be established from the leg's records.
 #
 # `pytest_sessionfinish` is reached on those paths too: `_pytest.main.
 # wrap_session` calls it from its `finally` block whenever `initstate >= 2`,

@@ -22,6 +22,7 @@ from conftest import load_script, redirect_paths  # noqa: E402
 
 import _cctally_db as _db  # noqa: E402
 import _lib_codex_conversation_query as _cxq  # noqa: E402
+from conftest import as_process_owner  # noqa: E402
 
 UTC = dt.timezone.utc
 
@@ -34,6 +35,22 @@ def _env(tmp_path, monkeypatch):
     conn = ns["open_cache_db"]()
     retention = importlib.import_module("_lib_conversation_retention")
     return ns, conn, retention
+
+
+#: #990 (spec D1): the planner helper's real-time floor for the tests whose
+#: subject is a chunk's outcome, never the helper's own failure or deadline.
+_PLANNER_FLOOR_SECONDS = 30.0
+
+
+def _floor_planner_budget(monkeypatch, retention) -> None:
+    """Give every planner helper of this test 30 s of its own deadline, and
+    31 s of subprocess timeout with the 1.0 s start-up slack, instead of a
+    direct chunk's 1.5 s default, so a multi-second host stall cannot turn
+    the chunk under test into a ``helper_timeout`` refusal (#990). The
+    product constants are unchanged, and a passing run never waits on the
+    floor: a helper returns in about 0.05 s."""
+    monkeypatch.setattr(retention, "_PLANNER_MIN_DEADLINE_SECONDS",
+                        _PLANNER_FLOOR_SECONDS)
 
 
 _OFFSET = [0]
@@ -935,6 +952,7 @@ def test_the_reader_that_loses_the_write_lock_is_named_by_instrumentation(
     ns, conn = _readonly_env(tmp_path, monkeypatch)
     store_mod = ns["_cctally_cache"]._cctally_store
     retention = importlib.import_module("_lib_conversation_retention")
+    _floor_planner_budget(monkeypatch, retention)
     freed = _fill_and_free_pages(conn)
     assert freed > 0, "the fixture must really have a freelist to reclaim"
     db_path = retention._resolve_main_db_path(conn)
@@ -980,7 +998,8 @@ def test_the_reader_that_loses_the_write_lock_is_named_by_instrumentation(
 
     monkeypatch.setattr(retention, "_run_incremental_vacuum_chunk",
                         locking_chunk)
-    reader = threading.Thread(target=read_under_the_lock, daemon=True)
+    reader = threading.Thread(target=as_process_owner(read_under_the_lock),
+                              daemon=True)
     reader.start()
     reclaim = retention.open_reclaim_connection(db_path)
     retention.normalize_reclaim_record(reclaim, NOW)

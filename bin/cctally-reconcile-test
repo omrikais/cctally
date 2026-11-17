@@ -317,6 +317,7 @@ mod.__file__ = str(script_path)
 sys.modules["cctally"] = mod
 code = compile(script_path.read_text(), str(script_path), "exec")
 exec(code, mod.__dict__)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 sys.path.insert(0, str(repo_root / "bin"))
 import _cctally_dashboard as D
@@ -461,6 +462,7 @@ mod.__file__ = str(script_path)
 sys.modules["cctally"] = mod
 code = compile(script_path.read_text(), str(script_path), "exec")
 exec(code, mod.__dict__)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 sys.path.insert(0, str(repo_root / "bin"))
 import _cctally_dashboard as D
@@ -1593,6 +1595,7 @@ spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec)
 sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 assert str(mod.APP_DIR).startswith(os.environ["HOME"]), (
     f"APP_DIR {mod.APP_DIR} not under HOME={os.environ['HOME']!r}; "
@@ -1827,6 +1830,7 @@ loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
 spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 mod.APP_DIR.mkdir(parents=True, exist_ok=True)
 
 end_iso = "2026-05-16T05:00:00+00:00"
@@ -1998,6 +2002,7 @@ loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
 spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 mod.APP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Block whose 10-min-floored start is 19:30 UTC on 2026-05-16, window key
@@ -2194,6 +2199,7 @@ mod.__file__ = str(script_path)
 sys.modules["cctally"] = mod
 code = compile(script_path.read_text(), str(script_path), "exec")
 exec(code, mod.__dict__)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 sys.path.insert(0, str(repo_root / "bin"))
 import _cctally_dashboard as D
@@ -3073,6 +3079,7 @@ loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
 spec = importlib.util.spec_from_loader("cctally", loader)
 c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
 loader.exec_module(c)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 conn = c.open_db()
 now = c._command_as_of()
 proj = c._weekly_pct_week_avg_projection(conn, now)
@@ -3180,6 +3187,7 @@ loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
 spec = importlib.util.spec_from_loader("cctally", loader)
 c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
 loader.exec_module(c)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 import _lib_forecast as fc
 import _lib_quota_model as qm
 
@@ -3263,6 +3271,7 @@ loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
 spec = importlib.util.spec_from_loader("cctally", loader)
 c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
 loader.exec_module(c)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 conn = c.open_db()
 now_dt = c._command_as_of()
 inputs = c._build_budget_status_inputs(
@@ -3374,6 +3383,7 @@ loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
 spec = importlib.util.spec_from_loader("cctally", loader)
 c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
 loader.exec_module(c)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 config = c.load_config()
 tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)   # CONFIG tz (R3)
 now_dt = c._command_as_of()
@@ -3510,6 +3520,7 @@ loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
 spec = importlib.util.spec_from_loader("cctally", loader)
 c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
 loader.exec_module(c)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 # Drive the REAL reconcile path (record without dispatch) with project alerts
 # forced active over the SAME projects + thresholds the displayed status used.
@@ -3735,6 +3746,7 @@ loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
 spec = importlib.util.spec_from_loader("cctally", loader)
 c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
 loader.exec_module(c)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 import argparse
 config = c.load_config()
@@ -3884,6 +3896,7 @@ loader = SourceFileLoader("cctally", os.path.join(bin_dir, "cctally"))
 spec = importlib.util.spec_from_loader("cctally", loader)
 c = importlib.util.module_from_spec(spec); sys.modules["cctally"] = c
 loader.exec_module(c)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 
 import argparse
 config = c.load_config()
@@ -4188,6 +4201,7 @@ script_path = repo_root / "bin" / "cctally"
 mod = types.ModuleType("cctally"); mod.__file__ = str(script_path)
 sys.modules["cctally"] = mod
 exec(compile(script_path.read_text(), str(script_path), "exec"), mod.__dict__)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 sys.path.insert(0, str(repo_root / "bin"))
 import _cctally_tui as T
 import _cctally_dashboard_envelope as E
@@ -4459,6 +4473,7 @@ _spec = ilu.spec_from_loader("cctally", _loader)
 _mod = ilu.module_from_spec(_spec)
 sys.modules["cctally"] = _mod
 _loader.exec_module(_mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 import _cctally_cache as cache
 import _lib_pricing as pricing
 

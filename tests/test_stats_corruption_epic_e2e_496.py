@@ -326,6 +326,7 @@ _spec = importlib.util.spec_from_loader("cctally", _loader)
 _mod = importlib.util.module_from_spec(_spec)
 sys.modules["cctally"] = _mod
 _loader.exec_module(_mod)
+sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
 
 import sqlite3
 import _cctally_core, _cctally_journal, _cctally_tui
@@ -371,6 +372,7 @@ _spec = importlib.util.spec_from_loader("cctally", _loader)
 _mod = importlib.util.module_from_spec(_spec)
 sys.modules["cctally"] = _mod
 _loader.exec_module(_mod)
+sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
 
 import _cctally_tui
 

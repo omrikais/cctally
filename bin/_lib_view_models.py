@@ -285,6 +285,19 @@ class TuiSessionRow:
 # === Internal helpers ======================================================
 
 
+def blocks_row_label(start_time: dt.datetime, display_tz) -> str:
+    """A Blocks panel row's ``label``: its start, rounded to the nearest
+    10-minute boundary (reset-jitter normalization), as "HH:MM MMM DD" in
+    ``display_tz``. One home for the builder and for a kept frame that
+    redraws it in a new zone from the row's UTC ``start_at`` (#787 / #861
+    revision 33, R32-V3)."""
+    c = _cctally()
+    return c.format_display_dt(
+        c._round_to_ten_minutes(start_time),
+        display_tz, fmt="%H:%M %b %d", suffix=True,
+    )
+
+
 def _display_tz_label(display_tz) -> str:
     """Mirror of cctally._share_display_tz_label.
 
@@ -1581,10 +1594,7 @@ def build_blocks_view(
                 # below stay exact — they key the React row and the
                 # ``/api/block/:start_at`` lookup, which matches by exact
                 # equality (issue #76).
-                local_label = c.format_display_dt(
-                    c._round_to_ten_minutes(b.start_time),
-                    display_tz, fmt="%H:%M %b %d", suffix=True,
-                )
+                local_label = blocks_row_label(b.start_time, display_tz)
                 rows.append(BlocksPanelRow(
                     start_at=b.start_time.astimezone(dt.timezone.utc).isoformat(),
                     end_at=b.end_time.astimezone(dt.timezone.utc).isoformat(),

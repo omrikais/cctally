@@ -24,7 +24,7 @@ if str(BIN_DIR) not in sys.path:
 if str(REPO_ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tests"))
 
-from conftest import load_script, redirect_paths  # noqa: E402
+from conftest import as_process_owner, load_script, redirect_paths  # noqa: E402
 import _lib_accounts as accts  # noqa: E402
 
 RED_UUID = "11111111-1111-4111-8111-111111111111"
@@ -1280,7 +1280,10 @@ def test_a_crash_after_the_append_recovers_without_a_second_decision(ing):
         cc._cache_storm_test_pause = die
         _sync(ing)
         os._exit(0)
-    proc = multiprocessing.get_context("fork").Process(target=child)
+    # #787 / #861 (spec 5.1, D5): a forked child starts with no authority;
+    # it stands in for a sync process, so it runs at `process`.
+    proc = multiprocessing.get_context("fork").Process(
+        target=as_process_owner(child))
     proc.start()
     proc.join(60)
     assert proc.exitcode == 9
@@ -1295,20 +1298,537 @@ def test_a_crash_after_the_append_recovers_without_a_second_decision(ing):
 
 def test_an_append_failure_recovers_on_the_next_sync(ing):
     """Detects: a failed append leaving a cursor advanced past undecided
-    records (they would never be ingested)."""
+    records (they would never be ingested), or (#1042) a deferred file
+    taking the earlier file of its batch down with it."""
     a = _login("A")
     _clock(ing, "2026-10-09T10:05:00Z")
-    _line(ing, "2026-10-09T10:01:00Z", "x")
+    _line(ing, "2026-10-09T10:01:00Z", "w", file="s1")
+    _line(ing, "2026-10-09T10:01:00Z", "x", file="s2")
     import _cctally_journal as jr
     real = jr.append_records
-    _unwritable_journal(ing)
-    _sync(ing)
-    assert _rows(ing) == {}
+    calls = []
+
+    def second_fails(records):
+        calls.append(1)
+        if len(calls) == 2:
+            raise OSError(30, "Read-only file system")
+        return real(records)
+    ing.mp.setattr(jr, "append_records", second_fails)
+    stats = _sync(ing)
+    assert stats.deferred_reason == "attribution_rehydration"
+    assert stats.attribution_files_deferred == 1
+    assert stats.files_failed == 0
+    assert stats.files_processed == 1
+    # s1 shared s2's batch; it commits with its cursor, s2 stays retryable.
+    assert set(_rows(ing)) == {"m-w"}
     ing.mp.setattr(jr, "append_records", real)
     stats = _sync(ing)
     assert stats.deferred_reason is None
     assert _rows(ing)["m-x"][:3] == (a, "fallback", "pre_timeline")
+    assert len(_decision_ops("m-w")) == 1
     assert len(_decision_ops("m-x")) == 1
+
+
+# --------------------------------------------------------------------------
+# #1042: the batched accounting walk (spec 6.6)
+# --------------------------------------------------------------------------
+
+def _batch_files(ing, n):
+    ing.mp.setattr(sys.modules["_cctally_cache"],
+                   "CLAUDE_ACCOUNTING_BATCH_FILES", n)
+
+
+def _cursors(env):
+    conn = env.ns["open_cache_db"]()
+    try:
+        return {pathlib.Path(r[0]).stem: (r[1], r[2], r[3]) for r in
+                conn.execute("SELECT path, size_bytes, last_byte_offset,"
+                             " session_id FROM session_files")}
+    finally:
+        conn.close()
+
+
+def _decision_keys(env):
+    conn = env.ns["open_cache_db"]()
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT msg_id FROM claude_cost_decisions")}
+    finally:
+        conn.close()
+
+
+def _links(env):
+    conn = env.ns["open_cache_db"]()
+    try:
+        return {r[0]: r[1] for r in conn.execute(
+            "SELECT msg_id, attribution_decision_key FROM session_entries")}
+    finally:
+        conn.close()
+
+
+def _mutation_seq(env):
+    import _cctally_claude_attribution as G
+    conn = env.ns["open_cache_db"]()
+    try:
+        row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                           (G.MUTATION_SEQ_KEY,)).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def _committed_identities(path):
+    """The files whose identity row a reader sees committed right now."""
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(path)
+    try:
+        return {pathlib.Path(r[0]).stem for r in conn.execute(
+            "SELECT path FROM session_files WHERE session_id IS NOT NULL")}
+    finally:
+        conn.close()
+
+
+def test_a_crash_inside_an_open_batch_commits_none_of_it(ing):
+    """A process killed at the second batch's COMMIT, after both of its files
+    appended their decisions. Detects (O3, O4): a batch that committed some
+    of its files individually, or a resume that decides a lost batch's
+    records again instead of replaying them."""
+    import multiprocessing
+    import _cctally_cache as cc
+    a = accts.account_key("claude", "A")
+    _obs("A", "2026-10-09T10:00:00Z")
+    for i in range(1, 5):
+        _line(ing, "2026-10-09T10:01:00Z", str(i), file=f"s{i}")
+    _obs("A", "2026-10-09T10:02:00Z")
+    _login("B")
+    _clock(ing, "2026-10-09T10:05:00Z")
+    _batch_files(ing, 2)
+    seq_before = _mutation_seq(ing)
+
+    def child():
+        calls = []
+
+        def die(point):
+            if point == "claude_precommit":
+                calls.append(point)
+                if len(calls) == 2:
+                    os._exit(9)
+        cc._cache_storm_test_pause = die
+        _sync(ing)
+        os._exit(0)
+    # #787 / #861 (spec 5.1, D5): a forked child starts with no authority;
+    # it stands in for a sync process, so it runs at `process`.
+    proc = multiprocessing.get_context("fork").Process(
+        target=as_process_owner(child))
+    proc.start()
+    proc.join(60)
+    assert proc.exitcode == 9
+    cursors = _cursors(ing)
+    assert set(cursors) == {"s1", "s2"}
+    assert all(c[0] > 0 and c[0] == c[1] for c in cursors.values())
+    assert set(_rows(ing)) == {"m-1", "m-2"}
+    assert _decision_keys(ing) == {"m-1", "m-2"}
+    assert all(_links(ing).values())
+    assert _mutation_seq(ing) == seq_before + 2
+    for i in range(1, 5):
+        assert len(_decision_ops(f"m-{i}")) == 1
+    ops_before = len(_decision_ops())
+    _login("C")
+    _sync(ing)
+    assert len(_decision_ops()) == ops_before
+    assert _rows(ing) == {
+        f"m-{i}": (a, "timeline_agreement", None, 500) for i in range(1, 5)}
+
+
+@pytest.mark.parametrize("mode", ["savepoint", "lost_transaction",
+                                  "restored_then_lost", "restore_fails"])
+def test_a_rollback_after_an_append_never_decides_again(ing, mode):
+    """s3 appends its decision for m-x, then a database error rolls it back
+    (its savepoint, or the whole batch). s4 repeats m-x and s1's m-a.
+    Detects (O3 within one walk): a decision the journal holds but the store
+    lost being decided a second time -- possibly for another account -- by
+    a later file of the same walk. ``restored_then_lost``: s2's m-b is
+    restored in the open batch after its savepoint rollback, and s3 then
+    loses that batch; detects a restored decision that the loss discards
+    again, so s4's repeat of m-b decides it a second time.
+    ``restore_fails``: detects a failed restore reported as an unwritable
+    journal (the journal was written), or a walk that goes on attributing
+    after it."""
+    import sqlite3 as _sqlite3
+    import _cctally_cache as cc
+    import _cctally_claude_attribution as G
+    a = _login("A")
+    _clock(ing, "2026-10-09T10:05:00Z")
+    _line(ing, "2026-10-09T10:01:00Z", "a", file="s1")
+    _line(ing, "2026-10-09T10:01:00Z", "b", file="s2")
+    _line(ing, "2026-10-09T10:01:00Z", "x", file="s3")
+    _line(ing, "2026-10-09T10:01:00Z", "a", file="s4")
+    _line(ing, "2026-10-09T10:01:00Z", "x", file="s4")
+    if mode == "restored_then_lost":
+        _line(ing, "2026-10-09T10:01:00Z", "b", file="s4")
+    real_bump = cc._bump_mutation_seq
+    bumps = []
+
+    def third_file_fails(conn):
+        bumps.append(1)
+        if len(bumps) == 2 and mode == "restored_then_lost":
+            raise _sqlite3.OperationalError("simulated failure after append")
+        if len(bumps) == 3:
+            if mode in ("lost_transaction", "restored_then_lost"):
+                conn.rollback()
+            raise _sqlite3.OperationalError("simulated failure after append")
+        return real_bump(conn)
+    ing.mp.setattr(cc, "_bump_mutation_seq", third_file_fails)
+    if mode == "restore_fails":
+        real_restore = G.restore_decision_ops
+
+        def boom(*_a, **_k):
+            raise _sqlite3.OperationalError("simulated restore failure")
+        ing.mp.setattr(G, "restore_decision_ops", boom)
+    stats = _sync(ing)
+    for tag in ("a", "b", "x"):
+        assert len(_decision_ops(f"m-{tag}")) == 1, tag
+    assert "s3" not in _cursors(ing)
+    if mode == "savepoint":
+        assert stats.files_failed == 1
+        assert set(_cursors(ing)) == {"s1", "s2", "s4"}
+        assert set(_rows(ing)) == {"m-a", "m-b", "m-x"}
+    elif mode == "lost_transaction":
+        assert stats.files_failed == 3
+        assert set(_cursors(ing)) == {"s4"}
+    elif mode == "restored_then_lost":
+        # s2 failed, then s3's loss failed s1 with it; s4 committed alone.
+        assert stats.files_failed == 3
+        assert set(_cursors(ing)) == {"s4"}
+        assert set(_rows(ing)) == {"m-a", "m-b", "m-x"}
+    else:
+        # The restore failed: the walk stops as a failed walk after
+        # committing the files released before it. No attribution deferral:
+        # the journal was written, and the next sync replays it.
+        assert stats.deferred_reason is None
+        assert stats.files_failed == 1
+        assert not stats.full_walk_complete
+        assert set(_cursors(ing)) == {"s1", "s2"}
+        assert set(_rows(ing)) == {"m-a", "m-b"}
+        conn = ing.ns["open_cache_db"]()
+        try:
+            assert not G.deferral_recorded(conn)
+        finally:
+            conn.close()
+    ing.mp.setattr(cc, "_bump_mutation_seq", real_bump)
+    if mode == "restore_fails":
+        ing.mp.setattr(G, "restore_decision_ops", real_restore)
+    _sync(ing)
+    assert set(_cursors(ing)) == {"s1", "s2", "s3", "s4"}
+    rows = _rows(ing)
+    assert set(rows) == {"m-a", "m-b", "m-x"}
+    assert {r[0] for r in rows.values()} == {a}
+    for tag in ("a", "b", "x"):
+        assert len(_decision_ops(f"m-{tag}")) == 1, tag
+
+
+def _precommit_probe(ing):
+    """Record, at each batch's ``claude_precommit`` seam, the identity rows
+    a reader sees committed. Successive differences are the batches."""
+    import _cctally_cache as cc
+    import _cctally_core as core
+    seen = []
+
+    def probe(point):
+        if point == "claude_precommit":
+            seen.append(_committed_identities(core.CACHE_DB_PATH))
+    ing.mp.setattr(cc, "_cache_storm_test_pause", probe)
+    return seen
+
+
+def _batches(seen):
+    import _cctally_core as core
+    snapshots = seen + [_committed_identities(core.CACHE_DB_PATH)]
+    return [after - before for before, after in zip(snapshots, snapshots[1:])]
+
+
+def test_a_failed_file_inside_a_batch_isolates_itself(ing):
+    """The second file of a three-file batch raises a non-corruption database
+    error. Detects (O5): one bad file rolling back its batch neighbours, a
+    failed file keeping an identity row or cursor it never committed with
+    its entries, counters describing uncommitted files, or a walk with a
+    failed file certifying itself complete."""
+    import sqlite3 as _sqlite3
+    import _cctally_cache as cc
+    _login("A")
+    _clock(ing, "2026-10-09T10:05:00Z")
+    for i in range(1, 4):
+        _line(ing, "2026-10-09T10:01:00Z", str(i), file=f"s{i}")
+    real = cc._attribute_claude_rows
+
+    def second_fails(conn, run, path_str, rows, metas):
+        if pathlib.Path(path_str).stem == "s2":
+            raise _sqlite3.OperationalError("simulated database error")
+        return real(conn, run, path_str, rows, metas)
+    ing.mp.setattr(cc, "_attribute_claude_rows", second_fails)
+    seen = _precommit_probe(ing)
+    stats = _sync(ing)
+    assert len(seen) == 1
+    assert stats.files_failed == 1
+    assert stats.files_processed == 2
+    assert not stats.full_walk_complete
+    cursors = _cursors(ing)
+    assert set(cursors) == {"s1", "s3"}
+    assert all(c[0] > 0 and c[0] == c[1] for c in cursors.values())
+    assert set(_rows(ing)) == {"m-1", "m-3"}
+    conn = ing.ns["open_cache_db"]()
+    try:
+        assert conn.execute("SELECT 1 FROM cache_meta WHERE key="
+                            "'claude_ingest_walk_complete'").fetchone() is None
+    finally:
+        conn.close()
+    ing.mp.setattr(cc, "_attribute_claude_rows", real)
+    stats = _sync(ing)
+    assert stats.files_processed == 1
+    assert stats.files_failed == 0
+    assert set(_rows(ing)) == {"m-1", "m-2", "m-3"}
+    assert set(_cursors(ing)) == {"s1", "s2", "s3"}
+
+    # A failed file's identity backfill rolls back with it. Detects: the
+    # backfill (which stamps every retained row of the file with a new
+    # mutation_seq) committed apart from the file's savepoint, so a file
+    # that wrote no entries still moved the accounting mutation signal.
+    s2 = str(ing.root / "s2.jsonl")
+
+    def s2_stamps():
+        conn = ing.ns["open_cache_db"]()
+        try:
+            return dict(conn.execute(
+                "SELECT msg_id, mutation_seq FROM session_entries"
+                " WHERE source_path = ?", (s2,)))
+        finally:
+            conn.close()
+    conn = ing.ns["open_cache_db"]()
+    try:
+        conn.execute("UPDATE session_files SET session_id = NULL,"
+                     " project_path = NULL WHERE path = ?", (s2,))
+        conn.commit()
+    finally:
+        conn.close()
+    seq_before = _mutation_seq(ing)
+    stamps_before = s2_stamps()
+    assert stamps_before
+    _line(ing, "2026-10-09T10:02:00Z", "4", file="s2")
+    ing.mp.setattr(cc, "_attribute_claude_rows", second_fails)
+    stats = _sync(ing)
+    assert stats.files_failed == 1
+    assert _mutation_seq(ing) == seq_before
+    assert s2_stamps() == stamps_before
+    assert _cursors(ing)["s2"][2] is None
+    ing.mp.setattr(cc, "_attribute_claude_rows", real)
+    stats = _sync(ing)
+    assert stats.files_failed == 0
+    assert _cursors(ing)["s2"][2] == "s2"
+    assert set(_rows(ing)) == {"m-1", "m-2", "m-3", "m-4"}
+
+
+def test_a_failed_batch_commit_fails_each_file_once(ing):
+    """The batch COMMIT fails. Detects: a lost batch counted as processed (or
+    one file counted failed twice), and journal-backed decisions left
+    discarded until a replay, so a later file of the walk could decide them
+    again."""
+    import sqlite3 as _sqlite3
+    import _cctally_cache as cc
+    a = _login("A")
+    _clock(ing, "2026-10-09T10:05:00Z")
+    _line(ing, "2026-10-09T10:01:00Z", "1", file="s1")
+    _line(ing, "2026-10-09T10:01:00Z", "2", file="s2")
+    real = cc._cache_storm_test_pause
+
+    def commit_fails(point):
+        if point == "claude_precommit":
+            raise _sqlite3.OperationalError("simulated commit failure")
+    ing.mp.setattr(cc, "_cache_storm_test_pause", commit_fails)
+    stats = _sync(ing)
+    assert stats.files_failed == 2
+    assert stats.files_processed == 0
+    assert stats.rows_changed == 0
+    assert _rows(ing) == {}
+    assert _cursors(ing) == {}
+    assert _decision_keys(ing) == {"m-1", "m-2"}
+    ing.mp.setattr(cc, "_cache_storm_test_pause", real)
+    stats = _sync(ing)
+    assert stats.files_processed == 2
+    assert {k: v[:3] for k, v in _rows(ing).items()} == {
+        "m-1": (a, "fallback", "pre_timeline"),
+        "m-2": (a, "fallback", "pre_timeline")}
+    assert len(_decision_ops("m-1")) == 1
+    assert len(_decision_ops("m-2")) == 1
+
+
+def test_a_deferred_file_in_a_failed_rebuild_commit_stays_deferred(
+        ing, capsys):
+    """A rebuild batch in which one file's append defers and the batch COMMIT
+    then fails. Detects: the deferral withdrawn with the lost batch, so a
+    rebuild that already wiped the store reports itself skipped, or the
+    deferred file also counted failed."""
+    import sqlite3 as _sqlite3
+    import _cctally_cache as cc
+    _login("A")
+    _clock(ing, "2026-10-09T10:05:00Z")
+    _line(ing, "2026-10-09T10:01:00Z", "x")
+    _sync(ing)
+    _line(ing, "2026-10-09T10:03:00Z", "y", file="s2")
+    _clock(ing, "2026-10-09T10:06:00Z")
+    _unwritable_journal(ing)
+
+    def commit_fails(point):
+        if point == "claude_precommit":
+            raise _sqlite3.OperationalError("simulated commit failure")
+    ing.mp.setattr(cc, "_cache_storm_test_pause", commit_fails)
+    capsys.readouterr()
+    assert _cli(ing, "--source", "claude", "--rebuild") == 1
+    err = capsys.readouterr().err
+    # One failed file (s1, lost with the batch) plus one deferred (s2).
+    assert "[cache-sync] rebuild incomplete (claude): 2 file(s) failed" in err
+    assert "rebuild skipped (claude)" not in err
+
+
+@pytest.mark.parametrize("rebuild", [True, False])
+def test_a_failed_restore_during_a_rebuild_reports_incomplete(
+        ing, capsys, rebuild):
+    """A sync in which a file fails after its append and the restore of its
+    decisions then fails, so the walk stops as a failed walk. Detects: a
+    rebuild that already wiped the store reporting itself skipped, or any
+    sync reporting that the journal could not be written when it was."""
+    import sqlite3 as _sqlite3
+    import _cctally_cache as cc
+    import _cctally_claude_attribution as G
+    _login("A")
+    _clock(ing, "2026-10-09T10:05:00Z")
+    _line(ing, "2026-10-09T10:01:00Z", "a", file="s1")
+    _line(ing, "2026-10-09T10:01:00Z", "x", file="s2")
+    real_attr = cc._attribute_claude_rows
+
+    def fails_after_append(conn, run, path_str, rows, metas):
+        out = real_attr(conn, run, path_str, rows, metas)
+        if pathlib.Path(path_str).name == "s2.jsonl":
+            raise _sqlite3.OperationalError("simulated failure after append")
+        return out
+    ing.mp.setattr(cc, "_attribute_claude_rows", fails_after_append)
+
+    def boom(*_a, **_k):
+        raise _sqlite3.OperationalError("simulated restore failure")
+    ing.mp.setattr(G, "restore_decision_ops", boom)
+    capsys.readouterr()
+    if rebuild:
+        assert _cli(ing, "--source", "claude", "--rebuild") == 1
+    else:
+        _cli(ing, "--source", "claude")
+    err = capsys.readouterr().err
+    if rebuild:
+        assert ("[cache-sync] rebuild incomplete (claude): 1 file(s) failed"
+                in err)
+        assert "rebuild skipped (claude)" not in err
+    assert "journal could not be written" not in err
+    assert cc.CLAUDE_ATTRIBUTION_SYNC_DEFERRED_MESSAGE not in err
+    assert cc.CLAUDE_ATTRIBUTION_REBUILD_DEFERRED_MESSAGE not in err
+
+
+@pytest.mark.parametrize("bound", ["files", "bytes"])
+def test_progress_runs_only_outside_a_transaction(ing, capsys, bound):
+    """Detects (O7): a progress callback run inside the open batch, where the
+    TUI and dashboard callback would take the stats maintenance flock while
+    a SQLite write transaction is held -- including the batch opened right
+    after an admission commit ends the previous one at the byte bound; and a
+    stderr progress line that a batch's jump in ``files_processed`` steps
+    over."""
+    import _cctally_cache as cc
+    _login("A")
+    _clock(ing, "2026-10-09T10:05:00Z")
+    for i in range(1, 10):
+        _line(ing, "2026-10-09T10:01:00Z", str(i), file=f"s{i}")
+    if bound == "files":
+        _batch_files(ing, 3)
+    else:
+        # Three files fit and a fourth does not, so each batch ends at the
+        # admission commit before the next file joins.
+        size = (ing.root / "s1.jsonl").stat().st_size
+        ing.mp.setattr(cc, "CLAUDE_ACCOUNTING_BATCH_BYTES",
+                       3 * size + size // 2)
+    ing.mp.setattr(cc, "_PROGRESS_STDERR_EVERY", 4)
+    conn = ing.ns["open_cache_db"]()
+    calls = []
+
+    def spy(stats):
+        assert not conn.in_transaction
+        calls.append(stats.files_processed)
+        cc._progress_stderr(stats)
+    capsys.readouterr()
+    try:
+        stats = ing.ns["sync_cache"](conn, progress=spy)
+    finally:
+        conn.close()
+    assert stats.files_processed == 9
+    assert {3, 6, 9} <= set(calls)
+    printed = [line.split()[1].split("/")[0]
+               for line in capsys.readouterr().err.splitlines()
+               if line.startswith("[cache-sync] ") and " files, " in line]
+    # 4 is crossed on the way to 6, and 8 on the way to 9.
+    assert printed == ["6", "9"]
+
+
+@pytest.mark.parametrize("case", ["oversized", "exceeds", "identity_only"])
+def test_batch_bounds_admit_before_exceeding(ing, case):
+    """Detects (O8): a batch bound checked only after a file joined, so the
+    batch overshoots it; an oversized file sharing a batch; and a walk of
+    identity-only backfills that is never bounded."""
+    import _cctally_cache as cc
+    _login("A")
+    _clock(ing, "2026-10-09T10:05:00Z")
+    tags = {"s1": 1, "s2": 3 if case == "oversized" else 1, "s3": 1}
+    for name, count in tags.items():
+        for j in range(count):
+            _line(ing, "2026-10-09T10:01:00Z", f"{name}-{j}", file=name)
+    size = {name: (ing.root / f"{name}.jsonl").stat().st_size
+            for name in tags}
+    if case == "oversized":
+        ing.mp.setattr(cc, "CLAUDE_ACCOUNTING_BATCH_BYTES", size["s1"] + 1)
+        expected = [{"s1"}, {"s2"}, {"s3"}]
+    elif case == "exceeds":
+        ing.mp.setattr(cc, "CLAUDE_ACCOUNTING_BATCH_BYTES",
+                       size["s1"] + size["s2"] + size["s3"] // 2)
+        expected = [{"s1", "s2"}, {"s3"}]
+    else:
+        _sync(ing)
+        conn = ing.ns["open_cache_db"]()
+        try:
+            conn.execute("UPDATE session_files SET session_id = NULL,"
+                         " project_path = NULL")
+            conn.commit()
+        finally:
+            conn.close()
+        _batch_files(ing, 2)
+        expected = [{"s1", "s2"}, {"s3"}]
+    seen = _precommit_probe(ing)
+    stats = _sync(ing)
+    assert stats.files_failed == 0
+    assert _batches(seen) == expected
+
+
+def test_a_one_file_sync_commits_once(ing):
+    """Detects: a steady-state sync that commits its identity row apart from
+    the file's entries and cursor, or commits more than once."""
+    _login("A")
+    _clock(ing, "2026-10-09T10:05:00Z")
+    _line(ing, "2026-10-09T10:01:00Z", "1", file="s1")
+    _sync(ing)
+    _line(ing, "2026-10-09T10:02:00Z", "2", file="s2")
+    seen = _precommit_probe(ing)
+    _sync(ing)
+    assert seen == [{"s1"}]
+    assert set(_rows(ing)) == {"m-1", "m-2"}
+    cursors = _cursors(ing)
+    assert cursors["s2"][0] > 0 and cursors["s2"][0] == cursors["s2"][1]
+    assert cursors["s2"][2] == "s2"
+    seen.clear()
+    _sync(ing)
+    assert seen == []
 
 
 def test_the_neighbour_memo_holds_only_the_current_file(ing):

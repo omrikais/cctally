@@ -299,6 +299,8 @@ def test_doctor_finds_structural_classes_appended_after_its_checkpoint(
 
     journal_dir = _cctally_core.JOURNAL_DIR
     journal_dir.mkdir(parents=True, exist_ok=True)
+    # #787: an owner-established (0700) data dir, as on every install.
+    os.chmod(_cctally_core.APP_DIR, 0o700)
     segment = journal_dir / "observations-2026-07.jsonl"
     base = journal.make_evt(
         kind="snapshot_accept",

@@ -18,7 +18,7 @@ import sys
 import pytest
 
 import _lib_diagnosis as kernel
-from conftest import load_script, redirect_paths
+from conftest import as_process_owner, load_script, redirect_paths
 
 UTC = dt.timezone.utc
 WINDOW_START = dt.datetime(2026, 8, 10, tzinfo=UTC)
@@ -2318,34 +2318,82 @@ def test_every_published_gap_code_is_a_declared_kernel_constant(
 
 # --- F11: the conversations probe must cover the cache read it performs --
 
+def _commit_as_another_writer(ns, sql: str) -> None:
+    """Commit `sql` to cache.db from a concurrent writer, as a hook tick does.
+
+    #787 / #861 (AD21, AD31): the bundle's read unit holds its sessions, and
+    their `query` authority, on this thread between the two probes, so the
+    writer is its own process owner on its own thread (D5), joined before the
+    second probe exactly as the in-thread writer was."""
+    import threading
+
+    failures: list = []
+
+    def write():
+        try:
+            writer = ns["open_cache_db"]()
+            try:
+                writer.execute(sql)
+                writer.commit()
+            finally:
+                writer.close()
+        except BaseException as exc:  # re-raised on the test thread
+            failures.append(exc)
+
+    thread = threading.Thread(target=as_process_owner(write))
+    thread.start()
+    thread.join(60)
+    assert not thread.is_alive(), "the concurrent writer did not finish"
+    if failures:
+        raise failures[0]
+
+
 def test_a_cache_mutation_is_visible_to_the_conversations_probe(
         tmp_path, monkeypatch):
     """`_evaluate_cache_churn` reads `session_entries` off the cache
     connection while the conversations component is inside its own
     probe-read-probe cycle, after the cache component's probe pair has closed.
-    A writer committing between the two changes `flaggedTurnCount`, which the
-    conversations digest binds, so the conversations probe must cover it or
-    `generation_incoherent` cannot fire for a mutation that genuinely moved a
-    published figure."""
+    A writer committing there changes `flaggedTurnCount`, which the
+    conversations digest binds, so that commit must never move a published
+    figure the digest does not describe.
+
+    #787 / #861 AD21 and 5.13: the probe pair and the read are one read unit,
+    and each store session in it is one SQLite snapshot (the session's
+    transaction), opened by the first probe. So a commit landing inside the
+    unit is invisible to the read and to both probes alike: the published
+    vector is the pre-commit one. The next establishment does see it, which
+    is what makes the first assertion more than a tautology."""
     ns = _stores(tmp_path, monkeypatch)
     _seed_churn(ns, compaction_before_window=False)
     sources = _sources()
     scope = _scope()
-    bundle = sources.StoreBundle(
-        scope, kernel.resolve_policy_plan("claude", transcripts_visible=True))
-    try:
-        before = sources._probe_component("conversations", bundle)
-        writer = ns["open_cache_db"]()
-        try:
-            writer.execute(
-                "UPDATE session_entries SET cache_read_tokens = 12345")
-            writer.commit()
-        finally:
-            writer.close()
-        after = sources._probe_component("conversations", bundle)
-    finally:
-        bundle.close()
-    assert before != after
+    plan = kernel.resolve_policy_plan("claude", transcripts_visible=True)
+
+    def establish():
+        with sources.StoreBundle(scope, plan) as bundle:
+            sources._establish(scope, bundle)
+            return bundle.vector
+
+    baseline = establish()
+    real_read = sources._read_component
+    committed: list = []
+
+    def read_after_a_commit(component, scope_, bundle_):
+        # After the conversations unit's first probe, before its read.
+        if component == "conversations" and not committed:
+            committed.append(component)
+            _commit_as_another_writer(
+                ns, "UPDATE session_entries SET cache_read_tokens = 12345")
+        return real_read(component, scope_, bundle_)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sources, "_read_component", read_after_a_commit)
+        during = establish()
+    after = establish()
+    assert committed == ["conversations"]
+    assert after.conversations != baseline.conversations, (
+        "non-vacuity: the commit moves a figure the conversations digest binds")
+    assert during == baseline
 
 
 # --- F12: the exception cause splits by KIND, not by layer --------------
@@ -2819,18 +2867,21 @@ def test_a_conversations_store_error_leaves_codex_fanout_measured(
 def _conversations_statements_executed(sources, scope, monkeypatch):
     """Every SQL the evaluators run against the CONVERSATIONS connection."""
     seen: list[str] = []
-    conversations_ids: set[int] = set()
+    # The connections themselves, not their ids: #787 / #861 AD21 bounds the
+    # conversations reader to one read unit, so it is closed and freed between
+    # units, and a later stats or cache connection can take its id.
+    conversations: list = []
     real_execute = sources._execute
     real_connection = sources.StoreBundle.connection
 
     def _connection(self, kind):
         conn = real_connection(self, kind)
         if kind == "conversations":
-            conversations_ids.add(id(conn))
+            conversations.append(conn)
         return conn
 
     def _spy(conn, sql, params=()):
-        if id(conn) in conversations_ids and not sql.startswith(
+        if any(conn is c for c in conversations) and not sql.startswith(
                 ("PRAGMA", "EXPLAIN")):
             seen.append(sql)
         return real_execute(conn, sql, params)
@@ -2964,8 +3015,41 @@ def test_the_schema_gap_branch_does_not_fold_the_cache_probe(
     digests a constant, so a hook tick committing to `cache.db` must not force
     a re-read — and a second one must not serve a spurious 503 for a digest
     that cannot depend on that store."""
+    # #787 / #861 (AD21, 5.13): each session in the bundle's read unit is one
+    # SQLite snapshot, so a cache commit between two probes is invisible to
+    # BOTH whether or not the probe folds the cache part, and comparing them
+    # proves nothing. The property is asserted directly instead: on the
+    # schema-gap branch the probe IS the conversations probe alone and opens
+    # no cache session, while the normal branch folds the cache part in (the
+    # contrast that shows the shape check can fail).
     ns = _stores(tmp_path, monkeypatch)
     _seed_churn(ns, compaction_before_window=False)
+    sources = _sources()
+    scope = _scope()
+
+    def probe() -> tuple[str, str, list]:
+        bundle = sources.StoreBundle(
+            scope,
+            kernel.resolve_policy_plan("claude", transcripts_visible=True))
+        opened: list = []
+        real_open = bundle._open_session
+
+        def _open_session(kind):
+            opened.append(kind)
+            return real_open(kind)
+
+        bundle._open_session = _open_session
+        try:
+            folded = sources._probe_component("conversations", bundle)
+            alone = sources._store_probe("conversations", bundle)
+        finally:
+            bundle.close()
+        return folded, alone, opened
+
+    folded, alone, opened = probe()
+    assert "cache" in opened, "the normal branch reads the cache part"
+    assert folded.startswith(alone + "|") and folded != alone
+
     conv = ns["open_conversations_db"]()
     try:
         conv.execute("ALTER TABLE conversation_messages "
@@ -2973,23 +3057,9 @@ def test_the_schema_gap_branch_does_not_fold_the_cache_probe(
         conv.commit()
     finally:
         conv.close()
-    sources = _sources()
-    scope = _scope()
-    bundle = sources.StoreBundle(
-        scope, kernel.resolve_policy_plan("claude", transcripts_visible=True))
-    try:
-        before = sources._probe_component("conversations", bundle)
-        writer = ns["open_cache_db"]()
-        try:
-            writer.execute(
-                "UPDATE session_entries SET cache_read_tokens = 4242")
-            writer.commit()
-        finally:
-            writer.close()
-        after = sources._probe_component("conversations", bundle)
-    finally:
-        bundle.close()
-    assert before == after
+    gap_probe, alone, opened = probe()
+    assert gap_probe == alone, "the schema-gap probe folds a cache part"
+    assert "cache" not in opened, "the schema-gap probe opens a cache session"
 
 
 def test_a_digest_row_failure_never_takes_down_the_accounting_classes(

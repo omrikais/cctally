@@ -140,23 +140,31 @@ def test_label_ref_during_stats_maintenance_names_the_hold(cc):
         assert "accounts" not in stored.get("budget", {})
 
 
-def test_raw_key_during_stats_maintenance_remains_writable(
-    cc, monkeypatch,
-):
+def test_raw_key_during_stats_maintenance_remains_writable(cc):
     ka = _acc("claude", "uuid-a")
     _seed([dict(at="2026-07-01T00:00:00Z", account_key=ka, provider="claude",
                 email="a@x.com", label="alice", label_source="auto")])
 
-    import _cctally_db
-    import _cctally_store
-
-    def maintenance_unavailable(*_args, **_kwargs):
-        raise _cctally_db.StatsDbMaintenanceError()
-
-    monkeypatch.setattr(_cctally_store, "stats_open_guarded",
-                        maintenance_unavailable)
+    # #787 / #861: the registry read is a stats query session, no longer
+    # `stats_open_guarded`, so the maintenance is real rather than a stub on
+    # an opener the write no longer reaches: the maintenance lock is held
+    # exclusively, exactly as the label-ref case above holds it.
     key = "0123456789abcdef0123456789abcdef"
-    assert _set(cc, "budget.accounts", json.dumps({key: 25})) == 0
+    lock_path = _cctally_core.STATS_LOCK_MAINTENANCE_PATH
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            [
+                sys.executable,
+                cc.__file__,
+                "config", "set", "budget.accounts", json.dumps({key: 25}),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    assert result.returncode == 0, result.stdout + result.stderr
     assert _stored_budget(cc)["accounts"] == {key: 25.0}
 
 

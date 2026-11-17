@@ -14,6 +14,8 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
+import sqlite3
 import subprocess
 import sys
 
@@ -296,6 +298,83 @@ def test_a_non_text_week_anchor_is_a_store_failure_and_never_exit_1(rich_home):
     run = _run_cli(["explain", "--window", "this-week"], home=rich_home)
     assert run.exit_code == 3, (run.exit_code, run.stdout, run.stderr)
     assert "store_unavailable" in run.stderr, run.stderr
+
+
+def _corrupt_store(home, name):
+    path = home / ".local" / "share" / "cctally" / name
+    for suffix in ("-wal", "-shm", "-journal"):
+        pathlib.Path(f"{path}{suffix}").unlink(missing_ok=True)
+    path.write_bytes(b"not a database " * 512)
+
+
+def _class_codes(result):
+    return {c["contributorClass"]: (c["verdict"], c.get("code"))
+            for c in result["classes"]}
+
+
+def test_a_corrupt_stats_store_withholds_only_the_facts_it_holds(rich_home):
+    """Accuracy (#787 / #861 parity with base): a corrupt stats.db withholds
+    the stats-derived facts (native blocks, the store horizon) through each
+    reader's own handler, and the cache-derived accounting still answers at
+    exit 0. Refusing the store as a whole-provider `provider_unavailable`
+    at exit 3 withheld a denominator that base reported."""
+    _corrupt_store(rich_home, "stats.db")
+    run = _run_cli(["explain", "--json", *_WINDOW_FLAGS], home=rich_home)
+    assert run.exit_code == 0, (run.exit_code, run.stdout, run.stderr)
+    claude = run.json["results"][0]
+    assert claude["code"] != "provider_unavailable", claude
+    usd = claude["denominator"]["usd"]
+    assert usd["state"] == "available", usd
+    assert not usd.get("qualifications"), usd
+    assert all(code != "provider_unavailable"
+               for _verdict, code in _class_codes(claude).values()), claude
+
+    # `--source all`: the Claude half is the same answer, and the Codex half
+    # (whose quota gate fails closed on corruption) is withheld with the
+    # store's sentence instead of crashing the command at exit 1.
+    both = _run_cli(["explain", "--json", "--source", "all", *_WINDOW_FLAGS],
+                    home=rich_home)
+    assert both.exit_code != 1, (both.stdout, both.stderr)
+    by_source = {r["source"]: r for r in both.json["results"]}
+    assert _class_codes(by_source["claude"]) == _class_codes(claude)
+    codex = by_source["codex"]
+    assert codex["code"] == "provider_unavailable", codex
+    assert codex["denominator"]["usd"]["qualifications"] == [
+        "stats store could not be opened read-only: file is not a database"]
+    measured = any(c["verdict"] in ("contributor", "no_contributor")
+                   for c in by_source["claude"]["classes"])
+    assert both.exit_code == (0 if measured else 3), both.stderr
+
+
+def test_a_corrupt_cache_store_is_withheld_by_its_reader_as_base_did(
+        rich_home):
+    """Accuracy (#787 / #861 parity with base): a corrupt cache.db withholds
+    the provider through the cache reader's own handler, which digests the
+    failure and adds no qualification. Refusing it as an establishment
+    failure published an empty population digest and a new sentence."""
+    _corrupt_store(rich_home, "cache.db")
+    run = _run_cli(["explain", "--json", *_WINDOW_FLAGS], home=rich_home)
+    assert run.exit_code == 3, (run.exit_code, run.stdout, run.stderr)
+    claude = run.json["results"][0]
+    assert claude["code"] == "provider_unavailable", claude
+    denominator = claude["denominator"]
+    assert denominator["usd"]["state"] == "withheld"
+    assert not denominator["usd"].get("qualifications"), denominator
+    assert denominator["populationDigest"], denominator
+
+
+def test_an_account_ref_over_a_refused_stats_store_is_a_store_failure(
+        rich_home):
+    """Accuracy (#787 / #861): a stats.db that exists but is refused still
+    holds the account registry, so `--account` over it reports the store's
+    failure (exit 3) instead of claiming the machine has no registry and
+    rejecting the ref as unknown (exit 2). Base crashed at exit 1."""
+    _corrupt_store(rich_home, "stats.db")
+    run = _run_cli(["explain", "--account", "nobody", *_WINDOW_FLAGS],
+                   home=rich_home)
+    assert run.exit_code == 3, (run.exit_code, run.stdout, run.stderr)
+    assert "store_unavailable" in run.stderr, run.stderr
+    assert "no account registry" not in run.stderr, run.stderr
 
 
 def test_an_unresolvable_account_is_exit_2_even_without_a_registry(tmp_path):
@@ -1026,8 +1105,68 @@ def test_every_establishment_failure_exits_3(code, rich_home, monkeypatch,
     assert code in captured.err
 
 
+@pytest.mark.parametrize(("state", "exit_code", "says"), [
+    # Refused stats states the CLI's owner startup does not resolve: a live
+    # repair, and a version-ahead index the startup defers to the epoch
+    # worker (today's deferral message, exit 3).
+    ("maintenance", 3, "anchor could not be read"),
+    ("unhealable_ahead", 3, "retry shortly"),
+    # A missing stats.db, and one with no usage snapshot, hold no anchor:
+    # the selector answer `run record-usage first` stays.
+    ("absent", 2, "no subscription-week anchor"),
+    ("empty", 2, "no subscription-week anchor"),
+])
+def test_a_refused_stats_store_under_the_window_anchor_exits_3(
+        empty_home, state, exit_code, says):
+    """R32-3 / R32-V4 (#787 / #861 revisions 32-33): a stats.db that exists
+    but cannot be read is an unavailable store (exit 3, `store_unavailable`,
+    the anchor named as the failed read), never "no subscription-week anchor
+    available" (exit 2), which tells the user to record usage while the
+    store is refused. Detects the anchor helper's swallowed open failure on
+    the explain path."""
+    data = empty_home / ".local" / "share" / "cctally"
+    stats = data / "stats.db"
+    held = None
+    if state == "unhealable_ahead":
+        conn = sqlite3.connect(stats)
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.execute(f"PRAGMA user_version = {version + 1}")
+        conn.commit()
+        conn.close()
+        journal = data / "journal"
+        if journal.exists():
+            shutil.rmtree(journal)
+    elif state == "maintenance":
+        held = subprocess.Popen([sys.executable, "-c",
+                                 "import time; time.sleep(120)"])
+        (data / "stats.db.repairing").write_text(str(held.pid))
+    elif state == "absent":
+        stats.unlink()
+    try:
+        run = _run_cli(["explain", "--window", "this-week"], home=empty_home)
+    finally:
+        if held is not None:
+            held.kill()
+            held.wait()
+    assert run.exit_code == exit_code, (run.exit_code, run.stdout, run.stderr)
+    assert says in run.stderr, run.stderr
+    if exit_code == 3:
+        assert "no subscription-week anchor" not in run.stderr, run.stderr
+
+
+@pytest.mark.parametrize("refusal", [
+    None,
+    # Q-W1 (#787 / #861): query-layer refusals whose internal detail must
+    # not reach stderr; each renders as the existing `stats.db could not be
+    # read` sentence.
+    ("schema_ahead", ""),
+    ("absent", "stats.db maintenance lock is absent"),
+    ("recovery_pending", "stats.db recovery is pending"),
+    ("unavailable", "stats.db maintenance lock unreadable ([Errno 13] "
+                    "Permission denied: '/private/x/stats.db.maint.lock')"),
+])
 def test_a_store_failure_under_the_window_anchor_is_not_a_selector_error(
-        rich_home, monkeypatch, capsys):
+        rich_home, monkeypatch, capsys, refusal):
     """Exit 2 means the user wrote the selector wrong.
 
     `_resolve_window` reaches stats.db through the ordinary opener for any
@@ -1035,14 +1174,21 @@ def test_a_store_failure_under_the_window_anchor_is_not_a_selector_error(
     here. Reporting that as `explain: <sqlite message>` and exit 2 tells the
     user to fix a `--window` token that was never wrong, and hides an
     infrastructure failure inside the argument taxonomy.
+
+    A query-layer refusal (``refusal``) also reaches it since R32-3; its
+    internal reason, path or errno text printed on stderr (Q-W1) is what the
+    refusal cases detect.
     """
     import sqlite3
 
     ns = load_script()
     diagnosis = ns["_cctally_diagnosis"]
     dk = ns["_load_sibling"]("_lib_diff_kernel")
+    import _cctally_store_access as store_access
 
     def _raise(*_a, **_kw):
+        if refusal is not None:
+            raise store_access._unavailable("stats", *refusal)
         raise sqlite3.DatabaseError("database disk image is malformed")
 
     monkeypatch.setattr(dk, "_diff_resolve_anchor", _raise)
@@ -1063,7 +1209,13 @@ def test_a_store_failure_under_the_window_anchor_is_not_a_selector_error(
         tz = None
 
     assert diagnosis.cmd_explain(_Args()) == 3
-    assert "store_unavailable" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "store_unavailable" in err
+    if refusal is not None:
+        assert "stats.db could not be read" in err, err
+        for leak in ("schema_ahead", "lock is absent", "recovery is pending",
+                     "Errno", "/private/x", "is not readable"):
+            assert leak not in err, err
 
 
 def test_a_malformed_window_token_is_still_a_selector_error(rich_home,

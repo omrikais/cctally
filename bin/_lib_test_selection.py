@@ -48,6 +48,22 @@ SERIAL: tuple[str, ...] = (
     # A wall-clock scaling ratio (test regime reset, Task 5.5): under -n 10 it
     # measured scheduler contention, not the planner.
     'tests/test_retention_planner_scaling.py',
+    # A loaded bulk leg (21 workers, run 5afb86dffbdd8b11) took T1's cases past
+    # their 360 s budget and killed three workers; away from that load (re-runs
+    # at the leg's eased tail, an idle profile) a case took 78-109 s (#996).
+    'tests/test_world_enumeration_oracle_f17.py::test_t1_finite_continuous_recovery',
+    # At 21 workers on lan its [codex] case took 104-114 s of the 120 s cap, and
+    # it is the likeliest trigger of three runs whose bulk leg lost one worker
+    # and then stalled to its deadline (#996).
+    'tests/test_retention_spill_free.py::test_spill_free_deletion_writes_each_dirty_page_once',
+    # It starts nested xdist sessions and kills their workers (#1086).
+    'tests/test_xdist_recovery.py::test_worker_death_subprocess',
+    # A nested pytest under a 100 s launch wait: 19 of 19 lan@21 bulk legs
+    # killed it at that wait; it takes 39.7 s idle (#1082).
+    'tests/test_quick_gate.py::test_every_source_a_rule_guard_scans_selects_it[tests/test_public_test_dep_closure.py]',
+    # bin/cctally-update-test under an 85 s wait took 76-86 s at lan@21, where
+    # 13 of 19 bulk legs failed it; it takes 26.6 s idle (#1082).
+    'tests/test_test_temp_kernel.py::test_an_update_test_cleanup_failure_fails_the_harness_and_spares_hard_links',
 )
 
 COMMON: tuple[str, ...] = ('-q', '-rfE', '-p', 'no:cacheprovider')
@@ -59,7 +75,9 @@ def _contains(target: str, node: str) -> bool:
 
 
 def _xdist(jobs: int) -> list[str]:
-    return ['-n', str(jobs), '--dist', 'loadgroup'] if jobs else []
+    # tests/_xdist_recovery.py corrects loadgroup's worker-death handling and
+    # makes an unrecoverable death a classified failure (#1086).
+    return ['-n', str(jobs), '--dist', 'loadgroup', '-p', 'tests._xdist_recovery'] if jobs else []
 
 
 def pytest_legs(repo: Path, quarantine_ids: Sequence[str], *, jobs: int,

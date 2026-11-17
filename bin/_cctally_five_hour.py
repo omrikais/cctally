@@ -50,6 +50,7 @@ import _lib_rebuild_progress  # #997 D9 progress ticks (stdlib only)
 import _lib_stats_content_revision  # #1050 identical child-set check
 from _lib_five_hour import latest_five_hour_reading
 from _cctally_core import _command_as_of, eprint, now_utc_iso, open_db, parse_iso_datetime
+import _cctally_store_access as _store_access
 
 
 def _cctally():
@@ -318,7 +319,7 @@ def _load_recorded_five_hour_windows(
     """
     _c = _cctally()
     try:
-        with open_db() as conn:
+        with _store_access.statement_reader("stats") as conn:
             rows = conn.execute(
                 "SELECT five_hour_resets_at, five_hour_window_key "
                 "FROM weekly_usage_snapshots "
@@ -830,7 +831,7 @@ def _maybe_swap_active_block_to_canonical(
         return
     active = blocks[active_idx]
     try:
-        with open_db() as conn:
+        with _store_access.statement_reader("stats") as conn:
             snap = conn.execute(
                 "SELECT five_hour_window_key FROM weekly_usage_snapshots "
                 "WHERE five_hour_window_key IS NOT NULL "
@@ -1325,7 +1326,7 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
     acct_key, acct_exit = _c.resolve_account_filter(args, "claude", needs_cache=False)
     if acct_exit is not None:
         return acct_exit
-    conn = open_db()
+    conn = _store_access.statement_reader("stats")
     try:
         # Date filter parsing — same convention as cmd_blocks.
         # _parse_date_filter routes through _parse_dual_form_date, which
@@ -1589,7 +1590,7 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
     acct_key, acct_exit = _c.resolve_account_filter(args, "claude", needs_cache=False)
     if acct_exit is not None:
         return acct_exit
-    conn = open_db()
+    conn = _store_access.statement_reader("stats")
     try:
         try:
             block = _resolve_block_selector(

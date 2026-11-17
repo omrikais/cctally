@@ -1002,3 +1002,196 @@ def test_stampless_migration_persists_and_is_not_rewalked(
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
     finally:
         conn.close()
+
+
+# ── #1068 D3: per-run migration fence + incarnation rotation ─────────────
+#
+# Stored-data failure these detect: a fingerprinted rollup row reused (or a
+# row certified) across a migration's untracked write. The fence row must be
+# durable while every handler runs, survive a failed or deferred run, and be
+# removed only by its owner or by a cleanup that proves no run is active; each
+# removal (and every ledger trim) must change the store's incarnation id.
+
+import fcntl  # noqa: E402
+import os  # noqa: E402
+
+_FENCE_PREFIX = "migration_fence:"
+
+
+def _db(cctally_module):
+    return cctally_module._cctally_db
+
+
+def _fence_store(tmp_path, *, user_version=0, applied=(), incarnation="old"):
+    """A file-backed existing-install store with a ledger and cache_meta."""
+    conn = sqlite3.connect(tmp_path / "cache.db")
+    conn.execute("CREATE TABLE schema_migrations "
+                 "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)")
+    conn.execute("CREATE TABLE schema_migrations_skipped "
+                 "(name TEXT PRIMARY KEY, skipped_at_utc TEXT NOT NULL, reason TEXT)")
+    conn.execute("CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT)")
+    for name in applied:
+        conn.execute("INSERT INTO schema_migrations VALUES (?, '2026-01-01T00:00:00Z')",
+                     (name,))
+    if incarnation is not None:
+        conn.execute("INSERT INTO cache_meta VALUES ('cache_incarnation_id', ?)",
+                     (incarnation,))
+    conn.execute(f"PRAGMA user_version = {user_version}")
+    conn.commit()
+    return conn
+
+
+def _fence_keys(conn):
+    return [r[0] for r in conn.execute(
+        "SELECT key FROM cache_meta WHERE key LIKE 'migration_fence:%'")]
+
+
+def _incarnation(conn, key="cache_incarnation_id"):
+    row = conn.execute("SELECT value FROM cache_meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _lock_fd(tmp_path, name="cache.db"):
+    """A second open file description of the store's fence lock: under flock
+    it conflicts with the dispatcher's own descriptor, like another process."""
+    return os.open(str(tmp_path / f"{name}.fence.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+
+
+def _exclusive_free(tmp_path) -> bool:
+    fd = _lock_fd(tmp_path)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_run_fence_row_held_during_handler_then_removed_with_rotation(
+        cctally_module, tmp_path):
+    conn = _fence_store(tmp_path)
+    seen = {}
+
+    def handler(c):
+        seen["rows"] = _fence_keys(c)
+        seen["fenced"] = _db(cctally_module).migration_fence_present(c, "main")
+        seen["exclusive_free"] = _exclusive_free(tmp_path)
+
+    reg = [cctally_module.Migration(seq=1, name="001_a", handler=handler)]
+    cctally_module._run_pending_migrations(conn, registry=reg, db_label="cache.db")
+
+    assert len(seen["rows"]) == 1 and seen["rows"][0].startswith(_FENCE_PREFIX)
+    assert seen["fenced"] is True
+    assert seen["exclusive_free"] is False  # the run holds the lock shared
+    assert _fence_keys(conn) == []
+    assert _incarnation(conn) not in (None, "old")
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(reg)
+    assert _db(cctally_module).migration_fence_present(conn, "main") is False
+    assert _exclusive_free(tmp_path)  # released on return
+
+
+@pytest.mark.parametrize("outcome", ["fails", "defers"])
+def test_failing_and_deferred_runs_keep_their_row_and_release_the_lock(
+        cctally_module, tmp_path, monkeypatch, outcome):
+    import _cctally_core
+    monkeypatch.setattr(_cctally_core, "MIGRATION_ERROR_LOG_PATH",
+                        tmp_path / "migration-errors.log")
+    conn = _fence_store(tmp_path)
+
+    def handler(c):
+        if outcome == "fails":
+            raise RuntimeError("planned failure")
+        raise _db(cctally_module).MigrationGateNotMet("planned defer")
+
+    reg = [cctally_module.Migration(seq=1, name="001_a", handler=handler)]
+    cctally_module._run_pending_migrations(conn, registry=reg, db_label="cache.db")
+
+    assert len(_fence_keys(conn)) == 1
+    assert _incarnation(conn) == "old"
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    assert _exclusive_free(tmp_path)
+
+
+def test_entry_cleanup_requires_no_active_run(cctally_module, tmp_path):
+    conn = _fence_store(tmp_path, user_version=1, applied=["001_a"])
+    conn.execute("INSERT INTO cache_meta VALUES ('migration_fence:dead', 'x')")
+    conn.commit()
+    reg = _registry(cctally_module, "001_a")
+    active = _lock_fd(tmp_path)
+    try:
+        fcntl.flock(active, fcntl.LOCK_SH)
+        cctally_module._run_pending_migrations(conn, registry=reg, db_label="cache.db")
+        assert _fence_keys(conn) == ["migration_fence:dead"]
+        assert _incarnation(conn) == "old"
+    finally:
+        os.close(active)
+    cctally_module._run_pending_migrations(conn, registry=reg, db_label="cache.db")
+    assert _fence_keys(conn) == []
+    assert _incarnation(conn) not in (None, "old")
+
+
+def test_recovery_rotates_and_never_removes_an_active_row(cctally_module, tmp_path):
+    conn = _fence_store(tmp_path, user_version=3, applied=["001_a", "002_newer"])
+    conn.execute("INSERT INTO cache_meta VALUES ('migration_fence:newer-run', 'x')")
+    conn.commit()
+    active = _lock_fd(tmp_path)
+    try:
+        fcntl.flock(active, fcntl.LOCK_SH)
+        cctally_module._run_pending_migrations(
+            conn, registry=_registry(cctally_module, "001_a"),
+            db_label="cache.db", recover_version_ahead=True)
+        assert _fence_keys(conn) == ["migration_fence:newer-run"]
+        assert _incarnation(conn) not in (None, "old")
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    finally:
+        os.close(active)
+
+
+def test_recovery_to_known_head_then_reopen_leaves_no_fence(cctally_module, tmp_path):
+    conn = _fence_store(tmp_path, user_version=3, applied=["001_a", "002_newer"])
+    conn.execute("INSERT INTO cache_meta VALUES ('migration_fence:dead-run', 'x')")
+    conn.commit()
+    reg = _registry(cctally_module, "001_a")
+    # `db recover`'s direct path removes a dead run's row through the
+    # exclusive cleanup, rotating with its trim.
+    _db(cctally_module)._recover_version_ahead(conn, reg, "cache.db")
+    assert _fence_keys(conn) == []
+    rotated = _incarnation(conn)
+    assert rotated not in (None, "old")
+    cctally_module._run_pending_migrations(
+        conn, registry=reg, db_label="cache.db", recover_version_ahead=True)
+    assert _fence_keys(conn) == []
+    assert _incarnation(conn) == rotated  # a clean reopen rotates nothing
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_fresh_install_writes_no_fence_row(cctally_module, tmp_path):
+    conn = sqlite3.connect(tmp_path / "cache.db")
+    seen = []
+    reg = [cctally_module.Migration(seq=1, name="001_a",
+                                    handler=lambda c: seen.append("ran"))]
+    cctally_module._run_pending_migrations(conn, registry=reg, db_label="cache.db")
+    assert seen == []
+    assert _db(cctally_module).migration_fence_present(conn, "main") is False
+    # A transient row would have been retired with a rotation, which mints
+    # the id; a fresh install's stamp-only branch takes neither step.
+    assert conn.execute("SELECT name FROM sqlite_master "
+                        "WHERE name='cache_meta'").fetchone() is None
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_memory_connection_skips_fence(cctally_module):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE schema_migrations "
+                 "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)")
+    conn.execute("CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+    seen = {}
+    reg = [cctally_module.Migration(
+        seq=1, name="001_a", handler=lambda c: seen.update(rows=_fence_keys(c)))]
+    cctally_module._run_pending_migrations(conn, registry=reg, db_label="cache.db")
+    assert seen["rows"] == []
+    assert _incarnation(conn) is None
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert _db(cctally_module)._fence_lock_path(conn) is None

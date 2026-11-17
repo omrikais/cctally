@@ -35,7 +35,9 @@ Spec: docs/superpowers/specs/2026-08-19-620-s2-on-demand-diagnosis.md §3, §5
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -695,6 +697,201 @@ class RawFacts:
         return self._index.population_digest
 
 
+#: The stores `build_diagnosis` reads through query sessions, for either
+#: provider. `conversations` reads under its held admission (AD31), which
+#: has no startup phase.
+_SESSION_STORES = ("stats", "cache")
+
+#: The schema refusals CLI `explain`'s startup phase found its query phase
+#: may read as they are, per store (revision 31, R30-2). Set only by
+#: `command_query_phase`; a fork inherits it, so the forked provider reads
+#: exactly as the parent does.
+_PHASE_TOLERATE: "contextvars.ContextVar[Mapping[str, frozenset[str]]]" = (
+    contextvars.ContextVar("_cctally_diagnosis_phase_tolerate", default={}))
+#: The SQLite error the startup phase's owner opener raised, per store: the
+#: query phase's refusal of that store reports it, as the read that ran the
+#: opener itself reported it before.
+_PHASE_STARTUP_ERRORS: "contextvars.ContextVar[Mapping[str, sqlite3.Error]]" = (
+    contextvars.ContextVar("_cctally_diagnosis_phase_errors", default={}))
+
+
+@contextlib.contextmanager
+def command_query_phase():
+    """CLI `explain`'s two phases (#787 / #861 revision 31, R30-2).
+
+    The startup phase runs first, at the command's `process` authority: for
+    every store a requested provider reads through a query session, the
+    effect-free readiness probe and, for a refusal the owner opener resolves
+    (a WAL-header stats.db, a missing lock, a pending recovery), the full
+    opener, exactly as each read's own `reader_retry` ran it before. It runs
+    once, before any provider forks, so a forked provider never converts a
+    store beside the parent's read. A schema-behind or -ahead store, which
+    base read as it was and the startup phase does not migrate, is read as
+    it is (`tolerate`), the read-only admission the diagnostic policy gave
+    it at `process`.
+
+    The body is the query phase: `query` authority at the `command` policy,
+    so every read, the held conversations reader and the `source=all`
+    provider's handoff are query reads and no owner work can run in them."""
+    import _cctally_store_access as _store_access
+
+    tolerate, errors = {}, {}
+    for store in _SESSION_STORES:
+        try:
+            policy = _store_access.reader_startup(store)
+        except sqlite3.Error as exc:
+            errors[store] = exc
+            continue
+        if policy == "diagnostic":
+            tolerate[store] = frozenset(
+                _store_access._READER_DIAGNOSTIC_REASONS)
+    with _cctally_core.authority_scope("query", policy="command"):
+        tokens = (_PHASE_TOLERATE.set(MappingProxyType(tolerate)),
+                  _PHASE_STARTUP_ERRORS.set(MappingProxyType(errors)))
+        try:
+            yield
+        finally:
+            _PHASE_STARTUP_ERRORS.reset(tokens[1])
+            _PHASE_TOLERATE.reset(tokens[0])
+
+
+@contextlib.contextmanager
+def query_session(kind: str):
+    """One read unit over `kind` (#787 / #861 AD21): a `query` session,
+    never the startup phase, yielding its ``sqlite3.Row`` connection. A store
+    that is absent or not readable is `STORE_UNAVAILABLE`, as the read-only
+    open it replaces reported it."""
+    import _cctally_store_access as _store_access
+
+    unavailable = EstablishmentError.STORE_UNAVAILABLE.value
+    if kind not in ("stats", "cache"):
+        # conversations reads under its held admission (StoreBundle).
+        _store_path(kind)  # raises the unrecognised-source failure
+        if kind == "conversations":
+            raise EstablishmentFailure(
+                EstablishmentError.STORE_UNAVAILABLE.value,
+                "conversations store opens only under the read admission",
+            )
+    def _enter(policy):
+        cm = _store_access.command_session(
+            kind, startup=False, row_factory=sqlite3.Row, policy=policy,
+            tolerate=_PHASE_TOLERATE.get().get(kind, frozenset()))
+        return cm, cm.__enter__()
+
+    try:
+        try:
+            session_cm, session = _enter(None)
+        except _cctally_core.StoreUnavailable as refused:
+            # I2f item 1 (AD2): a refusal base's raw `mode=ro` open read
+            # through (a missing lock, a WAL-header stats file, a schema
+            # behind or ahead) runs the owner opener or reads under the
+            # diagnostic policy, as `alerts` and `config` readers do. Any
+            # other refusal, or a caller without the authority, keeps it.
+            failed = _PHASE_STARTUP_ERRORS.get().get(kind)
+            if failed is not None:
+                raise failed from refused
+            retry, policy = _store_access.reader_retry(kind, refused.reason)
+            if not retry:
+                raise
+            session_cm, session = _enter(policy)
+    except sqlite3.Error as exc:
+        if (getattr(exc, "reason", None) == "absent"
+                and not os.path.lexists(_store_path(kind))):
+            raise EstablishmentFailure(
+                unavailable, f"{kind} store is not present") from exc
+        raise EstablishmentFailure(
+            unavailable,
+            f"{kind} store could not be opened read-only: "
+            f"{_cctally_core.store_refusal_text(exc)}",
+        ) from exc
+    with contextlib.ExitStack() as stack:
+        stack.push(session_cm.__exit__)
+        yield session.conn
+
+
+class _HeldSessionLatch:
+    """The AD31 held-session reader's exit check, as `_session`'s: a denial
+    recorded on its connection's latch refuses at close even when the
+    caller swallowed the raising statement (5.2)."""
+
+    def __init__(self, latch) -> None:
+        self._latch = latch
+
+    def __enter__(self) -> "_HeldSessionLatch":
+        return self
+
+    def __exit__(self, _exc_type, exc, _tb) -> bool:
+        if self._latch.violated and not isinstance(
+                exc, _cctally_core.QueryAuthorityViolation):
+            first = self._latch.events[0]
+            raise _cctally_core.QueryAuthorityViolation(
+                first.entry, first.capability, first.authority) from exc
+        return False
+
+
+class _RefusedStoreConnection:
+    """A corrupt store's query-session refusal, met where base met it.
+
+    Base opened stats.db and cache.db with a lazy `mode=ro` connect, so a
+    corrupt file raised `sqlite3.DatabaseError` at each reader's first
+    statement, inside that reader's own `except sqlite3.Error`, and only the
+    facts that reader owns were withheld (#787 / #861 spec 5.8: where today's
+    path raised on `corrupt`, the caller keeps its exception path). The query
+    session still refuses the store at admission, so nothing here opens,
+    heals or recovers it. This stand-in holds no connection: every statement
+    raises a fresh `sqlite3.DatabaseError` with SQLite's own text, the type
+    and message base's statement raised, so the readers' handlers, their
+    published digest rows (which name the exception type) and the probes'
+    fallbacks are base's."""
+
+    in_transaction = False
+
+    def __init__(self, kind: str, cause: BaseException) -> None:
+        self.kind = kind
+        self._text = str(cause)
+        self._code = getattr(cause, "sqlite_errorcode", None)
+        self._name = getattr(cause, "sqlite_errorname", None)
+        self.row_factory = None
+
+    @classmethod
+    def for_corruption(cls, kind: str, exc: EstablishmentFailure
+                       ) -> "_RefusedStoreConnection | None":
+        """The stand-in when `exc` is a `corrupt` refusal, else `None`."""
+        if exc.code != EstablishmentError.STORE_UNAVAILABLE.value:
+            return None
+        cause = exc.__cause__
+        if isinstance(cause, _cctally_core.StoreUnavailable):
+            corrupt = cause.reason == "corrupt"
+        elif isinstance(cause, sqlite3.DatabaseError):
+            # A startup-phase failure the phase recorded for this store.
+            import _cctally_db
+            corrupt = _cctally_db._is_sqlite_corruption_error(cause)
+        else:
+            corrupt = False
+        return cls(kind, cause) if corrupt else None
+
+    def _refuse(self, *_args, **_kwargs):
+        error = sqlite3.DatabaseError(self._text)
+        if self._code is not None:
+            error.sqlite_errorcode = self._code
+            error.sqlite_errorname = self._name
+        raise error
+
+    execute = executemany = executescript = cursor = _refuse
+
+    def establishment_failure(self) -> EstablishmentFailure:
+        """The whole-provider failure for a reader that has no per-reader
+        degradation (the Codex quota gate fails closed on corruption)."""
+        return EstablishmentFailure(
+            EstablishmentError.STORE_UNAVAILABLE.value,
+            f"{self.kind} store could not be opened read-only: {self._text}")
+
+    def close(self) -> None:
+        return None
+
+    commit = rollback = close
+
+
 # The "not yet asked" sentinel for the memoized schema-gap answer, because
 # `None` is a real answer there and would make every probe re-ask.
 _UNPROBED = object()
@@ -748,40 +945,94 @@ class StoreBundle:
         self._admissions = contextlib.ExitStack()
 
     def connection(self, kind: str) -> sqlite3.Connection:
+        """The current read unit's query-session connection for `kind`.
+
+        #787 / #861 AD21: a session lives for one read unit. Each component
+        read (its probe pair included) is one unit: the sessions it opens are
+        held until `end_read_unit()`, so a rollback-journal stats session
+        never outlives the component that read it."""
         conn = self._connections.get(kind)
         if conn is None:
-            if kind == "conversations":
-                conn = self._open_conversations()
-            else:
-                conn = open_read_only(kind)
+            conn = self._open_session(kind)
             self._connections[kind] = conn
         return conn
 
+    def _open_session(self, kind: str) -> sqlite3.Connection:
+        if kind == "conversations":
+            return self._open_conversations()
+        stack = contextlib.ExitStack()
+        try:
+            conn = stack.enter_context(query_session(kind))
+        except EstablishmentFailure as exc:
+            stack.close()
+            refused = _RefusedStoreConnection.for_corruption(kind, exc)
+            if refused is None:
+                raise
+            return refused
+        except BaseException:
+            stack.close()
+            raise
+        self._admissions.enter_context(stack)
+        return conn
+
     def _open_conversations(self) -> sqlite3.Connection:
-        """Open `conversations.db` under the diagnostic read admission.
+        """Open `conversations.db` under the held read admission.
 
         The admission (`_cctally_cache.conversation_ro_guarded`) holds the
         conversation maintenance flock SHARED for the connection's life, so
         the pre-rebuild probe's in-place read and recovery's quarantine
         cannot run under this reader, and it declines rather than open the
-        family while they, or a repair, own it (#1000 §5.10).
+        family while they, or a repair, own it (#1000 §5.10). #787 / #861
+        keeps this reader (spec 4.2 prior art: a query session releases its
+        admission once connected) and bounds it to the read unit (AD21).
+
+        AD31 (revision 29): only the lock's lifetime differs from a query
+        session. Revision 31: the reader enters `query` authority (at the
+        caller's policy) before it takes the lock and leaves it after the
+        connection closes. The connection is the held-session query connection
+        (`_cctally_store_access.held_query_connection`: the query factory
+        with no statement cache, the composed authorizer, ``temp_store``
+        MEMORY and its tag); its own violation latch refuses at close a
+        denial the caller swallowed; and the lock attempt, the connect and
+        the readiness reads are one admission of the read unit's AD29
+        budget, debited once, whose deadline also bounds the busy timeout.
         """
         import _cctally_cache
+        import _cctally_store_access as _store_access
 
         unavailable = EstablishmentError.STORE_UNAVAILABLE.value
+        policy = _store_access._default_read_policy()
         admission = contextlib.ExitStack()
         try:
-            conn = admission.enter_context(
-                _cctally_cache.conversation_ro_guarded(
-                    timeout=READ_BUSY_TIMEOUT_MS / 1000))
+            # The read unit's budget (drawn on when one is open), held, like
+            # a session's, for the connection's life.
+            admission.enter_context(_cctally_core.operation_budget(policy))
+            # Revision 31 (R30-2): the reads run under `query` authority
+            # from before the lock until the connection closes, even when
+            # the caller (CLI `explain`) runs at `process`.
+            admission.enter_context(
+                _cctally_core.authority_scope("query", policy=policy))
+            latch = admission.enter_context(_cctally_core.operation_boundary(
+                f"{_store_access.HELD_SESSION_TAG}:conversations"))
+            admission.enter_context(_HeldSessionLatch(latch))
+            with _cctally_core.admission_scope(policy):
+                conn = admission.enter_context(
+                    _cctally_cache.conversation_ro_guarded(
+                        connect=lambda path: (
+                            _store_access.held_query_connection(
+                                "conversations", path, policy))))
         except (sqlite3.Error, OSError) as exc:
             # OSError: the admission's lock file cannot be opened (an
             # unwritable data folder), which is unavailability, not a crash.
             admission.close()
             raise EstablishmentFailure(
                 unavailable,
-                f"conversations store could not be opened read-only: {exc}",
+                "conversations store could not be opened read-only: "
+                f"{_cctally_core.store_refusal_text(exc)}",
             ) from exc
+        except BaseException:
+            admission.close()
+            raise
         if conn is None:
             admission.close()
             if not os.path.lexists(_store_path("conversations")):
@@ -796,6 +1047,13 @@ class StoreBundle:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def end_read_unit(self) -> None:
+        """Close the current read unit's sessions (AD21)."""
+        self._connections.clear()
+        admissions, self._admissions = (self._admissions,
+                                        contextlib.ExitStack())
+        admissions.close()
+
     def conversations_schema_gap(self) -> str | None:
         """Which of our own tables this store cannot serve, memoized.
 
@@ -809,15 +1067,7 @@ class StoreBundle:
         return self._conversations_gap
 
     def close(self) -> None:
-        try:
-            for conn in self._connections.values():
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
-            self._connections.clear()
-        finally:
-            self._admissions.close()
+        self.end_read_unit()
 
     def __enter__(self) -> "StoreBundle":
         return self
@@ -1459,10 +1709,20 @@ def _read_stats_component(scope: DiagnosisScope,
                           bundle: StoreBundle) -> tuple[list, Any]:
     conn = bundle.connection("stats")
     if scope.source == "codex":
-        blocks, digest_rows = _read_codex_blocks(scope, conn)
+        try:
+            blocks, digest_rows = _read_codex_blocks(scope, conn)
+            horizon, raw_horizon = _read_store_horizon(scope, conn)
+        except sqlite3.DatabaseError as exc:
+            # The quota gate re-raises corruption unchanged (fail closed), so
+            # a corrupt stats.db withholds the Codex provider with the
+            # store's sentence rather than crashing the command, which base
+            # did (exit 1).
+            if not isinstance(conn, _RefusedStoreConnection):
+                raise
+            raise conn.establishment_failure() from exc
     else:
         blocks, digest_rows = _read_claude_blocks(scope, conn)
-    horizon, raw_horizon = _read_store_horizon(scope, conn)
+        horizon, raw_horizon = _read_store_horizon(scope, conn)
     # The horizon is part of the facts the report rests on, so it belongs in
     # the digest: a mutation that moved it must move this component.
     digest_rows = list(digest_rows) + [("horizon", raw_horizon)]
@@ -3558,9 +3818,15 @@ def _establish(scope: DiagnosisScope, bundle: StoreBundle) -> StoreBundle:
 
     def _read_with_probe(component: str) -> None:
         for attempt in (0, 1):
-            before = _probe_component(component, bundle)
-            component_rows, payload = _read_component(component, scope, bundle)
-            after = _probe_component(component, bundle)
+            # #787 / #861 AD21: the probe pair and the read are one read
+            # unit; its sessions close before the next component.
+            try:
+                before = _probe_component(component, bundle)
+                component_rows, payload = _read_component(
+                    component, scope, bundle)
+                after = _probe_component(component, bundle)
+            finally:
+                bundle.end_read_unit()
             if before == after:
                 rows[component] = list(component_rows)
                 payloads[component] = payload
@@ -4523,18 +4789,26 @@ def _build_provider_task(args) -> kernel.ProviderResult:
 def _start_forked_provider(args) -> tuple[int, int]:
     """Fork before any provider store opens; return `(pid, read_fd)`."""
     read_fd, write_fd = os.pipe()
+    # #787 / #861 spec 5.1: the child starts with no authority; it works on
+    # the forking thread's behalf, so it establishes that thread's.
+    handoff = _cctally_core.authority_handoff()
     pid = os.fork()
     if pid == 0:
+        # The worker ignores TERM so it can outlive its group's TERM and send
+        # the KILL (#1087); the provider must still die on TERM.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         os.close(read_fd)
         try:
-            payload = (True, _build_provider_task(args))
+            with _cctally_core.establish_handoff(handoff):
+                payload = (True, _build_provider_task(args))
         except EstablishmentFailure as exc:
             payload = (False, "establishment", exc.code, exc.message)
         except BaseException as exc:
             payload = (False, "unexpected", type(exc).__name__, str(exc))
         try:
             with os.fdopen(write_fd, "wb") as stream:
-                pickle.dump(payload, stream, protocol=5)
+                pickle.dump(payload + (_probed_header_verdicts(),), stream,
+                            protocol=5)
         finally:
             # #901 W9 (Q14): `os._exit` skips `atexit`; a provider task that
             # synced a store hands its frames to the checkpoint policy's
@@ -4554,7 +4828,7 @@ def _finish_forked_provider(worker: tuple[int, int]):
     pid, read_fd = worker
     try:
         with os.fdopen(read_fd, "rb") as stream:
-            payload = pickle.load(stream)
+            payload = _adopt_header_verdicts(pickle.load(stream))
     finally:
         _waited_pid, status = os.waitpid(pid, 0)
     if not payload[0]:
@@ -4572,13 +4846,78 @@ def _finish_forked_provider(worker: tuple[int, int]):
 # conversation maintenance lock must be the parent's own: the transcript read
 # admission excludes the pre-rebuild probe and recovery on that file and on
 # no other (#1000 §5.10).
+#: #787 / #861: the worker reads through query sessions, which also read
+#: the data directory's access policy (AD20) and every store's maintenance
+#: lock, so those paths are handed over as well.
 _WORKER_CORE_PATHS = ("CACHE_DB_PATH", "DB_PATH", "CONVERSATIONS_DB_PATH",
-                      "CONVERSATIONS_LOCK_MAINTENANCE_PATH", "CONFIG_PATH")
+                      "CONVERSATIONS_LOCK_MAINTENANCE_PATH", "CONFIG_PATH",
+                      "APP_DIR", "STATS_LOCK_MAINTENANCE_PATH",
+                      "CACHE_LOCK_MAINTENANCE_PATH")
+
+
+def _worker_initargs() -> tuple:
+    """`_spawn_worker_init`'s arguments: the cctally file, the parent's
+    `_WORKER_CORE_PATHS`, and (#787 AD30) the parent's cached AD19 header
+    verdicts for stats.db's current stat identity. A one-shot worker's own
+    cache starts empty, so without them every request launched a probe
+    child inside its interactive admission, whose launch alone could spend
+    the whole budget under load. The handoff only reads the parent's cache;
+    it never probes."""
+    import _cctally_store_access as _store_access
+
+    c = _cctally()
+    paths = {
+        name: str(getattr(_cctally_core, name)) for name in _WORKER_CORE_PATHS
+    }
+    verdicts = _store_access.header_verdict_handoff((paths["DB_PATH"],))
+    return (str(c.__file__), paths, verdicts)
+
+
+def _probed_header_verdicts() -> tuple:
+    """The AD19 verdicts this worker learned (#787 AD30): probed itself
+    (revision 29) or adopted from its own forked provider child (revision
+    31), returned with its result. Read through the store-access module the
+    worker's reads used (the one its initializer loaded); a worker that
+    never loaded it probed nothing."""
+    access = sys.modules.get("_cctally_store_access")
+    if access is None:
+        return ()
+    try:
+        return tuple(access.probed_header_verdicts())
+    except Exception:  # noqa: BLE001 — the result never depends on it
+        return ()
+
+
+#: The length of a worker payload that carries its returned verdicts as its
+#: last element (AD30), by its first element: a bounded or isolated worker's
+#: result (``"ok"``), a forked provider's result (True) or failure (False);
+#: any other is a bounded worker's typed or unexpected failure.
+_PAYLOAD_LENGTHS = {"ok": 3, True: 3, False: 5}
+
+
+def _adopt_header_verdicts(payload):
+    """Add the verdicts a worker returned as PAYLOAD's last element to this
+    process's AD19 cache, each under the stat identity it was probed for
+    (AD30, revision 29), and return the payload. A payload without them (a
+    worker that failed before its task) is returned as it is."""
+    if (isinstance(payload, tuple) and payload
+            and len(payload) == _PAYLOAD_LENGTHS.get(
+                payload[0] if isinstance(payload[0], (str, bool)) else None,
+                4)):
+        import _cctally_store_access as _store_access
+
+        _store_access.seed_header_verdicts(payload[-1], learned=True)
+    return payload
 
 
 def _spawn_worker_init(cctally_path: str,
-                       store_paths: Mapping[str, str]) -> None:
-    """Initialize a safe spawned/forkserver dashboard worker."""
+                       store_paths: Mapping[str, str],
+                       header_verdicts=()) -> None:
+    """Initialize a safe spawned/forkserver dashboard worker.
+
+    HEADER_VERDICTS seed the worker's AD19 cache before its first read
+    (AD30). Each stays keyed by the stat identity the parent observed, so a
+    stats.db whose identity moved since re-probes as an empty cache would."""
     import importlib.machinery
     import importlib.util
     import pathlib
@@ -4596,66 +4935,457 @@ def _spawn_worker_init(cctally_path: str,
     spec.loader.exec_module(module)
     for name, raw in store_paths.items():
         setattr(_cctally_core, name, pathlib.Path(raw))
+    import _cctally_store_access as _store_access
+    _store_access.seed_header_verdicts(header_verdicts)
 
 
+# The bounded diagnosis worker retires itself (#1087 §4.10, plan §R G1-G2).
+#
+# On a platform with `os.setsid` and `os.killpg` the parent never signals a
+# process. A process number is safe to signal only while its holder still
+# holds it (K6): the parent cannot know that of the worker (under the
+# forkserver the forkserver, not the parent, reaps it), but a live member of a
+# group always can of its own group, so the worker stops itself. It leads its
+# own session and group S (`setsid` at entry), and a watchdog thread reads the
+# parent's command channel:
+#
+#   worker -> parent  b"D"  the result is written;
+#   parent -> worker  b"E"  the result was received: exit;
+#   parent -> worker  b"T"  stop: `killpg(0, SIGTERM)`, the grace,
+#                           `killpg(0, SIGKILL)`, which ends the worker and
+#                           every member of its group (signals by a live
+#                           member to its own group, K6 b).
+#
+# The watchdog keeps reading after `E` until end-of-file, so a `T` the parent
+# sends later (the worker did not exit within the margin) is still honoured;
+# no received `T` is ever discarded. The worker survives the group TERM (a
+# Python handler that does nothing; children it execs get the default) so it
+# can send the KILL. The parent waits on the done channel and the worker's
+# sentinel; on every path other than a received `D` it confirms retirement
+# (`_worker_retired`) and raises `_RetirementPending` when that cannot be
+# shown within `_DIAGNOSIS_RETIRE_WAIT_SECONDS`, and on the `D` path it
+# appends a `wait()` for a worker not shown retired (not exited within the
+# margin, or a process it left still in its session) to the caller's
+# RETIREMENT list. The dashboard keeps its single admission slot
+# until the retirement is shown, so a worker tree that may still run never
+# has a second one started beside it.
 _DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS = 0.5
+# How long the parent waits for the worker to exit after `E`, and on top of
+# the grace after `T`.
+_DIAGNOSIS_RETIRE_MARGIN_SECONDS = 2.0
+# How long a non-`D` path waits for the retirement predicate to hold.
+_DIAGNOSIS_RETIRE_WAIT_SECONDS = 1.0
+# The poll period of `_RetirementPending.wait()`.
+_DIAGNOSIS_RETIRE_POLL_SECONDS = 0.5
+# Private test seams (#1087 test 12), read in the parent and handed to the
+# worker, because a forkserver worker inherits the forkserver's environment,
+# frozen when that server started. Each names a marker file the worker waits
+# for (it first writes `<marker>.reached` holding its pid): before its
+# watchdog starts; and, for the second, after its result is written, either
+# before `D` (a value `before-done:<path>`) or after it (a plain path).
+_DIAGNOSIS_TEST_HOLD_WATCHDOG_ENV = "CCTALLY_TEST_DIAGNOSIS_HOLD_WATCHDOG"
+_DIAGNOSIS_TEST_HOLD_RESULT_ENV = "CCTALLY_TEST_DIAGNOSIS_HOLD_RESULT"
+_DIAGNOSIS_TEST_HOLD_BOUND_SECONDS = 120.0
+
+
+class _RetirementPending(TimeoutError):
+    """The worker, or a process in its session, could not be shown gone.
+
+    `wait()` joins the worker without a bound, then polls the retirement
+    predicate every `_DIAGNOSIS_RETIRE_POLL_SECONDS` until it holds, then
+    closes the process object. The caller keeps whatever the worker tree
+    would hold (the dashboard's admission slot) until it returns."""
+
+    def __init__(self, message, waiter):
+        super().__init__(message)
+        self._waiter = waiter
+
+    def wait(self) -> None:
+        self._waiter()
+
+
+# A `/proc` read of a process or task that exited after the listing: ENOENT,
+# or ESRCH (as `_lib_hold`'s census reads it).
+_PROC_GONE = (errno.ENOENT, errno.ESRCH)
+
+
+def _proc_session_members(sid: int, proc_root: str = "/proc"):
+    """Linux: True when a live process in `proc_root` has session id SID,
+    False when none has, None when the listing cannot be read. A process
+    whose leader thread is a zombie (`Z`) or dead (`X`) is live while any
+    of its tasks is not (#1087 §R G3); a task that cannot be read counts as
+    live. A process or task that vanished during the scan (ENOENT or ESRCH)
+    is gone."""
+    try:
+        names = os.listdir(proc_root)
+    except OSError:
+        return None
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc_root, name, "stat")) as stream:
+                fields = stream.read().rsplit(")", 1)[1].split()
+            state, session = fields[0], int(fields[3])
+        except OSError as exc:
+            if exc.errno in _PROC_GONE:
+                continue
+            return None
+        except (IndexError, ValueError):
+            return None
+        if session != sid:
+            continue
+        if state not in ("Z", "X"):
+            return True
+        task_root = os.path.join(proc_root, name, "task")
+        try:
+            tasks = os.listdir(task_root)
+        except OSError as exc:
+            if exc.errno in _PROC_GONE:
+                continue
+            return True
+        for task in tasks:
+            try:
+                with open(os.path.join(task_root, task, "stat")) as stream:
+                    if stream.read().rsplit(")", 1)[1].split()[0] not in ("Z", "X"):
+                        return True
+            except OSError as exc:
+                if exc.errno in _PROC_GONE:
+                    continue
+                return True
+            except IndexError:
+                return True
+    return False
+
+
+def _ps_session_members(sid: int, listing=None, getsid=None):
+    """Elsewhere (Darwin): True when a listed pid has session id SID, False
+    when none has, None when the listing cannot be read or a session read
+    fails other than with ESRCH. Darwin answers ESRCH for an unreaped
+    zombie, which is not live."""
+    import subprocess
+
+    getsid = getsid or os.getsid
+    if listing is None:
+        try:
+            listing = subprocess.run(["ps", "-A", "-o", "pid="], stdin=subprocess.DEVNULL,
+                                     capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if listing.returncode != 0:
+            return None
+        listing = listing.stdout
+    for token in listing.split():
+        try:
+            pid = int(token)
+        except ValueError:
+            return None
+        try:
+            if getsid(pid) == sid:
+                return True
+        except ProcessLookupError:
+            continue
+        except OSError:
+            return None
+    return False
+
+
+def _session_members(sid: int):
+    """Whether a live process has session id SID: True, False, or None when
+    the census cannot be read (which means members present). Best effort:
+    it can only add caution to `_worker_retired`, never release on its own."""
+    if os.path.isdir("/proc/self/task"):
+        return _proc_session_members(sid)
+    return _ps_session_members(sid)
+
+
+def _worker_retired(process, sid) -> bool:
+    """The release predicate (#1087 §R G1): the worker's exit is confirmed,
+    `killpg(S, 0)` raises `ProcessLookupError` and the census finds no live
+    process with session id S. Signal 0 delivers nothing: with group S gone
+    no task, live or zombie, is left in it, and no fork can add one (a fork
+    joins its parent's group). Any other probe result, or an unreadable
+    census, is "not retired"."""
+    if sid is None or process.exitcode is None:
+        return False
+    try:
+        os.killpg(sid, 0)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return False
+    else:
+        return False
+    return _session_members(sid) is False
+
+
+def _await_retirement(process, sid, seconds) -> bool:
+    limit = time.monotonic() + seconds
+    while True:
+        process.join(0)
+        if _worker_retired(process, sid):
+            return True
+        if time.monotonic() >= limit:
+            return False
+        time.sleep(0.05)
+
+
+def _retirement_waiter(process, sid):
+    """`wait()` for a worker that was not shown retired: join it without a
+    bound, poll the predicate, then close the process object."""
+    def wait():
+        process.join()
+        while not _worker_retired(process, sid):
+            time.sleep(_DIAGNOSIS_RETIRE_POLL_SECONDS)
+        try:
+            process.close()
+        except ValueError:
+            pass
+    return wait
+
+
+def _diagnosis_test_hold(marker) -> None:
+    """A private test seam: write `<marker>.reached` (this process's pid),
+    then wait, bounded, for MARKER to exist."""
+    if not marker:
+        return
+    with open(marker + ".reached", "w") as stream:
+        stream.write(str(os.getpid()))
+    limit = time.monotonic() + _DIAGNOSIS_TEST_HOLD_BOUND_SECONDS
+    while not os.path.exists(marker) and time.monotonic() < limit:
+        time.sleep(0.02)
+
+
+def _diagnosis_ignore_term(_signum, _frame) -> None:
+    """The worker outlives its group's TERM so it can send the KILL."""
+
+
+class _DiagnosisStop:
+    """Whether the watchdog has begun a `T` stop, and whether the worker's
+    main thread has begun to exit; one lock orders the two, so a stop is
+    either begun before the exit (which then waits for it) or not begun."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.begun = False
+        self.exiting = False
+
+    def begin(self) -> bool:
+        with self.lock:
+            if not self.exiting:
+                self.begun = True
+            return self.begun
+
+    def exit(self) -> bool:
+        with self.lock:
+            self.exiting = True
+            return self.begun
+
+
+def _diagnosis_watchdog(cmd_r, released, grace, stop=None) -> None:
+    """Read the parent's command channel until end-of-file. `E` (the result
+    was received) and end-of-file release the main thread; `T` runs the
+    stop to its end, whatever the main thread is doing: once begun (STOP)
+    before the main thread began to exit, that exit waits for the KILL."""
+    while True:
+        try:
+            frame = cmd_r.recv_bytes()
+        except (EOFError, OSError):
+            released.set()
+            return
+        if frame == b"E":
+            released.set()
+            continue
+        if frame == b"T":
+            # Begun before the main thread began to exit, the stop has its
+            # grace (the exit waits for it). Otherwise the process may end at
+            # any moment, so the KILL follows the TERM at once.
+            begun = stop is None or stop.begin()
+            try:
+                os.killpg(0, signal.SIGTERM)
+            except OSError:
+                pass
+            if begun:
+                time.sleep(grace)
+            os.killpg(0, signal.SIGKILL)
+            return
+
+
+def _write_payload(result_path, payload) -> None:
+    """Write the worker's PAYLOAD with the verdicts it probed (AD30) as its
+    last element."""
+    with open(result_path, "wb") as stream:
+        pickle.dump(payload + (_probed_header_verdicts(),), stream,
+                    protocol=5)
+
+
+def _carried_authority(handoff):
+    """`establish_handoff` in a spawned worker, whose `_cctally_core` is the
+    one the initializer loaded."""
+    return sys.modules["_cctally_core"].establish_handoff(handoff)
 
 
 def _bounded_process_entry(result_path: str, task, args,
-                           initializer, initargs) -> None:
-    """Run one pickle-safe task in its own killable process group."""
-    if hasattr(os, "setsid"):
+                           initializer, initargs, cmd_r=None, done_w=None,
+                           control=None) -> None:
+    """Run one pickle-safe task in its own session and process group, which
+    the worker stops itself (#1087 §4.10).
+
+    Without the channels (no `os.setsid`/`os.killpg`: Windows) the task
+    runs as before and the parent retires the worker through its handle."""
+    # #787 / #861 spec 5.1: the worker process establishes the authority of
+    # the thread it runs for (``control["authority"]``) before the task.
+    handoff = (control or {}).get("authority")
+    if cmd_r is None:
         try:
-            os.setsid()
-        except OSError:
-            # The parent still terminates this process directly if the group
-            # was not established. No descendants exist before this point.
-            pass
+            if initializer is not None:
+                initializer(*initargs)
+            with _carried_authority(handoff):
+                payload = ("ok", task(*args))
+        except EstablishmentFailure as exc:
+            payload = ("establishment", exc.code, exc.message)
+        except BaseException as exc:
+            payload = ("unexpected", type(exc).__name__, str(exc))
+        _write_payload(result_path, payload)
+        return
+    control = control or {}
     try:
-        if initializer is not None:
-            initializer(*initargs)
-        payload = ("ok", task(*args))
-    except EstablishmentFailure as exc:
-        payload = ("establishment", exc.code, exc.message)
-    except BaseException as exc:
-        payload = ("unexpected", type(exc).__name__, str(exc))
-    with open(result_path, "wb") as stream:
-        pickle.dump(payload, stream, protocol=5)
-
-
-def _terminate_process_group(process) -> None:
-    """Terminate and reap one bounded worker plus any provider descendants."""
-    grouped = False
-    if process.pid is not None and hasattr(os, "killpg"):
+        os.setsid()
+    except OSError as exc:
+        # No group of its own to stop: the task never runs, and the parent
+        # raises from this payload having signalled nothing.
+        _write_payload(result_path, ("unexpected", "ProcessGroupError", str(exc)))
+        return
+    signal.signal(signal.SIGTERM, _diagnosis_ignore_term)
+    _diagnosis_test_hold(control.get("hold_watchdog"))
+    released = threading.Event()
+    stop = _DiagnosisStop()
+    grace = control.get("grace", _DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS)
+    watchdog = threading.Thread(
+        target=_diagnosis_watchdog, args=(cmd_r, released, grace, stop),
+        name="cctally-diagnosis-watchdog", daemon=True,
+    )
+    watchdog.start()
+    try:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-            grouped = True
-        except ProcessLookupError:
-            pass
+            if initializer is not None:
+                initializer(*initargs)
+            with _carried_authority(handoff):
+                payload = ("ok", task(*args))
+        except EstablishmentFailure as exc:
+            payload = ("establishment", exc.code, exc.message)
+        except BaseException as exc:
+            payload = ("unexpected", type(exc).__name__, str(exc))
+        _write_payload(result_path, payload)
+        hold_at, hold = control.get("hold_result") or (None, None)
+        if hold_at == "before-done":
+            _diagnosis_test_hold(hold)
+        try:
+            done_w.send_bytes(b"D")
         except OSError:
             pass
-    if process.is_alive() and not grouped:
-        process.terminate()
-    process.join(_DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS)
-    if grouped and process.pid is not None:
+        if hold_at == "after-done":
+            _diagnosis_test_hold(hold)
+        # Exit only once the parent has the result (`E`) or is gone (end of
+        # file); a `T` meanwhile ends this process through its group's KILL.
+        released.wait()
+    finally:
+        # A `T` stop begun before this point (after `E`, say) ends in the
+        # group's KILL, which ends this process too: do not exit first and
+        # leave a TERM-ignoring member running. Bounded, in case the KILL
+        # itself failed.
+        if stop.exit():
+            watchdog.join(grace + _DIAGNOSIS_RETIRE_MARGIN_SECONDS)
+
+
+def _diagnosis_test_control():
+    control = {"hold_watchdog": os.environ.get(_DIAGNOSIS_TEST_HOLD_WATCHDOG_ENV) or None}
+    raw = os.environ.get(_DIAGNOSIS_TEST_HOLD_RESULT_ENV) or ""
+    if raw.startswith("before-done:"):
+        control["hold_result"] = ("before-done", raw[len("before-done:"):])
+    elif raw:
+        control["hold_result"] = ("after-done", raw)
+    return control
+
+
+def _send_frame(conn, frame) -> None:
+    try:
+        conn.send_bytes(frame)
+    except OSError:     # a closed or broken channel: the next join decides
+        pass
+
+
+def _read_payload(result_path):
+    try:
+        with open(result_path, "rb") as stream:
+            payload = pickle.load(stream)
+    except (EOFError, OSError, pickle.PickleError) as exc:
+        raise RuntimeError("diagnosis process returned no result") from exc
+    return _adopt_header_verdicts(payload)
+
+
+def _payload_result(payload):
+    if payload[0] == "ok":
+        return payload[1]
+    if payload[0] == "establishment":
+        raise EstablishmentFailure(payload[1], payload[2])
+    raise RuntimeError(f"{payload[1]}: {payload[2]}")
+
+
+def _run_process_with_deadline_by_handle(context, task, args, *, timeout_seconds,
+                                         initializer, initargs):
+    """Without `os.setsid`/`os.killpg` (Windows): the handle pins the
+    process, so the parent retires it through `terminate()` and `kill()`."""
+    import tempfile
+
+    fd, result_path = tempfile.mkstemp(prefix="cctally-diagnosis-")
+    os.close(fd)
+    process = context.Process(
+        target=_bounded_process_entry,
+        args=(result_path, task, args, initializer, initargs, None, None,
+              {"authority": _cctally_core.authority_handoff()}),
+        name="cctally-diagnosis-process",
+    )
+    try:
+        process.start()
+        process.join(timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join(_DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS)
+            if process.is_alive():
+                process.kill()
+            process.join(_DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS)
+            raise TimeoutError("diagnosis process deadline expired")
+        if process.exitcode != 0:
+            raise RuntimeError(
+                f"diagnosis process exited {process.exitcode}")
+        payload = _read_payload(result_path)
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(_DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS)
         try:
-            # The leader may have exited on SIGTERM while a provider child
-            # ignored it. The process group remains addressable until every
-            # descendant is gone, so always finish the group with SIGKILL.
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            os.unlink(result_path)
+        except FileNotFoundError:
             pass
-        except OSError:
-            pass
-    elif process.is_alive():
-        process.kill()
-    process.join(_DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS)
+        if not process.is_alive():
+            process.close()
+    return _payload_result(payload)
 
 
 def _run_process_with_deadline(task, args, *, timeout_seconds: float,
-                               initializer=None, initargs=()):
-    """Run TASK in a one-shot process and forcibly retire it at the deadline."""
+                               initializer=None, initargs=(), retirement=None):
+    """Run TASK in a one-shot worker that retires itself at the deadline.
+
+    The parent never signals a process (#1087 §4.10): at the deadline it
+    sends `T` and the worker stops its own group. A non-`D` path whose
+    retirement cannot be shown raises `_RetirementPending` (a
+    `TimeoutError`); a `D` path returns the result, appending a `wait()`
+    to RETIREMENT (a list the caller runs before releasing what the worker
+    tree would hold) when the worker is not shown retired, or, without one,
+    returning after sending `T` to a worker still running."""
     import multiprocessing
+    import multiprocessing.connection
     import tempfile
 
     if timeout_seconds <= 0:
@@ -4663,40 +5393,86 @@ def _run_process_with_deadline(task, args, *, timeout_seconds: float,
     methods = multiprocessing.get_all_start_methods()
     method = "forkserver" if "forkserver" in methods else "spawn"
     context = multiprocessing.get_context(method)
+    if not (hasattr(os, "setsid") and hasattr(os, "killpg")):
+        return _run_process_with_deadline_by_handle(
+            context, task, args, timeout_seconds=timeout_seconds,
+            initializer=initializer, initargs=initargs)
+    grace = _DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS
+    margin = _DIAGNOSIS_RETIRE_MARGIN_SECONDS
+    control = dict(_diagnosis_test_control(), grace=grace,
+                   authority=_cctally_core.authority_handoff())
     fd, result_path = tempfile.mkstemp(prefix="cctally-diagnosis-")
     os.close(fd)
+    cmd_r, cmd_w = context.Pipe(duplex=False)
+    done_r, done_w = context.Pipe(duplex=False)
     process = context.Process(
         target=_bounded_process_entry,
-        args=(result_path, task, args, initializer, initargs),
+        args=(result_path, task, args, initializer, initargs, cmd_r, done_w, control),
         name="cctally-diagnosis-process",
     )
+    # Whether the process object may be closed here: not while a pending
+    # retirement owns it.
+    owned_by_waiter = False
     try:
-        process.start()
-        process.join(timeout_seconds)
-        if process.is_alive():
-            _terminate_process_group(process)
-            raise TimeoutError("diagnosis process deadline expired")
-        if process.exitcode != 0:
-            raise RuntimeError(
-                f"diagnosis process exited {process.exitcode}")
         try:
-            with open(result_path, "rb") as stream:
-                payload = pickle.load(stream)
-        except (EOFError, OSError, pickle.PickleError) as exc:
-            raise RuntimeError("diagnosis process returned no result") from exc
+            process.start()
+        finally:
+            cmd_r.close()
+            done_w.close()
+        sid = process.pid
+        ready = multiprocessing.connection.wait([done_r, process.sentinel], timeout_seconds)
+        done = False
+        if done_r in ready:
+            try:
+                done = done_r.recv_bytes() == b"D"
+            except (EOFError, OSError):
+                done = False
+        if done:
+            _send_frame(cmd_w, b"E")
+            process.join(margin)
+            if process.exitcode is None:
+                _send_frame(cmd_w, b"T")
+                if retirement is None:
+                    # The CLI path: nothing outlives the caller to wait on.
+                    owned_by_waiter = True
+                else:
+                    process.join(grace + margin)
+            if retirement is not None and not _await_retirement(process, sid, 0):
+                # The worker has not exited, or a process it left is still
+                # in its session: the slot waits for the predicate.
+                retirement.append(_retirement_waiter(process, sid))
+                owned_by_waiter = True
+            return _payload_result(_read_payload(result_path))
+        if ready:
+            # The worker ended without `D`: an exception before its result,
+            # a crash, an outside signal, or its own group failure.
+            if not _await_retirement(process, sid, _DIAGNOSIS_RETIRE_WAIT_SECONDS):
+                owned_by_waiter = True
+                raise _RetirementPending(
+                    "diagnosis process ended but its session was not shown empty",
+                    _retirement_waiter(process, sid))
+            if process.exitcode != 0:
+                raise RuntimeError(
+                    f"diagnosis process exited {process.exitcode}")
+            return _payload_result(_read_payload(result_path))
+        # The deadline: a late `D` is a timeout, as a late result always was.
+        _send_frame(cmd_w, b"T")
+        process.join(grace + margin)
+        if not _await_retirement(process, sid, _DIAGNOSIS_RETIRE_WAIT_SECONDS):
+            owned_by_waiter = True
+            raise _RetirementPending(
+                "diagnosis process deadline expired; its retirement is pending",
+                _retirement_waiter(process, sid))
+        raise TimeoutError("diagnosis process deadline expired")
     finally:
-        if process.is_alive():
-            _terminate_process_group(process)
+        for conn in (cmd_w, done_r):
+            conn.close()
         try:
             os.unlink(result_path)
         except FileNotFoundError:
             pass
-        process.close()
-    if payload[0] == "ok":
-        return payload[1]
-    if payload[0] == "establishment":
-        raise EstablishmentFailure(payload[1], payload[2])
-    raise RuntimeError(f"{payload[1]}: {payload[2]}")
+        if not owned_by_waiter and process.exitcode is not None:
+            process.close()
 
 
 def _build_diagnosis_process_task(scope: DiagnosisScope,
@@ -4711,38 +5487,54 @@ def _build_diagnosis_process_task(scope: DiagnosisScope,
 def build_diagnosis_bounded(scope: DiagnosisScope, *,
                             measured_at: dt.datetime | None = None,
                             transcripts_visible: bool,
-                            timeout_seconds: float) -> kernel.DiagnosisReport:
-    """Build one dashboard diagnosis in a process retired at TIMEOUT_SECONDS."""
-    c = _cctally()
-    paths = {
-        name: str(getattr(_cctally_core, name)) for name in _WORKER_CORE_PATHS
-    }
+                            timeout_seconds: float,
+                            retirement=None) -> kernel.DiagnosisReport:
+    """Build one dashboard diagnosis in a worker that retires itself at
+    TIMEOUT_SECONDS; RETIREMENT is `_run_process_with_deadline`'s list."""
     return _run_process_with_deadline(
         _build_diagnosis_process_task,
         (scope, measured_at, transcripts_visible),
         timeout_seconds=timeout_seconds,
         initializer=_spawn_worker_init,
-        initargs=(str(c.__file__), paths),
+        initargs=_worker_initargs(),
+        retirement=retirement,
     )
 
 
-def _build_isolated_provider(args):
-    """Run one provider in a portable, one-shot safe process worker."""
+def _build_carried_provider_task(handoff, args):
+    """`_build_provider_task` under the originating thread's authority, with
+    the AD19 verdicts this worker probed (AD30): ``(result, verdicts)``."""
+    with _carried_authority(handoff):
+        result = _build_provider_task(args)
+    return result, _probed_header_verdicts()
+
+
+def _build_isolated_provider(args, handoff=None):
+    """Run one provider in a portable, one-shot safe process worker, under
+    HANDOFF: the authority of the thread it builds for (#787 / #861)."""
     import concurrent.futures
     import multiprocessing
 
-    c = _cctally()
-    paths = {
-        name: str(getattr(_cctally_core, name)) for name in _WORKER_CORE_PATHS
-    }
     methods = multiprocessing.get_all_start_methods()
     method = "forkserver" if "forkserver" in methods else "spawn"
-    with concurrent.futures.ProcessPoolExecutor(
-            max_workers=1,
-            mp_context=multiprocessing.get_context(method),
-            initializer=_spawn_worker_init,
-            initargs=(str(c.__file__), paths)) as executor:
-        return executor.submit(_build_provider_task, args).result()
+    # Revision 31 (R30-1): this launcher thread starts with no authority
+    # (spec 5.1) and works on the building thread's behalf, so the pool's
+    # start, use and retirement run under that thread's handed-over
+    # authority: the route's query scope, where AD32 judges the lifecycle.
+    with _cctally_core.establish_handoff(handoff), \
+            concurrent.futures.ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context(method),
+                initializer=_spawn_worker_init,
+                initargs=_worker_initargs()) as executor:
+        result, verdicts = executor.submit(
+            _build_carried_provider_task, handoff, args).result()
+    # AD30: the parent adopts the verdicts the worker paid for, and returns
+    # them in turn when it is itself a worker (revision 31).
+    import _cctally_store_access as _store_access
+
+    _store_access.seed_header_verdicts(verdicts, learned=True)
+    return result
 
 
 def build_diagnosis(scope: DiagnosisScope,
@@ -4840,7 +5632,8 @@ def build_diagnosis(scope: DiagnosisScope,
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=1) as launcher:
                 codex_future = launcher.submit(
-                    _build_isolated_provider, tasks[1])
+                    _build_isolated_provider, tasks[1],
+                    _cctally_core.authority_handoff())
                 claude_result = _build_one("claude")
                 codex_result = codex_future.result()
         results = [claude_result, codex_result]

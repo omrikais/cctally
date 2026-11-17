@@ -35,6 +35,7 @@ from typing import Any
 
 from _cctally_core import _command_as_of, eprint, open_db, parse_iso_datetime
 from _lib_fmt import stable_sum
+import _cctally_store_access as _store_access
 
 
 def _cctally():
@@ -371,7 +372,7 @@ def cmd_weekly(args: argparse.Namespace) -> int:
         return range
     range_start, range_end = range
 
-    conn = open_db()
+    conn = _store_access.statement_reader("stats")
 
     try:
         # Build the subscription-week list spanning the range. Boundaries are

@@ -2052,3 +2052,298 @@ def test_an_authorized_recompute_settles_the_record_rather_than_dropping_it(
         assert settled is not None and settled["active"] is False
     finally:
         conn.close()
+
+
+# --- #1068 D2/D8: the rollup input fingerprint ------------------------------
+
+
+def _fp_store(tmp_path, monkeypatch, sessions=("s1",)):
+    """A synced, certified store with one assistant turn per session."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _bin_on_path(ns)
+    import _cctally_cache as cache
+    projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    projects.mkdir(parents=True, exist_ok=True)
+    transcript = projects / "a.jsonl"
+    transcript.write_text("".join(
+        _asst_line(f"u-{sid}", f"m-{sid}", f"r-{sid}", "hi", session_id=sid,
+                   ts=f"2026-06-01T00:00:{n:02d}Z")
+        for n, sid in enumerate(sessions)))
+    _sync_core(ns, cache)
+    conn = ns["open_conversations_db"]()
+    cache.sync_claude_conversations(conn)
+    return ns, cache, conn, transcript
+
+
+def _sync_core(ns, cache):
+    core = ns["open_cache_db"]()
+    try:
+        cache.sync_cache(core)
+    finally:
+        core.close()
+
+
+def _stored_fp(conn, sid, table="conversation_sessions"):
+    row = conn.execute(
+        f"SELECT input_fingerprint FROM {table} WHERE session_id=?", (sid,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _oracle_fp(cache, conn, sid, table="conversation_sessions"):
+    """The fingerprint the session's current inputs give, read independently
+    of the writer: one aggregate for max_id, one join for the accounting
+    half, and the seal over the stored content."""
+    epoch = cache._conversation_rollup_epoch(conn)
+    assert epoch is not None
+    max_id = conn.execute(
+        "SELECT MAX(id) FROM main.conversation_messages WHERE session_id=?",
+        (sid,)).fetchone()[0]
+    entries, max_seq = conn.execute(
+        "SELECT COUNT(*), MAX(e.mutation_seq) FROM cache_db.session_entries e "
+        "WHERE (e.msg_id, e.req_id) IN (SELECT msg_id, req_id FROM "
+        "main.conversation_messages WHERE session_id=?)", (sid,)).fetchone()
+    content = conn.execute(
+        "SELECT " + ", ".join(cache._ROLLUP_SEAL_COLUMNS)
+        + f" FROM {table} WHERE session_id=?", (sid,)).fetchone()
+    seq = "" if max_seq is None else str(max_seq)
+    return f"{epoch}:{max_id}:{entries}:{seq}:{cache._rollup_row_seal(content)}"
+
+
+@pytest.mark.parametrize("writer", ["steady", "targeted", "backfill", "rebuild"])
+def test_fingerprint_written_by_every_writer_path(tmp_path, monkeypatch, writer):
+    """#1068 D2 (T5). Accuracy failure detected: a writer path that rewrites a
+    rollup row without its fingerprint (or with one describing other inputs),
+    so the scoped Viewer either never reuses that row or reuses a row whose
+    cost and counts no longer match the session."""
+    ns, cache, conn, transcript = _fp_store(tmp_path, monkeypatch)
+    try:
+        assert _stored_fp(conn, "s1") == _oracle_fp(cache, conn, "s1"), \
+            "precondition: the first sync certifies the row"
+        conn.execute("UPDATE conversation_sessions SET input_fingerprint=NULL")
+        conn.commit()
+        with transcript.open("a") as fh:
+            fh.write(_asst_line("u2", "m2", "r2", "more", session_id="s1",
+                                ts="2026-06-01T00:01:00Z"))
+        _sync_core(ns, cache)
+        staged = []
+        if writer == "steady":
+            cache.sync_claude_conversations(conn)
+        elif writer == "targeted":
+            cache.sync_claude_conversations(conn, only_paths={str(transcript)})
+        elif writer == "backfill":
+            conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+                         "VALUES(?,?)", (FLAG, "1"))
+            conn.commit()
+            cache.sync_claude_conversations(conn)
+            assert _get_meta(conn, FLAG) is None
+        else:
+            real = cache._publish_title_generation
+
+            def capture(c, *args, **kwargs):
+                staged.append((
+                    _stored_fp(c, "s1", "conversation_sessions_staging"),
+                    _oracle_fp(cache, c, "s1", "conversation_sessions_staging")))
+                return real(c, *args, **kwargs)
+
+            monkeypatch.setattr(cache, "_publish_title_generation", capture)
+            cache.sync_claude_conversations(conn, rebuild=True)
+            assert staged and staged[0][0] == staged[0][1], \
+                "the staging derivation writes the certified fingerprint"
+        conn = _reopened(cache, conn)
+        stored = _stored_fp(conn, "s1")
+        assert stored is not None and stored == _oracle_fp(cache, conn, "s1")
+        assert stored.split(":")[2] == "2", "both turns are counted"
+        if staged:
+            assert stored == staged[0][0], "the publish copies the staged value"
+    finally:
+        conn.close()
+
+
+def test_staged_row_published_with_derivation_time_fingerprint(
+        tmp_path, monkeypatch):
+    """#1068 D2. Accuracy failure detected: a publish that re-stamps a staged
+    row with the inputs current at publish time, certifying a row whose
+    content was derived from older inputs."""
+    ns, cache, conn, _transcript = _fp_store(tmp_path, monkeypatch)
+    try:
+        real = cache._publish_title_generation
+        staged = []
+
+        def change_inputs_then_publish(c, *args, **kwargs):
+            staged.append(_stored_fp(c, "s1", "conversation_sessions_staging"))
+            other = sqlite3.connect(str(ns["_cctally_core"].CACHE_DB_PATH))
+            try:
+                other.execute("UPDATE session_entries "
+                              "SET mutation_seq = mutation_seq + 100")
+                other.commit()
+            finally:
+                other.close()
+            return real(c, *args, **kwargs)
+
+        monkeypatch.setattr(cache, "_publish_title_generation",
+                            change_inputs_then_publish)
+        cache.sync_claude_conversations(conn, rebuild=True)
+        conn = _reopened(cache, conn)
+        assert staged and staged[0] is not None
+        assert _stored_fp(conn, "s1") == staged[0]
+        assert _stored_fp(conn, "s1") != _oracle_fp(cache, conn, "s1"), \
+            "the published row describes its derivation-time inputs"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("condition",
+                         ["promote_flag", "reingest_flag", "fence_main",
+                          "fence_cache"])
+def test_fingerprint_null_under_promote_flag_fence_or_no_cache_attachment(
+        tmp_path, monkeypatch, condition):
+    """#1068 D2/D3. Accuracy failure detected: a row certified while an
+    in-place rewrite or a migration's untracked writes may still change its
+    inputs, which a later reader would reuse as current. The reingest flag
+    (review F4) changes the title fill itself (skill-preamble prompts are
+    skipped while it is set), and it is cleared in a commit separate from the
+    backfill arm, so a row certified under it could outlive the flag."""
+    ns, cache, conn, _transcript = _fp_store(tmp_path, monkeypatch)
+    try:
+        if condition in ("promote_flag", "reingest_flag"):
+            key = ("conversation_promote_command_args_pending"
+                   if condition == "promote_flag"
+                   else "conversation_reingest_pending")
+            conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) "
+                         "VALUES(?,'1')", (key,))
+            conn.commit()
+        elif condition == "fence_main":
+            conn.execute("INSERT INTO cache_meta(key,value) "
+                         "VALUES('migration_fence:test','t')")
+            conn.commit()
+        else:
+            conn.commit()
+            other = sqlite3.connect(str(ns["_cctally_core"].CACHE_DB_PATH))
+            try:
+                other.execute("INSERT INTO cache_meta(key,value) "
+                              "VALUES('migration_fence:test','t')")
+                other.commit()
+            finally:
+                other.close()
+        assert cache._rollup_certification_allowed(conn) is False
+        assert cache._recompute_conversation_sessions(conn, {"s1"}) is True
+        assert conn.execute(
+            "SELECT msg_count FROM conversation_sessions WHERE session_id='s1'"
+        ).fetchone()[0] == 1, "the content is still derived"
+        assert _stored_fp(conn, "s1") is None
+        assert cache._refresh_uncertified_conversation_sessions(conn) == 0
+        conn.rollback()
+    finally:
+        conn.close()
+    # The orphan prune's transcript-only connection (attach_cache=False) can
+    # neither read the accounting ledger nor the cache incarnation id.
+    bare = ns["open_conversations_db"](attach_cache=False)
+    try:
+        assert cache._conversation_rollup_epoch(bare) is None
+        assert cache._rollup_certification_allowed(bare) is False
+    finally:
+        bare.close()
+
+
+def test_refresh_stops_at_its_time_budget(tmp_path, monkeypatch):
+    """#1068 D8 (review F1). Machine-safety failure detected: one steady pass
+    re-deriving its full batch inside the rollup write transaction held the
+    conversations.db write lock for 3-17 s on the production-scale copy, past
+    the 15 s busy_timeout other writers wait with, after every epoch change.
+    A pass starts no further batch once its budget is spent, always makes
+    progress, and resumes in session order on the next pass."""
+    sessions = ("s1", "s2", "s3")
+    ns, cache, conn, _transcript = _fp_store(tmp_path, monkeypatch, sessions)
+    try:
+        certified = {sid: _stored_fp(conn, sid) for sid in sessions}
+        conn.execute("UPDATE conversation_sessions SET input_fingerprint=NULL")
+        conn.commit()
+        monkeypatch.setattr(
+            cache, "_CONVERSATION_FINGERPRINT_REFRESH_BUDGET_S", 0.0,
+            raising=False)
+        monkeypatch.setattr(
+            cache, "_CONVERSATION_FINGERPRINT_REFRESH_BATCH", 1, raising=False)
+        assert cache._refresh_uncertified_conversation_sessions(conn) == 1
+        conn.commit()
+        assert _stored_fp(conn, "s1") == certified["s1"]
+        assert _stored_fp(conn, "s2") is None
+        assert cache._refresh_uncertified_conversation_sessions(conn) == 1
+        conn.commit()
+        assert _stored_fp(conn, "s2") == certified["s2"]
+        assert _stored_fp(conn, "s3") is None
+    finally:
+        conn.close()
+
+
+def test_refresh_converges_at_most_n_per_pass(tmp_path, monkeypatch):
+    """#1068 D8. Accuracy failure detected: rows written before this change
+    (NULL), under another epoch, or re-filled without their fingerprint never
+    reaching a current fingerprint, or one pass re-deriving the whole store."""
+    sessions = ("s1", "s2", "s3", "s4")
+    ns, cache, conn, _transcript = _fp_store(tmp_path, monkeypatch, sessions)
+    try:
+        certified = {sid: _stored_fp(conn, sid) for sid in sessions}
+        assert all(certified[sid] == _oracle_fp(cache, conn, sid)
+                   for sid in sessions)
+        conn.execute("UPDATE conversation_sessions SET input_fingerprint=NULL "
+                     "WHERE session_id='s1'")
+        conn.execute("UPDATE conversation_sessions SET input_fingerprint=? "
+                     "WHERE session_id='s2'",
+                     ("0" * 32 + certified["s2"][32:],))
+        conn.execute("UPDATE conversation_sessions SET title='tampered' "
+                     "WHERE session_id='s3'")
+        conn.commit()
+
+        assert cache._refresh_uncertified_conversation_sessions(
+            conn, limit=2) == 2
+        conn.commit()
+        assert _stored_fp(conn, "s1") == certified["s1"]
+        assert _stored_fp(conn, "s2") == certified["s2"]
+        assert conn.execute("SELECT title FROM conversation_sessions "
+                            "WHERE session_id='s3'").fetchone()[0] == "tampered"
+        assert cache._refresh_uncertified_conversation_sessions(
+            conn, limit=2) == 1
+        conn.commit()
+        assert {sid: _stored_fp(conn, sid) for sid in sessions} == certified
+        assert cache._refresh_uncertified_conversation_sessions(conn) == 0
+
+        # The steady pass runs the refresh with no touched session.
+        conn.execute("UPDATE conversation_sessions SET input_fingerprint=NULL "
+                     "WHERE session_id='s4'")
+        conn.commit()
+        cache.sync_claude_conversations(conn)
+        conn = _reopened(cache, conn)
+        assert _stored_fp(conn, "s4") == certified["s4"]
+    finally:
+        conn.close()
+
+
+def test_refused_recompute_leaves_rows(tmp_path, monkeypatch):
+    """#1068 D8. Stored-data failure detected: a process the pricing order
+    refuses rewriting cost while converging fingerprints, or arming the
+    backfill flag on an otherwise idle pass."""
+    ns, cache, conn, _transcript = _fp_store(tmp_path, monkeypatch,
+                                             ("s1", "s2"))
+    try:
+        conn.execute("UPDATE conversation_sessions SET input_fingerprint=NULL, "
+                     "cost_usd=7.1149 WHERE session_id='s1'")
+        conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+                     (FP, "2026-09-30"))
+        conn.commit()
+        before = conn.execute(
+            "SELECT * FROM conversation_sessions ORDER BY session_id").fetchall()
+        monkeypatch.setattr(cache, "PRICING_SNAPSHOT_DATE", "2026-08-25")
+
+        assert cache._refresh_uncertified_conversation_sessions(conn) == 0
+        conn.commit()
+        conn = _reopened(cache, conn)
+        assert conn.execute(
+            "SELECT * FROM conversation_sessions ORDER BY session_id"
+        ).fetchall() == before
+        assert _get_meta(conn, FLAG) is None
+        assert _get_meta(
+            conn, cache.CONVERSATION_ROLLUP_PRICING_REFUSED_KEY) is None
+    finally:
+        conn.close()

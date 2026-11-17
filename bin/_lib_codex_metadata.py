@@ -242,15 +242,29 @@ def resolve_codex_threads_table(conn: sqlite3.Connection) -> str:
     with ``no such table`` on the bare cache connection, which is why the
     reference is resolved rather than written out.
 
-    A positive resolution is retained for this connection object. Production
-    connections establish their fixed ``main``/``cache_db`` topology before
-    their first read, so steady-state requests perform no repeated
-    ``sqlite_master`` or ``database_list`` probes. A caller that changes that
-    topology with ATTACH, DETACH, or table DDL must call
-    :func:`invalidate_codex_threads_table_resolution` before the next read.
-    Closing the connection ends the useful lifetime of its entry, and the
-    bounded LRU eventually releases the closed object. Absent-table results
-    are never cached.
+    An answer for this connection object arises in one of three ways:
+
+    1. Seeded. ``open_conversations_db_readonly`` records the last-good view
+       through :func:`seed_codex_last_good_threads_resolution` once its view
+       installation has succeeded, so a viewer request served by that opener
+       resolves here without any statement.
+    2. A cache hit after a probe. Any other connection probes on its first
+       call, and a positive answer is retained for the connection object.
+    3. A re-probe after eviction or invalidation. A caller must call
+       :func:`invalidate_codex_threads_table_resolution` before the next read
+       when it changes what this resolver probes: ATTACH or DETACH, DDL that
+       creates or drops ``temp.codex_last_good_threads``, or DDL that adds or
+       removes the raw table in ``main`` or ``cache_db``. Replacing the
+       unqualified ``temp.codex_conversation_threads`` view, as account
+       scoping does, changes none of those and needs no invalidation. The view
+       installer invalidates at its entry, and the dashboard request lifecycle
+       evicts its connection before closing it.
+
+    The 64-entry LRU is an optimization, not a lifetime guarantee: under
+    enough concurrent insertions an entry (seeded or probed) can be evicted
+    before its connection's next read, which then re-probes correctly. A
+    closed connection that nothing evicted is released once newer insertions
+    push it out. Absent-table results are never cached.
 
     ``RuntimeError`` means exactly one thing: the table is absent from every
     schema this connection can see. A ``sqlite3.Error`` raised while
@@ -303,7 +317,35 @@ def resolve_codex_threads_table(conn: sqlite3.Connection) -> str:
     return resolved
 
 
+def seed_codex_last_good_threads_resolution(conn: sqlite3.Connection) -> None:
+    """Record that ``conn`` resolves to the #968 last-good view.
+
+    Precondition: ``_install_codex_last_good_views(conn)`` has just returned
+    True on this exact connection. Executes no SQL.
+
+    The recorded reference is fixed, and it is exactly what the resolver's
+    first probe branch computes on such a connection, because that branch
+    tests for the view the installer has just created. The bookkeeping is the
+    resolver's own positive insert: most-recent end, then the shared bound.
+    """
+    with _threads_table_resolution_lock:
+        _threads_table_resolution_cache[conn] = f"temp.{LAST_GOOD_THREADS_VIEW}"
+        _threads_table_resolution_cache.move_to_end(conn)
+        while len(_threads_table_resolution_cache) > (
+                _THREADS_TABLE_RESOLUTION_CACHE_MAX):
+            _threads_table_resolution_cache.popitem(last=False)
+
+
 def invalidate_codex_threads_table_resolution(conn: sqlite3.Connection) -> None:
-    """Forget a positive raw-table answer after connection schema changes."""
+    """Forget a positive raw-table answer for ``conn``.
+
+    Called after a connection's schema changes, at the entry of
+    ``_install_codex_last_good_views`` (so a failed or interrupted
+    installation leaves no earlier answer behind), by
+    ``open_conversations_db_readonly``'s cleanup guard when the open fails
+    after its connection exists, and by the dashboard request lifecycle
+    immediately before it closes a request connection (including the
+    reader's cleanup when its legacy-bridge probe raises).
+    """
     with _threads_table_resolution_lock:
         _threads_table_resolution_cache.pop(conn, None)

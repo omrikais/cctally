@@ -2,9 +2,9 @@
 residual gates (A session-id shared, B uuid-less coverage gap, C surviving
 key overlap), degraded conversation_messages, and marker re-establishment."""
 from __future__ import annotations
-import json, os, pathlib
+import json, os, pathlib, sqlite3
 import pytest
-from conftest import load_script, redirect_paths
+from conftest import load_script, redirect_paths, rollup_fresh_mismatches
 
 
 def _assistant(msg_id, req_id, *, uuid=None, out=10, ts="2026-07-01T00:00:00Z"):
@@ -644,3 +644,231 @@ def test_residual_walks_leave_orphan_rows_and_ingest_appends_once(env):
         "SELECT msg_id, req_id FROM session_entries WHERE source_path=?",
         (str(keep),)).fetchall()) == [("mk", "rk"), ("mk2", "rk2"), ("mk3", "rk3")]
     assert orphan_rows() == retained
+
+
+_WATERMARK = "conversation_sessions_input_watermark"
+_PENDING = "conversation_sessions_rederive_pending"
+
+
+def _conv_meta(conversations, key):
+    row = conversations.execute(
+        "SELECT value FROM cache_meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _generation(conn):
+    row = conn.execute("SELECT value FROM cache_meta "
+                       "WHERE key='claude_accounting_generation'").fetchone()
+    return row[0] if row else None
+
+
+def _residual_sibling_store(ns, conn, conversations, projects, *,
+                            residual_session="S"):
+    """Session S spans two removed files: p1 (prunable) inserted the turn key
+    (m2, r2) first, and p2 (residual: m9 has no transcript row) holds the same
+    turn, under S or under another session (a fork). Both directories are
+    gone on return."""
+    p1 = projects / "-proj-gone" / "a.jsonl"
+    p2 = projects / "-proj-gone2" / "b.jsonl"
+    _write(p1, "S", [_assistant("m1", "r1", uuid="u1"),
+                     _assistant("m2", "r2", uuid="u2", out=40)])
+    _sync(ns, conn, conversations)              # pins (m2,r2) -> p1
+    _write(p2, residual_session, [_assistant("m2", "r2", uuid="u2b", out=40),
+                                  _assistant("m9", "r9", uuid=None)])
+    _sync(ns, conn, conversations)
+    assert rollup_fresh_mismatches(conversations) == []
+    import shutil
+    shutil.rmtree(p1.parent)
+    shutil.rmtree(p2.parent)
+    return p1, p2
+
+
+@pytest.mark.parametrize("residual_session", ["S", "T"])
+def test_prune_leaves_a_residual_session_rollup_fresh(env, residual_session):
+    """#1072 input path 4: the prune deletes accounting rows a residual session
+    still prices (its retained transcript holds the same turn key, whose row
+    the pruned file inserted first), either the pruned session itself or
+    another session holding the turn under the residual path (a fork, T).
+    Stale-cost failure: that session keeps its pre-prune cost and
+    cache-rebuild count in the unscoped Viewer. The prune also acknowledges
+    its own generation rotation, so the next pass needs no full re-derive."""
+    ns, conn, conversations, projects = env
+    _p1, p2 = _residual_sibling_store(ns, conn, conversations, projects,
+                                      residual_session=residual_session)
+    before = json.loads(_conv_meta(conversations, _WATERMARK))
+    assert before["generation"] == _generation(conn)
+
+    def residual_cost():
+        return conversations.execute(
+            "SELECT cost_usd FROM conversation_sessions WHERE session_id=?",
+            (residual_session,)).fetchone()[0]
+
+    cost_before = residual_cost()
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.pruned_files == 1 and str(p2) in res.residual_paths
+    assert rollup_fresh_mismatches(conversations) == []
+    assert residual_cost() < cost_before
+    after = json.loads(_conv_meta(conversations, _WATERMARK))
+    assert _generation(conn) != before["generation"]
+    assert after == {**before, "generation": _generation(conn)}
+    assert _conv_meta(conversations, _PENDING) is None
+
+
+def test_prune_of_a_multi_session_path_rederives_every_session(env):
+    """A pruned file holding two sessions' messages: ``session_files`` names
+    only one of them, so re-deriving by that id left the other session's row
+    (its messages now deleted) in the Viewer with its old cost and count."""
+    ns, conn, conversations, projects = env
+    orphan = projects / "-proj-gone" / "mixed.jsonl"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for sid, (mid, rid, uid) in (("S1", ("m1", "r1", "u1")),
+                                 ("S2", ("m2", "r2", "u2"))):
+        ln = _assistant(mid, rid, uuid=uid)
+        ln["sessionId"] = sid
+        lines.append(json.dumps(ln))
+    orphan.write_text("\n".join(lines) + "\n")
+    _sync(ns, conn, conversations)
+    assert {r[0] for r in conversations.execute(
+        "SELECT session_id FROM conversation_sessions")} == {"S1", "S2"}
+    import shutil
+    shutil.rmtree(orphan.parent)
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.pruned_files == 1
+    assert rollup_fresh_mismatches(conversations) == []
+    assert conversations.execute(
+        "SELECT count(*) FROM conversation_sessions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("crash", ["after_step2", "step4_raises"])
+def test_prune_dies_after_transcript_step(env, monkeypatch, crash):
+    """A prune that dies after deleting the transcript rows (before the
+    accounting delete), or whose re-derive step fails, must leave the affected
+    sessions recorded durably, so the next steady pass repairs them; nothing
+    else would ever touch a session whose files are gone."""
+    import _cctally_cache as cache
+    ns, conn, conversations, projects = env
+    _residual_sibling_store(ns, conn, conversations, projects)
+    if crash == "after_step2":
+        def die(*_args, **_kwargs):
+            raise RuntimeError("the prune died before its accounting delete")
+        real = cache._delete_claude_session_entries
+        monkeypatch.setattr(cache, "_delete_claude_session_entries", die)
+        with pytest.raises(RuntimeError):
+            ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+        monkeypatch.setattr(cache, "_delete_claude_session_entries", real)
+    else:
+        def fail(*_args, **_kwargs):
+            raise sqlite3.OperationalError("step 4 failed")
+        monkeypatch.setattr(cache, "_acknowledge_generation_rotation", fail)
+        res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+        assert res.pruned_files == 1
+    assert "S" in json.loads(_conv_meta(conversations, _PENDING))["sessions"]
+    assert rollup_fresh_mismatches(conversations) != []
+    ns["sync_claude_conversations"](conversations)
+    assert rollup_fresh_mismatches(conversations) == []
+    assert _conv_meta(conversations, _PENDING) is None
+
+
+def test_restored_pre_prune_cache_converges(env, tmp_path):
+    """A cache.db copy taken before a prune and restored after the prune's
+    acknowledged pass carries the pre-prune generation; the rollup must treat
+    that as a discontinuity and converge in one pass instead of keeping the
+    post-prune costs of the rows the copy brought back."""
+    import _cctally_core as core_mod
+    ns, conn, conversations, projects = env
+    _residual_sibling_store(ns, conn, conversations, projects)
+    copy = tmp_path / "pre-prune-cache.db"
+    src = sqlite3.connect(str(core_mod.CACHE_DB_PATH))
+    dst = sqlite3.connect(str(copy))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.pruned_files == 1
+    ns["sync_claude_conversations"](conversations)
+    assert rollup_fresh_mismatches(conversations) == []
+    src = sqlite3.connect(str(copy))
+    dst = sqlite3.connect(str(core_mod.CACHE_DB_PATH))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    assert rollup_fresh_mismatches(conversations) != []
+    ns["sync_claude_conversations"](conversations)
+    assert rollup_fresh_mismatches(conversations) == []
+
+
+def test_prune_transcript_step_holds_the_write_lock_before_reading(
+        env, monkeypatch):
+    """The transcript transaction reads (the affected sessions, the key
+    holders, the pending set) before its first write. Deferred, it holds only
+    a read snapshot, so a Codex conversation write committed in that window
+    makes the prune's first write fail at once with `database is locked`
+    (SQLITE_BUSY_SNAPSHOT, which no busy timeout retries) and the prune
+    raises. Holding the write lock from the start makes that writer wait
+    instead."""
+    import shutil
+    import _cctally_cache as cache
+    import _cctally_core as core
+    ns, conn, conversations, projects = env
+    orphan = projects / "-proj-gone" / "s1.jsonl"
+    _write(orphan, "S1", [_assistant("m1", "r1", uuid="u1")])
+    _sync(ns, conn, conversations)
+    shutil.rmtree(orphan.parent)
+    real = cache._sessions_holding_turn_key
+    attempts = []
+
+    def interleave(conv, mid, rid):
+        other = sqlite3.connect(str(core.CONVERSATIONS_DB_PATH), timeout=0)
+        try:
+            other.execute(
+                "INSERT INTO cache_meta(key, value) VALUES('test_1072_probe', "
+                "'x') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            other.commit()
+            attempts.append("committed")
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc):
+                raise
+            attempts.append("locked")
+        finally:
+            other.close()
+        return real(conv, mid, rid)
+
+    monkeypatch.setattr(cache, "_sessions_holding_turn_key", interleave)
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.pruned_files == 1
+    assert attempts == ["locked"]
+    assert _counts(conn, conversations, str(orphan)) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("stored", ["pruned_generation", "other_generation"])
+def test_acknowledge_rotation_rewrites_only_the_pruned_generation(env, stored):
+    """The prune may rewrite only the generation it read and rotated itself.
+    Rewriting a watermark or cursor target that carries another generation (an
+    earlier rotation nothing has consumed yet) would acknowledge deletes no
+    pass re-derived, leaving their sessions' costs stale."""
+    import _cctally_cache as cache
+    _ns, _conn, conversations, _projects = env
+    held = "G-old" if stored == "pruned_generation" else "G-earlier"
+    target = {"v": 1, "generation": held, "seq": 5, "message_id": 7,
+              "migrations": []}
+    cursor = {"v": 1, "target": dict(target), "after": "s1",
+              "pricing": "2026-01-01", "derivation": 1}
+    for key, value in ((_WATERMARK, target),
+                       ("conversation_sessions_rederive_cursor", cursor)):
+        conversations.execute(
+            "INSERT INTO cache_meta(key,value) VALUES(?,?) ON CONFLICT(key) "
+            "DO UPDATE SET value=excluded.value", (key, json.dumps(value)))
+    conversations.commit()
+    cache._acknowledge_generation_rotation(conversations, "G-old", "G-new")
+    conversations.commit()
+    expected = "G-new" if stored == "pruned_generation" else "G-earlier"
+    assert json.loads(_conv_meta(conversations, _WATERMARK)) == {
+        **target, "generation": expected}
+    assert json.loads(_conv_meta(
+        conversations, "conversation_sessions_rederive_cursor")) == {
+        **cursor, "target": {**target, "generation": expected}}

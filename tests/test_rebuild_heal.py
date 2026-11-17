@@ -1857,6 +1857,7 @@ def _load_cctally_in_child(bin_dir, home_dir, data_dir):
     mod = importlib.util.module_from_spec(spec)
     _sys.modules["cctally"] = mod
     loader.exec_module(mod)
+    _sys.modules["_cctally_core"].establish_script_owner()  # #787 / #861 spec 5.1
     return mod
 
 

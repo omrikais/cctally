@@ -17,6 +17,8 @@ import datetime as dt
 import decimal
 import json
 import sqlite3
+import contextlib
+import os
 import sys
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -958,8 +960,20 @@ def _resolve_window(args, now_utc: dt.datetime, tz_name: str):
     except dk.NoAnchorError:
         pass
     try:
-        anchor_week_start, anchor_resets_at = dk._diff_resolve_anchor(now_utc)
+        # R32-3 / R32-V4 (#787 / #861): a stats.db that exists but is refused
+        # (version ahead, a missing maintenance lock beside it, a pending
+        # recovery) is unavailable, not a store with no anchor; only a
+        # missing stats.db or a successful read that finds no snapshot keeps
+        # the no-anchor answer. The refusal tells the owner, which resolves
+        # the owner-work reasons (a no-op where nothing listens, as in the
+        # CLI).
+        anchor_week_start, anchor_resets_at = dk._diff_resolve_anchor(
+            now_utc, raise_unavailable=True)
     except (sqlite3.Error, ValueError, TypeError, AttributeError) as exc:
+        core = sys.modules.get("_cctally_core")
+        if core is not None and isinstance(exc, core.StoreUnavailable):
+            core.notify_owner(exc.store or "stats", core.Readiness(
+                exc.store or "stats", False, exc.reason, frozenset()))
         # The anchor read is a STORE read, so its failures belong to the
         # establishment taxonomy, not to selector validation. Reporting a
         # malformed stats.db as `explain: database disk image is malformed`
@@ -977,15 +991,20 @@ def _resolve_window(args, now_utc: dt.datetime, tz_name: str):
         # damage rather than because this schema can produce it.) Neither was
         # caught, so the exception escaped into the CLI's top-level handler
         # and printed `Error: a bytes-like object is required, not 'str'` at
-        # exit 1, which spec §4 does not use. `open_db()` failures never reach
-        # here — the anchor helper catches those itself and returns
-        # `(None, None)`. The widening stays bounded to this one call: a
+        # exit 1, which spec §4 does not use. A refused open of an existing
+        # stats.db reaches here too (`raise_unavailable`); a missing stats.db
+        # is the helper's `(None, None)`. The widening stays bounded to this
+        # one call: a
         # `TypeError` from anywhere else in the command still propagates,
         # because reporting a code bug as an infrastructure failure tells the
         # user to fix a store that is not broken.
+        # A query-layer refusal renders through the one Q-W1 chokepoint, so
+        # its internal reason, path or errno text never reaches stderr or
+        # the route's `error` field; every other exception renders as before.
+        text = core.store_refusal_text(exc) if core is not None else str(exc)
         raise kernel.EstablishmentFailure(
             kernel.EstablishmentError.STORE_UNAVAILABLE.value,
-            f"the subscription-week anchor could not be read: {exc}",
+            f"the subscription-week anchor could not be read: {text}",
         ) from exc
     return dk._parse_diff_window(
         token, now_utc=now_utc,
@@ -1025,9 +1044,19 @@ def _resolve_account_key(sources, args, provider: str):
     import _lib_accounts as accounts
 
     c = _cctally()
+    # #787 / #861: the resolution is one `query` read unit over stats.
+    phase = contextlib.ExitStack()
     try:
-        conn = sources.open_read_only("stats")
+        conn = phase.enter_context(sources.query_session("stats"))
     except kernel.EstablishmentFailure:
+        phase.close()
+        if os.path.lexists(sources._store_path("stats")):
+            # #787 / #861: a stats.db that exists but is refused (corrupt,
+            # under maintenance, busy, not readable) still holds a registry,
+            # so this is the store's failure, not an unknown ref: the caller
+            # reports it as the establishment error it is (exit 3). Base's
+            # lazy open read through maintenance and crashed on corruption.
+            raise
         # Selector validation is exit 2, and a ref that cannot be resolved is
         # unresolvable whatever the reason: with no account registry on the
         # machine there is no account this ref could name. Letting the failure
@@ -1047,7 +1076,7 @@ def _resolve_account_key(sources, args, provider: str):
             )
             return None, 2
     finally:
-        conn.close()
+        phase.close()
 
 
 def cmd_explain(args) -> int:
@@ -1127,8 +1156,12 @@ def cmd_explain(args) -> int:
         # authorization layer to compose and transcripts are always visible.
         # Stated rather than defaulted: `build_diagnosis` carries no default,
         # because the one call site that forgot it was the dashboard route.
-        report = sources.build_diagnosis(scope, measured_at=now_utc,
-                                         transcripts_visible=True)
+        # #787 / #861 revision 31 (R30-2): the startup phase, then the build
+        # as a query phase, so neither its reads nor the `--source all`
+        # provider child can do owner work.
+        with sources.command_query_phase():
+            report = sources.build_diagnosis(scope, measured_at=now_utc,
+                                             transcripts_visible=True)
     except kernel.EstablishmentFailure as exc:
         # An `EstablishmentFailure` is always exit 3. Argument-shaped
         # validation — a malformed `--window` token, an unresolvable account

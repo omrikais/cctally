@@ -20,6 +20,7 @@ Spec: docs/superpowers/specs/2026-05-30-extract-project-cmd-design.md
 from __future__ import annotations
 
 import argparse
+import contextlib
 import bisect
 import datetime as dt
 import json
@@ -38,6 +39,7 @@ from _lib_fmt import stable_sum
 
 # #620 S1 D11: the one affordance shape every warning state renders.
 import _lib_alert_scope
+import _cctally_store_access as _store_access
 
 
 def _cctally():
@@ -421,12 +423,10 @@ def _load_week_snapshots(
     This wrapper is the leg that opens its own connection; the reducer takes
     the caller's, because the dashboard already holds a transaction.
     """
-    conn = open_db()
-    try:
+    # #787 / #861 AD21: one read unit per statement.
+    with _store_access.statement_reader("stats") as conn:
         by_segment = latest_usage_by_segment(
             conn, subweeks, account_key=account_key)
-    finally:
-        conn.close()
     out: dict[dt.datetime, float] = {}
     for segment_key, pct in by_segment.items():
         if pct is None:
@@ -732,6 +732,13 @@ def _project_sort_key(row: dict, sort_by: str, order: str):
 
 
 def cmd_project(args: argparse.Namespace) -> int:
+    """`cmd_project` with its stats connection closed on every return
+    (#787 / #861 D10: the connection used to be left open)."""
+    with contextlib.ExitStack() as stack:
+        return _cmd_project_body(args, stack)
+
+
+def _cmd_project_body(args: argparse.Namespace, stack) -> int:
     """Roll entries up by project (git-root) with per-project usage attribution."""
     c = _cctally()
     c._share_validate_args(args)
@@ -772,7 +779,9 @@ def cmd_project(args: argparse.Namespace) -> int:
             return 2
 
     now = _command_as_of()
-    conn = open_db()
+    # #787 / #861 AD21: one read unit per statement, so the computation
+    # between this command's reads never holds stats.db's SHARED lock.
+    conn = stack.enter_context(_store_access.statement_reader("stats"))
 
     # #341 --account: resolve the render filter (provider=claude; fail closed
     # with exit 3 when the entry cache is unavailable). None = merged.

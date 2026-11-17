@@ -33,7 +33,7 @@ if str(BIN_DIR) not in sys.path:
 if str(REPO_ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tests"))
 
-from conftest import load_script, redirect_paths  # noqa: E402
+from conftest import as_process_owner, load_script, redirect_paths  # noqa: E402
 import _lib_accounts as accts  # noqa: E402
 
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "codex-parity" / "v1" / "rollouts"
@@ -505,7 +505,10 @@ def _run_child(body) -> None:
     def child():
         body()
         os._exit(0)
-    proc = multiprocessing.get_context("fork").Process(target=child)
+    # #787 / #861 (spec 5.1, D5): a forked child starts with no authority;
+    # it stands in for a sync process, so it runs at `process`.
+    proc = multiprocessing.get_context("fork").Process(
+        target=as_process_owner(child))
     proc.start()
     proc.join(120)
     if proc.is_alive():

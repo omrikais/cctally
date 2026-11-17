@@ -19,7 +19,7 @@ for extra in (REPO_ROOT / "bin", REPO_ROOT / "tests"):
     if str(extra) not in sys.path:
         sys.path.insert(0, str(extra))
 
-from conftest import load_script, redirect_paths  # noqa: E402
+from conftest import as_process_owner, load_script, redirect_paths  # noqa: E402
 from _codex_zstd_fixtures import token_records, write_rollout, zstd_bytes  # noqa: E402
 from test_codex_hook_lifecycle import _hook_args  # noqa: E402
 
@@ -625,8 +625,10 @@ def test_fairness_schedule_conditional_yield(debt_estate, monkeypatch):
     # post-release seam), never on a sleep or a row-count poll.
     monkeypatch.setattr(adm, "_after_finish", after_finish)
     marker_dir = ns["APP_DIR"] / "codex-hook-tick"
+    # Each drain is a detached `cctally` process owner (#787 / #861).
     worker = threading.Thread(
-        target=drain, kwargs={"wait_for_requests": True}, daemon=True)
+        target=as_process_owner(drain), kwargs={"wait_for_requests": True},
+        daemon=True)
     worker.start()
     # 1. the oversized identity's transaction is admitted and held open
     assert in_txn.wait(remaining())
@@ -640,7 +642,7 @@ def test_fairness_schedule_conditional_yield(debt_estate, monkeypatch):
             verify_errors.append(exc)
             poke()
 
-    verifier = threading.Thread(target=verify, daemon=True)
+    verifier = threading.Thread(target=as_process_owner(verify), daemon=True)
     verifier.start()
     # 2. hook A: contended no-op, request published, no success stamp
     assert ns["cmd_hook_tick"](_hook_args()) == 0
@@ -827,8 +829,9 @@ def test_hook_wall_time_stays_within_u4_overlapping_a_worker_and_alone(
     in_txn = threading.Event()
     monkeypatch.setattr(cache_mod, "_CODEX_PRUNE_PRECOMMIT_HOOK",
                         lambda p, r: (in_txn.set(), hold.wait(60)))
-    worker = threading.Thread(target=cache_mod.run_codex_prune_drain,
-                              kwargs={"wait_for_requests": False}, daemon=True)
+    worker = threading.Thread(
+        target=as_process_owner(cache_mod.run_codex_prune_drain),
+        kwargs={"wait_for_requests": False}, daemon=True)
     worker.start()
     assert in_txn.wait(30)
     proc, wall = _run_hook(ns, provider, data_dir)
@@ -1757,3 +1760,1000 @@ def test_1033_a_whole_provider_clear_leaves_an_empty_ready_summary(
         assert _ev_meta(conn, _EV_STATE) == "ready"
     finally:
         conn.close()
+
+
+# ── #1034: the drain settles its own deletions (spec §5.2, §5.5) ─────────────
+
+def _enable_codex_hooks(home: pathlib.Path, *, enabled: bool = True) -> None:
+    """Install the managed handlers and the trust entries Codex records, so
+    ``codex_hook_roots_all_enabled`` observes ``installed_enabled`` (or, with
+    ``enabled=False``, ``installed_disabled``) through the real config."""
+    home = home.resolve()
+    handler = {"type": "command", "timeout": 30,
+               "command": "/opt/cctally/bin/cctally hook-tick --foreground "
+                          "--source codex"}
+    hooks_path = home / "hooks.json"
+    hooks_path.write_text(json.dumps({"hooks": {
+        event: [{"hooks": [dict(handler)]}]
+        for event in ("Stop", "SubagentStop")}}))
+    flag = "" if enabled else "enabled = false\n"
+    (home / "config.toml").write_text(
+        f'[hooks.state."{hooks_path}:stop:0:0"]\ntrusted_hash = "aaa"\n{flag}'
+        f'[hooks.state."{hooks_path}:subagent_stop:0:0"]\n'
+        f'trusted_hash = "bbb"\n{flag}', encoding="utf-8")
+    stamp = os.stat(home / "config.toml").st_mtime
+    os.utime(hooks_path, (stamp - 60, stamp - 60))
+
+
+def _record():
+    return sys.modules["_cctally_record"]
+
+
+@pytest.fixture
+def settle_estate(debt_estate):
+    """``debt_estate`` ready to settle: the root's managed hooks enabled
+    through the real config, and the projection materialized by a primed
+    eligible pass, so the drain's deletions change a published projection."""
+    from test_codex_hook_lifecycle import _eligible_reconcile
+    ns, paths, spawned, clock = debt_estate
+    home = pathlib.Path(os.environ["CODEX_HOME"])
+    # A second survivor, so a continuation can also delete the keeper: #485
+    # never deletes a root's last recognizable rollout.
+    write_rollout(paths[0].parent / "rollout-2026-07-20T15-00-00-0199aaaa-"
+                  "bbbb-7ccc-8ddd-eeeeffff0099.jsonl",
+                  token_records(2, session_id="survivor"))
+    conn = _cache(ns)
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    _enable_codex_hooks(home)
+    import _lib_codex_hooks as hooks
+    assert hooks.codex_hook_roots_all_enabled(_record()._codex_lifecycle_roots())
+    assert _eligible_reconcile(ns).status in ("published", "current")
+    return ns, paths, spawned, clock, home
+
+
+def _drain_line(ns) -> dict:
+    lines = [line for line in (ns["APP_DIR"] / "logs" / "hook-tick.log")
+             .read_text().splitlines() if "op=prune-drain" in line]
+    assert lines, "the worker wrote no op=prune-drain line"
+    return dict(tok.split("=", 1) for tok in lines[-1].split()[1:] if "=" in tok)
+
+
+def _hook_evidence(ns) -> tuple:
+    """Lifecycle success markers and lifecycle lines: hook-only evidence."""
+    markers = sorted(p.name for p in (ns["APP_DIR"] / "codex-hook-tick")
+                     .glob("*.last-success"))
+    log = ns["APP_DIR"] / "logs" / "hook-tick.log"
+    lines = [line for line in (log.read_text().splitlines()
+                               if log.exists() else [])
+             if "source_root_key=" in line]
+    return markers, lines
+
+
+def test_the_worker_settles_its_deletions(settle_estate):
+    """Detects the defect #1034 removes: the drain commits prune deletions
+    that change a published projection and leaves the change-ledger range to
+    the next Codex hook, which then spends seconds re-projecting it on the
+    blocking path. The worker must settle the range itself, under every
+    root's lifecycle lock, so the next hook's scope is empty."""
+    ns, _paths, _spawned, _clock, _home = settle_estate
+    import argparse
+    import _cctally_quota as quota
+    from helpers.quota_projection_dump import scope_recorder
+    from test_codex_hook_lifecycle import (
+        _next_eligible_scope_units, _scoped_units)
+    cache = _cache_mod()
+    with scope_recorder(quota) as scopes:
+        assert cache._cmd_codex_prune_drain_body(argparse.Namespace()) == 0
+    fields = _drain_line(ns)
+    assert (fields["result"], fields["deleted"]) == ("drained", str(ORPHANS))
+    assert fields.get("settle") == "published", fields
+    assert fields["settle_projection"] == "published", fields
+    assert fields["settle_eligible_roots"] == "1", fields
+    assert fields["settle_budget"] == "1", fields
+    assert _scoped_units(scopes) > 0, "the drain left no ledger range"
+    assert _next_eligible_scope_units(ns) == 0
+
+
+@pytest.mark.parametrize("caller", ["executor", "cache_sync"])
+def test_the_executor_and_cache_sync_never_settle(
+    settle_estate, monkeypatch, caller,
+):
+    """Detects a settlement reached from a caller that is not the drain
+    worker (#1034 §5.2): ``cache-sync`` and every executor test call the
+    drain directly, and a settlement there would evaluate alerts at a
+    command's wall clock. Their deletions stay owed to the next hook."""
+    ns, _paths, _spawned, _clock, _home = settle_estate
+    from test_codex_hook_lifecycle import _next_eligible_scope_units
+    cache = _cache_mod()
+    if caller == "executor":
+        result = _executor()(wait_for_requests=False)
+        assert result.identities_deleted == ORPHANS
+        assert result.settlement == "none", result
+        assert _next_eligible_scope_units(ns) > 0
+        return
+    import argparse
+    seen: list = []
+    real_drain = cache.run_codex_prune_drain
+
+    def drain(**kwargs):
+        result = real_drain(**kwargs)
+        seen.append((kwargs, result))
+        return result
+
+    monkeypatch.setattr(cache, "run_codex_prune_drain", drain)
+    assert cache.cmd_cache_sync(argparse.Namespace(
+        source="codex", rebuild=False, prune_orphans=False)) == 0
+    assert seen and all(
+        not kwargs.get("settle_projection") and result.settlement == "none"
+        for kwargs, result in seen), seen
+    assert seen[0][1].identities_deleted == ORPHANS, seen
+
+
+def _hold_lifecycle_locks(ns, roots):
+    import fcntl
+    base = ns["APP_DIR"] / "codex-hook-tick"
+    base.mkdir(parents=True, exist_ok=True)
+    fds = []
+    for root in roots:
+        fd = os.open(base / f"{root.source_root_key}.lock",
+                     os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        fds.append(fd)
+    return fds
+
+
+def _flip(case, ns, monkeypatch, home, tmp_path, notes):
+    """Flip one settlement premise at settlement time. Where the real config
+    or store can express the premise it is used (hooks disabled, mixed roots,
+    held lifecycle locks, prune debt for the pin); a predicate is patched only
+    where a real state would also change what the drain loop itself does
+    (no roots, an epoch rebuild, a replay refill, inventory, the quota index,
+    root drift and an unreadable cache)."""
+    cache, record = _cache_mod(), _record()
+    if case == "hooks_disabled":
+        _enable_codex_hooks(home, enabled=False)
+    elif case == "mixed_roots":
+        other = tmp_path / "codex-other"
+        (other / "sessions").mkdir(parents=True)
+        monkeypatch.setenv("CODEX_HOME", f"{home},{other}")
+    elif case == "no_roots":
+        monkeypatch.setattr(record, "_codex_lifecycle_roots", lambda: [])
+    elif case == "locks_busy":
+        notes["fds"] = _hold_lifecycle_locks(
+            ns, record._codex_lifecycle_roots())
+        notes["sleeps"] = []
+        monkeypatch.setattr(time, "sleep", notes["sleeps"].append)
+    elif case == "partial_locks":
+        # Two enabled roots, another holder keeping ONE root's lock through
+        # every attempt: each attempt acquires the free root only, so the
+        # partial set must be released before each retry sleep.
+        import fcntl
+        other = tmp_path / "codex-other"
+        (other / "sessions").mkdir(parents=True)
+        _enable_codex_hooks(other)
+        monkeypatch.setenv("CODEX_HOME", f"{home},{other}")
+        roots = record._codex_lifecycle_roots()
+        assert len(roots) == 2, roots
+        busy = [root for root in roots
+                if root.codex_home.resolve() == other.resolve()]
+        assert len(busy) == 1, roots
+        free = [root for root in roots if root not in busy][0]
+        notes["fds"] = _hold_lifecycle_locks(ns, busy)
+        free_lock = (ns["APP_DIR"] / "codex-hook-tick"
+                     / f"{free.source_root_key}.lock")
+        notes["free_acquirable"] = []
+
+        def probe_free_root(_seconds):
+            fd = os.open(free_lock, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    notes["free_acquirable"].append(False)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    notes["free_acquirable"].append(True)
+            finally:
+                os.close(fd)
+        monkeypatch.setattr(time, "sleep", probe_free_root)
+    elif case == "root_drift":
+        import _lib_codex_hooks as hooks
+        real = record._codex_lifecycle_roots
+        calls = {"n": 0}
+
+        def drifting():
+            calls["n"] += 1
+            roots = real()
+            if calls["n"] == 1:
+                return roots
+            # Under the complete set: the report's occupancy must cover it.
+            time.sleep(_DRIFT_HOLD_SECONDS)
+            return roots + [hooks.CodexHookRoot(
+                "zz-drifted", home.resolve(), home.resolve() / "hooks.json")]
+        monkeypatch.setattr(record, "_codex_lifecycle_roots", drifting)
+    elif case == "epoch_pending":
+        notes["deferred"] = []
+        monkeypatch.setattr(record, "_stats_epoch_rebuild_pending", lambda: True)
+        monkeypatch.setattr(record, "_defer_stats_epoch_rebuild",
+                            lambda: notes["deferred"].append(1) or "spawned")
+    elif case == "replay_refill":
+        monkeypatch.setattr(cache, "_codex_replay_refill_unlocked",
+                            lambda conn: True)
+    elif case == "inventory_pending":
+        monkeypatch.setattr(cache, "codex_identity_inventory_ready",
+                            lambda conn: False)
+    elif case == "quota_index_pending":
+        real_sync = ns["sync_codex_cache"]
+
+        def deferring_sync(conn, **kwargs):
+            stats = real_sync(conn, **kwargs)
+            stats.deferred_reason = "quota_index_pending"
+            return stats
+        monkeypatch.setitem(ns, "sync_codex_cache", deferring_sync)
+    elif case == "unusable_pin":
+        conn = _cache(ns)
+        try:
+            conn.execute(
+                "INSERT INTO codex_prune_debt (source_path, source_root_key, "
+                "recorded_at_utc) VALUES (?, '', '2026-07-20T00:00:00+00:00')",
+                (str(home / "sessions" / "gone.jsonl"),))
+            conn.commit()
+        finally:
+            conn.close()
+    elif case == "cache_unavailable":
+        def unreadable(db_path):
+            raise sqlite3.OperationalError("unable to open database file")
+        monkeypatch.setattr(cache, "_hook_snapshot_connect", unreadable)
+    else:
+        assert case == "ready", case
+
+
+_DRIFT_HOLD_SECONDS = 0.05
+
+_DECLINES = {
+    "hooks_disabled": ("hooks_disabled", ""),
+    "mixed_roots": ("hooks_disabled", ""),
+    "no_roots": ("no_roots", ""),
+    "locks_busy": ("locks_busy", ""),
+    "partial_locks": ("locks_busy", ""),
+    "root_drift": ("not_ready", "root_drift"),
+    "epoch_pending": ("not_ready", "epoch_pending"),
+    "replay_refill": ("not_ready", "replay_pending"),
+    "inventory_pending": ("not_ready", "inventory_pending"),
+    "quota_index_pending": ("not_ready", "quota_index_pending"),
+    "unusable_pin": ("not_ready", "pin_prune_debt"),
+    "cache_unavailable": ("unavailable", "cache_unavailable"),
+}
+
+#: The core ran these declines while the settlement held every root's lock.
+_DECLINES_UNDER_THE_LOCKS = {"quota_index_pending", "unusable_pin"}
+
+
+def _settle_with(settle_estate, monkeypatch, tmp_path, case):
+    """Run the settling drain with ``case``'s premise flipped once the
+    executor loop has ended, so the flip cannot change what the loop does."""
+    ns, _paths, _spawned, _clock, home = settle_estate
+    cache = _cache_mod()
+    real_settle = cache._settle_codex_quota_after_prune
+    notes: dict = {}
+
+    def settle():
+        with monkeypatch.context() as patch:
+            _flip(case, ns, patch, home, tmp_path, notes)
+            try:
+                return real_settle()
+            finally:
+                for fd in notes.get("fds", ()):
+                    os.close(fd)
+    monkeypatch.setattr(cache, "_settle_codex_quota_after_prune", settle)
+    result = _executor()(wait_for_requests=False, settle_projection=True)
+    return result, notes
+
+
+@pytest.mark.parametrize("case", sorted(_DECLINES))
+def test_a_settlement_declines_with_its_specific_token(
+    settle_estate, monkeypatch, tmp_path, case,
+):
+    """Detects a settlement that publishes where it must not (#1034 A8): on
+    an install whose hooks Codex never invokes (alerts at drain time), with a
+    lifecycle lock it does not hold, or on a store the hook would refuse
+    (partial population). Each premise is flipped alone on the ready
+    fixture; the paired ready control below does settle."""
+    ns = settle_estate[0]
+    from test_codex_hook_lifecycle import _next_eligible_scope_units
+    result, notes = _settle_with(settle_estate, monkeypatch, tmp_path, case)
+    assert result.identities_deleted == ORPHANS, result
+    assert (result.settlement, result.settle_reason) == _DECLINES[case], result
+    assert result.settle_projection == "" and result.settle_counts is None
+    if case == "locks_busy":
+        assert len(notes["sleeps"]) == 20, notes["sleeps"]
+    if case == "partial_locks":
+        # Between attempts an outside caller can take the free root's lock:
+        # the partial set was released before every sleep, never held idle.
+        assert notes["free_acquirable"] == [True] * 20, notes
+    # §5.5: occupancy runs from the complete acquisition to the release, so
+    # only the declines taken under the complete set report any: the root
+    # drift recheck and the core's own declines.
+    if case == "root_drift":
+        assert result.settle_held_ms >= int(_DRIFT_HOLD_SECONDS * 1000), result
+    elif case in _DECLINES_UNDER_THE_LOCKS:
+        assert result.settle_held_ms > 0, result
+    else:
+        assert result.settle_held_ms == 0, result
+    if case == "epoch_pending":
+        assert notes["deferred"] == [1]
+    assert _hook_evidence(ns) == ([], [])
+    assert _next_eligible_scope_units(ns) > 0, (
+        "a declined settlement consumed the drain's ledger range")
+
+
+def test_the_ready_control_settles(settle_estate, monkeypatch, tmp_path):
+    """The decline matrix's paired control (#1034 A8): the same fixture with
+    no premise flipped settles, so each decline above is its own gate's."""
+    ns = settle_estate[0]
+    from test_codex_hook_lifecycle import _next_eligible_scope_units
+    result, _notes = _settle_with(settle_estate, monkeypatch, tmp_path, "ready")
+    assert (result.settlement, result.settle_projection) == (
+        "published", "published"), result
+    assert result.settle_counts.eligible_roots == 1, result
+    assert _next_eligible_scope_units(ns) == 0
+
+
+class _OffsetClock:
+    """``_cctally_cache``'s ``time`` with a monotonic clock the test can step
+    forward; every other attribute is the real module."""
+
+    def __init__(self, on_sleep):
+        self.offset = 0.0
+        self._on_sleep = on_sleep
+
+    def monotonic(self):
+        return time.monotonic() + self.offset
+
+    def sleep(self, seconds):
+        self._on_sleep(self)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def test_settle_held_ms_is_the_hold_alone(settle_estate, monkeypatch):
+    """Detects a lifecycle-lock occupancy that is not the hold (#1034 §5.5):
+    ``settle_held_ms`` is how long hooks were locked out, from the complete
+    acquisition to the release. The first attempt finds a root's lock held,
+    the retry sleep steps the clock 100 s, and the core steps it 10 s while it
+    holds the set: the report must carry the core's 10 s and none of the
+    retry wait."""
+    ns = settle_estate[0]
+    cache, record = _cache_mod(), _record()
+    roots = record._codex_lifecycle_roots()
+    fds = _hold_lifecycle_locks(ns, roots)
+    sleeps: list = []
+
+    def retry_sleep(clock):
+        sleeps.append(1)
+        while fds:
+            os.close(fds.pop())
+        clock.offset += 100.0
+
+    clock = _OffsetClock(retry_sleep)
+    real_core = record._run_codex_lifecycle_core
+
+    def core(locks, roots, **kwargs):
+        outcome = real_core(locks, roots, **kwargs)
+        clock.offset += 10.0
+        return outcome
+    real_settle = cache._settle_codex_quota_after_prune
+
+    def settle():
+        with monkeypatch.context() as patch:
+            patch.setattr(cache, "time", clock)
+            patch.setattr(record, "_run_codex_lifecycle_core", core)
+            return real_settle()
+    monkeypatch.setattr(cache, "_settle_codex_quota_after_prune", settle)
+    try:
+        result = _executor()(wait_for_requests=False, settle_projection=True)
+    finally:
+        while fds:
+            os.close(fds.pop())
+    assert sleeps == [1], "the first attempt was not refused"
+    assert result.settlement == "published", result
+    assert 10_000 <= result.settle_held_ms < 100_000, result
+
+
+def test_a_budget_failure_after_publication_reaches_the_drain_line(
+    settle_estate, monkeypatch,
+):
+    """Detects a settlement error that hides its committed publication on the
+    worker's ``op=prune-drain`` line, or a reason that leaks a path or
+    impersonates a field (#1034 §5.5, §7 shared core (3)): the budget leg
+    raises after the reconcile published, and the line must still carry
+    ``settle=error`` with the reconcile's status and counts, the executor's
+    own ``result=``, and a sanitized ``settle_reason`` last."""
+    ns = settle_estate[0]
+    import argparse
+    cache = _cache_mod()
+
+    def fail_budget(saved, **kwargs):
+        raise OSError(2, "boom key=value", "/Users/someone/secret/path")
+    monkeypatch.setitem(ns, "maybe_record_codex_budget_milestone", fail_budget)
+
+    assert cache._cmd_codex_prune_drain_body(argparse.Namespace()) == 0
+
+    [line] = [line for line in (ns["APP_DIR"] / "logs" / "hook-tick.log")
+              .read_text().splitlines() if "op=prune-drain" in line]
+    fields = _drain_line(ns)
+    assert fields["result"] == "drained", fields
+    assert (fields["settle"], fields["settle_projection"]) == (
+        "error", "published"), fields
+    for key in ("settle_blocks", "settle_milestones", "settle_eligible_roots"):
+        assert fields[key].isdigit(), (key, fields)
+    head, reason = line.split(" settle_reason=", 1)
+    assert "/Users/" not in line and "someone" not in line, line
+    assert "[Errno 2]" in reason and "boom" in reason, reason
+    assert "=" not in reason, (
+        "the reason carries a key that a last-wins parser would take", line)
+    assert "error=" not in head, line
+
+
+def test_an_unreadable_exit_recheck_keeps_the_settlement(
+    settle_estate, monkeypatch,
+):
+    """Detects a diagnostic read that discards committed work's report
+    (#1034 §5.5): the re-check after a real settlement opens a fresh cache
+    connection, and an open that raises there must not turn the worker's line
+    into ``result=error`` without ``settle=``, nor skip the conversations
+    drain. The re-check reports ``unknown`` and runs no continuation."""
+    ns = settle_estate[0]
+    import argparse
+    cache = _cache_mod()
+    real_open = cache.open_cache_db
+    real_settle = cache._settle_codex_quota_after_prune
+    armed = {"on": False, "raised": 0}
+
+    def open_cache_db():
+        if armed["on"]:
+            armed["on"] = False
+            armed["raised"] += 1
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_open()
+
+    def settle():
+        report = real_settle()
+        armed["on"] = True
+        return report
+    monkeypatch.setattr(cache, "open_cache_db", open_cache_db)
+    monkeypatch.setattr(cache, "_settle_codex_quota_after_prune", settle)
+    results: list = []
+    real_drain = cache.run_codex_prune_drain
+    monkeypatch.setattr(cache, "run_codex_prune_drain",
+                        lambda **kw: results.append(real_drain(**kw))
+                        or results[-1])
+    phases: list = []
+    real_phase = cache._run_codex_prune_drain_phase
+    monkeypatch.setattr(cache, "_run_codex_prune_drain_phase",
+                        lambda *a, **kw: phases.append(1) or real_phase(*a, **kw))
+
+    assert cache._cmd_codex_prune_drain_body(argparse.Namespace()) == 0
+
+    assert armed["raised"] == 1, "the re-check never opened the cache"
+    [result] = results
+    assert result.settlement == "published", result
+    assert result.work_remaining is None and result.ledger_retained == -1
+    assert phases == [1], "a continuation ran on an unreadable re-check"
+    fields = _drain_line(ns)
+    assert fields["result"] == "drained", fields
+    assert (fields["settle"], fields["work_remaining"],
+            fields["ledger_retained"]) == ("published", "unknown",
+                                           "unknown"), fields
+    assert "conv_remaining" in fields, "the conversations drain was skipped"
+
+
+def test_a_settlement_leaves_no_hook_evidence(settle_estate):
+    """Detects a settlement that impersonates a hook (#1034 §5.1 point 3):
+    a success marker would throttle the next real hook for 15 s, a lifecycle
+    line would feed doctor's hook counters, and an activity ticket would tell
+    the dashboard frontier a hook ran."""
+    ns = settle_estate[0]
+    import _lib_ingest_frontier as frontier
+    ticket = frontier.activity_marker_path(ns["APP_DIR"])
+    before = ticket.read_bytes() if ticket.exists() else None
+    result = _executor()(wait_for_requests=False, settle_projection=True)
+    assert result.settlement == "published", result
+    assert _hook_evidence(ns) == ([], [])
+    assert (ticket.read_bytes() if ticket.exists() else None) == before
+
+
+def test_the_drain_line_reports_unknowns_for_busy(debt_estate):
+    """Detects a ``busy`` drain reported as having checked its work: the
+    single-flight loser inspected nothing, so ``work_remaining`` and
+    ``ledger_retained`` must read ``unknown`` rather than a false 0."""
+    ns = debt_estate[0]
+    import argparse
+    cache = _cache_mod()
+    held = cache._worker_lock(cache.CODEX_PRUNE_DRAIN_LOCK_NAME)
+    assert held is not None
+    try:
+        result = _executor()(wait_for_requests=False, settle_projection=True)
+        assert result.outcome == "busy" and result.work_remaining is None
+        assert result.ledger_retained == -1 and result.settlement == "none"
+        assert cache._cmd_codex_prune_drain_body(argparse.Namespace()) == 0
+    finally:
+        cache._release_worker_lock(held)
+    fields = _drain_line(ns)
+    assert (fields["result"], fields["settle"], fields["work_remaining"],
+            fields["ledger_retained"]) == ("busy", "none", "unknown",
+                                           "unknown"), fields
+
+
+def _core_outcome(**fields):
+    defaults = dict(sync="ok", result="noop", pinned=True, reconciled=True,
+                    budget_completed=True)
+    defaults.update(fields)
+    return _record().CodexLifecycleCoreOutcome(**defaults)
+
+
+def _status_projection(status, *, pending=False):
+    from types import SimpleNamespace
+    return SimpleNamespace(status=status, alert_work_pending=pending,
+                           blocks_upserted=2, milestones_upserted=1,
+                           alerts_dispatched=0)
+
+
+_TOKEN_CASES = {
+    "budget_contended": (dict(projection=_status_projection("published"),
+                              budget_completed=False), "budget_deferred"),
+    "budget_deferred": (dict(projection=_status_projection("current"),
+                             budget_completed=False,
+                             reason="budget_ingest_incomplete"),
+                        "budget_deferred"),
+    "alert_pending": (dict(projection=_status_projection(
+        "published", pending=True), request_verify=True), "alert_pending"),
+    "deferred_verify": (dict(projection=_status_projection("deferred_verify")),
+                        "deferred_verify"),
+    "deferred_model": (dict(projection=_status_projection("deferred_model")),
+                       "deferred_model"),
+    "contended": (dict(projection=_status_projection("contended")),
+                  "contended"),
+    "unavailable": (dict(projection=_status_projection("unavailable")),
+                    "unavailable"),
+    "published": (dict(result="success",
+                       projection=_status_projection("published")),
+                  "published"),
+    "budget_error_after_publication": (dict(
+        result="error", error="RuntimeError: x",
+        projection=_status_projection("published")), "error"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_TOKEN_CASES))
+def test_post_reconcile_outcomes_map_to_their_tokens(case):
+    """Detects a post-reconcile outcome reported as ``not_ready`` or without
+    the reconcile's own status (#1034 V1): a committed publication followed
+    by a budget deferral, pending alert work or a budget failure must stay
+    visible as such on the drain line."""
+    fields, token = _TOKEN_CASES[case]
+    cache = _cache_mod()
+    core = _core_outcome(**fields)
+    assert cache._settlement_token(core) == token
+    report = cache.SettlementReport(token, core, core.reason, 0.25, 1)
+    result = cache._apply_settlement(
+        cache.PruneDrainResult("drained", ORPHANS, 0, 0, 0), report)
+    assert result.settlement == token
+    assert result.settle_projection == fields["projection"].status
+    assert result.settle_counts.blocks == 2 and result.settle_held_ms == 250
+
+
+def test_a_pre_reconcile_decline_maps_to_not_ready():
+    """The other half of the phase rule: a ``noop`` before the reconcile is
+    ``not_ready`` and carries no projection status."""
+    cache = _cache_mod()
+    core = _core_outcome(reconciled=False, pinned=False,
+                         reason="pin_prune_debt", budget_completed=False)
+    assert cache._settlement_token(core) == "not_ready"
+    result = cache._apply_settlement(
+        cache.PruneDrainResult("drained", ORPHANS, 0, 0, 0),
+        cache.SettlementReport("not_ready", core, core.reason, 0.0))
+    assert (result.settle_projection, result.settle_counts) == ("", None)
+
+
+# ── #1034 J3: the continuation after the settlement (spec §5.4) ──────────────
+
+def _after_settlement_core(monkeypatch, action, *, raise_after=False):
+    """Run ``action`` inside the settlement, right after the real core
+    returned and while it still holds every lifecycle lock; optionally raise
+    afterwards, as a core failing after its publication committed would."""
+    record = _record()
+    real = record._run_codex_lifecycle_core
+    outcomes: list = []
+
+    def core(locks, roots, **kwargs):
+        outcome = real(locks, roots, **kwargs)
+        outcomes.append(outcome)
+        action()
+        if raise_after:
+            raise RuntimeError("core failed after its publication")
+        return outcome
+    monkeypatch.setattr(record, "_run_codex_lifecycle_core", core)
+    return outcomes
+
+
+def _count_settlements(monkeypatch):
+    cache = _cache_mod()
+    real = cache._settle_codex_quota_after_prune
+    calls: list = []
+    monkeypatch.setattr(cache, "_settle_codex_quota_after_prune",
+                        lambda: calls.append(1) or real())
+    return calls
+
+
+def _keeper_debt(ns, paths):
+    """Delete the estate's keeper and record it as prune debt, as a hook
+    would after the rollout vanished."""
+    keeper = paths[ORPHANS]
+    keeper.unlink()
+    conn = _cache(ns)
+    try:
+        conn.execute(
+            "INSERT INTO codex_prune_debt (source_path, source_root_key, "
+            "recorded_at_utc) SELECT path, COALESCE(source_root_key, ''), "
+            "'2026-07-20T00:00:00+00:00' FROM codex_session_files "
+            "WHERE path=?", (str(keeper),))
+        conn.commit()
+    finally:
+        conn.close()
+    return str(keeper)
+
+
+def _stale_debt(ns, home, name="gone.jsonl"):
+    conn = _cache(ns)
+    try:
+        conn.execute(
+            "INSERT INTO codex_prune_debt (source_path, source_root_key, "
+            "recorded_at_utc) VALUES (?, '', '2026-07-20T00:00:00+00:00')",
+            (str(home / "sessions" / name),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_class(case, ns, paths, home):
+    cache = _cache_mod()
+    if case in ("prune", "core_raises"):
+        _keeper_debt(ns, paths)
+        return
+    conn = _cache(ns)
+    try:
+        if case == "finalization":
+            start = dt.datetime(2026, 7, 20, tzinfo=dt.timezone.utc)
+            cache.add_codex_finalization_debt(conn, spans={
+                source_root_key(str(home.resolve())):
+                    (start, start + dt.timedelta(days=1))})
+        elif case == "owed":
+            cache._store_codex_owed_maintenance(conn, {"change_log_prune": True})
+        else:
+            assert case == "root_cleanup", case
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, '1')",
+                (cache.CODEX_PRUNE_ROOT_CLEANUP_KEY,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _class_present(case, ns) -> bool:
+    cache = _cache_mod()
+    conn = _cache(ns)
+    try:
+        if case in ("prune", "core_raises"):
+            return conn.execute(
+                "SELECT 1 FROM codex_prune_debt LIMIT 1").fetchone() is not None
+        if case == "finalization":
+            return not cache.load_codex_finalization_debt(conn).empty
+        if case == "owed":
+            return cache._codex_owed_anything(conn)
+        return conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?",
+            (cache.CODEX_PRUNE_ROOT_CLEANUP_KEY,)).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def source_root_key(value):
+    from _lib_source_identity import source_root_key as key
+    return key(value)
+
+
+@pytest.mark.parametrize("case", [
+    "finalization", "prune", "owed", "root_cleanup", "core_raises"])
+def test_debt_recorded_during_the_settlement_is_consumed(
+    settle_estate, monkeypatch, case,
+):
+    """Detects durable work stranded behind the attempt throttle (J3): debt
+    a settlement's own sync or reconcile records while the drain holds its
+    single-flight lock would otherwise wait for a spawn the original marker
+    throttles for 600 s. A core that raises after its publication committed
+    must not skip the continuation either."""
+    ns, paths, _spawned, _clock, home = settle_estate
+    present_at_return: list = []
+
+    def seed():
+        _seed_class(case, ns, paths, home)
+        present_at_return.append(_class_present(case, ns))
+    _after_settlement_core(monkeypatch, seed,
+                           raise_after=(case == "core_raises"))
+    result = _executor()(wait_for_requests=False, settle_projection=True)
+    assert present_at_return == [True], "the seam seeded nothing"
+    expected = "error" if case == "core_raises" else "published"
+    assert result.settlement == expected, result
+    assert not _class_present(case, ns), (
+        f"the continuation left the {case} work the settlement recorded")
+    assert result.work_remaining is False, result
+
+
+def test_the_continuation_keeps_one_budget(settle_estate, monkeypatch):
+    """Detects a continuation that resets the run's budget or retries a kind
+    the first phase blocked (#1034 §5.4): one invocation has one
+    ``max_identities`` and one blocked set, and runs one settlement."""
+    ns, paths, _spawned, _clock, home = settle_estate
+    cache = _cache_mod()
+    conn = _cache(ns)
+    try:
+        cache._store_codex_owed_maintenance(conn, {"change_log_prune": True})
+        conn.commit()
+    finally:
+        conn.close()
+    real_unit = cache._run_codex_executor_unit
+    attempts: list = []
+
+    def failing_unit(conn, unit):
+        if unit == "change_log_prune":
+            attempts.append(unit)
+            return False, False
+        return real_unit(conn, unit)
+    monkeypatch.setattr(cache, "_run_codex_executor_unit", failing_unit)
+    debt_at_settlement: list = []
+
+    def seed():
+        debt_at_settlement.append(_count(
+            ns, "SELECT COUNT(*) FROM codex_prune_debt"))
+        _keeper_debt(ns, paths)
+        _stale_debt(ns, home)
+    _after_settlement_core(monkeypatch, seed)
+    settlements = _count_settlements(monkeypatch)
+    budget = ORPHANS + 1
+
+    result = _executor()(wait_for_requests=False, max_identities=budget,
+                         settle_projection=True)
+
+    assert debt_at_settlement == [0], "the first phase consumed nothing"
+    assert settlements == [1], settlements
+    assert result.identities_deleted + result.identities_dropped == budget
+    assert result.remaining == 1, result
+    assert attempts == ["change_log_prune"], (
+        "the continuation retried a kind the first phase blocked")
+    assert _class_present("owed", ns)
+    assert result.work_remaining is True and result.outcome == "partial"
+
+
+def _publish_request(ns):
+    return adm.publish_waiting_request(ns["APP_DIR"], root_keys=["hook"])
+
+
+def _watermark(ns):
+    import _cctally_quota as quota
+    stats = ns["open_db"]()
+    try:
+        return quota._ledger_state(stats)["watermark"]
+    finally:
+        stats.close()
+
+
+@pytest.mark.parametrize("case", [
+    "clean", "blocked", "capped", "admission_refused", "redirtied"])
+def test_the_exit_report(settle_estate, monkeypatch, case):
+    """Detects a drain exit that misreports its remaining work (#1034 R-a,
+    §5.4 point 6): ``outcome`` keeps the prune-row rule, ``work_remaining``
+    names any remaining class, and ``ledger_retained`` is a count. A
+    continuation's own deletions stay owed to the next hook, after the range
+    the settlement published."""
+    ns, paths, _spawned, _clock, _home = settle_estate
+    cache = _cache_mod()
+    kwargs = dict(wait_for_requests=False, settle_projection=True)
+    watermark: list = []
+    if case == "blocked":
+        conn = _cache(ns)
+        try:
+            cache._store_codex_owed_maintenance(conn, {"change_log_prune": True})
+            conn.commit()
+        finally:
+            conn.close()
+        monkeypatch.setattr(cache, "_run_codex_executor_unit",
+                            lambda conn, unit: (False, False))
+    elif case == "capped":
+        kwargs["max_identities"] = 1
+    elif case == "admission_refused":
+        assert _publish_request(ns)
+    elif case == "redirtied":
+        def seed():
+            watermark.append(_watermark(ns))
+            _keeper_debt(ns, paths)
+        _after_settlement_core(monkeypatch, seed)
+
+    result = _executor()(**kwargs)
+
+    assert isinstance(result.ledger_retained, int)
+    assert result.ledger_retained >= 0, result
+    expected = {
+        "clean": ("drained", False, "published"),
+        "blocked": ("drained", True, "published"),
+        # The debt the cap left makes the pin unusable (prune_debt), so the
+        # settlement declines rather than publish a partial population.
+        "capped": ("partial", True, "not_ready"),
+        "admission_refused": ("yielded", True, "none"),
+        "redirtied": ("drained", False, "published"),
+    }[case]
+    assert (result.outcome, result.work_remaining, result.settlement) == (
+        expected), result
+    if case == "redirtied":
+        from test_codex_hook_lifecycle import _next_eligible_scope_units
+        assert result.identities_deleted == ORPHANS + 1, result
+        assert _watermark(ns) == watermark[0], (
+            "something republished after the settlement")
+        conn = _cache(ns)
+        try:
+            ops = [row[0] for row in conn.execute(
+                "SELECT op FROM quota_window_change_log WHERE seq > ?",
+                (watermark[0],))]
+        finally:
+            conn.close()
+        assert ops and set(ops) == {"delete"}, ops
+        assert _next_eligible_scope_units(ns) > 0
+
+
+def _keeper_retained(ns, keeper):
+    return _count(ns, "SELECT COUNT(*) FROM codex_prune_debt "
+                      "WHERE source_path=?", (keeper,)) == 1
+
+
+def test_continuation_waits_out_a_fresh_request_under_production_admission(
+    settle_estate, monkeypatch,
+):
+    """Detects a production continuation that returns on a refusal and
+    strands the work behind the attempt throttle, or one that deletes while a
+    hook's waiting request is fresh (J3 admission): with
+    ``wait_for_requests=True`` the phase backs off until the request expires,
+    then consumes the work."""
+    ns, paths, _spawned, clock, _home = settle_estate
+    cache = _cache_mod()
+    keeper: list = []
+
+    def seed():
+        keeper.append(_keeper_debt(ns, paths))
+        assert _publish_request(ns)
+    _after_settlement_core(monkeypatch, seed)
+    sleeps: list = []
+
+    def advancing_sleep(seconds):
+        sleeps.append((seconds, bool(_requests(ns)),
+                       _keeper_retained(ns, keeper[0])))
+        clock.now += int(seconds * 1_000_000_000)
+        assert len(sleeps) < 100, "the backoff never ended"
+    monkeypatch.setattr(adm, "_sleep", advancing_sleep)
+    fresh_at_commit: list = []
+    monkeypatch.setattr(cache, "_CODEX_PRUNE_PRECOMMIT_HOOK",
+                        lambda path, root: fresh_at_commit.append(
+                            (path, bool(_requests(ns)))))
+
+    result = _executor()(wait_for_requests=True, settle_projection=True)
+
+    assert result.yielded >= 1, "the continuation was never refused"
+    assert sleeps and sleeps[0][1] and sleeps[0][2], (
+        "the backoff did not start while the request was fresh and the work "
+        "retained", sleeps)
+    assert (keeper[0], False) in fresh_at_commit, fresh_at_commit
+    assert all(not fresh for _path, fresh in fresh_at_commit), fresh_at_commit
+    assert not _keeper_retained(ns, keeper[0])
+    assert result.outcome == "drained" and result.settlement == "published"
+
+
+def test_continuation_refusal_ends_the_phase_without_waiting(
+    settle_estate, monkeypatch,
+):
+    """The ``wait_for_requests=False`` half of J3 admission: the first
+    refusal ends the phase, and the work stays as debt for a later drain."""
+    ns, paths, _spawned, _clock, _home = settle_estate
+    keeper: list = []
+
+    def seed():
+        keeper.append(_keeper_debt(ns, paths))
+        assert _publish_request(ns)
+    _after_settlement_core(monkeypatch, seed)
+    sleeps: list = []
+    monkeypatch.setattr(adm, "_sleep", sleeps.append)
+
+    result = _executor()(wait_for_requests=False, settle_projection=True)
+
+    assert sleeps == [] and result.yielded == 1, (sleeps, result)
+    assert _keeper_retained(ns, keeper[0])
+    assert result.outcome == "yielded" and result.work_remaining is True
+
+
+def _marker(ns):
+    return ns["APP_DIR"] / _cache_mod().CODEX_PRUNE_DRAIN_MARKER_NAME
+
+
+def test_continuation_leaves_the_original_spawn_marker_unchanged(
+    settle_estate, monkeypatch,
+):
+    """Detects a drain that resets or restamps its own attempt marker (J3):
+    the spawn that started this drain stamped it, so a request raised inside
+    the settlement (a refused projection asking for model resolution) is
+    throttled, and the continuation, not a new worker, consumes the work."""
+    ns, paths, spawned, _clock, _home = settle_estate
+    cache = _cache_mod()
+    import _cctally_quota as quota
+    # The fixture's ingest already requested a drain; this run's marker is
+    # the one its own spawning request stamps.
+    _marker(ns).unlink(missing_ok=True)
+    spawned.clear()
+    assert cache._request_codex_drain_worker(
+        cache.CODEX_PRUNE_DRAIN_COMMAND) == "spawned"
+    assert spawned == [cache.CODEX_PRUNE_DRAIN_COMMAND]
+    stamp = _marker(ns).stat().st_mtime_ns
+    requests: list = []
+
+    def seed():
+        _keeper_debt(ns, paths)
+        requests.append(cache._request_codex_drain_worker(
+            cache.CODEX_PRUNE_DRAIN_COMMAND))
+        quota._request_codex_model_resolution()
+    _after_settlement_core(monkeypatch, seed)
+
+    result = _executor()(wait_for_requests=False, settle_projection=True)
+
+    assert requests == ["throttled"], requests
+    assert _marker(ns).stat().st_mtime_ns == stamp
+    assert spawned == [cache.CODEX_PRUNE_DRAIN_COMMAND], spawned
+    assert result.identities_deleted == ORPHANS + 1 and result.remaining == 0
+
+
+def test_an_expired_marker_restamps_and_the_second_worker_is_busy(
+    settle_estate, monkeypatch,
+):
+    """The expired half of J3's marker rule: a request raised inside the
+    settlement restamps an expired marker and spawns a worker, which finds
+    the single-flight lock held and returns ``busy``; the running drain's
+    continuation consumes the work."""
+    ns, paths, _spawned, _clock, _home = settle_estate
+    cache = _cache_mod()
+    marker = _marker(ns)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+    aged = time.time() - cache.CODEX_PRUNE_DRAIN_SPAWN_THROTTLE_SECONDS - 60
+    os.utime(marker, (aged, aged))
+    second: list = []
+
+    def spawn(command):
+        # The spawned prune worker, run in-process; other workers are inert.
+        if command == cache.CODEX_PRUNE_DRAIN_COMMAND:
+            second.append(cache.run_codex_prune_drain(wait_for_requests=False))
+        return True
+    monkeypatch.setattr(sys.modules["_cctally_update"], "_spawn_detached", spawn)
+    requests: list = []
+
+    def seed():
+        _keeper_debt(ns, paths)
+        requests.append(cache._request_codex_drain_worker(
+            cache.CODEX_PRUNE_DRAIN_COMMAND))
+    _after_settlement_core(monkeypatch, seed)
+
+    result = _executor()(wait_for_requests=False, settle_projection=True)
+
+    assert requests == ["spawned"], requests
+    assert marker.stat().st_mtime > aged + 60, "the marker was not restamped"
+    assert [r.outcome for r in second] == ["busy"], second
+    assert result.identities_deleted == ORPHANS + 1 and result.remaining == 0

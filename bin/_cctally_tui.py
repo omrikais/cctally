@@ -181,6 +181,8 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md §7.2
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
 import dataclasses
 import datetime as dt
 import hashlib
@@ -332,8 +334,19 @@ def load_config(*args, **kwargs):
     return sys.modules["cctally"].load_config(*args, **kwargs)
 
 
-def get_claude_session_entries(*args, **kwargs):
-    return sys.modules["cctally"].get_claude_session_entries(*args, **kwargs)
+def get_claude_session_entries(range_start, range_end, *, project=None,
+                               skip_sync=False, account_key=None):
+    """The joined Claude entry read; a pure query read inside a query scope
+    (#787 / #861 spec 5.11: the narrowed snapshot build, a request route),
+    the owner facade in an owner phase."""
+    import _cctally_store_access
+    if _cctally_store_access.reads_through_query():
+        return _cctally()._load_sibling("_cctally_cache").query_entries(
+            "claude_session_entries", range_start, range_end,
+            project=project, account_key=account_key)
+    return sys.modules["cctally"].get_claude_session_entries(
+        range_start, range_end, project=project, skip_sync=skip_sync,
+        account_key=account_key)
 
 
 def _resolve_display_tz_obj(*args, **kwargs):
@@ -1242,6 +1255,162 @@ def _tui_attribute_corruption(
     return attributed, corruption
 
 
+def _tui_is_query_maintenance(exc: BaseException, store: str) -> bool:
+    """Whether ``exc`` is a query session's maintenance refusal of ``store``
+    (the typed `StoreUnavailable`, or the error a command session maps it
+    to), never an owner open's."""
+    for candidate in (exc, getattr(exc, "__cause__", None)):
+        if (isinstance(candidate, _cctally_core.StoreUnavailable)
+                and getattr(candidate, "query_refusal", False)
+                and candidate.store == store
+                and candidate.reason == "maintenance"):
+            return True
+    return False
+
+
+def _tui_is_stats_query_maintenance(exc: BaseException) -> bool:
+    """Whether ``exc`` is a query session's maintenance refusal of stats.db
+    (the typed `StoreUnavailable`, or the `StatsDbMaintenanceError` a command
+    session maps it to), never an owner open's."""
+    return _tui_is_query_maintenance(exc, "stats")
+
+
+#: Set by a publisher that holds a coherent frame for the build it runs
+#: (`_tui_keeping_last_coherent`); a build with no such publisher (the very
+#: first build, a partial, a CLI render) records its legs as before.
+_TUI_KEEP_LAST_COHERENT: "contextvars.ContextVar" = contextvars.ContextVar(
+    "cctally_tui_keep_last_coherent", default=False)
+
+
+@contextlib.contextmanager
+def _tui_keeping_last_coherent(keep: bool):
+    """Run a build whose publisher can keep its last coherent frame."""
+    token = _TUI_KEEP_LAST_COHERENT.set(bool(keep))
+    try:
+        yield
+    finally:
+        _TUI_KEEP_LAST_COHERENT.reset(token)
+
+
+class _TuiStoreRefusalPending(Exception):
+    """A narrowed read met an owner-resolved refusal while the publisher
+    holds a coherent frame (#787 / #861 spec 5.11). Carries the legs the
+    build recorded up to it, this one included, for the kept frame."""
+
+    def __init__(self, refusal, *, errors, failures) -> None:
+        self.refusal = refusal
+        self.errors = tuple(errors)
+        self.failures = tuple(failures)
+        # The store-independent precomputes the aborted build refreshed
+        # (`_tui_build_snapshot_once`); None keeps the kept frame's own.
+        self.doctor_payload: "dict | None" = None
+        self.envelope_precompute: "dict | None" = None
+        # The aborted build's display zone (R32-V3), for the zone-formatted
+        # text the kept frame redraws; `display_tz_known` is False until the
+        # build records it (a None zone is the host-local one).
+        self.display_tz = None
+        self.display_tz_known = False
+        super().__init__(str(refusal))
+
+
+def _tui_owner_resolved_refusal(exc: BaseException):
+    """The query refusal ``exc`` carries for a reason the owner resolves
+    (`_cctally_core.OWNER_RESOLVED_REASONS`; a dashboard or TUI build keeps
+    its publisher's last coherent frame for them and tells the owner), else
+    None. Only a query session's refusal counts, never an owner open's."""
+    for candidate in (exc, getattr(exc, "__cause__", None)):
+        if (isinstance(candidate, _cctally_core.StoreUnavailable)
+                and getattr(candidate, "query_refusal", False)
+                and candidate.reason in _cctally_core.OWNER_RESOLVED_REASONS):
+            return candidate
+    return None
+
+
+def _tui_redraw_zone_text(frame, display_tz) -> dict:
+    """The kept frame's zone-formatted text redrawn in ``display_tz`` from
+    the instants its retained rows carry, with no store read (#787 / #861
+    revision 33, R32-V3), as ``dataclasses.replace`` fields.
+
+    Only the Blocks labels are server-formatted from an instant the row
+    keeps (its UTC ``start_at``). The rest of a kept frame's zone-dependent
+    text cannot be redrawn without the refused store: the Daily, Monthly and
+    cache-report rows are calendar buckets in the old zone, the trend and
+    weekly-history labels may come from a date with no instant, and the
+    source bundle and Projects envelope carry windows computed in the old
+    zone. Those wait for the next coherent build. Text the envelope or the
+    client formats at render time (the header week, the reset) already
+    follows the new zone."""
+    from _lib_view_models import blocks_row_label
+    rows = list(getattr(frame, "blocks_panel", None) or ())
+    if not rows:
+        return {}
+    redrawn = []
+    for row in rows:
+        try:
+            start = dt.datetime.fromisoformat(row.start_at)
+        except (TypeError, ValueError):
+            redrawn.append(row)
+            continue
+        redrawn.append(dataclasses.replace(
+            row, label=blocks_row_label(start, display_tz)))
+    return {"blocks_panel": redrawn}
+
+
+def _tui_last_coherent_frame(prior, pending: _TuiStoreRefusalPending, *,
+                             now_utc: dt.datetime):
+    """The publisher's last coherent frame, marked pending (spec 5.11).
+
+    Every store-derived panel is the prior frame's. The failure fields and
+    the clock change: ``last_sync_error`` and ``sync_failures`` carry the
+    refused legs (the existing sync-failure chip and TUI banner read them)
+    and ``last_sync_at`` stays the last successful build's, so the sync age
+    keeps growing until a build the owner's resolution permits replaces it.
+    The Doctor block and the config / update-state precompute, which read no
+    refused store (AD28), are the aborted build's when it refreshed them, so
+    a setting changed meanwhile reaches the frame, and zone-formatted text
+    the frame's rows can redraw follows the aborted build's display zone
+    (`_tui_redraw_zone_text`).
+    """
+    refreshed = {}
+    if pending.display_tz_known:
+        refreshed.update(_tui_redraw_zone_text(prior, pending.display_tz))
+    if pending.doctor_payload is not None:
+        refreshed["doctor_payload"] = pending.doctor_payload
+    if pending.envelope_precompute is not None:
+        refreshed["envelope_precompute"] = pending.envelope_precompute
+    return dataclasses.replace(
+        prior,
+        last_sync_error="; ".join(pending.errors),
+        sync_failures=pending.failures,
+        generated_at=now_utc,
+        hydrating=False,
+        **refreshed,
+    )
+
+
+def _tui_frame_is_coherent(frame) -> bool:
+    """Whether a TUI frame is the last coherent one (5.11): a completed
+    build (every build stamps `last_sync_at`; the empty initial frame does
+    not) whose store reads all succeeded, or a frame kept from one."""
+    return (getattr(frame, "last_sync_at", None) is not None
+            and not getattr(frame, "store_leg_failed", False))
+
+
+def _tui_dashboard_frame_is_coherent(frame) -> bool:
+    """Whether a dashboard frame holds a completed build's data (5.11).
+
+    The sync-mode seed and a startup deferral frame carry the hydrating
+    bootstrap bundle, and a crash over the seed carries none; every frame a
+    complete build published, and every frame kept from one, carries its real
+    source bundle. A build that recorded a refused or failed store read (a
+    `--no-sync` launch or a settings rebuild during a repair) is complete but
+    not coherent (`store_leg_failed`)."""
+    bundle = getattr(frame, "source_bundle", None)
+    return (bundle is not None
+            and not _tui_is_hydrating_source_bundle(bundle)
+            and not getattr(frame, "store_leg_failed", False))
+
+
 def _tui_capture_sync_failure(
     conn: sqlite3.Connection,
     errors: list[str],
@@ -1252,8 +1421,35 @@ def _tui_capture_sync_failure(
     exc: Exception,
     stats_heal_attempted: bool,
 ) -> None:
-    """Record one attributed leg failure or request the single stats retry."""
+    """Record one attributed leg failure or request the single stats retry.
 
+    A narrowed stats read refused for maintenance (#787 / #861 5.3: the
+    interactive admission refuses at once, as `maintenance`) is not a leg
+    failure: it is re-raised, so the build publishes nothing of its own and
+    its publisher keeps the prior frame or the #932 deferral frame, exactly
+    as when base's owner stats open met maintenance at the build's start. A
+    frame recording it per leg would mix fresh panels with emptied stats
+    ones.
+
+    A narrowed read refused for a reason the owner resolves (spec 5.11: an
+    absent store, a schema behind or ahead, a pending recovery or bridge)
+    tells the owner. When the publisher holds a coherent frame it ends the
+    build (`_TuiStoreRefusalPending`), and the publisher keeps that frame
+    marked pending; on the very first build it is recorded per leg."""
+
+    if _tui_is_stats_query_maintenance(exc):
+        raise exc
+    refusal = _tui_owner_resolved_refusal(exc)
+    if refusal is not None:
+        _cctally_core.notify_owner(refusal.store, _cctally_core.Readiness(
+            refusal.store, False, refusal.reason, frozenset()))
+        if _TUI_KEEP_LAST_COHERENT.get():
+            raise _TuiStoreRefusalPending(
+                refusal,
+                errors=[*errors, f"{leg}: {exc}"],
+                failures=[*failures, SyncFailureAttribution(
+                    leg=leg, database=refusal.store, corruption=False)],
+            )
     attributed_database, corruption = _tui_attribute_corruption(
         conn, exc, database=database
     )
@@ -1284,6 +1480,140 @@ def _tui_capture_sync_failure(
         raise _StatsSnapshotCorruption(exc)
     failures.append(failure)
     errors.append(f"{leg}: {exc}")
+
+
+def _tui_store_access():
+    """`_cctally_store_access`, resolved at call time (conftest reloads it)."""
+    import _cctally_store_access
+    return _cctally_store_access
+
+
+def _tui_open_cache_read():
+    """A cache.db handle for one read unit of a snapshot builder (#787 / #861
+    spec 5.7, AD21).
+
+    Inside a query scope (the narrowed snapshot build, a request route) it is
+    one query session, handed back as a `HeldSessionConnection` whose
+    ``close()`` ends it; its transaction is the read unit's snapshot. An
+    owner phase (`process`) keeps the owner opener, unchanged."""
+    access = _tui_store_access()
+    if access.reads_through_query():
+        return access.held_session("cache")
+    return _cctally().open_cache_db()
+
+
+def _tui_projects_cache_views(conn) -> None:
+    """The two TEMP views the Projects envelope reads cache.db through.
+
+    session_entries / session_files live in cache.db; the builder reads them
+    via raw SQL keyed by the unqualified table names. SQLite's name
+    resolution prefers the `main` schema, so create temporary views in
+    `main` that point at the attached schema's tables. Aliasing via VIEWs
+    keeps the builder portable: unit tests pass one conn carrying both
+    schemas; production wiring uses an attached cache."""
+    conn.execute(
+        "CREATE TEMP VIEW IF NOT EXISTS session_entries AS "
+        "SELECT * FROM cache_db.session_entries"
+    )
+    conn.execute(
+        "CREATE TEMP VIEW IF NOT EXISTS session_files AS "
+        "SELECT * FROM cache_db.session_files"
+    )
+
+
+def _tui_build_owner_phase(*, skip_sync: bool):
+    """The snapshot build's owner phase (#787 / #861 spec 5.12, AD21).
+
+    At the enclosing `process` authority it runs exactly the opens today's
+    build ran first: the owner `open_db()` (cutover, content revision,
+    migration-error reconciliation, epoch deferral and its rebuild-worker
+    launch, which keep today's frame and exceptions) and, when the build
+    ingests nothing, the owner `open_cache_db()` (create, migrate, recover)
+    that today's first cache read performed; an ingesting build opens it in
+    its refresh. Returns ``(narrow, stats_reader)``: whether the build then
+    narrows to `query(interactive)`, and the per-statement stats reader its
+    narrowed reads use (a stats read never holds a build-long transaction).
+    A caller already inside a query scope gets the reader without the owner
+    opens; a thread with no established authority gets ``None`` and keeps
+    the owner connection."""
+    access = _tui_store_access()
+    narrow = access.holds_owner_startup()
+    if not (narrow or access.reads_through_query()):
+        return False, None
+    if narrow:
+        open_db().close()
+        if skip_sync:
+            try:
+                _cctally().open_cache_db().close()
+            except Exception:  # noqa: BLE001 — the reads report it
+                # An owner cache open that cannot complete leaves the store
+                # unreadable; each narrowed read then records its own
+                # failure leg, as today's reads did.
+                pass
+    return narrow, access.statement_reader("stats", startup=False)
+
+
+#: The snapshot build in progress on this thread, when it runs narrowed
+#: (#787 / #861 spec 5.12). Read by a step the build must run at the owner's
+#: authority (the Doctor precompute's diagnostic gather).
+_TUI_BUILD_QUERY: "contextvars.ContextVar" = contextvars.ContextVar(
+    "cctally_tui_build_query", default=None)
+
+
+class _TuiBuildQueryScope:
+    """The snapshot build's `query(interactive)` phase (#787 / #861 spec 5.12).
+
+    Entered after the build's owner phase (the owner opens and the ingest, at
+    `process`) and left before the post-query heal. A scope only narrows, so
+    the Doctor precompute, whose gather narrows from the owner to
+    `diagnostic`, leaves it for that gather and comes back (`outside`):
+    sequential phases under one enclosing authority, as spec 5.1 permits."""
+
+    def __init__(self) -> None:
+        self._cm = None
+
+    def enter(self) -> None:
+        if self._cm is None:
+            cm = _cctally_core.authority_scope("query", policy="interactive")
+            cm.__enter__()
+            self._cm = cm
+
+    def exit(self) -> None:
+        cm, self._cm = self._cm, None
+        if cm is not None:
+            cm.__exit__(None, None, None)
+
+    @contextlib.contextmanager
+    def outside(self):
+        if self._cm is None:
+            yield
+            return
+        self.exit()
+        try:
+            yield
+        finally:
+            self.enter()
+
+
+@contextlib.contextmanager
+def _tui_owner_precompute_scope():
+    """The owner phase of the Doctor and envelope precomputes (#787 / #861
+    spec 5.12, AD28): outside the snapshot build's narrowed query reads, at
+    the owner's `process` authority. The Doctor gather's database-reading
+    legs open their own diagnostic sessions, as CLI `doctor`'s do; its other
+    legs (keychain, lock state, filesystem facts) are owner work. Entered
+    inside a query scope that is not the build's (a request route) the
+    `process` scope is a widening and raises, as it must: a request never
+    gathers."""
+    build = _TUI_BUILD_QUERY.get()
+    with (build.outside() if build is not None
+          else contextlib.nullcontext()):
+        with _cctally_core.authority_scope("process"):
+            yield
+
+
+#: The Doctor gather's scope; one shape for every caller (AD28).
+_tui_doctor_gather_scope = _tui_owner_precompute_scope
 
 
 def _tui_heal_post_query_stats(exc: Exception) -> bool:
@@ -1502,6 +1832,15 @@ class DataSnapshot:
     # Never published. Idle copies carry it unchanged. LAST, with a default,
     # for the positional constructors.
     evidence_eligible_at: dt.datetime | None = None
+    # #787 / #861 spec 5.11: True when the build that produced this frame's
+    # panels recorded a refused or failed store read (a leg after the owner
+    # phase whose failure names a database). Such a frame is not the last
+    # coherent one a publisher keeps under an owner-resolved refusal
+    # (`_tui_frame_is_coherent`): a launch build under a cache repair would
+    # otherwise be republished for as long as any later build met a refusal.
+    # Every copy of a frame (idle, kept, crash, republish) carries it. Never
+    # published; trailing default for the positional constructors.
+    store_leg_failed: bool = False
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -2561,7 +2900,7 @@ def _tui_sessions_cached(
     """
     c = _cctally()
     sc = c._load_sibling("_lib_snapshot_cache")
-    cache_conn = c.open_cache_db()
+    cache_conn = _tui_open_cache_read()
     try:
         def _aggregate_all():
             entries = get_claude_session_entries(
@@ -2736,8 +3075,12 @@ def _tui_build_session_detail_indexed(
     c = _cctally()
     open_cache_db = c.open_cache_db
     _JoinedClaudeEntry = c._JoinedClaudeEntry
+    import _cctally_store_access as _store_access
     try:
-        conn = open_cache_db()
+        # #787 / #861 spec 5.11: a query caller (the dashboard's session
+        # detail route) reads one query session; an owner keeps its opener.
+        conn = (_store_access.held_session("cache")
+                if _store_access.reads_through_query() else open_cache_db())
     except (sqlite3.DatabaseError, OSError):
         return None
     try:
@@ -2826,9 +3169,17 @@ def _tui_build_session_detail(
     if match is None:
         # Fall back to the bulk-aggregate path. Same shape as before,
         # used only when the index lookup couldn't conclude.
-        entries = get_claude_session_entries(
-            range_start, now_utc, skip_sync=True,
-        )
+        import _cctally_store_access as _store_access
+        if _store_access.reads_through_query():
+            # #787 / #861 spec 5.11: never the owner facade from a query
+            # caller; a store the owner resolves raises (never "not found").
+            entries = _cctally()._load_sibling(
+                "_cctally_cache").query_entries(
+                    "claude_session_entries", range_start, now_utc)
+        else:
+            entries = get_claude_session_entries(
+                range_start, now_utc, skip_sync=True,
+            )
         sessions = _aggregate_claude_sessions(entries)
         for s in sessions:
             if s.session_id == session_id:
@@ -4516,7 +4867,7 @@ def _tui_build_source_bundle(
     # an unobserved file stamps no identity (the next tick rebuilds Codex once).
     cache_file_before_open = _tui_cache_file_before_open()
     with _perf.phase("source.store_open"):
-        cache_conn = c.open_cache_db()
+        cache_conn = _tui_open_cache_read()
     cache_read_tx = False
     pin_started_ns: "int | None" = None
     codex_scope_cm = None
@@ -4550,8 +4901,13 @@ def _tui_build_source_bundle(
         # composite signature below is already the cross-database consistency
         # gate: any stats generation movement rejects this build, so a long
         # stats snapshot buys no correctness and creates unbounded WAL growth.
-        if not cache_conn.in_transaction:
-            cache_conn.execute("BEGIN")
+        # #787 / #861 AD21: a query session's own transaction is this pin
+        # (the cache-backed capture is one existing read unit); it ends at
+        # the same rollback, so the reads after it observe new commits.
+        session_pin = getattr(cache_conn, "query_session_snapshot", False)
+        if session_pin or not cache_conn.in_transaction:
+            if not session_pin:
+                cache_conn.execute("BEGIN")
             cache_read_tx = True
             # #583 S5 §2.4 / acceptance criterion 16: the hold is stamped at
             # the BEGIN and ROLLBACK boundaries themselves. This function's
@@ -5008,6 +5364,27 @@ def _tui_build_source_bundle(
             _record_cache_pin()
             cache_conn.rollback()
             cache_read_tx = False
+        if session_pin and (codex_context is None
+                            or codex_split_seams_unpatched):
+            # #787 / #861 AD21: the capture is the cache session's whole read
+            # unit, so the session ends here, at its rollback, before the
+            # folds: no cache snapshot outlives the read it pins. (Under AD29
+            # the folds' computation would not spend a held session's
+            # admission budget, which only admission draws on; AD21 alone is
+            # the reason to close.) Only the patched-seam path
+            # (`build_codex_source_state`) folds from the context's cache
+            # connection, so it keeps the session.
+            cache_conn.close()
+            if codex_capture is not None:
+                # The captured fold's one later cache read, the cycle index's
+                # cost inputs, ran after this rollback in autocommit, as base
+                # read it; it now reads per statement, each statement its own
+                # read unit, like the build's stats reads.
+                codex_capture = dataclasses.replace(
+                    codex_capture, context=dataclasses.replace(
+                        codex_capture.context,
+                        cache_conn=_tui_store_access().statement_reader(
+                            "cache", startup=False)))
         if claude is None:
             claude_published_current = True
             claude_available = "ok" if (claude_cost_usd or claude_total_tokens) else "empty"
@@ -5310,14 +5687,22 @@ def _tui_build_source_bundle(
             post_stats_digest = codex_stats_digest(stats_conn)
             post_accounts_digest = accounts_identity_digest(stats_conn)
             post_claude_digest = claude_stats_digest(stats_conn)
-            post_signature = c.compute_signature(
-                cache_conn,
-                stats_conn,
-                generation=c.current_generation(),
-                codex_stats_digest=post_stats_digest,
-                accounts_digest=post_accounts_digest,
-                claude_stats_digest=post_claude_digest,
-            )
+            # #787 / #861 AD21: under query, the validation reads cache in a
+            # fresh session, so it observes every commit since the pin.
+            validation_conn = (_tui_open_cache_read() if session_pin
+                               else cache_conn)
+            try:
+                post_signature = c.compute_signature(
+                    validation_conn,
+                    stats_conn,
+                    generation=c.current_generation(),
+                    codex_stats_digest=post_stats_digest,
+                    accounts_digest=post_accounts_digest,
+                    claude_stats_digest=post_claude_digest,
+                )
+            finally:
+                if validation_conn is not cache_conn:
+                    validation_conn.close()
             stats_generation_moved = (
                 post_signature.max_wus_id != signature.max_wus_id
                 or post_signature.max_wcs_id != signature.max_wcs_id
@@ -5838,7 +6223,14 @@ def _tui_build_snapshot_once(
     _build_display_tz = _resolve_display_tz_obj(
         _apply_display_tz_override(raw_config, display_tz_pref_override)
     )
-    conn = open_db()
+    # #787 / #861 spec 5.12, AD21: the build's owner phase, then a stats
+    # reader for the narrowed reads (`_tui_build_owner_phase`); an owner
+    # connection only for a caller with no established authority.
+    narrow, conn = _tui_build_owner_phase(skip_sync=skip_sync)
+    if conn is None:
+        conn = open_db()
+    build_query = _TuiBuildQueryScope()
+    build_query_token = None
     try:
         errors: list[str] = []
         sync_failures: list[SyncFailureAttribution] = []
@@ -5965,6 +6357,10 @@ def _tui_build_snapshot_once(
                                 )
                     finally:
                         cache_conn.close()
+                except _TuiStoreRefusalPending:
+                    # #787 / #861 5.11: a leg above recorded a refusal that
+                    # ends the build; never record the signal as a leg.
+                    raise
                 except Exception as exc:
                     claude_ingest_failed = True
                     if precompute_envelope:
@@ -5972,6 +6368,17 @@ def _tui_build_snapshot_once(
                     capture_failure("sync-cache-open", "cache", exc)
                 if _ingest_span is not None:
                     _ingest_span.__exit__(None, None, None)
+        # #787 / #861 spec 5.11: the failures recorded from here on are the
+        # build's reads; one naming a database makes the frame incoherent
+        # (`store_leg_failed`). A failed refresh above leaves the reads, and
+        # so the frame, intact.
+        read_failures_start = len(sync_failures)
+        # #787 / #861 spec 5.12: the refresh is done; the rest of the build
+        # reads under `query(interactive)` until the `finally` below leaves
+        # it, before any post-query heal.
+        if narrow:
+            build_query.enter()
+            build_query_token = _TUI_BUILD_QUERY.set(build_query)
         # Force pure reads for every view builder below, independent of the
         # caller's flag: the single ingest above is the only glob per tick.
         skip_sync = True
@@ -6105,6 +6512,11 @@ def _tui_build_snapshot_once(
                                 _revision_error)
                     calibration_dependency = (
                         _tui_read_calibration_dependency(conn))
+                except _TuiStoreRefusalPending:
+                    # #787 / #861 5.11: the revision refusal recorded above
+                    # ends the build; the handlers below would record it as
+                    # a generic dispatch failure and build on.
+                    raise
                 except QuotaProjectionIncomplete as exc:
                     # #496 S5b §4.7: ahead of the generic handler on purpose.
                     # Below it the refusal is sanitized into a generic
@@ -6137,10 +6549,8 @@ def _tui_build_snapshot_once(
                 # render-key change forces a full rebuild that re-buckets the
                 # calendar builders (their Group A cache already keys tz) and
                 # refreshes every config-derived envelope block.
-                render_key = (
-                    display_tz_pref_override,
-                    json.dumps(raw_config, sort_keys=True, default=str),
-                )
+                render_key = _tui_render_key(
+                    display_tz_pref_override, raw_config)
                 # #857: the Codex quota-dependency identity — the dedicated
                 # quota change ledger, the attribution revision, the projection
                 # certificate and the cache file's identity, none of which the
@@ -6225,7 +6635,7 @@ def _tui_build_snapshot_once(
                 # (safe direct-compute fallback, byte-identical output).
                 try:
                     with _perf.phase("reconcile.cache_open"):
-                        _rc_cache_conn = _cctally().open_cache_db()
+                        _rc_cache_conn = _tui_open_cache_read()
                     try:
                         with _perf.phase("reconcile.weekref") as _pr:
                             _pr.set_meta(hit=False)
@@ -6590,30 +7000,27 @@ def _tui_build_snapshot_once(
         # try/except/finally; the broad except + finally guarantee no escape.
         _p_pe = _perf.phase("build.projects_envelope")
         _p_pe.__enter__()
+        # #787 / #861 AD21: under query, a per-statement stats reader with
+        # cache attached read-only as `cache_db` (spec 5.13's attachment
+        # name), whose every session carries the two TEMP views; the owner
+        # path attaches cache to its own connection, as before.
+        pe_conn = (
+            _tui_store_access().statement_reader(
+                "stats", attach=("cache",), startup=False,
+                on_session=_tui_projects_cache_views)
+            if _tui_store_access().reads_through_query() else None)
         try:
             c = _cctally()
-            cache_db_path = _cctally_core.CACHE_DB_PATH
-            conn.execute(
-                "ATTACH DATABASE ? AS cache_db",
-                (str(cache_db_path),),
-            )
-            # session_entries / session_files live in cache.db; the
-            # builder reads them via raw SQL keyed by the unqualified
-            # table names. SQLite's name resolution prefers the `main`
-            # schema, so create temporary views in `main` that point
-            # at the attached schema's tables. Aliasing via VIEWs keeps
-            # the builder portable: unit tests pass one conn carrying
-            # both schemas; production wiring uses an attached cache.
-            conn.execute(
-                "CREATE TEMP VIEW IF NOT EXISTS session_entries AS "
-                "SELECT * FROM cache_db.session_entries"
-            )
-            conn.execute(
-                "CREATE TEMP VIEW IF NOT EXISTS session_files AS "
-                "SELECT * FROM cache_db.session_files"
-            )
+            if pe_conn is None:
+                pe_conn = conn
+                cache_db_path = _cctally_core.CACHE_DB_PATH
+                conn.execute(
+                    "ATTACH DATABASE ? AS cache_db",
+                    (str(cache_db_path),),
+                )
+                _tui_projects_cache_views(conn)
             projects_envelope_block = c._build_projects_envelope(
-                conn,
+                pe_conn,
                 now_utc=now_utc,
                 current_week=cw,
                 weeks_back=12,
@@ -6631,16 +7038,44 @@ def _tui_build_snapshot_once(
             projects_envelope_built = True
         except Exception as exc:
             capture_failure("projects-envelope", "stats_or_cache", exc)
+            # #787 / #861 revision 35, R35-1: a live cache.db repair refuses
+            # this leg as `maintenance`, and only cache.db can answer it (N2
+            # forbids reading it during the repair). Carry the last published
+            # build's Projects envelope forward, as the idle path reuses that
+            # snapshot's heavy rows, so a running dashboard keeps its Projects
+            # data through a repair that finishes by itself. The failure stays
+            # recorded above, so the frame is still not coherent
+            # (`store_leg_failed`) and the sync chip still names the repair;
+            # the memo holds no earlier envelope for a dashboard started
+            # during the repair, which keeps `None`. `projects_envelope_built`
+            # stays False: this build resolved no project identity.
+            # The reuse takes the idle path's guards too: the prior frame's
+            # render key (display zone override and config) must match this
+            # tick's, and no day/week/5h period may have rolled over since it
+            # was built. Otherwise nothing is carried, and the panel shows its
+            # loading skeleton under `maintenance_active`.
+            if (prior_snap is not None
+                    and _tui_is_query_maintenance(exc, "cache")
+                    and isinstance(prior_key, tuple) and len(prior_key) > 1
+                    and prior_key[1] == _tui_render_key(
+                        display_tz_pref_override, raw_config)
+                    and not _snapshot_period_rolled_over(
+                        prior_snap, now_utc, _build_display_tz)):
+                projects_envelope_block = getattr(
+                    prior_snap, "projects_envelope", None)
         finally:
-            try:
-                conn.execute("DROP VIEW IF EXISTS session_entries")
-                conn.execute("DROP VIEW IF EXISTS session_files")
-            except Exception:
-                pass
-            try:
-                conn.execute("DETACH DATABASE cache_db")
-            except Exception:
-                pass
+            if pe_conn is not None and pe_conn is not conn:
+                pe_conn.close()
+            else:
+                try:
+                    conn.execute("DROP VIEW IF EXISTS session_entries")
+                    conn.execute("DROP VIEW IF EXISTS session_files")
+                except Exception:
+                    pass
+                try:
+                    conn.execute("DETACH DATABASE cache_db")
+                except Exception:
+                    pass
         _p_pe.__exit__(None, None, None)
         # Late-bind disambiguated `project_key` onto each SessionsPanel
         # row so the SessionsPanel → ProjectsModal cross-nav (spec §4.1)
@@ -6744,20 +7179,16 @@ def _tui_build_snapshot_once(
         doctor_payload_block: "dict | None" = None
         envelope_precompute_block: "dict | None" = None
         if precompute_envelope:
-            with _perf.phase("doctor"):
-                try:
-                    doctor_payload_block = _tui_precompute_doctor_payload(
-                        now_utc, runtime_bind,
-                    )
-                except Exception as exc:
-                    capture_failure("doctor-precompute", "other", exc)
-            with _perf.phase("envelope.precompute"):
-                try:
-                    envelope_precompute_block = _tui_precompute_envelope_config(
-                        raw_config,
-                    )
-                except Exception as exc:
-                    capture_failure("envelope-precompute", "other", exc)
+            # AD28: both precomputes are owner work, at `process`, outside
+            # the narrowed reads; the Doctor precompute always yields a block.
+            with _tui_owner_precompute_scope():
+                with _perf.phase("doctor"):
+                    doctor_payload_block = _tui_doctor_precompute_leg(
+                        now_utc, runtime_bind, capture_failure)
+                with _perf.phase("envelope.precompute"):
+                    envelope_precompute_block = (
+                        _tui_envelope_config_precompute_leg(
+                            raw_config, capture_failure))
 
         # Determine the shared visible interval before publishing either source.
         # The actual source bundle is built after ``snap`` exists, so Claude's
@@ -6816,6 +7247,9 @@ def _tui_build_snapshot_once(
             data_version=data_version,
             source_bundle=None,
             evidence_eligible_at=evidence_eligible_at,
+            store_leg_failed=any(
+                failure.database != "other"
+                for failure in sync_failures[read_failures_start:]),
         )
         if precompute_envelope:
             source_bundle: SourceDashboardBundle | None = None
@@ -6948,13 +7382,102 @@ def _tui_build_snapshot_once(
     except _StatsSnapshotCorruption:
         _p_snapshot.__exit__(*sys.exc_info())
         raise
+    except _TuiStoreRefusalPending as pending:
+        # #787 / #861 spec 5.11: the publisher keeps its last coherent frame.
+        # The Doctor and envelope precomputes read no refused store (AD28):
+        # run them as the build would have, so the kept frame carries the
+        # current config / update / Doctor state, not the one it was built
+        # under. Then close the phase, as the maintenance path does.
+        pending.display_tz = _build_display_tz
+        pending.display_tz_known = True
+        if precompute_envelope:
+            late_errors: list[str] = []
+            late_failures: list[SyncFailureAttribution] = []
+
+            def capture_late(leg, database, exc):
+                _tui_capture_sync_failure(
+                    conn, late_errors, late_failures, leg=leg,
+                    database=database, exc=exc,
+                    stats_heal_attempted=stats_heal_attempted)
+
+            try:
+                (pending.doctor_payload,
+                 pending.envelope_precompute) = _tui_kept_frame_precomputes(
+                    now_utc, runtime_bind, raw_config, capture_late)
+            except Exception as exc:  # noqa: BLE001 — keep the frame's own
+                late_errors.append(f"envelope-precompute: {exc}")
+            pending.errors = (*pending.errors, *late_errors)
+            pending.failures = (*pending.failures, *late_failures)
+        _p_snapshot.__exit__(*sys.exc_info())
+        raise
+    except Exception as exc:
+        if _tui_is_stats_query_maintenance(exc):
+            _p_snapshot.__exit__(*sys.exc_info())
+        raise
     finally:
+        build_query.exit()
+        if build_query_token is not None:
+            _TUI_BUILD_QUERY.reset(build_query_token)
         conn.close()
+
+
+def _tui_doctor_precompute_leg(now_utc: dt.datetime,
+                               runtime_bind: "str | None", capture) -> dict:
+    """The dashboard build's Doctor block (#268 M4 spec §6), which always
+    yields one: a failure is recorded through ``capture(leg, database,
+    exc)`` and yields the fail block.
+
+    AD28: owner work, run by `_tui_build_snapshot_once` inside
+    `_tui_owner_precompute_scope()` and its own "doctor" phase, which the
+    caller opens so the perf audit sees the phase at the call site."""
+    try:
+        return _tui_precompute_doctor_payload(now_utc, runtime_bind)
+    except Exception as exc:
+        fail_block = _tui_doctor_fail_block(now_utc, exc)
+        capture("doctor-precompute", "other", exc)
+        return fail_block
+
+
+def _tui_envelope_config_precompute_leg(raw_config: dict,
+                                        capture) -> "dict | None":
+    """The dashboard build's config / update-state precompute (#268 M4 spec
+    §6). A failure is recorded through ``capture(leg, database, exc)`` and
+    yields None, so the envelope falls back to its inline reads.
+
+    AD28: owner work, run inside `_tui_owner_precompute_scope()` and the
+    caller's "envelope.precompute" phase, as the Doctor leg is."""
+    try:
+        return _tui_precompute_envelope_config(raw_config)
+    except Exception as exc:
+        capture("envelope-precompute", "other", exc)
+        return None
+
+
+def _tui_kept_frame_precomputes(now_utc: dt.datetime,
+                                runtime_bind: "str | None",
+                                raw_config: dict, capture) -> tuple:
+    """The precomputes of a build that ended to keep its publisher's last
+    coherent frame (#787 / #861 spec 5.11), ``(doctor_payload,
+    envelope_precompute)``: the same owner scope, phases and legs as the
+    build's own call in `_tui_build_snapshot_once`. That call opens the
+    phases at its call site; this one runs in the build's
+    `_TuiStoreRefusalPending` handler, so it opens them here, where the
+    phase-name audit does not count them twice."""
+    with _tui_owner_precompute_scope():
+        with _perf.phase("doctor"):
+            doctor_payload = _tui_doctor_precompute_leg(
+                now_utc, runtime_bind, capture)
+        with _perf.phase("envelope.precompute"):
+            envelope_precompute = _tui_envelope_config_precompute_leg(
+                raw_config, capture)
+    return doctor_payload, envelope_precompute
 
 
 def _tui_precompute_doctor_payload(
     now_utc: dt.datetime,
     runtime_bind: "str | None",
+    *,
+    use_memo: bool = True,
 ) -> dict:
     """Precompute the dashboard envelope's small doctor block, via the
     short-TTL memo (#268 M4, spec §6).
@@ -6969,35 +7492,61 @@ def _tui_precompute_doctor_payload(
     subprocess every tick.
     """
     c = _cctally()
-    sc = c._load_sibling("_lib_snapshot_cache")
 
     def _compute(now: dt.datetime, bind: "str | None") -> dict:
-        _ld = c._load_sibling("_lib_doctor")
         try:
-            with _perf.phase("doctor.gather"):
+            _ld = c._load_sibling("_lib_doctor")
+            with _perf.phase("doctor.gather"), _tui_doctor_gather_scope():
                 _doc_state = c.doctor_gather_state(
                     now_utc=now, runtime_bind=bind)
             with _perf.phase("doctor.checks"):
                 _doc_report = _ld.run_checks(_doc_state)
             return _ld.envelope_block(_doc_report)
         except Exception as exc:  # noqa: BLE001 — never crash the rebuild
-            # Mirror `snapshot_to_envelope`'s inline FAIL fallback (dashboard
-            # `_iso_z`: strftime, no microseconds) so a doctor failure serves
-            # the same shape whether computed here or in the envelope.
-            return {
-                "severity": "fail",
-                "counts": {"ok": 0, "warn": 0, "fail": 1},
-                "generated_at": now.astimezone(dt.timezone.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
-                "fingerprint": "sha1:" + ("0" * 40),
-                "rebuild_worker": None,
-                "_error": f"{type(exc).__name__}: {exc}",
-            }
+            return _tui_doctor_fail_block(now, exc)
 
-    return sc.doctor_payload_memo(
-        now_utc, runtime_bind, ttl_s=sc.DOCTOR_MEMO_TTL_S, compute=_compute,
-    )
+    # AD28: the owner always publishes a block. A memo that raises is
+    # bypassed (the gather runs without it); a gather that raises yields the
+    # base envelope's inline FAIL block, never `None` and never an exception.
+    if use_memo:
+        try:
+            sc = c._load_sibling("_lib_snapshot_cache")
+            return sc.doctor_payload_memo(
+                now_utc, runtime_bind, ttl_s=sc.DOCTOR_MEMO_TTL_S,
+                compute=_compute,
+            )
+        except Exception:  # noqa: BLE001 — fall through to the plain gather
+            pass
+    return _compute(now_utc, runtime_bind)
+
+
+def _tui_doctor_fail_block(now: dt.datetime, exc: BaseException) -> dict:
+    """The base envelope's inline Doctor FAIL block (`snapshot_to_envelope`'s
+    fallback; dashboard `_iso_z`: strftime, no microseconds), so a Doctor
+    failure serves the same shape wherever it is computed. ``_error`` marks
+    it for owner recomputation (AD28)."""
+    return {
+        "severity": "fail",
+        "counts": {"ok": 0, "warn": 0, "fail": 1},
+        "generated_at": now.astimezone(dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "fingerprint": "sha1:" + ("0" * 40),
+        "rebuild_worker": None,
+        "_error": f"{type(exc).__name__}: {exc}",
+    }
+
+
+def _tui_doctor_payload_needs_owner(snap) -> bool:
+    """Whether a published snapshot's Doctor block awaits an owner's
+    recomputation (AD28): none at all, or one recording a gather exception
+    (``_error``). A stats deferral frame keeps its prior payload or the
+    placeholder until a build replaces it (#997 D10), so it never does."""
+    if snap is None or _tui_snapshot_is_stats_deferral(snap):
+        return False
+    payload = getattr(snap, "doctor_payload", None)
+    return payload is None or (isinstance(payload, dict)
+                               and "_error" in payload)
 
 
 def _deferred_doctor_placeholder(now_utc: dt.datetime) -> dict:
@@ -7093,12 +7642,12 @@ def _tui_open_observed_cache(c):
     not be observed, never on an ordinary tick.
     """
     opened_file = _tui_cache_file_before_open()
-    conn = c.open_cache_db()
+    conn = _tui_open_cache_read()
     if opened_file is not None:
         return opened_file, conn
     conn.close()
     opened_file = _tui_cache_file_before_open()
-    return opened_file, c.open_cache_db()
+    return opened_file, _tui_open_cache_read()
 
 
 #: The identity a read records when the Claude content revision cannot be read
@@ -7198,7 +7747,7 @@ def _tui_compute_dispatch_signature(stats_conn, *, with_codex_dependency=False,
     if with_codex_dependency:
         opened_file, cache_conn = _tui_open_observed_cache(c)
     else:
-        opened_file, cache_conn = None, c.open_cache_db()
+        opened_file, cache_conn = None, _tui_open_cache_read()
     try:
         # One deferred read transaction on the cache handle: it pins nothing
         # until `compute_signature`'s first cache read, and every cache read
@@ -7258,6 +7807,15 @@ def _tui_read_calibration_dependency(stats_conn) -> tuple:
         sidecar,
         calibration_basis_digest(stats_conn),
         calibration_supersession_digest(stats_conn),
+    )
+
+
+def _tui_render_key(display_tz_pref_override, raw_config) -> tuple:
+    """The config-derived half of the dispatch key (the idle gate's render
+    key): the resolved display-tz override and the full raw config."""
+    return (
+        display_tz_pref_override,
+        json.dumps(raw_config, sort_keys=True, default=str),
     )
 
 
@@ -8042,74 +8600,26 @@ class _TuiSyncThread:
         self._thread.join(timeout=self._interval + 0.5)
 
     def _run(self) -> None:
+        # #787 / #861 spec 5.1, 5.12: an owner thread establishes `process`
+        # at its target (a new thread has no authority). Each rebuild is its
+        # own operation: the refresh at `process`, the snapshot build
+        # narrowed to `query`, the post-query heal outside it.
+        with _cctally_core.establish_authority("process"):
+            self._run_owned()
+
+    def _run_owned(self) -> None:
         import time
         while not self._stop.is_set():
             try:
-                # Route through cctally so test monkeypatches on
-                # ``_tui_build_snapshot`` propagate into the sync thread
-                # (cf. _make_run_sync_now_locked above).
-                snap = sys.modules["cctally"]._tui_build_snapshot(
-                    now_utc=self._now_utc, skip_sync=self._skip_sync,
-                    display_tz_pref_override=self._display_tz_pref_override,
-                )
-                self._ref.set(snap)
-            except (Exception, _cctally().StatsRebuildDeferred) as exc:
-                # Don't crash the thread on unexpected errors — surface in UI.
-                # #932 §4.5: a stats deferral is a `BaseException`, and one
-                # raised by a later rebuild used to end this thread, leaving
-                # the TUI on its last frame forever; it is carried like any
-                # other error and the next interval retries.
-                # Carry every additive view-model scalar through verbatim so
-                # the prior frame's panel rows and their envelope totals stay
-                # consistent. Bundle 1 / #56 / #57 / #59 each added envelope
-                # scalars the React panels now trust over a client-side
-                # ``rows.reduce``; without preserving them here, a sync crash
-                # leaves populated rows next to a ``$0.00`` footer (the
-                # dataclass defaults kick in for any field not explicitly
-                # passed). The structural-equality invariant
-                # ``total === sum(visible rows).cost_usd`` must survive a
-                # crash recovery, not just the happy path.
-                prev = self._ref.get()
-                self._ref.set(DataSnapshot(
-                    current_week=prev.current_week,
-                    forecast=prev.forecast,
-                    trend=prev.trend,
-                    sessions=prev.sessions,
-                    last_sync_at=prev.last_sync_at,
-                    last_sync_error=(
-                        f"stats-open: {exc}"
-                        if isinstance(exc, _cctally().StatsRebuildDeferred)
-                        else f"sync crashed: {exc}"),
-                    generated_at=dt.datetime.now(dt.timezone.utc),
-                    percent_milestones=prev.percent_milestones,
-                    # Carry the navigation index forward on a sync crash so the
-                    # hero modal's week chip stays usable (spec §3 idle-carry).
-                    week_index=prev.week_index,
-                    weekly_history=prev.weekly_history,
-                    weekly_periods=prev.weekly_periods,
-                    monthly_periods=prev.monthly_periods,
-                    blocks_panel=prev.blocks_panel,
-                    daily_panel=prev.daily_panel,
-                    daily_total_cost_usd=prev.daily_total_cost_usd,
-                    daily_total_tokens=prev.daily_total_tokens,
-                    monthly_total_cost_usd=prev.monthly_total_cost_usd,
-                    monthly_total_tokens=prev.monthly_total_tokens,
-                    weekly_total_cost_usd=prev.weekly_total_cost_usd,
-                    weekly_total_tokens=prev.weekly_total_tokens,
-                    blocks_total_cost_usd=prev.blocks_total_cost_usd,
-                    blocks_total_tokens=prev.blocks_total_tokens,
-                    trend_avg_dollars_per_pct=prev.trend_avg_dollars_per_pct,
-                    trend_history_median_dpp=prev.trend_history_median_dpp,
-                    forecast_view=prev.forecast_view,
-                    # #268 M4 (Codex F6): carry the precomputed doctor payload
-                    # + config/update-state forward so the envelope stays a
-                    # pure renderer (and the doctor chip stays populated)
-                    # across a transient sync crash, instead of dropping to the
-                    # dataclass defaults and re-forking `security` per client.
-                    doctor_payload=prev.doctor_payload,
-                    envelope_precompute=prev.envelope_precompute,
-                    source_bundle=prev.source_bundle,
-                ))
+                with _cctally_core.operation_boundary("snapshot-build"):
+                    self._rebuild_once()
+            except _cctally_core.QueryAuthorityViolation:
+                # Spec 5.2: an owner thread logs a violation, skips that
+                # publication (snapshot publication refuses on the latch) and
+                # continues; the terminal keeps its last frame.
+                _lib_log.get_logger("tui").error(
+                    "tui sync rebuild refused by store authority",
+                    exc_info=True)
             # Wait up to interval, or until forced.
             for _ in range(int(max(1, self._interval * 10))):
                 if self._stop.is_set():
@@ -8117,6 +8627,85 @@ class _TuiSyncThread:
                 if self._ref.take_sync_request():
                     break
                 time.sleep(0.1)
+
+    def _rebuild_once(self) -> None:
+        # #787 / #861 spec 5.11: a frame a completed build produced with
+        # every store read succeeding (`_tui_frame_is_coherent`) is the last
+        # coherent one, kept while the owner resolves a store.
+        prev = self._ref.get()
+        try:
+            # Route through cctally so test monkeypatches on
+            # ``_tui_build_snapshot`` propagate into the sync thread
+            # (cf. _make_run_sync_now_locked above).
+            with _tui_keeping_last_coherent(_tui_frame_is_coherent(prev)):
+                snap = sys.modules["cctally"]._tui_build_snapshot(
+                    now_utc=self._now_utc, skip_sync=self._skip_sync,
+                    display_tz_pref_override=self._display_tz_pref_override,
+                )
+            self._ref.set(snap)
+        except _TuiStoreRefusalPending as pending:
+            self._ref.set(_tui_last_coherent_frame(
+                prev, pending, now_utc=dt.datetime.now(dt.timezone.utc)))
+        except (Exception, _cctally().StatsRebuildDeferred) as exc:
+            # Don't crash the thread on unexpected errors — surface in UI.
+            # #932 §4.5: a stats deferral is a `BaseException`, and one
+            # raised by a later rebuild used to end this thread, leaving
+            # the TUI on its last frame forever; it is carried like any
+            # other error and the next interval retries.
+            # Carry every additive view-model scalar through verbatim so
+            # the prior frame's panel rows and their envelope totals stay
+            # consistent. Bundle 1 / #56 / #57 / #59 each added envelope
+            # scalars the React panels now trust over a client-side
+            # ``rows.reduce``; without preserving them here, a sync crash
+            # leaves populated rows next to a ``$0.00`` footer (the
+            # dataclass defaults kick in for any field not explicitly
+            # passed). The structural-equality invariant
+            # ``total === sum(visible rows).cost_usd`` must survive a
+            # crash recovery, not just the happy path.
+            prev = self._ref.get()
+            self._ref.set(DataSnapshot(
+                current_week=prev.current_week,
+                forecast=prev.forecast,
+                trend=prev.trend,
+                sessions=prev.sessions,
+                last_sync_at=prev.last_sync_at,
+                last_sync_error=(
+                    f"stats-open: {exc}"
+                    if isinstance(exc, _cctally().StatsRebuildDeferred)
+                    else f"sync crashed: {exc}"),
+                generated_at=dt.datetime.now(dt.timezone.utc),
+                percent_milestones=prev.percent_milestones,
+                # Carry the navigation index forward on a sync crash so the
+                # hero modal's week chip stays usable (spec §3 idle-carry).
+                week_index=prev.week_index,
+                weekly_history=prev.weekly_history,
+                weekly_periods=prev.weekly_periods,
+                monthly_periods=prev.monthly_periods,
+                blocks_panel=prev.blocks_panel,
+                daily_panel=prev.daily_panel,
+                daily_total_cost_usd=prev.daily_total_cost_usd,
+                daily_total_tokens=prev.daily_total_tokens,
+                monthly_total_cost_usd=prev.monthly_total_cost_usd,
+                monthly_total_tokens=prev.monthly_total_tokens,
+                weekly_total_cost_usd=prev.weekly_total_cost_usd,
+                weekly_total_tokens=prev.weekly_total_tokens,
+                blocks_total_cost_usd=prev.blocks_total_cost_usd,
+                blocks_total_tokens=prev.blocks_total_tokens,
+                trend_avg_dollars_per_pct=prev.trend_avg_dollars_per_pct,
+                trend_history_median_dpp=prev.trend_history_median_dpp,
+                forecast_view=prev.forecast_view,
+                # #268 M4 (Codex F6): carry the precomputed doctor payload
+                # + config/update-state forward so the envelope stays a
+                # pure renderer (and the doctor chip stays populated)
+                # across a transient sync crash, instead of dropping to the
+                # dataclass defaults and re-forking `security` per client.
+                doctor_payload=prev.doctor_payload,
+                envelope_precompute=prev.envelope_precompute,
+                source_bundle=prev.source_bundle,
+                # #787 / #861 5.11: the carried panels are as coherent as
+                # the frame they came from.
+                store_leg_failed=getattr(prev, "store_leg_failed", False),
+            ))
 
 
 def _tui_panel_current_week(
@@ -10050,7 +10639,20 @@ def _make_a2_progress_cb(*, ref, hub, build_partial, throttle, monotonic,
     would later close into a detached or fragmented root. Isolating the partial
     build's thread state addresses exactly that, and the publication now
     happens whether or not tracing is on.
+
+    #787 / #861 revision 34 L2: A2 fills the FIRST build only. When the sync
+    starts over a coherent frame (`_tui_dashboard_frame_is_coherent`), an
+    ingest that runs past the throttle (behind a cache vacuum's exclusive
+    hold, for example) builds and publishes nothing, so no client and no
+    `/api/data` read reports a complete dashboard as hydrating; the tick's
+    final publication replaces the held frame as before. Decided once, from
+    the frame held when the callback is made: a first build's own partials
+    are coherent frames, so a check per progress call would end the
+    progressive fill after its first partial.
     """
+    if _tui_dashboard_frame_is_coherent(ref.get()):
+        return lambda _stats: None
+
     def cb(_stats) -> None:
         now = monotonic()
         if not throttle.should_fire(now):
@@ -10496,11 +11098,23 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 # mid-ingest cannot split one ingest across two tracing states,
                 # and A2 partial builds never consume it.
                 _perf.apply_pending()
-                snap = (
-                    prior_snapshot
-                    if publish_prior
-                    else _build(skip_sync=True)
-                )  # final: hydrating=False (default)
+                kept = False
+                if publish_prior:
+                    snap = prior_snapshot
+                else:
+                    try:
+                        with _tui_keeping_last_coherent(
+                                _tui_dashboard_frame_is_coherent(
+                                    prior_snapshot)):
+                            snap = _build(skip_sync=True)  # hydrating=False
+                    except _TuiStoreRefusalPending as pending:
+                        # #787 / #861 spec 5.11: the owner resolves the store;
+                        # keep the complete pre-tick frame, marked pending.
+                        snap = _tui_last_coherent_frame(
+                            prior_snapshot, pending,
+                            now_utc=(pinned_now
+                                     or dt.datetime.now(dt.timezone.utc)))
+                        kept = True
                 if sync_error is not None:
                     # Thread the standalone sync error into last_sync_error, sync
                     # error FIRST (mirrors the internal path where the `sync`
@@ -10526,11 +11140,25 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 # cleared the throttle above — several on a cold first-run
                 # ingest, none on a warm one.
                 snap = ref.set_final(snap)
-                _tui_publish_final(tick, hub, snap)
+                if kept:
+                    tick.mark_degraded()
+                    _tui_publish_final(tick, hub, snap, publication="degraded")
+                else:
+                    _tui_publish_final(tick, hub, snap)
                 return
             # ── skip_sync=True: single-build path (POST /api/settings) ──────
             _perf.apply_pending()   # §2.2: the no-ingest build's arm boundary
-            snap = _build(skip_sync=True)
+            kept = False
+            try:
+                with _tui_keeping_last_coherent(
+                        _tui_dashboard_frame_is_coherent(held)):
+                    snap = _build(skip_sync=True)
+            except _TuiStoreRefusalPending as pending:
+                # #787 / #861 spec 5.11, as on the ingesting path above.
+                snap = _tui_last_coherent_frame(
+                    held, pending,
+                    now_utc=pinned_now or dt.datetime.now(dt.timezone.utc))
+                kept = True
             # Mirror the startup override: suppress the monotonic sync stamp so
             # the envelope keeps emitting sync_age_s=None and the client keeps
             # rendering "sync paused" after the user hits r / clicks the sync
@@ -10547,7 +11175,11 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
             # Terminal for this branch too, for the same reason: POST
             # /api/settings brackets its rebuild with the same flag pair.
             snap = ref.set_final(snap)
-            _tui_publish_final(tick, hub, snap)
+            if kept:
+                tick.mark_degraded()
+                _tui_publish_final(tick, hub, snap, publication="degraded")
+            else:
+                _tui_publish_final(tick, hub, snap)
         except _cctally().StatsRebuildDeferred as exc:
             # #453: the first periodic tick runs before HTTP bind. Preserve the
             # initial hydrating/degraded frame while the dedicated replay owns

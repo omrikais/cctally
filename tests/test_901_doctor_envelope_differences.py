@@ -359,7 +359,12 @@ def _report(doc):
 #: (The test regime reset's doctor cut deleted the legacy-write and
 #: rebuild-worker scenarios with their baselines; section 12 of its protection
 #: map names their retained detectors.)
-POST_BASELINE_SCENARIOS = ("40-account-bound-clear",)
+#: #947: the scenario pinned one byte below the default free-disk floor, the
+#: end-to-end detector of `db.retained_artifacts`'s `min_free_bytes` FAIL.
+POST_BASELINE_SCENARIOS = (
+    "40-account-bound-clear",
+    "43-retained-artifacts-below-free-floor",
+)
 
 
 def test_baseline_covers_every_doctor_scenario():

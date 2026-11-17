@@ -700,7 +700,8 @@ def _diff_resolve_used_pct(window: ParsedWindow) -> tuple:
     """
     if window.kind == "week" and window.week_aligned and window.full_weeks_count == 1:
         try:
-            conn = open_db()
+            import _cctally_store_access as _store_access  # #787 AD21
+            conn = _store_access.statement_reader("stats")
         except Exception:
             return None, "n/a"
         try:
@@ -723,7 +724,8 @@ def _diff_resolve_used_pct(window: ParsedWindow) -> tuple:
             conn.close()
     if window.full_weeks_count >= 2:
         try:
-            conn = open_db()
+            import _cctally_store_access as _store_access  # #787 AD21
+            conn = _store_access.statement_reader("stats")
         except Exception:
             return None, "n/a"
         try:
@@ -1585,6 +1587,7 @@ def _diff_resolve_anchor(
     now_utc: dt.datetime,
     *,
     account_key: "str | None" = None,
+    raise_unavailable: bool = False,
 ) -> "tuple[dt.datetime | None, dt.datetime | None]":
     """Read the latest weekly_usage_snapshots row to obtain the
     (anchor_week_start, anchor_resets_at) pair, then apply two
@@ -1621,10 +1624,22 @@ def _diff_resolve_anchor(
     `--account` before it calls this.
 
     Returns (None, None) when the DB is unreachable or has no rows.
+
+    ``raise_unavailable`` (#787 / #861 revisions 32-33, R32-3 / R32-V4; only
+    `explain` passes it) re-raises a failed open of a stats.db that exists,
+    so a refused store is reported as unavailable rather than as a store
+    with no anchor. A stats.db that does not exist still returns
+    ``(None, None)``; `diff` and every other caller keep that answer for
+    every open failure.
     """
     try:
-        conn = open_db()
+        import _cctally_store_access as _store_access  # #787 AD21
+        conn = _store_access.statement_reader("stats")
     except Exception:
+        import os
+        import _cctally_core
+        if raise_unavailable and os.path.lexists(_cctally_core.DB_PATH):
+            raise
         return None, None
     try:
         acct_pred = "" if account_key is None else " WHERE account_key = ?"

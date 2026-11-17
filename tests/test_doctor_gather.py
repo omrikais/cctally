@@ -30,6 +30,11 @@ def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
     doctor_gather_state runs — used to monkeypatch module-level helpers
     (e.g. force `_setup_is_brew_install` to True without a keg copy).
     """
+    # #787: an existing data dir is owner-established (0700), as on every
+    # install; Doctor's diagnostic sessions read only a private data dir.
+    data_dir = home / ".local" / "share" / "cctally"
+    if data_dir.is_dir():
+        data_dir.chmod(0o700)
     if now_iso is None:
         now_arg = "None"
     else:
@@ -47,6 +52,9 @@ def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
         # sys.modules[cls.__module__].__dict__, which would NPE otherwise.
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
+        # #787 / #861 spec 5.1: this driver is a process owner, like the
+        # CLI main thread that runs `doctor`.
+        sys.modules["_cctally_core"].establish_script_owner()
         {pre_call_stmt}
         st = mod.doctor_gather_state(
             now_utc={now_arg},
@@ -172,6 +180,9 @@ def _seed_rollup_cache(home: pathlib.Path, *, rollup_rows: int,
     import _cctally_db as db  # noqa: PLC0415
     cdir = home / ".local" / "share" / "cctally"
     cdir.mkdir(parents=True, exist_ok=True)
+    # #787 AD22: the maintenance lock every owner open creates; a diagnostic
+    # read treats a missing one as an absent store and never creates it.
+    (cdir / "conversations.db.maintenance.lock").touch()
     conn = sqlite3.connect(str(cdir / "conversations.db"))
     try:
         db._apply_conversations_schema(conn)
@@ -988,7 +999,13 @@ def test_preserved_decisions_cost_the_population_query_no_link_probe(
     import _cctally_core as core  # noqa: PLC0415
     import _cctally_db as db  # noqa: PLC0415
     import _cctally_doctor as doctor  # noqa: PLC0415
+    import _cctally_store_access as access  # noqa: PLC0415
     core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    # #787 / #861 AD28: the gather reads through a diagnostic cache session,
+    # which reads only an owner-established (0700) data dir with the cache
+    # maintenance lock every owner open creates.
+    os.chmod(core.APP_DIR, 0o700)
+    pathlib.Path(core.CACHE_LOCK_MAINTENANCE_PATH).touch()
     conn = sqlite3.connect(str(core.CACHE_DB_PATH))
     db._apply_cache_schema(conn)
     conn.commit()
@@ -1003,7 +1020,8 @@ def test_preserved_decisions_cost_the_population_query_no_link_probe(
         name: getattr(sqlite3, name) for name in dir(sqlite3)
         if not name.startswith("__")})
     proxy.connect = connect
-    monkeypatch.setattr(doctor, "sqlite3", proxy)
+    # The session's connection is made by the store-access layer.
+    monkeypatch.setattr(access, "sqlite3", proxy)
     now = dt.datetime(2026, 5, 13, 14, 22, 31, tzinfo=dt.timezone.utc)
 
     def gather_steps():

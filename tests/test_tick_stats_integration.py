@@ -26,6 +26,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -35,7 +36,7 @@ import time
 import types
 
 import pytest
-from conftest import copy_shared_corpus, corpus_lock_path, load_script
+from conftest import corpus_lock_path, load_script
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
@@ -149,22 +150,6 @@ def _run_refresh(data_dir, bbf, *, skip_sync=False, force_a2=False,
     return ref, hub
 
 
-def _private_corpus(data_dir, tmp_path, name="corpus"):
-    """Copy every corpus axis so this test owns cache.db and its flock.
-
-    Delegates to ``conftest.copy_shared_corpus``, the ONE copier in the estate.
-    It resolves the source root, excludes the SQLite sidecars a concurrent
-    reader can create and remove between ``copytree``'s directory scan and its
-    ``copy2`` call, and holds the scale's build lock SHARED for the whole walk
-    so a copy can never observe ``_clear_previous_corpus`` mid-rebuild.
-
-    ``name`` distinguishes two copies inside one test, which the writer-hazard
-    regression needs: one tree standing in for the shared corpus, and one
-    private copy taken from it.
-    """
-    return copy_shared_corpus(data_dir, tmp_path / name)
-
-
 def _plan_detail(plan, note=""):
     """A frontier plan's mode AND its reason, for an assertion message.
 
@@ -219,17 +204,6 @@ _FRONTIER_ROOT_TABLES = {
 }
 
 
-def _assert_clean_rebuild(label, stats):
-    """A rederive that failed files, or never took its lock, proves nothing."""
-    assert not stats.lock_contended, (
-        f"{label} never took its writer lock, so it rederived nothing")
-    assert stats.files_failed == 0, (
-        f"{label} failed {stats.files_failed} of {stats.files_total} files")
-    assert stats.files_processed > 0, (
-        f"{label} processed no files at all, so every containment check below "
-        f"would pass over an empty table")
-
-
 def _assert_roots_are_private(conn, tables, private_root):
     """Every frontier root in ``tables`` resolves INSIDE ``private_root``.
 
@@ -273,135 +247,17 @@ def _assert_roots_are_private(conn, tables, private_root):
         )
 
 
-def _drop_inherited_source_rows(conn, tables, private_root):
-    """Drop the copied store's source rows that name the tree it was copied FROM.
-
-    A rebuild no longer removes them, and that is deliberate rather than a
-    defect. #777 replaced the unconditional ``conversation_source_files``
-    delete with a prune by difference against the walked set, because those
-    rows carry the ``source_incarnation_id`` every durable account stamp is
-    keyed by. #780 then guarded that prune with disk liveness: a row is deleted
-    only when ``_path_is_genuinely_absent`` confirms its path is really gone,
-    because "absent from this walk" and "absent from disk" are different facts
-    and taking the first for the second lets one unreadable root destroy the
-    only non-re-derivable data in the store. ``test_conversation_account_
-    dimension.py::test_a_path_still_on_disk_survives_a_walk_that_missed_it``
-    states that rule directly.
-
-    Every path this copy inherits names a file in the SHARED corpus, and that
-    corpus is a live directory the other xdist workers are still reading — so
-    the rebuild below correctly keeps all of them, and the copy is what has to
-    drop them. Removing the rows here rather than after the rebuild keeps
-    ``_assert_roots_are_private`` a statement about what the rebuild wrote.
-
-    The Codex twin is dropped through the same loop even though
-    ``_clear_codex_conversation_store`` still truncates its table on every
-    rebuild: the two tables are one frontier root set, and a helper that
-    cleaned only the half that currently needs it would go quietly wrong the
-    day the Codex side adopts the same durable-identity treatment.
-    """
-    for table in tables:
-        stale = [
-            str(row[0]) for row in conn.execute(f"SELECT path FROM {table}")
-            if not pathlib.Path(str(row[0])).resolve().is_relative_to(
-                private_root)
-        ]
-        if not stale:
-            continue
-        placeholders = ",".join("?" for _ in stale)
-        conn.execute(
-            f"DELETE FROM {table} WHERE path IN ({placeholders})", stale)
-        if table == "conversation_source_files":
-            # The stamps and the gap records are keyed by the source path and
-            # become unreachable the moment its row is gone, which is the same
-            # reasoning the production prune applies.
-            conn.execute(
-                "DELETE FROM claude_conversation_account_stamps "
-                f"WHERE canonical_source_path IN ({placeholders})", stale)
-            conn.execute(
-                "DELETE FROM claude_conversation_account_stamp_gaps "
-                f"WHERE source_path IN ({placeholders})", stale)
-    conn.commit()
-
-
-def _private_frontier_corpus(data_dir, tmp_path, bbf, name="corpus"):
-    """Copy then rederive cache paths so an exhaustive walk can certify it.
-
-    WHAT IS REDERIVED AND WHAT IS COPIED. The JSONL sources, the Codex
-    rollouts, ``home/`` and every other file under the corpus root are COPIED
-    verbatim. ``cache.db`` and ``conversations.db`` are copied and then
-    REDERIVED in place, by a full-rebuild ``sync_cache``, ``sync_codex_cache``,
-    ``sync_claude_conversations`` and ``sync_codex_conversations`` over the
-    private tree. ``stats.db`` and the append-only journal are neither: they
-    are copied and left as they are, because no frontier reads a root from
-    them.
-
-    Both databases store ABSOLUTE source paths. A plain private copy therefore
-    quite correctly sees the shared fixture paths as orphaned and withholds its
-    walk-complete sentinel, so a frontier test needs a genuinely self-contained
-    cache rather than a copied database whose source estate lives elsewhere.
-
-    ``conversations.db`` is rederived for that reason and one more: the
-    frontier tests take their ``roots`` from ``conversation_source_files.path``,
-    so a copied conversations database aims them at the SESSION-SCOPED corpus
-    that every xdist worker shares. ``plan_provider`` stats those roots, and a
-    write by any other worker then trips its ``filesystem_changed`` guard and
-    degrades the plan to ``full`` — a cross-worker race whose victim is
-    whichever test happens to be between its seed and its plan.
-
-    Rederiving ``conversations.db`` is no longer sufficient on its own. The
-    rebuild keeps a source row whose path still exists on disk, and every path
-    this copy inherits does, so ``_drop_inherited_source_rows`` removes them
-    first; its docstring records why that rule is right and why the copy owns
-    the cleanup.
-    """
-    corpus = _private_corpus(data_dir, tmp_path, name)
-    private_root = pathlib.Path(corpus).parent.resolve()
-    with _corpus_env(corpus, bbf) as cctally:
-        conn = cctally.open_cache_db()
-        try:
-            claude = cctally.sync_cache(conn, rebuild=True)
-            assert claude.full_walk_complete
-            _assert_clean_rebuild("sync_cache(rebuild=True)", claude)
-            codex = cctally.sync_codex_cache(conn, rebuild=True)
-            assert codex.full_walk_complete
-            _assert_clean_rebuild("sync_codex_cache(rebuild=True)", codex)
-            # Fail here, deterministically, rather than inside whichever test
-            # later draws a root from this table: a path outside the private
-            # tree IS the cross-worker race, and it is invisible at the point
-            # it actually causes a failure.
-            _assert_roots_are_private(
-                conn, _FRONTIER_ROOT_TABLES["cache"], private_root)
-        finally:
-            conn.close()
-        conv = cctally.open_conversations_db()
-        try:
-            _drop_inherited_source_rows(
-                conv, _FRONTIER_ROOT_TABLES["conversations"], private_root)
-            _assert_clean_rebuild(
-                "sync_claude_conversations(rebuild=True)",
-                cctally.sync_claude_conversations(conv, rebuild=True))
-            _assert_clean_rebuild(
-                "sync_codex_conversations(rebuild=True)",
-                cctally.sync_codex_conversations(conv, rebuild=True))
-            _assert_roots_are_private(
-                conv, _FRONTIER_ROOT_TABLES["conversations"], private_root)
-        finally:
-            conv.close()
-    return corpus
-
-
 # ── §7.2 the exclusive split never exceeds the whole ────────────────────────
 
 
 def test_the_exclusive_split_never_exceeds_the_whole(
-    small_corpus, monkeypatch, tmp_path,
+    private_corpus, monkeypatch,
 ):
     """A2 runs build_partial INSIDE sync_cache, so naive spans double-count."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
+    corpus = private_corpus("small")
     ts.reset_for_tests()
-    corpus = _private_corpus(small_corpus, tmp_path)
     _ref, hub = _run_refresh(corpus, bbf, force_a2=True,
                              monkeypatch=monkeypatch)
 
@@ -421,14 +277,12 @@ def test_the_exclusive_split_never_exceeds_the_whole(
         f"total {rec.duration_ns}; a nested span was counted twice")
 
 
-def test_one_refresh_writes_exactly_one_record(
-    small_corpus, monkeypatch, tmp_path,
-):
+def test_one_refresh_writes_exactly_one_record(private_corpus, monkeypatch):
     """The A2 partial is a nested build, not a second tick (spec §1.2)."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
+    corpus = private_corpus("small")
     ts.reset_for_tests()
-    corpus = _private_corpus(small_corpus, tmp_path)
     _ref, hub = _run_refresh(corpus, bbf, force_a2=True,
                              monkeypatch=monkeypatch)
     assert [s for s in hub.published if getattr(s, "hydrating", False)], (
@@ -442,7 +296,7 @@ def test_one_refresh_writes_exactly_one_record(
 
 @pytest.mark.parametrize("outcome", ["finalized", "raised"])
 def test_each_refresh_reports_its_accounting_census_to_write_io(
-    small_corpus, monkeypatch, tmp_path, outcome,
+    private_corpus, monkeypatch, outcome,
 ):
     """#939 D5. Detects: an accounting tick the admission hold never hears
     about (conversation passes would never count, a permanent hold), or a tick
@@ -450,7 +304,7 @@ def test_each_refresh_reports_its_accounting_census_to_write_io(
     count before accounting caught up)."""
     import _lib_write_io as wio
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = private_corpus("small")
     ticks = []
     monkeypatch.setattr(wio, "observe_accounting_tick",
                         lambda **kw: ticks.append(kw))
@@ -476,7 +330,7 @@ def test_each_refresh_reports_its_accounting_census_to_write_io(
 
 
 def test_refresh_retains_bounded_ingest_and_final_build_phase_trees(
-    small_corpus, monkeypatch, tmp_path,
+    private_corpus, monkeypatch,
 ):
     """The authoritative build must not overwrite ingest attribution (#680).
 
@@ -487,7 +341,7 @@ def test_refresh_retains_bounded_ingest_and_final_build_phase_trees(
     import _lib_perf as perf
 
     bbf = _load_build_bench()
-    corpus = _private_corpus(small_corpus, tmp_path)
+    corpus = private_corpus("small")
     perf.set_enabled(True)
     try:
         ref, _hub = _run_refresh(
@@ -533,8 +387,8 @@ def test_no_sync_reports_ingest_ran_false_and_zero(private_corpus):
     """Preserve 17: `--no-sync` is a full non-hydrating seed with no ingest."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
-    ts.reset_for_tests()
     corpus = private_corpus("small")
+    ts.reset_for_tests()
     _ref, hub = _run_refresh(corpus, bbf, skip_sync=True)
     rec = ts.snapshot().records[-1]
     assert rec.ingest_ran is False
@@ -547,8 +401,8 @@ def test_a_standalone_build_is_recorded_without_a_dashboard_tick(private_corpus)
     """`tui --render-once` and `cctally-snapshot-measure` reach this path."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
-    ts.reset_for_tests()
     corpus = private_corpus("small")
+    ts.reset_for_tests()
     with _corpus_env(corpus, bbf) as cctally:
         cctally._cctally_tui._tui_build_snapshot(
             now_utc=bbf.CORPUS_CLOCK_UTC, skip_sync=True,
@@ -565,16 +419,15 @@ def test_a_standalone_build_is_recorded_without_a_dashboard_tick(private_corpus)
 # ── §7.4 regime aggregation ─────────────────────────────────────────────────
 
 
-def test_a_cold_refresh_realises_a_codex_rebuild(small_corpus, monkeypatch,
-                                                 tmp_path):
+def test_a_cold_refresh_realises_a_codex_rebuild(private_corpus, monkeypatch):
     """The precondition for the aggregation gate: a cold tick IS active."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
+    corpus = private_corpus("small")
     ts.reset_for_tests()
     # #630 S2: this refresh omits `skip_sync=True`, so it runs a REAL ingest.
     # Against the session-scoped corpus that writes ingest state and WAL into
     # a store every other consumer is promised unchanged.
-    corpus = _private_corpus(small_corpus, tmp_path)
     _run_refresh(corpus, bbf, force_a2=True, monkeypatch=monkeypatch)
     rec = ts.snapshot().records[-1]
     assert rec.codex_regime == "active", (
@@ -611,8 +464,8 @@ def test_a_refresh_whose_early_build_rebuilt_codex_is_active():
 def test_dispatch_counts_sum_to_completed_ticks(private_corpus):
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
-    ts.reset_for_tests()
     corpus = private_corpus("small")
+    ts.reset_for_tests()
     for _ in range(3):
         _run_refresh(corpus, bbf, skip_sync=True)
     snap = ts.snapshot()
@@ -633,8 +486,8 @@ def test_a_warm_refresh_idles_and_does_not_touch_the_codex_leg(private_corpus):
     """
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
-    ts.reset_for_tests()
     corpus = private_corpus("small")
+    ts.reset_for_tests()
     for _ in range(2):
         _run_refresh(corpus, bbf, skip_sync=True)
     records = ts.snapshot().records
@@ -666,6 +519,7 @@ def test_each_group_a_open_failure_increments_its_own_counter(
     """Exactly one fixed counter, no SQL, and the original error unchanged."""
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
+    corpus = private_corpus("small")
     ts.reset_for_tests()
     dash = _dashboard()
     sentinel = sqlite3.OperationalError("unable to open database file")
@@ -675,10 +529,13 @@ def test_each_group_a_open_failure_increments_its_own_counter(
         opened["n"] += 1
         raise sentinel
 
-    monkeypatch.setattr(dash, "_raw_open_cache_db", failing_open)
+    # #787 / #861 spec 5.7: the Group A helpers read through a cache query
+    # session (`open_cache_query_counted`), so the open that fails is the
+    # session factory's, not the owner opener's.
+    monkeypatch.setattr(dash._store_access(), "held_session", failing_open)
     monkeypatch.setattr(dash, "_GROUP_A_CACHE_ENABLED", True)
 
-    with _corpus_env(private_corpus("small"), bbf):
+    with _corpus_env(corpus, bbf):
         fn = getattr(dash, caller)
         if caller == "_group_a_weekly_buckets":
             got = fn(None, bbf.CORPUS_CLOCK_UTC, weeks=[])
@@ -705,9 +562,9 @@ def test_the_wrapper_reraises_the_original_exception_unchanged(monkeypatch):
     def failing_open(*a, **kw):
         raise sentinel
 
-    monkeypatch.setattr(dash, "_raw_open_cache_db", failing_open)
+    monkeypatch.setattr(dash._store_access(), "held_session", failing_open)
     with pytest.raises(sqlite3.OperationalError) as caught:
-        dash.open_cache_db()
+        dash.open_cache_query_counted()
     assert caught.value is sentinel
     assert sum(ts.snapshot().cache_open_failures.values()) == 0, (
         "an unmatched caller must increment nothing (the fail-open rule)")
@@ -722,7 +579,7 @@ def test_an_unmatched_caller_does_not_guess_by_name(monkeypatch):
     def failing_open(*a, **kw):
         raise sqlite3.OperationalError("nope")
 
-    monkeypatch.setattr(dash, "_raw_open_cache_db", failing_open)
+    monkeypatch.setattr(dash._store_access(), "held_session", failing_open)
 
     ns: dict = {}
     exec(  # noqa: S102 — a deliberate same-named impostor
@@ -733,7 +590,7 @@ def test_an_unmatched_caller_does_not_guess_by_name(monkeypatch):
         "        return None\n",
         ns,
     )
-    assert ns["_group_a_daily_buckets"](dash.open_cache_db) is None
+    assert ns["_group_a_daily_buckets"](dash.open_cache_query_counted) is None
     assert sum(ts.snapshot().cache_open_failures.values()) == 0, (
         "a function merely NAMED _group_a_daily_buckets was credited")
 
@@ -743,10 +600,11 @@ def test_a_successful_open_costs_no_counter_and_returns_the_connection(
 ):
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
+    corpus = private_corpus("small")
     ts.reset_for_tests()
     dash = _dashboard()
-    with _corpus_env(private_corpus("small"), bbf):
-        conn = dash.open_cache_db()
+    with _corpus_env(corpus, bbf):
+        conn = dash.open_cache_query_counted()
         try:
             assert conn.execute("SELECT 1").fetchone() == (1,)
         finally:
@@ -887,8 +745,8 @@ def test_an_idle_tick_issues_identical_sql_with_and_without_the_recorder(
     import _lib_dashboard_sources as sources
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
-    ts.reset_for_tests()
     corpus = private_corpus("small")
+    ts.reset_for_tests()
     # The stats-digest memo reads `PRAGMA journal_mode` on the first refresh
     # after the store's files are `_STATS_DIGEST_MEMO_SETTLE_SECONDS` old, so
     # a host slow enough to put that instant between the two arms made only
@@ -905,6 +763,9 @@ def test_an_idle_tick_issues_identical_sql_with_and_without_the_recorder(
                 db, cache = _trace_every_connection(cctally, tui, statements)
                 mp.setattr(tui, "open_db", db)
                 mp.setattr(cctally, "open_cache_db", cache)
+                # #787 / #861: the build's query-session connections.
+                mp.setattr(sys.modules["_cctally_store"], "_TRACE_HOOK",
+                           statements.append)
                 if null_recorder:
                     null = _NullTick()
                     mp.setattr(ts, "begin_tick",
@@ -986,21 +847,21 @@ def test_the_period_is_the_gap_between_two_injected_final_publishes(
 
 
 def test_ingest_frontier_caught_up_targeted_and_structural_fallback(
-    small_corpus, tmp_path, monkeypatch,
+    private_corpus, monkeypatch,
 ):
     """A trusted frontier skips, targets an append, and fails safe on structure.
 
-    A REDERIVED private corpus, not a plain copy (#741). This test touches the
-    directory holding a tracked source file to provoke `filesystem_changed`,
-    and a plain copy keeps the absolute paths of the tree it was copied FROM —
-    so the mutation landed in the session-shared corpus, changing a directory
-    identity for every other worker. That is #721's mechanism, performed
-    deliberately. The write detector now refuses it.
+    A private corpus BUILT at its own root, not a copy (#741, #1099). This
+    test touches the directory holding a tracked source file to provoke
+    `filesystem_changed`, and a copy keeps the absolute paths of the tree it
+    was copied FROM — so the mutation landed in the session-shared corpus,
+    changing a directory identity for every other worker. That is #721's
+    mechanism, performed deliberately. The write detector now refuses it.
     """
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1062,7 +923,7 @@ def test_ingest_frontier_caught_up_targeted_and_structural_fallback(
     ],
 )
 def test_failed_pre_walk_cutoff_cannot_recapture_a_post_walk_boundary(
-    small_corpus, tmp_path, monkeypatch, frontier_class, open_db, source_table,
+    private_corpus, monkeypatch, frontier_class, open_db, source_table,
 ):
     """A failed cutoff must leave the completed full pass uncertified.
 
@@ -1074,7 +935,7 @@ def test_failed_pre_walk_cutoff_cannot_recapture_a_post_walk_boundary(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = getattr(cctally, open_db)()
         try:
@@ -1112,7 +973,7 @@ def test_failed_pre_walk_cutoff_cannot_recapture_a_post_walk_boundary(
 
 
 def test_marker_replacement_read_binds_identity_and_bytes_to_one_descriptor(
-    small_corpus, tmp_path, monkeypatch,
+    private_corpus, monkeypatch,
 ):
     """Replacing the marker between path stat and open must force a full pass.
 
@@ -1124,7 +985,7 @@ def test_marker_replacement_read_binds_identity_and_bytes_to_one_descriptor(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1162,13 +1023,13 @@ def test_marker_replacement_read_binds_identity_and_bytes_to_one_descriptor(
 
 
 def test_caught_up_frontier_never_requeries_the_session_file_estate(
-    small_corpus, tmp_path, monkeypatch,
+    private_corpus, monkeypatch,
 ):
     """The fast-negative may stat its saved directories, not walk DB paths."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1199,13 +1060,13 @@ def test_caught_up_frontier_never_requeries_the_session_file_estate(
 
 
 def test_conversation_frontier_caught_up_and_targeted_use_transcript_cursors(
-    small_corpus, tmp_path,
+    private_corpus,
 ):
     """Transcript sync owns an independent cursor over the shared activity log."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_conversations_db()
         try:
@@ -1230,13 +1091,13 @@ def test_conversation_frontier_caught_up_and_targeted_use_transcript_cursors(
 
 
 def test_conversation_frontier_caught_up_never_queries_all_source_paths(
-    small_corpus, tmp_path, monkeypatch,
+    private_corpus, monkeypatch,
 ):
     """The transcript fast-negative is O(saved directories), never O(files)."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_conversations_db()
         try:
@@ -1269,7 +1130,7 @@ def test_conversation_frontier_caught_up_never_queries_all_source_paths(
 
 
 def test_conversation_frontier_replacement_pending_and_cursor_gap_fail_full(
-    small_corpus, tmp_path,
+    private_corpus,
 ):
     """No structural ambiguity may advance the transcript certificate."""
     import _lib_ingest_frontier as frontier
@@ -1289,7 +1150,7 @@ def test_conversation_frontier_replacement_pending_and_cursor_gap_fail_full(
     assert frontier.conversation_sync_certifiable("full", clean)
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_conversations_db()
         try:
@@ -1318,7 +1179,7 @@ def test_conversation_frontier_replacement_pending_and_cursor_gap_fail_full(
 
             frontier.record_activity(app_dir, "claude", source_path)
             # Simulate a stored cursor beyond the physical file without
-            # mutating the shared benchmark source estate copied into this DB.
+            # mutating the benchmark source estate this corpus was built from.
             actual_size = pathlib.Path(source_path).stat().st_size
             conn.execute(
                 "UPDATE conversation_source_files SET size_bytes=? WHERE path=?",
@@ -1340,13 +1201,13 @@ def test_conversation_frontier_replacement_pending_and_cursor_gap_fail_full(
     ],
 )
 def test_conversation_frontier_same_size_source_replacement_requires_rebuild(
-    small_corpus, tmp_path, provider, table,
+    private_corpus, provider, table,
 ):
     """A ticketed same-size rewrite is replacement evidence, never unchanged."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_conversations_db()
         try:
@@ -1382,13 +1243,13 @@ def test_conversation_frontier_same_size_source_replacement_requires_rebuild(
 
 
 def test_frontier_can_certificate_a_stably_missing_tracked_directory(
-    small_corpus, tmp_path,
+    private_corpus, tmp_path,
 ):
     """A deletion already observed by the full seed remains a stable guard."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1409,9 +1270,7 @@ def test_frontier_can_certificate_a_stably_missing_tracked_directory(
             conn.close()
 
 
-def test_an_orphan_residual_store_seeds_and_plans_caught_up(
-    small_corpus, tmp_path,
-):
+def test_an_orphan_residual_store_seeds_and_plans_caught_up(private_corpus):
     """#916 A3(a). Detects: a store still tracking a deleted transcript that
     the prune gates refuse can never certify, so every dashboard tick plans
     ``full`` (``unseeded``) and rescans every Claude transcript until a
@@ -1419,7 +1278,7 @@ def test_an_orphan_residual_store_seeds_and_plans_caught_up(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         projects = cctally._get_claude_data_dirs()[0] / "projects"
         orphan_dir = projects / "-proj-916-residual"
@@ -1472,13 +1331,13 @@ def test_an_orphan_residual_store_seeds_and_plans_caught_up(
 
 
 def test_ingest_frontier_database_replacement_and_bad_marker_fail_full(
-    small_corpus, tmp_path,
+    private_corpus,
 ):
     """Replacement and ambiguous activity can never certify caught-up state."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1517,13 +1376,13 @@ def test_ingest_frontier_database_replacement_and_bad_marker_fail_full(
 
 
 def test_ambiguous_activity_forces_one_full_pass_then_can_reseed(
-    small_corpus, tmp_path,
+    private_corpus,
 ):
     """A pathless hook event is fail-safe without poisoning every later tick."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1550,13 +1409,13 @@ def test_ambiguous_activity_forces_one_full_pass_then_can_reseed(
 
 
 def test_full_seed_preserves_activity_that_arrives_after_its_cutoff(
-    small_corpus, tmp_path,
+    private_corpus,
 ):
     """A ticket written during a full walk belongs to the following tick."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1583,13 +1442,13 @@ def test_full_seed_preserves_activity_that_arrives_after_its_cutoff(
 
 
 def test_full_seed_preserves_first_activity_when_marker_was_absent(
-    small_corpus, tmp_path,
+    private_corpus,
 ):
     """An initially absent marker still has a pre-walk zero-byte cutoff."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1617,12 +1476,12 @@ def test_full_seed_preserves_first_activity_when_marker_was_absent(
             conn.close()
 
 
-def test_full_seed_rejects_a_malformed_marker_prefix(small_corpus, tmp_path):
+def test_full_seed_rejects_a_malformed_marker_prefix(private_corpus):
     """A full pass cannot certify over malformed pre-cutoff evidence."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1650,13 +1509,13 @@ def test_full_seed_rejects_a_malformed_marker_prefix(small_corpus, tmp_path):
     ("codex", "codex_session_files", "dashboard_codex_full_walk_complete"),
 ])
 def test_missing_full_walk_sentinel_invalidates_a_same_inode_store(
-    small_corpus, tmp_path, provider, table, complete_key,
+    private_corpus, provider, table, complete_key,
 ):
     """An interrupted destructive rebuild cannot retain its certificate."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1728,13 +1587,13 @@ def test_a_clean_residual_only_full_result_is_certifiable():
     "symlink_escape",
 ])
 def test_frontier_rejects_invalid_provider_targets_before_ingest(
-    small_corpus, tmp_path, invalid_kind,
+    private_corpus, tmp_path, invalid_kind,
 ):
     """Raw hook payloads are evidence, never filesystem authority."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1775,13 +1634,13 @@ def test_frontier_rejects_invalid_provider_targets_before_ingest(
 
 
 def test_ingest_frontier_hook_maintenance_and_cursor_changes_fail_full(
-    small_corpus, tmp_path,
+    private_corpus,
 ):
     """Every cheap source-of-truth guard invalidates before a provider skip."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1836,14 +1695,12 @@ def test_ingest_frontier_hook_maintenance_and_cursor_changes_fail_full(
             conn.close()
 
 
-def test_frontier_refuses_to_seed_while_maintenance_is_pending(
-    small_corpus, tmp_path,
-):
+def test_frontier_refuses_to_seed_while_maintenance_is_pending(private_corpus):
     """An already-present repair marker cannot become certified normal."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         conn = cctally.open_cache_db()
         try:
@@ -1899,7 +1756,7 @@ def _codex_append_record(session_id: str, marker: str) -> str:
 
 
 def test_a_codex_append_racing_the_walk_is_found_on_the_next_normal_tick(
-    small_corpus, tmp_path, monkeypatch,
+    private_corpus, monkeypatch,
 ):
     """#724, the whole of it, at the freshness bound that produced the lag.
 
@@ -1923,7 +1780,7 @@ def test_a_codex_append_racing_the_walk_is_found_on_the_next_normal_tick(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     clock = _FrozenClock()
     monkeypatch.setattr(frontier, "_now", clock)
     app_dir = pathlib.Path(corpus)
@@ -2080,7 +1937,7 @@ _AGE_BOUND_FRONTIERS = [
 @pytest.mark.parametrize(
     "frontier_class,open_db,source_table", _AGE_BOUND_FRONTIERS)
 def test_an_unchanged_certificate_expires_once_it_reaches_its_maximum_age(
-    small_corpus, tmp_path, monkeypatch, frontier_class, open_db, source_table,
+    private_corpus, monkeypatch, frontier_class, open_db, source_table,
 ):
     """Staleness is bounded by elapsed time, not only by writer-supplied evidence.
 
@@ -2094,7 +1951,7 @@ def test_an_unchanged_certificate_expires_once_it_reaches_its_maximum_age(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     clock = _FrozenClock()
     monkeypatch.setattr(frontier, "_now", clock)
     with _corpus_env(corpus, bbf) as cctally:
@@ -2128,8 +1985,8 @@ def test_an_unchanged_certificate_expires_once_it_reaches_its_maximum_age(
     "frontier_class,open_db,source_table", _AGE_BOUND_FRONTIERS)
 @pytest.mark.parametrize("commit_mode", ["caught_up", "targeted"])
 def test_committing_a_non_full_plan_never_postpones_the_age_bound(
-    small_corpus, tmp_path, monkeypatch,
-    frontier_class, open_db, source_table, commit_mode,
+    private_corpus, monkeypatch, frontier_class, open_db, source_table,
+    commit_mode,
 ):
     """Only an exhaustive walk may restart the clock.
 
@@ -2143,7 +2000,7 @@ def test_committing_a_non_full_plan_never_postpones_the_age_bound(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     clock = _FrozenClock()
     monkeypatch.setattr(frontier, "_now", clock)
     with _corpus_env(corpus, bbf) as cctally:
@@ -2178,7 +2035,7 @@ def test_committing_a_non_full_plan_never_postpones_the_age_bound(
 @pytest.mark.parametrize(
     "frontier_class,open_db,source_table", _AGE_BOUND_FRONTIERS)
 def test_the_full_pass_an_expired_certificate_forces_restarts_the_age_bound(
-    small_corpus, tmp_path, monkeypatch, frontier_class, open_db, source_table,
+    private_corpus, monkeypatch, frontier_class, open_db, source_table,
 ):
     """Expiry costs one walk, not the fast negative itself.
 
@@ -2189,7 +2046,7 @@ def test_the_full_pass_an_expired_certificate_forces_restarts_the_age_bound(
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     clock = _FrozenClock()
     monkeypatch.setattr(frontier, "_now", clock)
     with _corpus_env(corpus, bbf) as cctally:
@@ -2216,13 +2073,13 @@ def test_the_full_pass_an_expired_certificate_forces_restarts_the_age_bound(
 
 
 def test_dashboard_tick_skips_caught_up_estates_and_ingests_append_immediately(
-    small_corpus, monkeypatch, tmp_path,
+    private_corpus, monkeypatch,
 ):
     """The real refresh uses the certificate and publishes a new row on tick 1."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         tui = cctally._cctally_tui
         dash = cctally._load_sibling("_cctally_dashboard")
@@ -2372,13 +2229,13 @@ def test_activity_marker_write_all_handles_regular_file_short_writes(
     ],
 )
 def test_failed_hook_ticket_publishes_same_file_append_on_first_normal_tick(
-    small_corpus, monkeypatch, tmp_path, provider, table,
+    private_corpus, monkeypatch, provider, table,
 ):
     """Both hook paths fail closed to a real full ingest on tick one."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         tui = cctally._cctally_tui
         dash = cctally._load_sibling("_cctally_dashboard")
@@ -2533,13 +2390,13 @@ def test_failed_hook_ticket_publishes_same_file_append_on_first_normal_tick(
 
 
 def test_dashboard_recovery_promotes_both_caught_up_providers_to_full(
-    small_corpus, monkeypatch, tmp_path,
+    private_corpus, monkeypatch,
 ):
     """A replacement shared cache must be rebuilt by both provider legs now."""
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         tui = cctally._cctally_tui
         dash = cctally._load_sibling("_cctally_dashboard")
@@ -2632,11 +2489,11 @@ def test_dashboard_recovery_promotes_both_caught_up_providers_to_full(
 
 
 def test_dashboard_second_recovery_failure_retains_complete_snapshot(
-    small_corpus, monkeypatch, tmp_path,
+    private_corpus, monkeypatch,
 ):
     """The real recover-once loop cannot publish its partial replacement."""
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         tui = cctally._cctally_tui
         dash = cctally._load_sibling("_cctally_dashboard")
@@ -2701,11 +2558,11 @@ def test_dashboard_second_recovery_failure_retains_complete_snapshot(
 
 
 def test_frontier_database_failure_is_inside_the_shared_recovery_plan(
-    small_corpus, monkeypatch, tmp_path,
+    private_corpus, monkeypatch,
 ):
     """A corrupt guard query must reach the family recovery boundary."""
     bbf = _load_build_bench()
-    corpus = _private_frontier_corpus(small_corpus, tmp_path, bbf)
+    corpus = private_corpus("small")
     with _corpus_env(corpus, bbf) as cctally:
         tui = cctally._cctally_tui
         dash = cctally._load_sibling("_cctally_dashboard")
@@ -2876,7 +2733,7 @@ def test_a_refresh_applies_a_pending_trace_request(private_corpus):
 
 
 def test_the_cache_pin_hold_is_measured_at_its_own_boundaries(
-    small_corpus, monkeypatch, tmp_path,
+    private_corpus, monkeypatch,
 ):
     """The recorded hold is the BEGIN-to-ROLLBACK span, not the function's cost.
 
@@ -2895,13 +2752,14 @@ def test_the_cache_pin_hold_is_measured_at_its_own_boundaries(
     import _lib_tick_stats as ts
 
     bbf = _load_build_bench()
+    corpus = private_corpus("small")
     ts.reset_for_tests()
     _lib_perf.set_enabled(True)
     try:
         _lib_perf.reset_thread()
-        # #630 S2: a real ingest (no `skip_sync`), so it owns its own copy.
-        _run_refresh(_private_corpus(small_corpus, tmp_path), bbf,
-                     monkeypatch=monkeypatch)
+        # #630 S2: a real ingest (no `skip_sync`), so it owns its own corpus.
+        ref, _hub = _run_refresh(corpus, bbf,
+                                 monkeypatch=monkeypatch)
         root = _lib_perf.current_root()
         tree = root.to_dict() if root is not None else {}
     finally:
@@ -2918,11 +2776,22 @@ def test_the_cache_pin_hold_is_measured_at_its_own_boundaries(
         return None
 
     bundle = find(tree, "build.source_bundle")
+    records = ts.snapshot().records
+    record = records[-1] if records else None
+    # #1083: name the path this refresh took, so a recurrence is diagnosable
+    # from its message alone. A stale disarm leaves no root with a clean final
+    # snapshot; an idle final build, `publish_prior`, a crash and a failed
+    # legacy projection each differ in the root or the snapshot's errors.
+    final = ref.get()
     assert bundle is not None, (
         "non-vacuity: the traced build must contain a source_bundle phase, or "
-        "there is nothing to compare the recorded hold against")
+        "there is nothing to compare the recorded hold against; "
+        f"root={root.name if root is not None else None!r} "
+        f"dispatch={getattr(record, 'dispatch', None)!r} "
+        f"publication={getattr(record, 'publication', None)!r} "
+        f"last_sync_error={final.last_sync_error!r} "
+        f"sync_failures={tuple(getattr(final, 'sync_failures', ()) or ())!r}")
 
-    record = ts.snapshot().records[-1]
     assert record.cache_pin_ns > 0, (
         "non-vacuity: this refresh must actually have opened a cache pin")
     bundle_ns = bundle["elapsed_ms"] * 1_000_000
@@ -2971,7 +2840,7 @@ def _restored_process_pins(bbf):
 
 
 def test_a_benchmark_run_leaves_the_certificate_age_bound_intact(
-    tiny_corpus, tmp_path, monkeypatch,
+    private_corpus, tmp_path, monkeypatch,
 ):
     """#740's RED/GREEN pair, deterministic and in ONE process.
 
@@ -3009,7 +2878,7 @@ def test_a_benchmark_run_leaves_the_certificate_age_bound_intact(
         f"{frontier.FRONTIER_CERTIFICATE_MAX_AGE_SECONDS!r} as its bound")
 
     # And now the logic that the leak silently broke, over a real corpus.
-    corpus = _private_frontier_corpus(tiny_corpus, tmp_path, bbf)
+    corpus = private_corpus("tiny")
     clock = _FrozenClock()
     monkeypatch.setattr(frontier, "_now", clock)
     with _corpus_env(corpus, bbf) as cctally:
@@ -3049,11 +2918,12 @@ def test_a_benchmark_run_leaves_the_certificate_age_bound_intact(
 _SHARED_CORPUS_FIXTURES = ("small_corpus", "tiny_corpus", "shared_corpus")
 
 #: The helpers that take a private copy before anything else touches it.
-#: `_copy_in_child` belongs here for the same reason as the other two: it
-#: hands the shared path to a process whose only job is to copy it.
-_CORPUS_COPIERS = (
-    "_private_corpus", "_private_frontier_corpus", "_copy_in_child",
-)
+#: `copy_shared_corpus` copies a data directory only (#1099); a test that walks
+#: provider roots or builds a snapshot takes the `private_corpus` fixture, which
+#: BUILDS its corpus and so names no shared fixture at all. `_copy_in_child`
+#: belongs here for the same reason as the copier: it hands the shared path to
+#: a process whose only job is to copy it.
+_CORPUS_COPIERS = ("copy_shared_corpus", "_copy_in_child")
 
 
 def _shared_corpus_misuses(source):
@@ -3087,8 +2957,8 @@ def _shared_corpus_misuses(source):
             if (isinstance(call, ast.Call)
                     and isinstance(call.func, ast.Name)
                     and call.func.id in _CORPUS_COPIERS):
-                # Keywords as well as positionals: `_private_corpus(
-                # data_dir=small_corpus, tmp_path=tmp_path)` is a legitimate
+                # Keywords as well as positionals: `copy_shared_corpus(
+                # data_dir=small_corpus, destination=...)` is a legitimate
                 # copy, and reading `call.args` alone reported it as a direct
                 # use — a false positive that blocks a correctly written test.
                 for argument in list(call.args) + [
@@ -3145,8 +3015,8 @@ def test_the_private_copy_rule_reports_a_direct_user():
 
     accepted = textwrap.dedent('''
         def test_copies_first(small_corpus, tmp_path):
-            corpus = _private_corpus(small_corpus, tmp_path)
-            _run_refresh(corpus, bbf)
+            corpus = copy_shared_corpus(small_corpus, tmp_path / "corpus")
+            _open_stores(corpus)
     ''')
     assert _shared_corpus_misuses(accepted) == []
 
@@ -3180,8 +3050,9 @@ def test_the_private_copy_rule_reports_a_direct_user():
     # The false positive: a copy whose source is passed by KEYWORD.
     keyword_copy = textwrap.dedent('''
         def test_copies_by_keyword(small_corpus, tmp_path):
-            corpus = _private_corpus(data_dir=small_corpus, tmp_path=tmp_path)
-            _run_refresh(corpus, bbf)
+            corpus = copy_shared_corpus(
+                data_dir=small_corpus, destination=tmp_path / "corpus")
+            _open_stores(corpus)
     ''')
     assert _shared_corpus_misuses(keyword_copy) == [], (
         "a legitimate copy taken through keyword arguments was reported as a "
@@ -3437,7 +3308,7 @@ def test_a_seed_call_outside_an_assertion_is_setup_and_not_reported():
 # ── criterion 6: the copier waits on the corpus build lock ─────────────────
 
 _COPIER_CHILD = textwrap.dedent('''
-    """Copy the shared corpus through the ONE copier, from another process."""
+    """Copy the shared corpus's data dir through the ONE copier, elsewhere."""
     import pathlib
     import sys
 
@@ -3516,15 +3387,15 @@ def test_a_copy_waits_while_the_corpus_build_lock_is_held(
     assert child.wait(timeout=PRESENCE_BACKSTOP_SECONDS) == 0, (
         "the copier failed once the lock was released")
     assert done.exists(), "the copy never completed after the lock was freed"
-    assert (destination / "data" / "cache.db").exists(), (
-        "the released copy is not a usable corpus")
+    assert (destination / "cache.db").exists(), (
+        "the released copy is not a usable data directory")
 
 
 # ── criterion 10: a certificate is immune to writes into its SOURCE ────────
 
 
-def test_a_private_certificate_ignores_a_write_into_the_corpus_it_copied(
-    small_corpus, tmp_path,
+def test_a_private_certificate_ignores_a_write_into_another_corpus_of_its_scale(
+    private_corpus,
 ):
     """#721's mechanism, proved on a directory the certificate actually covers.
 
@@ -3539,15 +3410,17 @@ def test_a_private_certificate_ignores_a_write_into_the_corpus_it_copied(
     would not be in that set at all, so the same test shape over `data/` would
     pass without exercising the guard once.
 
-    `upstream` stands in for the session-shared corpus. The real one is not
-    mutated here because writing into it is precisely the hazard under test,
-    and the write detector now refuses it.
+    `upstream` stands in for the session-shared corpus: an INDEPENDENT build
+    of the same scale and seed, so its tree has the private corpus's layout
+    under another root (#1099). The real one is not mutated here because
+    writing into it is precisely the hazard under test, and the write detector
+    now refuses it.
     """
     import _lib_ingest_frontier as frontier
 
     bbf = _load_build_bench()
-    upstream = _private_corpus(small_corpus, tmp_path, name="upstream")
-    corpus = _private_frontier_corpus(upstream, tmp_path, bbf, name="private")
+    upstream = private_corpus("small", "upstream")
+    corpus = private_corpus("small", "private")
     upstream_root = pathlib.Path(upstream).parent.resolve()
     private_root = pathlib.Path(corpus).parent.resolve()
 
@@ -3591,13 +3464,13 @@ def test_a_private_certificate_ignores_a_write_into_the_corpus_it_copied(
                 "the write did not move the source tree's directory identity, "
                 "so this test could not distinguish the two trees")
             assert frontier._stat_identity(private_dir) == private_before, (
-                "the private copy's directory identity moved too")
+                "the private corpus's directory identity moved too")
             # Leg 4.
             _assert_plan(
                 state.plan_provider("claude", conn, roots=roots),
                 mode="caught_up",
-                note="a write into the corpus this copy was taken from "
-                     "degraded a certificate seeded over the copy")
+                note="a write into another corpus of the same scale "
+                     "degraded a certificate seeded over the private one")
 
             # Non-vacuity: the identical mutation on the PRIVATE side does
             # degrade the plan, so leg 4 is a real negative rather than a
@@ -3609,3 +3482,208 @@ def test_a_private_certificate_ignores_a_write_into_the_corpus_it_copied(
                 mode="full", reason="filesystem_changed")
         finally:
             conn.close()
+
+
+
+# ── criterion 11: a private corpus describes its own tree (#1099) ──────────
+
+
+#: A provider path inside a corpus tree: a `claude/projects` pair of components
+#: or a `codex-<n>` component. Only paths carrying one are checked, so text that
+#: merely mentions a directory is not.
+_CODEX_ROOT_COMPONENT = re.compile(r"codex-\d+")
+#: An absolute path embedded in free text, for strings that are not one path.
+_EMBEDDED_PATH = re.compile(r"(?<![\w/])/[^\s\"'<>|,;]+")
+
+
+def _provider_path_strings(text):
+    """Every string in ``text`` that could be a stored provider path.
+
+    A value that parses as JSON is walked, so its escaping is undone and every
+    string inside it is a candidate; a single-line value starting with ``/`` is
+    one path, spaces included; any other text contributes the absolute paths
+    embedded in it.
+    """
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = text
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, str):
+            if item.startswith("/") and "\n" not in item:
+                yield item
+            else:
+                yield from _EMBEDDED_PATH.findall(item)
+
+
+def _corpus_paths_outside(data_dir, private_root):
+    """Where the corpus at ``data_dir`` stores a provider path of another tree.
+
+    Every table of the three stores and every text file of the data directory
+    is scanned, so no store or column is named here and a store a later change
+    adds is covered too. Each candidate is resolved in full before the
+    containment check, so `..` cannot escape it. Returns ``{location: count}``.
+    """
+    data_dir = pathlib.Path(data_dir)
+    resolved = {}
+    stray = {}
+
+    def outside(candidate):
+        if candidate not in resolved:
+            parts = pathlib.PurePosixPath(candidate).parts
+            provider = any(
+                parts[i:i + 2] == ("claude", "projects")
+                for i in range(len(parts))
+            ) or any(_CODEX_ROOT_COMPONENT.fullmatch(part) for part in parts)
+            resolved[candidate] = provider and not pathlib.Path(
+                candidate).resolve().is_relative_to(private_root)
+        return resolved[candidate]
+
+    def scan(location, text):
+        for candidate in _provider_path_strings(text):
+            if outside(candidate):
+                stray[location] = stray.get(location, 0) + 1
+
+    for store in sorted(data_dir.glob("*.db")):
+        conn = sqlite3.connect(store.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            for (table,) in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"):
+                for column in [row[1] for row in conn.execute(
+                        f'PRAGMA table_info("{table}")')]:
+                    try:
+                        values = conn.execute(
+                            f'SELECT CAST("{column}" AS TEXT) FROM "{table}" '
+                            f'WHERE instr(CAST("{column}" AS TEXT), '
+                            f"'claude') > 0 OR "
+                            f'instr(CAST("{column}" AS TEXT), \'codex-\') > 0'
+                        ).fetchall()
+                    except sqlite3.Error:
+                        continue
+                    for (value,) in values:
+                        scan(f"{store.name}:{table}.{column}", value)
+        finally:
+            conn.close()
+    for path in sorted(data_dir.rglob("*")):
+        if not path.is_file() or path.name.endswith(
+                (".db", ".db-wal", ".db-shm", ".lock")):
+            continue
+        text = path.read_text(errors="replace")
+        lines = text.splitlines() if path.suffix == ".jsonl" else [text]
+        for line in lines:
+            scan(str(path.relative_to(data_dir)), line)
+    return stray
+
+def _private_corpus_contract_problems(corpus, bbf, capfd):
+    """Every way the private corpus at ``corpus`` is not its own source.
+
+    Collected rather than raised, so one run names each leg that fails. The
+    snapshot leg runs first because it must see the corpus as handed over;
+    the ingest leg then changes the stores, so this helper consumes its corpus.
+    """
+    private_root = pathlib.Path(corpus).parent.resolve()
+    problems = []
+    with _corpus_env(corpus, bbf) as cctally:
+        snap = cctally._cctally_tui._tui_build_snapshot(
+            now_utc=bbf.CORPUS_CLOCK_UTC, skip_sync=True,
+            precompute_envelope=True, runtime_bind="127.0.0.1")
+        envelope = cctally.snapshot_to_envelope(
+            snap, now_utc=bbf.CORPUS_CLOCK_UTC, monotonic_now=0.0,
+            runtime_bind="127.0.0.1")
+        rows = ((envelope["sources"]["codex"].get("data") or {})
+                .get("sessions") or {}).get("rows") or []
+        if not rows:
+            problems.append("non-vacuity: the snapshot published no Codex session")
+        bare = [row.get("key") for row in rows
+                if not (row.get("project") and row.get("project_key")
+                        and row.get("started_at"))]
+        if bare:
+            problems.append(
+                f"{len(bare)} of {len(rows)} published Codex sessions carry no "
+                f"project, project key or start time, so the metadata join "
+                f"missed them")
+
+        stray = _corpus_paths_outside(corpus, private_root)
+        if stray:
+            problems.append(f"stored provider paths outside the corpus: {stray}")
+        for opener, tables in (
+            (cctally.open_cache_db, _FRONTIER_ROOT_TABLES["cache"]),
+            (cctally.open_conversations_db,
+             _FRONTIER_ROOT_TABLES["conversations"]),
+        ):
+            conn = opener()
+            try:
+                _assert_roots_are_private(conn, tables, private_root)
+            except AssertionError as exc:
+                problems.append(str(exc).splitlines()[0])
+            finally:
+                conn.close()
+
+        conn = cctally.open_cache_db()
+        try:
+            capfd.readouterr()
+            ingests = {"claude": cctally.sync_cache(conn),
+                       "codex": cctally.sync_codex_cache(conn)}
+        finally:
+            conn.close()
+    stderr = capfd.readouterr().err
+    missing = [line for line in stderr.splitlines() if "no longer on disk" in line]
+    if missing:
+        problems.append(f"the first ingest reported tracked files missing: {missing[0]}")
+    for provider, stats in ingests.items():
+        if not (stats.files_total > 0 and stats.files_processed == 0
+                and stats.files_skipped_unchanged == stats.files_total):
+            problems.append(
+                f"{provider}: the first ingest re-read files "
+                f"(total={stats.files_total} processed={stats.files_processed} "
+                f"unchanged={stats.files_skipped_unchanged})")
+        if not stats.full_walk_complete:
+            problems.append(f"{provider}: the first ingest withheld walk-complete")
+    if getattr(ingests["claude"], "orphan_residual_count", 0):
+        problems.append(
+            f"claude: {ingests['claude'].orphan_residual_count} orphan residuals")
+    if getattr(ingests["codex"], "prune_debt_pending", 0):
+        problems.append(
+            f"codex: {ingests['codex'].prune_debt_pending} identities left as "
+            f"prune debt")
+    conn = bbf.open_fixture_db(corpus)
+    try:
+        counts = bbf.dataset_counts(conn)
+    finally:
+        conn.close()
+    marker = json.loads((pathlib.Path(corpus) / ".bench-fixture.json").read_text())
+    owed = bbf.expected_counts(bbf.SCALES[marker["scale"]])
+    for key in ("entries", "codex_entries", "codex_files", "quota_windows"):
+        if counts[key] != owed[key]:
+            problems.append(
+                f"after the first ingest {key}={counts[key]}, the corpus owes "
+                f"{owed[key]}")
+    return problems
+
+
+def test_a_private_corpus_describes_its_own_tree_and_refreshes_like_its_source(
+    private_corpus, capfd,
+):
+    """A private corpus whose stores name another tree measures a different one.
+
+    Failure it detects (#1099): a root copy kept the shared root's absolute
+    paths and root keys in every store. Its first ingest then re-read every
+    file under the copy's own identities, so Codex rows and their quota
+    history DOUBLED, the walk-complete marker was withheld and
+    `[cache] N tracked file(s) no longer on disk` printed in passing runs; and
+    a snapshot taken without any ingest published every Codex session without
+    its project metadata, because that join is keyed by the configured roots.
+    `private_corpus` is the one construction path every corpus consumer that
+    walks provider roots or builds a snapshot goes through, so this is its
+    contract.
+    """
+    problems = _private_corpus_contract_problems(
+        private_corpus("small"), _load_build_bench(), capfd)
+    assert not problems, "\n".join(problems)

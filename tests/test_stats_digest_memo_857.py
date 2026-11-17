@@ -764,9 +764,30 @@ def _1050_pct(snap):
 
 
 def _1050_once(fired, action):
-    """Run ``action`` the first time only, recording that it fired."""
+    """Run ``action`` the first time only, recording that it fired.
+
+    The action models another process's commit, so it runs on a thread of
+    its own under owner authority: the build that reaches the seam reads
+    through query sessions (#787 / #861 spec 5.12), and an owner open made
+    on the build's own thread would be a recorded query violation.
+    """
     if not fired:
-        action()
+        import threading
+        import _cctally_core
+        failure: list[BaseException] = []
+
+        def run():
+            try:
+                with _cctally_core.establish_authority("process"):
+                    action()
+            except BaseException as exc:  # re-raised on the test thread
+                failure.append(exc)
+        writer = threading.Thread(target=run, name="1050-seam-writer")
+        writer.start()
+        writer.join(30)
+        assert not writer.is_alive(), "the seam writer did not finish"
+        if failure:
+            raise failure[0]
         fired.append(True)
 
 

@@ -49,6 +49,7 @@ import _lib_five_hour
 import _lib_statusline
 import _lib_statusline_candidates as _candidates
 from _cctally_core import _command_as_of, eprint, open_db
+import _cctally_store_access as _store_access
 
 
 def _cctally():
@@ -1107,7 +1108,10 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
         raise ValueError("the statusline projection requires an exact account")
     import _cctally_journal
 
-    conn = open_db()
+    # #787 / #861 AD21: the snapshot below is one `query(command)` read unit
+    # (the session's own deferred transaction); it closes before rendering.
+    _session, _phase = _store_access.open_command_session("stats")
+    conn = _session.conn
     _acct_pred = " AND account_key = ?"
     _acct_params: tuple = (account_key,)
     try:
@@ -1115,7 +1119,7 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
         # by reduction, retry and publication come from ONE snapshot proven to
         # be the current interpretation. The read transaction ends when the
         # connection closes below.
-        conn.execute("BEGIN")
+        # (the session opened the read transaction)
         import _cctally_store
         _cctally_store.require_current_stats_identity(conn)
         # The reductions below choose the canonical window, then the latest
@@ -1312,7 +1316,7 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
                 five_window=max(five_groups) if five_groups else None,
                 five_projection=five_projection, five_floor_epoch=five_floor_epoch))
     finally:
-        conn.close()
+        _phase.close()
     if validity is not None:
         if instant > now_epoch:
             # The future band moves with an instant past the wall clock.
@@ -6027,7 +6031,9 @@ def _covered_drop_status(account_key: str, frontier: _PublicationFrontier):
     import _cctally_store
     import _lib_account_protocol
 
-    conn = open_db()
+    # #787 / #861 AD21: one `query(command)` read unit.
+    _session, _phase = _store_access.open_command_session("stats")
+    conn = _session.conn
     try:
         with _cctally_store.current_stats_snapshot(conn):
             cursor_row = conn.execute(
@@ -6041,7 +6047,7 @@ def _covered_drop_status(account_key: str, frontier: _PublicationFrontier):
             # between the two reads.
             extents = _journal_extents()
     finally:
-        conn.close()
+        _phase.close()
     if cursor_row is None or any(value is None for value in cursor_row):
         return _UNCOVERED
     cursor = (str(cursor_row[2]), int(cursor_row[3]))
@@ -7264,7 +7270,9 @@ def _wait_tokens(account_key: str, reason: "str | None" = None) -> str:
     depends on the index's coverage high-water (its journal cursor), so
     coverage advancement makes it runnable before its retry is due."""
     try:
-        conn = open_db()
+        # #787 / #861 AD21: per-statement read units; `_tokens_from`'s
+        # BEGIN ... close bracket is one session.
+        conn = _store_access.statement_reader("stats")
     except (Exception, _cctally().StatsRebuildDeferred):
         return _TOKENS_UNAVAILABLE
     return _tokens_from(conn, account_key, reason)
@@ -7285,35 +7293,20 @@ def _wait_tokens_without_waiting(account_key: str, reason: "str | None" = None) 
 
     db_path = pathlib.Path(_cctally_core.DB_PATH)
     try:
-        lock = open(_cctally_core.STATS_LOCK_MAINTENANCE_PATH, "a+")
-    except OSError:
+        if (not db_path.exists()
+                or _cctally_store._stats_repair_marker(db_path).exists()
+                or _cctally_db._quarantine_pending_path(db_path).exists()
+                or _cctally_store._stats_rebuild_artifact_bases(db_path)
+                or _cctally_store._stats_publication_marker(db_path).exists()
+                or _cctally_store.stats_epoch_rebuild_pending(db_path)):
+            return _TOKENS_UNAVAILABLE
+        # #787 / #861: a `query` session admits under the maintenance lock
+        # SHARED and non-blocking and recovers, migrates and creates nothing
+        # (no startup phase); `_tokens_from`'s bracket is its read unit.
+        conn = _store_access.statement_reader("stats", startup=False)
+    except (Exception, _cctally().StatsRebuildDeferred):
         return _TOKENS_UNAVAILABLE
-    try:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except OSError:
-            return _TOKENS_UNAVAILABLE
-        try:
-            if (not db_path.exists()
-                    or _cctally_store._stats_repair_marker(db_path).exists()
-                    or _cctally_db._quarantine_pending_path(db_path).exists()
-                    or _cctally_store._stats_rebuild_artifact_bases(db_path)
-                    or _cctally_store._stats_publication_marker(db_path).exists()
-                    or _cctally_store.stats_epoch_rebuild_pending(db_path)):
-                return _TOKENS_UNAVAILABLE
-            conn = _cctally_store.stats_open_guarded(
-                db_path, recover_interruptions=False,
-                connect=lambda path, **kwargs: sqlite3.connect(
-                    path, timeout=0, **kwargs))
-        except (Exception, _cctally().StatsRebuildDeferred):
-            return _TOKENS_UNAVAILABLE
-        return _tokens_from(conn, account_key, reason)
-    finally:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        lock.close()
+    return _tokens_from(conn, account_key, reason)
 
 
 def _tokens_from(conn, account_key: str, reason: "str | None") -> str:
@@ -8903,6 +8896,9 @@ def _fork_statusline_oauth_refresh(lock_fd: int) -> bool:
         return True
 
     try:
+        # #787 / #861 AD16: the OAuth child starts with no authority and
+        # establishes `process` for the rest of its life.
+        _cctally_core.establish_authority("process").__enter__()
         try:
             os.setsid()
         except OSError:
@@ -9051,7 +9047,7 @@ def _build_statusline_injections(warn_once):
         if not sid:
             return None
         try:
-            conn = c.open_cache_db()
+            conn = _store_access.statement_reader("cache")  # #787 AD21
         except Exception:
             return None
         try:
@@ -9191,7 +9187,7 @@ def _build_statusline_injections(warn_once):
         _acct_pred = "" if _sl_account is None else " AND account_key = ?"
         _acct_params = () if _sl_account is None else (_sl_account,)
         try:
-            conn = open_db()
+            conn = _store_access.statement_reader("stats")  # #787 AD21
         except c.StatsRebuildDeferred:
             return (None, None)
         except Exception:
@@ -9293,7 +9289,7 @@ def _build_statusline_injections(warn_once):
 
     def _db_latest_rate_limits():
         try:
-            conn = open_db()
+            conn = _store_access.statement_reader("stats")  # #787 AD21
         except _cctally().StatsRebuildDeferred:
             return None
         except Exception:

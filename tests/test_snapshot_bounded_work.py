@@ -2774,21 +2774,27 @@ def _doctor_store(monkeypatch, tmp_path):
 def _count_quota_population_reads(monkeypatch):
     """Attach a trace to the connections the DOCTOR opens, not the build's.
 
-    Criterion 4: the doctor opens independent raw SQLite connections, so a
-    trace on an injected connection observes nothing it does. `_cache_connection`
-    is the one place `load_codex_quota_observations` opens its own.
+    Criterion 4: the doctor opens independent connections, so a trace on an
+    injected connection observes nothing it does. Since #787 every cache read
+    the doctor makes is a query-session `StatementReader` from
+    `_cctally_store_access.statement_reader`: the doctor's population loader
+    opens one at the diagnostic policy and hands it to
+    `load_codex_quota_observations`, and that function's own fallback
+    (`_cctally_quota._cache_connection`) opens one too. Tracing every cache
+    statement reader covers both, whichever session runs each statement.
     """
-    import _cctally_quota
+    import _cctally_store_access
 
     statements: list[str] = []
-    real = _cctally_quota._cache_connection
+    real = _cctally_store_access.statement_reader
 
-    def traced():
-        conn = real()
-        conn.set_trace_callback(statements.append)
-        return conn
+    def traced(primary, **kwargs):
+        reader = real(primary, **kwargs)
+        if primary == "cache":
+            reader.set_trace_callback(statements.append)
+        return reader
 
-    monkeypatch.setattr(_cctally_quota, "_cache_connection", traced)
+    monkeypatch.setattr(_cctally_store_access, "statement_reader", traced)
     return statements
 
 

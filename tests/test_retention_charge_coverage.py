@@ -169,6 +169,22 @@ def _store(tmp_path, monkeypatch):
         retention._resolve_main_db_path(conn))
 
 
+#: #990 (spec D1): the planner helper's real-time floor for the tests whose
+#: subject is a chunk's outcome, never the helper's own failure or deadline.
+_PLANNER_FLOOR_SECONDS = 30.0
+
+
+def _floor_planner_budget(monkeypatch, retention) -> None:
+    """Give every planner helper of this test 30 s of its own deadline, and
+    31 s of subprocess timeout with the 1.0 s start-up slack, instead of a
+    direct chunk's 1.5 s default, so a multi-second host stall cannot turn
+    the chunk under test into a ``helper_timeout`` refusal (#990). The
+    product constants are unchanged, and a passing run never waits on the
+    floor: a helper returns in about 0.05 s."""
+    monkeypatch.setattr(retention, "_PLANNER_MIN_DEADLINE_SECONDS",
+                        _PLANNER_FLOOR_SECONDS)
+
+
 def _seed_groups(conn, sizes):
     """Expiring groups `g-<n>` of the given sizes, interleaved row by row
     with a surviving group, so a deletion dirties shared pages."""
@@ -239,6 +255,8 @@ import _lib_conversation_retention as r
 import _retention_fixtures as fx
 import _sqlite_write_accounting as acct
 db, kind, units = sys.argv[3], sys.argv[4], int(sys.argv[5])
+# #990: the parent's planner floor; a monkeypatch cannot reach this process.
+r._PLANNER_MIN_DEADLINE_SECONDS = float(sys.argv[6])
 if kind == "fallback":
     r.DELETION_FALLBACK_ROW_THRESHOLD = 10
 acct.activate()
@@ -295,7 +313,7 @@ def _measure(retention, db_path, kind, units, variant, monkeypatch, wio):
                 [sys.executable, "-c", _CRASH_CHILD, str(_BIN),
                  str(fx.TESTS_DIR), str(db_path),
                  kind if kind != "delete-fallback" else "fallback",
-                 str(units)],
+                 str(units), repr(retention._PLANNER_MIN_DEADLINE_SECONDS)],
                 capture_output=True, text=True, timeout=120, env=env)
             report, writes = fx.child_writes(child.stdout, "crash child",
                                              stderr=child.stderr)
@@ -364,6 +382,8 @@ def test_the_charge_covers_every_attributable_write(
     ns, conn, retention, wio, db_path = _store(tmp_path, monkeypatch)
     try:
         if kind == "reclaim":
+            # The `crash` variant's child receives this floor as an argument.
+            _floor_planner_budget(monkeypatch, retention)
             _interior_freelist(conn)
             # §5.4: the record is normalized outside any chunk, before the run.
             conn.commit()
@@ -633,3 +653,232 @@ def test_the_validity_guard_can_fail(tmp_path, monkeypatch):
     pages, _ = _wal_pages(db_path)
     assert result.outcome == "no_progress"
     assert not _valid({"frames": len(pages)})
+
+
+# ── #1090 T6: the applied-cutoff merge stays inside the allowance ─────────
+
+_APPLIED = "conversation_retention_applied_cutoff"
+_LOWER = "2025-12-01T00:00:00Z"
+
+
+def _applied_value(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                           (_APPLIED,)).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else row[0]
+
+
+@pytest.mark.parametrize("stored", [None, _LOWER],
+                         ids=["first-insertion", "advancement"])
+def test_the_deletion_charge_covers_the_applied_cutoff_merge(
+        tmp_path, monkeypatch, stored):
+    """#1090 T6: a deletion that inserts the applied cutoff, or advances a
+    lower one, in its own transaction stays covered by the unchanged
+    reservation in every variant. Detects an overrun of the #901 allowance
+    by the new state write."""
+    ns, conn, retention, wio, db_path = _store(tmp_path, monkeypatch)
+    try:
+        _seed_groups(conn, [50])
+        if stored is not None:
+            conn.execute("INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+                         (_APPLIED, stored))
+            conn.commit()
+        template = _copy(conn, tmp_path / "t6-template.db")
+    finally:
+        conn.close()
+    for variant in VARIANTS:
+        target = tmp_path / f"t6-{variant}.db"
+        src = sqlite3.connect(template)
+        try:
+            _copy(src, target)
+        finally:
+            src.close()
+        wio.reset_for_tests()
+        measurement = _measure(retention, target, "delete", 50, variant,
+                               monkeypatch, wio)
+        assert _valid(measurement), measurement
+        assert _applied_value(target) == CUTOFF, (
+            "the key really changed", stored, variant)
+        assert measurement["attributable"] <= measurement["charge"], (
+            "coverage: raise the failing reservation part per §5.4",
+            json.dumps(measurement, sort_keys=True))
+
+
+def _btree_leaves(db_path, name) -> int:
+    """Leaf pages of the b-tree `name`, parsed from the file's own bytes
+    after a TRUNCATE checkpoint (no dbstat dependency)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        root = int(conn.execute("SELECT rootpage FROM sqlite_schema "
+                                "WHERE name=?", (name,)).fetchone()[0])
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    finally:
+        conn.close()
+    data = pathlib.Path(db_path).read_bytes()
+    leaves, stack = 0, [root]
+    while stack:
+        pgno = stack.pop()
+        base = (pgno - 1) * page_size
+        header = base + (100 if pgno == 1 else 0)
+        kind = data[header]
+        if kind in (0x0A, 0x0D):
+            leaves += 1
+            continue
+        assert kind in (0x02, 0x05), (name, pgno, kind)
+        cells = int.from_bytes(data[header + 3:header + 5], "big")
+        stack.append(int.from_bytes(data[header + 8:header + 12], "big"))
+        for i in range(cells):
+            pointer = int.from_bytes(
+                data[header + 12 + 2 * i:header + 14 + 2 * i], "big")
+            stack.append(int.from_bytes(data[base + pointer:base + pointer + 4],
+                                        "big"))
+    return leaves
+
+
+_META_TREES = ("cache_meta", "sqlite_autoindex_cache_meta_1")
+
+
+def _meta_leaves(db_path) -> tuple:
+    return tuple(_btree_leaves(db_path, name) for name in _META_TREES)
+
+
+def _insertion_splits(template, probe) -> tuple:
+    """Whether inserting the applied key into a copy of `template` splits
+    the `cache_meta` table leaf and its primary-key index leaf."""
+    src = sqlite3.connect(template)
+    try:
+        _copy(src, probe)
+    finally:
+        src.close()
+    conn = sqlite3.connect(probe)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        before = _meta_leaves(probe)
+        conn.execute("INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+                     (_APPLIED, CUTOFF))
+        conn.commit()
+    finally:
+        conn.close()
+    after = _meta_leaves(probe)
+    return tuple(a > b for a, b in zip(after, before))
+
+
+def _populate_for_double_split(conn, db_path, probe):
+    """Fill `cache_meta` so the applied key's first insertion splits both
+    b-trees: neighbours of the key fill its index leaf, then the last
+    neighbour's value grows until the table's rightmost leaf is full."""
+    neighbour = None
+    for i in range(4000):
+        neighbour = f"{_APPLIED}#{i:05d}"
+        conn.execute("INSERT INTO cache_meta(key, value) VALUES (?, 'v')",
+                     (neighbour,))
+        conn.commit()
+        _truncate(db_path)
+        table, index = _insertion_splits(db_path, probe)
+        if index:
+            break
+    else:
+        raise AssertionError("the index leaf never filled")
+    for size in range(8, 3900, 8):
+        if table:
+            return
+        conn.execute("UPDATE cache_meta SET value=? WHERE key=?",
+                     ("v" * size, neighbour))
+        conn.commit()
+        _truncate(db_path)
+        table, index = _insertion_splits(db_path, probe)
+        assert index, "growing a value never touches the index"
+    assert table, "the table leaf never filled"
+
+
+def _measure_completion(retention, db_path, monkeypatch, *, merge):
+    _truncate(db_path)
+    holder = sqlite3.connect(db_path)
+    try:
+        holder.execute("SELECT COUNT(*) FROM cache_meta").fetchone()
+        with monkeypatch.context() as patch:
+            if not merge:
+                patch.setattr(retention, "_merge_applied_cutoff",
+                              lambda conn, cutoff_iso: False)
+            with fx.measure("operation") as interval:
+                conn = retention.open_deletion_connection(db_path)
+                try:
+                    fx.require_attributed(conn, "deletion connection")
+                    retention._stamp_retention_complete(conn, NOW, CUTOFF)
+                    frames = _cache_writes(conn)
+                finally:
+                    conn.close()
+        pages, page_size = _wal_pages(db_path)
+    finally:
+        holder.close()
+    _truncate(db_path)
+    wal_bytes = frames * (page_size + 24) + (32 if pages else 0)
+    copy_bytes = len(set(pages)) * page_size
+    temp = interval.writes.temp
+    return {"merge": merge, "frames": frames,
+            "distinct_pages": len(set(pages)), "page_size": page_size,
+            "wal_bytes": wal_bytes, "copy_bytes": copy_bytes,
+            "temp_bytes": temp, "attributable": wal_bytes + copy_bytes + temp,
+            "applied": _applied_value(db_path),
+            "leaves": _meta_leaves(db_path)}
+
+
+@pytest.mark.parametrize("state", ["absent", "lower", "double-split"])
+def test_the_completion_merge_stays_within_its_page_budget(
+        tmp_path, monkeypatch, state):
+    """#1090 T6 (revision 3, R2-P2-2): the bytes the completion's merge adds
+    — the same accounting around `_stamp_retention_complete` with and
+    without it — stay within eight pages of frame plus copy, with the key
+    absent, a lower key stored, and a `cache_meta` populated so the first
+    insertion splits both its table leaf and its primary-key index leaf.
+    Detects an overrun of the #901 allowance at episode end."""
+    ns, conn, retention, wio, db_path = _store(tmp_path, monkeypatch)
+    try:
+        assert retention.normalize_reclaim_record(conn, NOW)
+        record = retention.read_reclaim_pending(conn)
+        retention._write_reclaim_pending(
+            conn, {**record, "continuation_cutoff": CUTOFF})
+        retention._stamp_retention_prune(conn, NOW)
+        if state == "lower":
+            conn.execute("INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+                         (_APPLIED, _LOWER))
+        conn.commit()
+        if state == "double-split":
+            _populate_for_double_split(conn, db_path, tmp_path / "probe.db")
+        template = _copy(conn, tmp_path / "t6c-template.db")
+    finally:
+        conn.close()
+    runs = {}
+    for merge in (False, True):
+        target = tmp_path / f"t6c-{merge}.db"
+        src = sqlite3.connect(template)
+        try:
+            _copy(src, target)
+        finally:
+            src.close()
+        _truncate(target)
+        leaves_before = _meta_leaves(target)
+        wio.reset_for_tests()
+        runs[merge] = {**_measure_completion(retention, target, monkeypatch,
+                                             merge=merge),
+                       "leaves_before": leaves_before}
+    without, with_merge = runs[False], runs[True]
+    page_size = with_merge["page_size"]
+    budget = 8 * (2 * page_size + 24)
+    added = with_merge["attributable"] - without["attributable"]
+    record = {"state": state, "added": added, "budget": budget,
+              "with": with_merge, "without": without}
+    print("T6-RECORD " + json.dumps(record, sort_keys=True), flush=True)
+    assert without["applied"] == (_LOWER if state == "lower" else None)
+    assert with_merge["applied"] == CUTOFF, ("the key really changed", record)
+    assert without["leaves"] == without["leaves_before"], record
+    if state == "double-split":
+        assert all(a > b for a, b in zip(with_merge["leaves"],
+                                         with_merge["leaves_before"])), (
+            "validity: the first insertion split both b-trees", record)
+    assert added <= budget, (
+        "the merge's measured pages exceed the eight-page budget",
+        json.dumps(record, sort_keys=True))

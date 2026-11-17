@@ -41,6 +41,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import re
 from typing import Iterable, Mapping, Sequence
 
 from _lib_jsonl import (
@@ -193,11 +194,18 @@ def normalize_reset(value: object) -> str:
 
 
 def loading_unit_from_raw(group: Sequence) -> tuple:
-    """The loading unit one raw group belongs to."""
+    """The loading unit one raw group belongs to.
+
+    The key is snapped AND stripped of any ``modelPool`` member (#1071): a Spark
+    row can be stored under the pool-carrying key, and the block it produces
+    stamps the stripped unit through ``loading_unit_from_identity``. Naming the
+    pool-free key here is what makes a ledger entry over either stored
+    spelling dirty the one unit both pools' blocks share.
+    """
     root, limit_key, slot, minutes, reset = group
     return (
         str(root),
-        snap_window_minutes(str(limit_key)),
+        strip_model_pool(snap_window_minutes(str(limit_key))),
         str(slot),
         int(snap_codex_window_minutes(int(minutes))),
         normalize_reset(reset),
@@ -272,3 +280,93 @@ def compose_root_signature(pairs: Iterable[tuple[str, str]]) -> str:
         ensure_ascii=False, separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+#: The capture spelling every Codex writer produces (``_format_codex_timestamp``
+#: and the journal replay of its output): a UTC instant to the second, an
+#: optional fraction of any length, then ``Z`` or ``+00:00``. Within it the text
+#: order of the first nineteen characters IS the time order, which is what makes
+#: a textual index extremum usable as a time bound at all.
+_SUPPORTED_CAPTURE = re.compile(
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:Z|\+00:00)")
+
+
+def outward_capture_span(
+    low_text: object, high_text: object,
+) -> "tuple[float, float] | None":
+    """A closed epoch-second span enclosing every capture between two textual
+    index extrema, or ``None`` when the shortcut cannot vouch for it.
+
+    #1071 Q20. The producer writes variable-precision ISO strings, so the text
+    order disagrees with the time order INSIDE one second: ``…:20.500000Z``
+    sorts before ``…:20Z`` (``.`` < ``Z``) although it is half a second later.
+    Across seconds the supported spelling keeps the two orders equal, so the
+    textual minimum's second is the earliest second present and the textual
+    maximum's second the latest: flooring the first and adding one second to
+    the second encloses every parsed instant between them. Any other spelling
+    returns ``None`` and the caller reads the group's captures completely; a
+    row is never dropped because this shortcut cannot interpret it.
+    """
+    low = _SUPPORTED_CAPTURE.fullmatch(str(low_text))
+    high = _SUPPORTED_CAPTURE.fullmatch(str(high_text))
+    if low is None or high is None:
+        return None
+    try:
+        start = dt.datetime.fromisoformat(low.group(1) + "+00:00").timestamp()
+        end = dt.datetime.fromisoformat(high.group(1) + "+00:00").timestamp()
+    except ValueError:
+        return None
+    end += 1.0
+    if start > end:
+        return None
+    return (start, end)
+
+
+def interleave_closure(
+    intervals: Mapping[object, Iterable[tuple[float, float]]],
+    seeds: Iterable[object],
+) -> frozenset:
+    """Every node connected to a seed through intersecting CLOSED intervals,
+    transitively (#1071 Q18).
+
+    ``intervals`` maps one window of a family to its spans (its current
+    physical capture span and the published interpreted span of each of its
+    blocks; a node may carry several). Two nodes connect when any span of one
+    intersects any span of the other, endpoints included. One sorted sweep
+    merges overlapping spans into runs and a union-find joins the nodes of a
+    run and the runs of one node, so the fixpoint costs one sort rather than a
+    round per expansion. A seed with no span is returned alone: nothing it
+    holds can separate another window's readings.
+    """
+    parent: dict[object, object] = {}
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left, right):
+        a, b = find(left), find(right)
+        if a != b:
+            parent[b] = a
+
+    spans: list[tuple[float, float, object]] = []
+    for node, node_spans in intervals.items():
+        parent.setdefault(node, node)
+        for start, end in node_spans:
+            spans.append((float(start), float(end), node))
+    seed_set = set(seeds)
+    for node in seed_set:
+        parent.setdefault(node, node)
+    spans.sort(key=lambda item: (item[0], item[1]))
+    run_end: "float | None" = None
+    run_node = None
+    for start, end, node in spans:
+        if run_end is not None and start <= run_end:
+            union(run_node, node)
+            run_end = max(run_end, end)
+        else:
+            run_node, run_end = node, end
+    seed_roots = {find(node) for node in seed_set}
+    return frozenset(node for node in parent if find(node) in seed_roots)

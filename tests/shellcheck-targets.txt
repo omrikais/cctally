@@ -9,6 +9,7 @@ public bin/_lib-fixture-harness.sh
 public bin/_lib-fts5-probe.sh
 public bin/_lib-golden-diff.sh
 public bin/_lib-harness-env.sh
+public bin/_lib-hold.sh
 public bin/_lib-kill-server.sh
 public bin/_lib-test-contract.sh
 public bin/build-readme-screenshots.sh

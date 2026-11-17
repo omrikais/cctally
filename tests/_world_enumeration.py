@@ -54,7 +54,7 @@ import dataclasses
 import itertools
 import json
 import shutil
-from typing import Iterator
+from typing import Iterable
 
 import _outcome_quarantine_trace as T
 
@@ -107,9 +107,25 @@ def world_steps(steps, interpretation) -> list:
     return out
 
 
-def worlds(steps) -> Iterator[tuple]:
+#: `worlds`'s default: every world, unsharded.
+ALL = object()
+
+
+def worlds(steps, first=ALL) -> Iterable[tuple]:
+    """Every interpretation of the trace's excluded readings, or with ``first``
+    only the shard whose first excluded reading reads as ``first`` (#996). A
+    trace with no excluded reading has one empty world, which no shard holds,
+    so requesting a shard of it raises `ValueError`, as does a ``first`` that
+    is no interpretation (its shard would be empty and its check vacuous)."""
     count = sum(1 for kind, _ in steps if kind == "legacy")
-    return itertools.product(INTERPRETATIONS, repeat=count)
+    if first is ALL:
+        return itertools.product(INTERPRETATIONS, repeat=count)
+    if first not in INTERPRETATIONS:
+        raise ValueError(f"no interpretation {first!r} to shard by")
+    if count == 0:
+        raise ValueError("a trace with no excluded reading has no shard")
+    return tuple(world for world in itertools.product(INTERPRETATIONS, repeat=count)
+                 if world[0] == first)
 
 
 def trigger_index(steps) -> int:
@@ -344,12 +360,12 @@ def reference_horizon(steps, mixed) -> int:
     return len(steps)
 
 
-def run_and_check(store, traces) -> dict:
+def run_and_check(store, traces, *, first=ALL) -> dict:
     """Run every mixed trace, then all of their worlds in one trie walk,
     check each, and return ``{label: (mixed, {world: result})}``. ``traces``
     maps a label to its step list. A world shared by several traces runs to
     the longest `reference_horizon` they need; past it its result is
-    ``None``."""
+    ``None``. ``first`` restricts the worlds to one `worlds` shard."""
     labels = list(traces)
     mixed_results = dict(zip(labels, store.run_all(
         [traces[label] for label in labels])))
@@ -357,7 +373,7 @@ def run_and_check(store, traces) -> dict:
     refs = {}
     for label, steps in traces.items():
         horizon = reference_horizon(steps, mixed_results[label])
-        for world in worlds(steps):
+        for world in worlds(steps, first):
             seq = world_steps(steps, world)
             key = tuple(step_key(step) for step in seq)
             entry = unique.setdefault(key, [seq, 0])
@@ -371,7 +387,7 @@ def run_and_check(store, traces) -> dict:
     for label, steps in traces.items():
         mixed = mixed_results[label]
         per_world = {world: by_key[refs[(label, world)]]
-                     for world in worlds(steps)}
+                     for world in worlds(steps, first)}
         check(steps, mixed, per_world, label=label)
         out[label] = (mixed, per_world)
     return out

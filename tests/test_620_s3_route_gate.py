@@ -24,10 +24,12 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import fcntl
+import functools
 import hashlib
 import http.client
 import inspect
 import json
+import os
 import pathlib
 import sys
 import textwrap
@@ -235,6 +237,14 @@ def test_a_denied_request_never_opens_the_conversations_store(
         return real(kind)
 
     monkeypatch.setattr(sources, "open_read_only", _spy)
+    # #787 / #861 AD21: the bundle opens stats and cache as query sessions.
+    real_session = sources.query_session
+
+    def _spy_session(kind):
+        opened.append(kind)
+        return real_session(kind)
+
+    monkeypatch.setattr(sources, "query_session", _spy_session)
     # #1000: conversations opens through the bundle's read admission.
     real_conversations = sources.StoreBundle._open_conversations
 
@@ -285,6 +295,9 @@ def test_the_route_worker_reads_transcripts_under_the_parents_maintenance_lock(
     `conversations` component."""
     lock = tmp_path / "parent-only" / "conversations.db.maintenance.lock"
     lock.parent.mkdir()
+    # #787 AD22: the lock exists, as an owner open leaves it; a read never
+    # creates it, so a worker handed a wrong path finds no lock and declines.
+    lock.touch()
     monkeypatch.setattr(sys.modules["_cctally_core"],
                         "CONVERSATIONS_LOCK_MAINTENANCE_PATH", lock)
     query = f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}"
@@ -297,6 +310,295 @@ def test_the_route_worker_reads_transcripts_under_the_parents_maintenance_lock(
         response = claude_server.get(query, host="127.0.0.1")
     assert response.status == 200, response.body
     assert "conversations" not in response.json["results"][0]["generation"]
+
+
+def _probe_stub_worker_init(cctally_path, store_paths, *rest, delay, log,
+                            move_identity):
+    """The worker's initializer with AD19's probe stubbed (#787 AD30).
+
+    Module-level and bound with `functools.partial`, so it pickles by
+    reference into the forkserver worker, where a parent monkeypatch never
+    reaches. It runs the real initializer (paths, and the handed-over header
+    verdicts), then delays every probe child by DELAY seconds and records
+    each launch in LOG. MOVE_IDENTITY bumps stats.db's mtime after the
+    handoff, so the verdict the worker was handed no longer matches."""
+    sys.modules["_cctally_diagnosis_sources"]._spawn_worker_init(
+        cctally_path, store_paths, *rest)
+    access = sys.modules["_cctally_store_access"]
+    real_argv = access._header_probe_argv
+
+    def slow_argv(target):
+        with open(log, "a") as fh:
+            fh.write("probe\n")
+        return [sys.executable, "-c",
+                f"import os,sys,time; time.sleep({delay}); "
+                "os.execv(sys.argv[1], sys.argv[1:])", *real_argv(target)]
+
+    access._header_probe_argv = slow_argv
+    if move_identity:
+        st = os.stat(store_paths["DB_PATH"])
+        os.utime(store_paths["DB_PATH"],
+                 ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    with open(log, "a") as fh:
+        fh.write("installed\n")
+
+
+@pytest.mark.parametrize("moved", [None, "before_handoff", "in_worker"])
+def test_the_diagnosis_worker_inherits_the_parents_header_verdict(
+        claude_server, tmp_path, monkeypatch, moved):
+    """#787 AD30. The route builds in a one-shot forkserver worker whose AD19
+    header cache starts empty, so a probe child whose launch outlasts the
+    500 ms interactive budget refused stats.db and served 503 under load
+    (I5f-1). The parent hands the worker its cached verdict for stats.db's
+    current stat identity, so the worker launches no probe and serves 200.
+    A stat identity that moved, before the handoff (the parent holds only
+    the old identity's verdict) or after it (the worker was handed a verdict
+    for an identity the file no longer has), re-probes exactly as an empty
+    cache would: the delayed probe refuses and the route serves base's 503.
+    The conversations maintenance lock is held, as in the route-gate test
+    above, so the worker provably ran with the parent's handed-over paths."""
+    lock = tmp_path / "parent-only" / "conversations.db.maintenance.lock"
+    lock.parent.mkdir()
+    lock.touch()
+    # `_sources()` first: it reloads the siblings, and the route reads the
+    # modules it leaves registered.
+    sources = _sources()
+    core = sys.modules["_cctally_core"]
+    access = sys.modules["_cctally_store_access"]
+    monkeypatch.setattr(core, "CONVERSATIONS_LOCK_MAINTENANCE_PATH", lock)
+    log = tmp_path / "probe-stub.log"
+    monkeypatch.setattr(sources, "_spawn_worker_init", functools.partial(
+        _probe_stub_worker_init, delay=0.8, log=str(log),
+        move_identity=(moved == "in_worker")))
+    with access._HEADER_CACHE_LOCK:
+        access._HEADER_CACHE.clear()
+    # The parent's own stats read leaves its verdict, as a snapshot build does.
+    assert access._stats_header_kind(core.DB_PATH) == "rollback"
+    if moved == "before_handoff":
+        st = os.stat(core.DB_PATH)
+        os.utime(core.DB_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    query = f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}"
+    with open(lock, "a+") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        response = claude_server.get(query, host="127.0.0.1")
+    launches = log.read_text().split()
+    # Non-vacuity: the stub ran in the worker that served this request.
+    assert "installed" in launches
+    if moved is None:
+        assert response.status == 200, response.body
+        assert "probe" not in launches
+        assert "conversations" not in response.json["results"][0]["generation"]
+    else:
+        assert "probe" in launches
+        assert response.status == 503, response.body
+
+
+def test_the_verdict_handoff_never_probes_and_follows_the_identity(
+        claude_server, monkeypatch):
+    """#787 AD30, in process: the handoff only reads the parent's cache (a
+    parent without a verdict hands nothing and launches no child), and a
+    seeded verdict is keyed by the identity it was handed for, so it serves
+    that identity without a probe and never the one the file moves to."""
+    core = sys.modules["_cctally_core"]
+    access = sys.modules["_cctally_store_access"]
+    launches = []
+    real_run = access._run_header_probe
+
+    def _counting(target):
+        launches.append(str(target))
+        return real_run(target)
+
+    monkeypatch.setattr(access, "_run_header_probe", _counting)
+    with access._HEADER_CACHE_LOCK:
+        access._HEADER_CACHE.clear()
+    assert access.header_verdict_handoff((str(core.DB_PATH),)) == ()
+    assert launches == []
+    assert access._stats_header_kind(core.DB_PATH) == "rollback"
+    handed = access.header_verdict_handoff((str(core.DB_PATH),))
+    assert [verdict for _key, verdict in handed] == ["rollback"]
+    with access._HEADER_CACHE_LOCK:
+        access._HEADER_CACHE.clear()
+    access.seed_header_verdicts(handed + (("not-a-key", "rollback"),
+                                          (handed[0][0], "unknown")))
+    assert access._stats_header_kind(core.DB_PATH) == "rollback"
+    assert len(launches) == 1           # the parent's read only
+    st = os.stat(core.DB_PATH)
+    os.utime(core.DB_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    assert access._stats_header_kind(core.DB_PATH) == "rollback"
+    assert len(launches) == 2           # the moved identity re-probed
+
+
+def test_a_returned_worker_verdict_serves_only_its_own_identity(
+        claude_server, tmp_path, monkeypatch):
+    """#787 AD30 (revision 29), in process: the verdicts a worker returns
+    with its result are added to the parent's cache under the identity the
+    worker probed, so the parent hands them on without a probe, and never
+    serve another identity: an entry for an identity the file does not have
+    is never handed over for it, and once the file moves the parent
+    re-probes."""
+    import pickle
+
+    sources = _sources()
+    core = sys.modules["_cctally_core"]
+    access = sys.modules["_cctally_store_access"]
+    launches = []
+    real_run = access._run_header_probe
+
+    def _counting(target):
+        launches.append(str(target))
+        return real_run(target)
+
+    monkeypatch.setattr(access, "_run_header_probe", _counting)
+    with access._HEADER_CACHE_LOCK:
+        access._HEADER_CACHE.clear()
+    current = access._header_stat_key(os.stat(core.DB_PATH))
+    other = current[:3] + (current[3] + 7, current[4])
+    result = tmp_path / "worker-result"
+    with open(result, "wb") as fh:
+        pickle.dump(("ok", "report", ((current, "rollback"), (other, "wal"))),
+                    fh, protocol=5)
+    assert sources._payload_result(sources._read_payload(str(result))) == \
+        "report"
+    assert access.header_verdict_handoff((str(core.DB_PATH),)) == (
+        (current, "rollback"),)
+    assert access._stats_header_kind(core.DB_PATH) == "rollback"
+    assert launches == []               # the returned verdict served it
+    st = os.stat(core.DB_PATH)
+    os.utime(core.DB_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    assert access.header_verdict_handoff((str(core.DB_PATH),)) == ()
+    assert access._stats_header_kind(core.DB_PATH) == "rollback"
+    assert len(launches) == 1           # the moved identity re-probed
+
+
+def _prompt_probe_worker_init(cctally_path, store_paths, *rest, log):
+    """The worker's initializer with a prompt AD19 probe that logs each call
+    (#787 AD30): it reads the 20 header bytes in process, so a worker probe
+    costs no child launch and every one is counted in LOG."""
+    sys.modules["_cctally_diagnosis_sources"]._spawn_worker_init(
+        cctally_path, store_paths, *rest)
+    access = sys.modules["_cctally_store_access"]
+
+    def prompt(target):
+        with open(log, "a") as fh:
+            fh.write("probe\n")
+        with open(target, "rb") as fh:
+            return fh.read(20)
+
+    access._run_header_probe = prompt
+    with open(log, "a") as fh:
+        fh.write("installed\n")
+
+
+@pytest.mark.parametrize("no_sync", [True, False], ids=["no-sync", "sync"])
+def test_a_workers_probe_returns_to_the_parent_for_the_next_request(
+        claude_server, tmp_path, monkeypatch, no_sync):
+    """#787 AD30 (revision 29, R28-5). After a stats change the parent holds
+    no verdict for stats.db's new identity, so the first request's worker
+    probes. That worker returns its verdict with its result and the parent
+    adopts it, so the second request's worker is handed it and probes
+    nothing: two consecutive real-worker requests probe once in total, in
+    both dashboard modes. Without the return path every request's one-shot
+    worker probed again, and under load each probe could spend the whole
+    interactive budget and serve 503."""
+    sources = _sources()
+    core = sys.modules["_cctally_core"]
+    access = sys.modules["_cctally_store_access"]
+    monkeypatch.setattr(_dash().DashboardHTTPHandler, "no_sync", no_sync)
+    log = tmp_path / "worker-probes.log"
+    monkeypatch.setattr(sources, "_spawn_worker_init", functools.partial(
+        _prompt_probe_worker_init, log=str(log)))
+    parent = []
+    real_run = access._run_header_probe
+    monkeypatch.setattr(access, "_run_header_probe",
+                        lambda target: parent.append(str(target))
+                        or real_run(target))
+    with access._HEADER_CACHE_LOCK:
+        access._HEADER_CACHE.clear()
+    # The parent knew the old identity; the stats change moves it.
+    assert access._stats_header_kind(core.DB_PATH) == "rollback"
+    parent.clear()
+    st = os.stat(core.DB_PATH)
+    os.utime(core.DB_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    query = f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}"
+    first = claude_server.get(query, host="127.0.0.1")
+    second = claude_server.get(query, host="127.0.0.1")
+    assert (first.status, second.status) == (200, 200), (first.body,
+                                                         second.body)
+    lines = log.read_text().split()
+    # Non-vacuity: each request ran in its own stubbed worker.
+    assert lines.count("installed") == 2, lines
+    assert lines.count("probe") + len(parent) == 1, (lines, parent)
+    assert lines[:3] == ["installed", "probe", "installed"], lines
+
+
+def _child_only_probe_worker_init(cctally_path, store_paths, *rest, log):
+    """The worker's initializer with an AD19 probe that only a process
+    forked from the worker can run (#787 AD30, revision 31): in the worker
+    itself the probe fails closed, so the `source=all` provider child is the
+    one process that learns stats.db's current identity. Every call is
+    logged in LOG with the process role."""
+    sys.modules["_cctally_diagnosis_sources"]._spawn_worker_init(
+        cctally_path, store_paths, *rest)
+    access = sys.modules["_cctally_store_access"]
+    worker = os.getpid()
+
+    def child_only(target):
+        role = "worker" if os.getpid() == worker else "child"
+        with open(log, "a") as fh:
+            fh.write(f"probe:{role}\n")
+        if role == "worker":
+            return None
+        with open(target, "rb") as fh:
+            return fh.read(20)
+
+    access._run_header_probe = child_only
+    with open(log, "a") as fh:
+        fh.write("installed\n")
+
+
+def test_a_provider_childs_probe_crosses_the_worker_to_the_next_request(
+        claude_server, tmp_path, monkeypatch):
+    """#787 AD30 (revision 31, R30-3). A worker returns every verdict it
+    learned during the request, including one adopted from its own
+    `source=all` forked provider child, under the identity that child
+    probed. Here only the child can probe stats.db's new identity, and the
+    next request's worker is handed that verdict, so neither it nor its
+    provider child probes again. Detects a worker that returns only the
+    verdicts it probed itself: the child's verdict stopped at the worker,
+    and every later request probed again inside its interactive budget."""
+    sources = _sources()
+    core = sys.modules["_cctally_core"]
+    access = sys.modules["_cctally_store_access"]
+    log = tmp_path / "worker-probes.log"
+    monkeypatch.setattr(sources, "_spawn_worker_init", functools.partial(
+        _child_only_probe_worker_init, log=str(log)))
+    parent = []
+    real_run = access._run_header_probe
+    monkeypatch.setattr(access, "_run_header_probe",
+                        lambda target: parent.append(str(target))
+                        or real_run(target))
+    with access._HEADER_CACHE_LOCK:
+        access._HEADER_CACHE.clear()
+    assert access._stats_header_kind(core.DB_PATH) == "rollback"
+    parent.clear()
+    st = os.stat(core.DB_PATH)
+    os.utime(core.DB_PATH, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    current = access._header_stat_key(os.stat(core.DB_PATH))
+    query = f"/api/diagnosis?source=all&window={_WINDOW_QUERY}"
+    claude_server.get(query, host="127.0.0.1")
+    second = claude_server.get(query, host="127.0.0.1")
+    lines = log.read_text().split()
+    assert lines.count("installed") == 2, lines
+    split = lines.index("installed", 1)
+    # Non-vacuity: only the first request's provider child learned it.
+    assert "probe:child" in lines[:split], lines
+    assert lines[split + 1:] == [], lines
+    assert parent == []
+    assert second.status == 200, second.body
+    # The verdict the parent adopted is keyed by the identity the child
+    # probed, never another one.
+    assert access.header_verdict_handoff((str(core.DB_PATH),)) == (
+        (current, "rollback"),)
 
 
 def test_codex_fanout_is_measured_on_a_denied_route(codex_server):

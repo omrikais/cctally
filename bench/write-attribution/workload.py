@@ -447,7 +447,9 @@ def append(root, seconds, kib_per_min, *, codex_only=False, scratch=False) -> di
 
 def ops_from_perf(paths) -> dict:
     """Maintenance operations from successive `dashboard-perf --json`
-    snapshots, de-duplicated by (phase, op_id)."""
+    snapshots, de-duplicated by ring record (seq, phase, op_id, outcome,
+    start; #937 SD10): a skipped reclaim chunk reuses the op_id of the chunk
+    committed before it, so (phase, op_id) alone would drop that chunk."""
     ops = {}
     for path in paths:
         try:
@@ -456,7 +458,8 @@ def ops_from_perf(paths) -> dict:
             continue
         for row in (diag.get("tick") or {}).get("maintenance") or ():
             if row.get("op_id"):
-                ops[(row["phase"], row["op_id"])] = row
+                ops[(row.get("seq"), row.get("phase"), row.get("op_id"),
+                     row.get("outcome"), row.get("started_at"))] = row
     return ops
 
 

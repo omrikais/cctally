@@ -133,6 +133,23 @@ def test_the_latest_request_wins(perf):
     assert perf.enabled() is False
 
 
+def test_a_request_left_pending_by_one_test_cannot_disarm_the_next(perf):
+    # #1083: a test that ends with an accepted `{"enabled": false}` POST
+    # leaves `request_enabled(False)` unconsumed in the process-global
+    # mailbox. Without the per-test reset draining it, the next test on that
+    # worker arms with `set_enabled(True)`, its refresh's `apply_pending()`
+    # applies the stale False just before the final build, and that test's
+    # armed trace silently loses its build (an empty tree).
+    from conftest import reset_perf_process_state
+
+    perf.request_enabled(False)      # the earlier test's unconsumed request
+    reset_perf_process_state()       # the test boundary
+    perf.set_enabled(True)           # the next test arms
+    perf.apply_pending()             # its refresh, before the final build
+    assert perf.enabled() is True, (
+        "a request pending at the test boundary disarmed the next test")
+
+
 def test_no_request_racing_apply_pending_is_dropped(perf):
     """An unsynchronised test-and-clear loses a request landing between the
     read and the clear — the race `_SnapshotRef.take_sync_request` documents."""

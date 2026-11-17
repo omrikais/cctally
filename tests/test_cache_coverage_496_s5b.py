@@ -1139,6 +1139,13 @@ _COMPUTED_TABLE_SITES = frozenset({
     "_cctally_journal._remove_opened_block",
     "_cctally_journal._replace_block_children",
     "_cctally_journal.run_cutover",
+    # #1094 part 1: FTS5 special-command inserts ('rebuild', 'delete-all',
+    # 'integrity-check') into a conversation search index. Every caller names
+    # a fixed index (`conversation_fts`, `conversation_title_fts`,
+    # `conversation_fts_aux`, `codex_conversation_fts`, or a CONTENT_TABLES
+    # entry), never a cache family. Read and recorded in #1090.
+    "_lib_conversation_fts_integrity._check_indexes",
+    "_lib_conversation_fts_integrity.conversation_fts_command",
 })
 
 
@@ -1378,7 +1385,10 @@ def test_container_cursor_writes_preserve_coverage_except_a_real_cache_reset(
               and s.call_sites[0] in sites and _DML.search(s.sql)]
     if outcome != "reset":
         assert direct, "the classified computed write must actually execute"
-        assert {_DML.search(sql).group(1) for sql in direct} == {table}
+        # The conversations side also writes the #1090 §5.3 retry record,
+        # in the conversations store's `cache_meta`, outside coverage.
+        assert {_DML.search(sql).group(1) for sql in direct} == (
+            {table} if table == "codex_session_files" else {table, "cache_meta"})
     print(json.dumps({"store": table, "outcome": outcome,
                       "pendingDmlTargets": sorted({_DML.search(sql).group(1) for sql in pending_dml}),
                       "computedDml": direct,

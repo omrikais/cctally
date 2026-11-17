@@ -449,23 +449,36 @@ class _NoCloseConnection(sqlite3.Connection):
         super().close()
 
 
-def test_codex_accounting_reader_closes_its_cache_connection(monkeypatch):
-    """The project-excluding diff route must not leak its direct cache read."""
+def test_codex_accounting_reader_closes_its_cache_connection(
+    tmp_path, monkeypatch,
+):
+    """The project-excluding diff route must not leak its direct cache read.
+
+    The fixture models an owner-established install (#787 AD20/AD22): the
+    owner opener created cache.db, its maintenance lock and the private data
+    directory, so the read itself runs through the query session as it does
+    on a real install."""
     ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
     cache = ns["_cctally_cache"]
-    conn = sqlite3.connect(":memory:", factory=_NoCloseConnection)
-    conn.execute(
-        """CREATE TABLE codex_session_entries (
-               timestamp_utc TEXT, session_id TEXT, model TEXT,
-               input_tokens INTEGER, cached_input_tokens INTEGER,
-               output_tokens INTEGER, reasoning_output_tokens INTEGER,
-               total_tokens INTEGER, source_path TEXT, source_root_key TEXT
-           )"""
-    )
-    conn.execute(
-        "INSERT INTO codex_session_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("2026-06-16T12:00:00+00:00", "session", "gpt-5", 100, 20, 30, 5, 130, "/fixture.jsonl", None),
-    )
+    import _cctally_core
+    with _cctally_core.establish_authority("process"):
+        seed = cache.open_cache_db()
+    try:
+        seed.execute(
+            """INSERT INTO codex_session_entries (
+                   source_path, line_offset, timestamp_utc, session_id, model,
+                   input_tokens, cached_input_tokens, output_tokens,
+                   reasoning_output_tokens, total_tokens, source_root_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("/fixture.jsonl", 0, "2026-06-16T12:00:00+00:00", "session",
+             "gpt-5", 100, 20, 30, 5, 130, None),
+        )
+        seed.commit()
+    finally:
+        seed.close()
+    conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH),
+                           factory=_NoCloseConnection)
     monkeypatch.setattr(cache, "open_cache_db", lambda: conn)
 
     rows = cache.get_codex_entries(START, END, skip_sync=True)

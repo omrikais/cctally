@@ -53,6 +53,20 @@ from _lib_display_tz import _resolve_tz, resolve_display_tz_name
 
 
 # Share-CLI helpers consumed by the dashboard's share-data builders.
+def _share_stats_reader():
+    """The share surface's stats reader (#787 / #861 spec 5.11, AD21): a
+    connection-shaped reader whose every statement is one interactive query
+    read unit. Under a request ceiling it never creates, migrates or recovers
+    stats.db (the startup phase needs the owner's capabilities, so the owner
+    is told instead); a store the query refuses raises `StoreUnavailable` (a
+    `sqlite3.DatabaseError`) at the first statement, which every share caller
+    already degrades on. A caller holding the owner's authority keeps today's
+    owner startup."""
+    import _cctally_store_access
+    return _cctally_store_access.statement_reader(
+        "stats", policy="interactive")
+
+
 def _share_load_lib(*args, **kwargs):
     return sys.modules["cctally"]._share_load_lib(*args, **kwargs)
 
@@ -274,7 +288,11 @@ def _share_apply_period_override(panel: str, options: dict,
     # must resolve through cctally's namespace so ``monkeypatch.setitem(ns,
     # "_dashboard_build_weekly_periods", spy)`` propagates here per spec §5.6.
     c = sys.modules["cctally"]
-    conn = open_db()
+    # #787 / #861 spec 5.11, AD21: a share override is a pure query caller.
+    # Its stats reads are statements of one read unit each (a connection-
+    # shaped reader that never creates, migrates or recovers), so no stats
+    # SHARED lock outlives a statement while the builders compute.
+    conn = _share_stats_reader()
     try:
         if panel == "weekly":
             kwargs: dict = {"skip_sync": True}
@@ -657,7 +675,7 @@ def _share_per_block_per_project(
         return out
     epochs = list(iso_by_start_epoch)
     try:
-        conn = open_db()
+        conn = _share_stats_reader()
         try:
             placeholders = ",".join("?" for _ in epochs)
             rows = conn.execute(
@@ -1551,7 +1569,7 @@ def _share_account_display_label(source: str, account: "str | None",
     c = sys.modules["cctally"]
     try:
         import _cctally_account
-        conn = c._load_sibling("_cctally_core").open_db()
+        conn = _share_stats_reader()
         try:
             reg = _cctally_account.load_accounts(conn, source)
             label = _cctally_account.display_account_label(conn, account)
@@ -1617,7 +1635,6 @@ def _share_codex_state_for_period(data_snap, *, panel: str, options: dict):
     if now_override is None:
         return _source_state_for_share(data_snap, "codex")
 
-    from _cctally_cache import open_cache_db
     from _cctally_dashboard_sources import (
         DashboardReadContext,
         build_codex_source_state,
@@ -1634,8 +1651,12 @@ def _share_codex_state_for_period(data_snap, *, panel: str, options: dict):
     semantics = resolve_dashboard_source_semantics(
         config, display_tz_name=display_tz_name,
     )
-    stats_conn = open_db()
-    cache_conn = open_cache_db()
+    stats_conn = _share_stats_reader()
+    try:
+        cache_conn = sys.modules["_cctally_dashboard"].open_cache_query_counted()
+    except BaseException:
+        stats_conn.close()
+        raise
     try:
         return build_codex_source_state(
             DashboardReadContext(

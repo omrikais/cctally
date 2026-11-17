@@ -16,6 +16,7 @@
 // Vanilla markup, no chart library (stdlib-only ethos).
 import type { PreparedSeries } from './projectsChart';
 import { OTHER_KEY, colorFor, basenameOf } from './projectsChart';
+import { ProjectLabel } from '../components/ProjectLabel';
 
 export function ProjectsRankedBars({
   series,
@@ -33,7 +34,8 @@ export function ProjectsRankedBars({
         const color = colorFor(p.key, i);
         const pct = (p.cost / total) * 100;
         const w = Math.max((p.cost / top) * 100, 1.5);
-        const label = basenameOf(p.bucket_path);
+        // #923 S2 — an explicit display label when the caller has one.
+        const label = p.label ?? basenameOf(p.bucket_path);
         return (
           <button
             key={p.key}
@@ -46,7 +48,7 @@ export function ProjectsRankedBars({
               if (!isOther) onProjectSelect?.(p.key);
             }}
           >
-            <span className="rk-label">{label}</span>
+            <span className="rk-label"><ProjectLabel label={label} /></span>
             <span className="rk-track">
               <span className="rk-fill" style={{ width: `${w}%`, background: color }} />
             </span>

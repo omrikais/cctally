@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import sqlite3
 import sys
+import threading
 
 import pytest
 
@@ -12,6 +13,9 @@ from conftest import load_script, redirect_paths
 from _codex_zstd_fixtures import compress_in_place, token_records, write_rollout
 from _lib_source_identity import source_root_key
 from test_codex_hook_lifecycle import _hook_args
+from test_codex_conversation_normalization import (  # noqa: F401
+    _v850_corrupt, _v850_project_key, v850_store,
+)
 
 START = dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc)
 END = dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc)
@@ -121,6 +125,455 @@ def test_metadata_probe_keeps_last_good_priority_and_topology_invalidation():
         assert metadata.resolve_codex_threads_table(conn) == "main.codex_conversation_threads"
     finally:
         conn.close()
+
+
+# ── #854 R2: request-scoped threads-table resolution ──────────────────────
+
+_854_LAST_GOOD = "temp.codex_last_good_threads"
+
+
+def _854_store(tmp_path, monkeypatch):
+    """A head-schema store pair with one barrier-population conversation.
+
+    ``854-pop`` is in the barrier population and its published thread names
+    ``/published`` while its unpublished raw row names ``/raw/unpublished``;
+    ``854-raw`` is outside the population. A reader that bypasses the #968
+    publication boundary therefore reads a different ``cwd`` than one that
+    honors it.
+    """
+    ns = _runtime(tmp_path, monkeypatch)
+    cols = sys.modules["_cctally_cache"]._CODEX_THREAD_SNAPSHOT_COLUMNS
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute(
+            "INSERT INTO codex_source_roots (source_root_key, canonical_root_path,"
+            " first_seen_utc, last_seen_utc) VALUES (?,?,?,?)",
+            ("854-root", "/raw", "2026-11-01T00:00:00Z", "2026-11-01T00:00:00Z"))
+        for key, cwd in (("854-pop", "/raw/unpublished"), ("854-raw", "/raw/plain")):
+            cache.execute(
+                "INSERT INTO codex_conversation_threads "
+                "(conversation_key, source_root_key, native_thread_id,"
+                " root_thread_id, parent_thread_id, source_path, cwd, git_json,"
+                " first_seen_utc, last_seen_utc) VALUES (?,?,?,?,NULL,?,?,NULL,?,?)",
+                (key, "854-root", f"native-{key}", f"native-{key}",
+                 f"/raw/{key}.jsonl", cwd, "2026-11-01T00:00:00Z",
+                 "2026-11-01T00:00:00Z"))
+        cache.execute(
+            "INSERT INTO codex_barrier_population "
+            "(conversation_key, required_revision, entered_at_utc) "
+            "VALUES ('854-pop', 1, '2026-11-01T00:00:00Z')")
+        cache.commit()
+        published = dict(zip(
+            [name.strip() for name in cols.split(",")],
+            cache.execute(
+                f"SELECT {cols} FROM codex_conversation_threads "
+                "WHERE conversation_key = '854-pop'").fetchone()))
+    finally:
+        cache.close()
+    published["cwd"] = "/published"
+    conversations = ns["open_conversations_db"]()
+    try:
+        conversations.execute(
+            "INSERT INTO codex_conversation_publications "
+            "(conversation_key, published_revision, updated_at_utc) "
+            "VALUES ('854-pop', 1, '2026-11-01T00:00:00Z')")
+        conversations.execute(
+            f"INSERT INTO codex_conversation_published_threads ({cols}) "
+            f"VALUES ({','.join('?' for _ in published)})",
+            tuple(published.values()))
+        conversations.commit()
+    finally:
+        conversations.close()
+    return ns
+
+
+def test_854_readonly_open_seeds_the_last_good_resolution(tmp_path, monkeypatch):
+    """A viewer connection resolves the raw threads reference with no probe.
+
+    Failure detected: wrong or stale project attribution on the viewer. The
+    seed must name exactly what an uncached resolution computes (the #968
+    last-good view), so a population conversation reads its PUBLISHED
+    metadata and never its unpublished raw row, and account scoping (which
+    replaces only the unqualified TEMP view) must leave that answer intact.
+    """
+    import _lib_codex_metadata as metadata
+
+    _854_store(tmp_path, monkeypatch)
+    cache_mod = sys.modules["_cctally_cache"]
+    ro = cache_mod.open_conversations_db_readonly()
+    try:
+        statements = []
+        ro.set_trace_callback(statements.append)
+        assert metadata.resolve_codex_threads_table(ro) == _854_LAST_GOOD
+        assert statements == [], "a read-only viewer connection re-probed its seeded resolution"
+        metadata.invalidate_codex_threads_table_resolution(ro)
+        assert metadata.resolve_codex_threads_table(ro) == _854_LAST_GOOD
+        assert statements, "the uncached comparison never probed"
+        cwd = dict(ro.execute(f"SELECT conversation_key, cwd FROM {_854_LAST_GOOD}"))
+        assert cwd["854-pop"] == "/published", cwd
+        assert cwd["854-raw"] == "/raw/plain", cwd
+    finally:
+        metadata.invalidate_codex_threads_table_resolution(ro)
+        ro.close()
+
+    # Traced from before scoping: scoping resolves the reference itself, so a
+    # trace attached afterwards would pass on any tree where scoping re-probes
+    # and re-caches the answer.
+    scoped = cache_mod.open_conversations_db_readonly()
+    try:
+        resolution = []
+
+        def trace(sql):
+            if _854_in_resolution():
+                resolution.append(sql)
+
+        scoped.set_trace_callback(trace)
+        cache_mod.scope_conversations_db_to_account(scoped, "854-account")
+        assert metadata.resolve_codex_threads_table(scoped) == _854_LAST_GOOD
+        assert resolution == [], (
+            "account scoping or the scoped resolve re-probed the seeded resolution")
+        assert scoped.execute(
+            "SELECT COUNT(*) FROM codex_conversation_threads").fetchone() == (0,)
+    finally:
+        metadata.invalidate_codex_threads_table_resolution(scoped)
+        scoped.close()
+
+
+def test_854_a_full_open_holds_no_resolution_entry(tmp_path, monkeypatch):
+    """The full opener never seeds, so a failed full open cannot pin one.
+
+    Failure detected: a resolver-cache entry pinning a connection its owner
+    never received. The full opener can close or abandon its connection after
+    installing the last-good views (post-open refusals, a raising derivation),
+    and nothing evicts on those paths, so the seed belongs to the read-only
+    opener alone. The first open makes both derivations current, so the
+    second performs no resolver call of its own.
+    """
+    import _lib_codex_metadata as metadata
+
+    ns = _854_store(tmp_path, monkeypatch)
+    ns["open_conversations_db"]().close()
+    conn = ns["open_conversations_db"]()
+    try:
+        assert conn not in metadata._threads_table_resolution_cache
+    finally:
+        metadata.invalidate_codex_threads_table_resolution(conn)
+        conn.close()
+
+
+@pytest.mark.parametrize("failure", ["barrier_absent", "interrupted"])
+def test_854_a_failed_installation_leaves_no_cached_answer(
+    tmp_path, monkeypatch, failure,
+):
+    """An installation that does not complete forgets the connection's answer.
+
+    Failure detected: stale metadata attribution. A cached reference from
+    before a failed or interrupted reinstall can name a view that is gone or
+    that no longer reflects the barrier, and the fail-closed readers would
+    keep reading through it instead of probing afresh.
+    """
+    import _lib_codex_metadata as metadata
+
+    entries = metadata._threads_table_resolution_cache
+    if failure == "barrier_absent":
+        _runtime(tmp_path, monkeypatch)
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("ATTACH DATABASE ':memory:' AS cache_db")
+            conn.execute("CREATE TEMP VIEW codex_last_good_threads AS "
+                         "SELECT 'k' AS conversation_key")
+            assert metadata.resolve_codex_threads_table(conn) == _854_LAST_GOOD
+            assert conn in entries
+            assert sys.modules["_cctally_cache"]._install_codex_last_good_views(
+                conn) is False
+            assert conn not in entries
+        finally:
+            metadata.invalidate_codex_threads_table_resolution(conn)
+            conn.close()
+        return
+
+    _854_store(tmp_path, monkeypatch)
+    cache_mod = sys.modules["_cctally_cache"]
+    ro = cache_mod.open_conversations_db_readonly()
+    try:
+        assert metadata.resolve_codex_threads_table(ro) == _854_LAST_GOOD
+        assert ro in entries
+
+        def deny_temp_views(action, *_args):
+            if action == sqlite3.SQLITE_CREATE_TEMP_VIEW:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        ro.set_authorizer(deny_temp_views)
+        try:
+            with pytest.raises(sqlite3.DatabaseError):
+                cache_mod._install_codex_last_good_views(ro)
+        finally:
+            ro.set_authorizer(None)
+        assert ro not in entries
+    finally:
+        metadata.invalidate_codex_threads_table_resolution(ro)
+        ro.close()
+
+
+def test_854_a_failed_maintenance_close_releases_the_connection(
+    tmp_path, monkeypatch,
+):
+    """A read-only open that fails after connecting leaves nothing behind.
+
+    Failure detected: a seeded connection that never reaches its owner. The
+    maintenance-file close is the opener's last fallible step; when it raises,
+    the caller never receives the connection, so neither request-teardown
+    eviction can run and the opener itself must close the connection and
+    leave no resolver-cache entry for it.
+    """
+    import builtins
+    import os
+    import pathlib
+
+    import _lib_codex_metadata as metadata
+
+    _854_store(tmp_path, monkeypatch)
+    cache_mod = sys.modules["_cctally_cache"]
+    maintenance = pathlib.Path(
+        sys.modules["_cctally_core"].CONVERSATIONS_LOCK_MAINTENANCE_PATH)
+    real_open = builtins.open
+
+    class _RaisingClose:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def fileno(self):
+            return self._fh.fileno()
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
+
+        def close(self):
+            self._fh.close()
+            raise OSError("854 injected maintenance close failure")
+
+    def opener(file, *args, **kwargs):
+        fh = real_open(file, *args, **kwargs)
+        if isinstance(file, (str, os.PathLike)) and pathlib.Path(file) == maintenance:
+            return _RaisingClose(fh)
+        return fh
+
+    created = []
+    real_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        created.append(conn)
+        return conn
+
+    monkeypatch.setattr(cache_mod, "open", opener, raising=False)
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    with pytest.raises(OSError, match="854 injected"):
+        cache_mod.open_conversations_db_readonly()
+    try:
+        assert created, "the opener never connected"
+        for conn in created:
+            assert conn not in metadata._threads_table_resolution_cache
+            with pytest.raises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+    finally:
+        for conn in created:
+            metadata.invalidate_codex_threads_table_resolution(conn)
+            conn.close()
+
+
+class _854Handler:
+    path = "/api/conversations?source=codex"
+
+    def __init__(self):
+        self.errors = []
+        self.responses = []
+
+    def log_error(self, *args):
+        self.errors.append(args)
+
+    def _respond_json(self, status, body):
+        self.responses.append((status, body))
+
+
+def _854_in_resolution() -> bool:
+    """Whether the statement being traced was issued by the resolver."""
+    frame = sys._getframe(1)
+    while frame is not None:
+        code = frame.f_code
+        if (code.co_name in ("resolve_codex_threads_table",
+                             "_schema_holds_threads_table")
+                and code.co_filename.endswith("_lib_codex_metadata.py")):
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _854_new_run():
+    return {"created": [], "resolution": [], "readonly": 0, "full": 0}
+
+
+def _854_request(kernel, run, *, cancelled=None):
+    """One real viewer request lifecycle, traced from ``sqlite3.connect``.
+
+    No connection the request uses is touched before the request: it is
+    created inside ``_run_conversation_query_impl`` and recorded here.
+    """
+    dash = sys.modules["_cctally_dashboard"]
+    dconv = sys.modules["_cctally_dashboard_conversation"]
+    real_connect = sqlite3.connect
+    # #787 / #861: a request reads through one query session; the full
+    # opener must never run on its behalf.
+    real_readonly = dconv._open_conversation_session
+    real_full = dash.open_conversations_db
+    caller = threading.get_ident()
+
+    def traced_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        if threading.get_ident() != caller:
+            # The patch is process-wide; a stray thread's connection is not
+            # this request's.
+            return conn
+        run["created"].append(conn)
+
+        def trace(sql):
+            if _854_in_resolution():
+                run["resolution"].append(sql)
+
+        conn.set_trace_callback(trace)
+        return conn
+
+    def readonly(*args, **kwargs):
+        run["readonly"] += 1
+        return real_readonly(*args, **kwargs)
+
+    def full(*args, **kwargs):
+        run["full"] += 1
+        return real_full(*args, **kwargs)
+
+    handler = _854Handler()
+    sqlite3.connect = traced_connect
+    dconv._open_conversation_session = readonly
+    dash.open_conversations_db = full
+    try:
+        run["result"] = dconv._run_conversation_query_impl(
+            handler, kernel, "test-854", cancelled=cancelled)
+    finally:
+        sqlite3.connect = real_connect
+        dconv._open_conversation_session = real_readonly
+        dash.open_conversations_db = real_full
+    run["handler"] = handler
+    return run
+
+
+def test_854_viewer_requests_resolve_nothing_and_release_their_connection(
+    v850_store,
+):
+    """Steady-state viewer requests perform no threads-table resolution.
+
+    Failure detected: incorrect viewer output, and request connections kept
+    alive in the resolver cache after teardown. Each request opens its own
+    read-only connection, serves the same rows and page as an independent
+    control query, issues no statement from the resolver (the explicit R2
+    contract), and leaves no cache entry once it ends, including when the
+    kernel raises and when the request is cancelled before the kernel runs.
+    """
+    import _lib_codex_conversation_query as q
+    import _lib_codex_metadata as metadata
+
+    entries = metadata._threads_table_resolution_cache
+    _ns, cache, conversations = v850_store
+    project_key = _v850_project_key(conversations, "v850-b")
+    _v850_corrupt(cache, "v850-a", "cwd")
+
+    def kernel(conn):
+        return q.list_codex_conversations(
+            conn, effective_speed="standard", project_key=project_key, limit=2)
+
+    control = kernel(conversations)
+    assert control["rows"], control
+
+    for _request in range(2):
+        run = _854_request(kernel, _854_new_run())
+        ok, body = run["result"]
+        assert ok is True, (run["handler"].errors, run["handler"].responses)
+        assert body["rows"] == control["rows"]
+        assert body["page"] == control["page"]
+        assert (run["readonly"], run["full"]) == (1, 0)
+        assert run["resolution"] == [], run["resolution"]
+        assert all(conn not in entries for conn in run["created"])
+
+    seen = []
+
+    def failing(conn):
+        seen.append(conn in entries)
+        raise RuntimeError("854 injected kernel failure")
+
+    run = _854_request(failing, _854_new_run())
+    assert run["result"] == (False, None)
+    assert run["handler"].responses[-1][0] == 500, run["handler"].responses
+    assert seen == [True], "the failing request's connection was never seeded"
+    assert all(conn not in entries for conn in run["created"])
+
+    run = _854_new_run()
+    recorded = []
+
+    def cancelled():
+        if not recorded:
+            recorded.append(run["created"][-1] in entries)
+        return True
+
+    _854_request(kernel, run, cancelled=cancelled)
+    assert run["result"] == (None, None)
+    assert recorded == [True], "the cancelled request's connection was never seeded"
+    assert all(conn not in entries for conn in run["created"])
+
+
+def test_854_a_failed_bridge_probe_releases_the_seeded_connection(
+    v850_store, monkeypatch,
+):
+    """A request that fails before teardown leaves no seeded connection behind.
+
+    Failure detected: an open conversations connection pinned in the resolver
+    cache after its request failed. The read-only opener seeds the connection
+    it returns, and the reader probes the legacy bridge before the request's
+    teardown owns that connection; the probe swallows ``sqlite3.Error``, so
+    only a non-SQLite exception escapes there, and without its own cleanup the
+    cache's strong reference would keep the connection open instead of
+    leaving it to garbage collection.
+    """
+    import _lib_codex_metadata as metadata
+
+    entries = metadata._threads_table_resolution_cache
+    seen = []
+
+    def failing_probe(conn):
+        seen.append((conn, conn in entries))
+        raise RuntimeError("854 injected bridge probe failure")
+
+    def kernel(_conn):
+        pytest.fail("the kernel must not run after a failed open")
+
+    monkeypatch.setattr(
+        sys.modules["_cctally_cache"], "conversation_legacy_bridge_pending",
+        failing_probe)
+    run = _854_new_run()
+    try:
+        with pytest.raises(RuntimeError, match="854 injected"):
+            _854_request(kernel, run)
+        # #787 / #861: the session probes the bridge inside its readiness
+        # read, before it seeds anything, so the probed connection is closed
+        # unseeded.
+        assert len(seen) == 1, seen
+        probed = seen[0][0]
+        assert probed not in entries
+        with pytest.raises(sqlite3.ProgrammingError):
+            probed.execute("SELECT 1")
+    finally:
+        for conn in run["created"]:
+            metadata.invalidate_codex_threads_table_resolution(conn)
+            conn.close()
 
 
 @pytest.mark.parametrize("budget_block", [{}, {"budget": {"codex": {
@@ -731,3 +1184,155 @@ def test_real_budgeted_sync_states_pin_vendor_and_account_eligibility(
         conn.close()
     assert h.syncs == ["budgeted"] and h.direct_parses == []
     assert cache._active_hook_codex_read_policy() is None
+
+
+# --------------------------------------------------------------------------
+# #1076 — the off-hook Codex read policy
+# --------------------------------------------------------------------------
+
+
+def test_off_hook_policy_defers_every_codex_read(tmp_path, monkeypatch):
+    """#1076 D1. Detects an off-hook Codex spend read that syncs or opens the
+    cache inside a reconcile's ingest (the unbudgeted sync and the nested
+    reconcile that waited 10 s on its own ingest lock), for vendor-wide,
+    account-scoped and ``skip_sync`` reads alike."""
+    _runtime(tmp_path, monkeypatch)
+    cache = sys.modules["_cctally_cache"]
+    calls: list = []
+    monkeypatch.setattr(cache, "sync_codex_cache",
+                        lambda *a, **k: calls.append("sync"))
+    monkeypatch.setattr(cache, "open_cache_db",
+                        lambda *a, **k: calls.append("open"))
+    with cache.off_hook_codex_read_policy() as policy:
+        assert cache._active_codex_read_policy() is policy
+        for kwargs in ({}, {"account_key": "acct"}, {"skip_sync": True}):
+            with pytest.raises(cache.CodexReadDeferred) as deferred:
+                cache.get_codex_entries(START, END, **kwargs)
+            assert deferred.value.reason == "off_hook_unpinned", kwargs
+        policy.record_deferral("codex_budget:*", "off_hook_unpinned")
+        assert policy.first_deferral_reason() == "off_hook_unpinned"
+        assert (policy.deferred, policy.deferred_reasons) == (
+            ["codex_budget:*"], ["off_hook_unpinned"])
+        for attr in ("pin", "invalidate", "snapshot", "eligible",
+                     "account_eligible"):
+            assert not hasattr(policy, attr), attr
+    assert calls == [], "an off-hook read synced or opened the cache"
+    assert cache._active_codex_read_policy() is None
+
+
+def test_off_hook_policy_restores_on_exception_and_refuses_to_nest(
+    tmp_path, monkeypatch,
+):
+    """#1076 D1. Detects a leaked off-hook policy (every later read in the
+    process would defer), a second policy stacked over an active one (an
+    off-hook policy inside the hook would hide its pinned snapshot), and the
+    hook-only accessor returning the off-hook policy (the sync's pin site
+    would pin it and make it eligible)."""
+    _runtime(tmp_path, monkeypatch)
+    cache = sys.modules["_cctally_cache"]
+    with pytest.raises(ZeroDivisionError):
+        with cache.off_hook_codex_read_policy():
+            1 / 0
+    assert cache._active_codex_read_policy() is None
+    with cache.off_hook_codex_read_policy() as off:
+        assert cache._active_hook_codex_read_policy() is None
+        with pytest.raises(RuntimeError):
+            with cache.off_hook_codex_read_policy():
+                pass  # pragma: no cover - the entry raises
+        assert cache._active_codex_read_policy() is off
+    with cache.hook_codex_read_policy() as hook:
+        assert cache._active_hook_codex_read_policy() is hook
+        assert cache._active_codex_read_policy() is hook
+        with pytest.raises(RuntimeError):
+            with cache.off_hook_codex_read_policy():
+                pass  # pragma: no cover - the entry raises
+        assert cache._active_codex_read_policy() is hook
+    assert cache._active_codex_read_policy() is None
+
+
+def _codex_flocks_free(core) -> bool:
+    import fcntl
+    import os
+    for lock in (core.CACHE_LOCK_PATH, core.CACHE_LOCK_CODEX_PATH):
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+    return True
+
+
+def test_off_hook_policy_refuses_a_sync_before_any_work(tmp_path, monkeypatch):
+    """#1076 D3. Detects a Codex sync running under the off-hook policy: the
+    unbudgeted work this issue removes from a reconcile's ingest, and a sync
+    whose pin site could treat the policy as pinnable. The refusal comes
+    before the quota-index rebuild and before either writer flock."""
+    ns = _runtime(tmp_path, monkeypatch)
+    cache = sys.modules["_cctally_cache"]
+    import _cctally_core as core
+    import _lib_cache_writer_lock as writer_lock
+    calls: list = []
+    monkeypatch.setattr(cache, "_ensure_quota_index_before_producer_locks",
+                        lambda: calls.append("quota_index"))
+    real_acquire = writer_lock.acquire_cache_writer_flocks
+    monkeypatch.setattr(
+        writer_lock, "acquire_cache_writer_flocks",
+        lambda *a, **k: calls.append("flocks") or real_acquire(*a, **k))
+    conn = ns["open_cache_db"]()
+    try:
+        with cache.off_hook_codex_read_policy():
+            with pytest.raises(RuntimeError, match="off-hook"):
+                cache.sync_codex_cache(conn)
+            with pytest.raises(RuntimeError, match="off-hook"):
+                cache._sync_codex_cache_locked(conn)
+        assert calls == [], calls
+        assert _codex_flocks_free(core)
+        cache.sync_codex_cache(conn, maintenance="caller")
+        assert "quota_index" in calls and "flocks" in calls and (
+            calls.index("quota_index") < calls.index("flocks")), (
+            "positive control: the same sync without the policy does the work",
+            calls)
+    finally:
+        conn.close()
+
+
+def test_a_sync_inside_a_held_ingest_skips_the_auto_projection(
+    tmp_path, monkeypatch,
+):
+    """#1076 D4 (sync side). Detects the nested reconcile and the stats-side
+    signature probe a sync runs from inside a held ingest cycle: the reconcile
+    can only wait 10 s for the ingest lock its own context holds. Outside the
+    cycle the same stale store reconciles (positive control)."""
+    from helpers.quota_projection_dump import (
+        ROOT_KEY, append_one_observation_to_live_window,
+        build_codex_quota_store, store_as_of)
+    ns = _runtime(tmp_path, monkeypatch)
+    cache = sys.modules["_cctally_cache"]
+    quota = sys.modules["_cctally_quota"]
+    store = sys.modules["_cctally_store"]
+    build_codex_quota_store(ns, closed_windows=1, observations_per_window=4)
+    now = store_as_of(ns, before_reset=dt.timedelta(minutes=10))
+    quota.reconcile_codex_quota_projection(
+        now=now, alert_eligible_root_keys={ROOT_KEY})
+    append_one_observation_to_live_window(ns)  # the certificate is stale
+    calls: list = []
+    monkeypatch.setattr(quota, "reconcile_codex_quota_projection",
+                        lambda **k: calls.append("reconcile"))
+    real_probe = quota._stats_projection_signatures_match
+    monkeypatch.setattr(
+        quota, "_stats_projection_signatures_match",
+        lambda *a, **k: calls.append("probe") or real_probe(*a, **k))
+    conn = ns["open_cache_db"]()
+    try:
+        with store.stats_write_scope("ingest", ingest_lock=True):
+            assert store.holds_ingest_lock()
+            cache.sync_codex_cache(conn)
+        assert calls == [], "a sync inside a held ingest reconciled or probed"
+        cache.sync_codex_cache(conn)
+        assert calls == ["reconcile"], (
+            "positive control: the stale store reconciles outside the cycle")
+    finally:
+        conn.close()

@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import resource
 import sys
 import tracemalloc
 
@@ -48,8 +47,12 @@ def _deep_size(value, seen=None) -> int:
 
 
 def _rss_bytes() -> int:
-    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return value if sys.platform == "darwin" else value * 1024
+    # #1017: the product's reader, so on Linux the value is this process's
+    # own peak (``VmHWM``) rather than one that includes the peak of the
+    # pytest worker that launched it. ``main`` puts ``bin/`` on the path first.
+    import _lib_rebuild_progress
+
+    return _lib_rebuild_progress.peak_resident_bytes()
 
 
 def _load_builder():

@@ -154,14 +154,16 @@ class _Counter:
         return sum(self.tally.get(name, 0) for name in _METADATA_RELATIONS)
 
     def install(self, monkeypatch):
-        cache_module = sys.modules["_cctally_cache"]
-        real = cache_module.open_cache_db
+        # #787 / #861: the detail routes read the cache through the counted
+        # query session, not the owner opener.
+        dashboard = sys.modules["_cctally_dashboard"]
+        real = dashboard.open_cache_query_counted
 
         def _counting(*args, **kwargs):
             return _CountingConnection(
                 real(*args, **kwargs), self.tally, self.rows, self.statements)
 
-        monkeypatch.setattr(cache_module, "open_cache_db", _counting)
+        monkeypatch.setattr(dashboard, "open_cache_query_counted", _counting)
         return self
 
 
@@ -1006,6 +1008,118 @@ def test_a_codex_block_detail_resolves_beyond_the_two_hundred_and_fiftieth(
     )
     assert detail["detail_kind"] == "codex_block"
     assert detail["resets_at"].replace("Z", "+00:00") == _iso(_REQUESTED_RESET)
+
+
+# ── #1071 twin: a Spark block's detail loads its complete population ───────
+
+_SPARK_MODEL = "gpt-5.3-codex-spark"
+_SPARK_ROOT = "root-spark-detail"
+_SPARK_SLOT = "primary"
+_SPARK_RESET = NOW + dt.timedelta(hours=1)
+_SPARK_START = _SPARK_RESET - dt.timedelta(minutes=300)
+_SPARK_ACCOUNT = "acct-spark"
+#: ``(path, minutes after the window start, percent, stored pool?, model)``.
+#: Every Spark-interpreted row: three stored under the real ``modelPool`` key,
+#: two under the ordinary key whose observed model is Spark (the read path
+#: rewrites those into the same Spark block).
+_SPARK_ROWS = (
+    ("pool.jsonl", 10, 4.0, True, _SPARK_MODEL),
+    ("pool.jsonl", 40, 14.0, True, _SPARK_MODEL),
+    ("pool.jsonl", 70, 24.0, True, _SPARK_MODEL),
+    ("ordinary.jsonl", 100, 30.0, False, _SPARK_MODEL),
+    ("ordinary.jsonl", 130, 36.0, False, _SPARK_MODEL),
+)
+#: The mixed-pool case adds the standard pool's own rows to the same unit.
+_STANDARD_ROWS = (
+    ("standard.jsonl", 20, 2.0, False, "gpt-5"),
+    ("standard.jsonl", 90, 9.0, False, "gpt-5"),
+)
+
+
+@pytest.mark.parametrize("case", ["spark_only", "mixed_pool"])
+def test_a_spark_block_detail_loads_its_complete_population(
+    tmp_path, monkeypatch, case,
+):
+    """Detects #1071's dashboard twin: the Codex block detail mapped a Spark
+    block to its pool-free loading unit and asked only for that unit's
+    ordinary-key spellings, so the rows stored under the ``modelPool`` key
+    were never loaded and the detail rendered a partial series (or 404'd).
+    Asserts the rendered row population and the owning account, not only
+    that the route answered."""
+    import types
+
+    import _fixture_builders
+    import _lib_jsonl
+    from _lib_dashboard_sources import dashboard_resource_key
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    dashboard = sys.modules["_cctally_dashboard"]
+    rows = _SPARK_ROWS + (_STANDARD_ROWS if case == "mixed_pool" else ())
+    cache = ns["open_cache_db"]()
+    try:
+        _fixture_builders.seed_codex_source_root(
+            cache, source_root_key=_SPARK_ROOT,
+            canonical_root_path=f"/codex/{_SPARK_ROOT}")
+        for offset, (path, minutes, percent, pooled, model) in enumerate(rows):
+            _fixture_builders.seed_codex_quota_snapshot(
+                cache, source_root_key=_SPARK_ROOT,
+                source_path=f"/codex/{_SPARK_ROOT}/{path}", line_offset=offset,
+                captured_at_utc=_iso(
+                    _SPARK_START + dt.timedelta(minutes=minutes)),
+                observed_slot=_SPARK_SLOT,
+                logical_limit_key=_lib_jsonl._codex_logical_limit_key(
+                    _SPARK_ROOT, "codex", _SPARK_SLOT, 300,
+                    _SPARK_MODEL if pooled else None),
+                window_minutes=300, used_percent=percent,
+                resets_at_utc=_iso(_SPARK_RESET), observed_model=model,
+                account_key=_SPARK_ACCOUNT,
+            )
+        _fixture_builders.bump_codex_physical_mutation_seq(cache)
+        cache.commit()
+    finally:
+        cache.close()
+    ns["reconcile_codex_quota_projection"](now=NOW)
+
+    stats = ns["open_db"]()
+    try:
+        blocks = stats.execute(
+            "SELECT source_root_key, logical_limit_key, observed_slot, "
+            "       window_minutes, resets_at_utc, account_key "
+            "  FROM quota_window_blocks WHERE source='codex' "
+            "   AND orphaned_at IS NULL").fetchall()
+    finally:
+        stats.close()
+    spark = [tuple(row) for row in blocks if "modelPool" in str(row[1])]
+    assert len(spark) == 1, f"premise: one live Spark block; got {blocks}"
+    assert len(blocks) == (2 if case == "mixed_pool" else 1), blocks
+    root, limit_key, slot, minutes, reset, account = spark[0]
+    assert account == _SPARK_ACCOUNT
+
+    snapshot = types.SimpleNamespace(
+        generated_at=NOW,
+        source_bundle=types.SimpleNamespace(
+            sources={"codex": types.SimpleNamespace(data={})}),
+    )
+    key = dashboard_resource_key(
+        "block", "codex", root, limit_key, slot, minutes, reset)
+    for context in dashboard._codex_detail_context(snapshot):
+        detail = dashboard._build_codex_block_detail(context, key=key)
+    rendered = [
+        (item["captured_at"], item["used_percent"])
+        for item in detail["observations"]
+    ]
+    expected = [
+        (_iso(_SPARK_START + dt.timedelta(minutes=row_minutes)), percent)
+        for _path, row_minutes, percent, _pooled, model in sorted(
+            _SPARK_ROWS, key=lambda row: row[1])
+    ]
+    assert rendered == expected, (
+        f"the Spark block's detail rendered {rendered}, not its complete "
+        f"population {expected}: the rows stored under the modelPool key were "
+        f"not loaded")
+    assert detail["current_percent"] == expected[-1][1]
+    assert detail["milestones"][-1]["percent"] == int(expected[-1][1])
 
 
 # ── the project route's key resolution ─────────────────────────────────────

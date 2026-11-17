@@ -364,3 +364,28 @@ def test_codex_quota_r8_decoration_only_under_account(app):
     decorated = q._decorate_account({"source": "codex"}, ka)
     assert decorated["accountKey"] == ka
     assert decorated["accountLabel"] == "carol"
+
+
+def test_account_filter_reads_through_session(app, monkeypatch):
+    """#787 / #861 (X6, D7): `--account` resolution read the registry
+    through the full stats owner opener (`open_db`), so a read command could
+    migrate, recover or launch from its reference lookup. It now resolves in
+    a `query(command)` stats session after the startup phase, and the cache
+    attribution leg stays the existing owner open."""
+    ka, _kb = _two_accounts()
+    import _lib_accounts
+    import argparse
+    seen = []
+    real = _lib_accounts.resolve_account_ref
+
+    def spy(conn, ref, provider):
+        a = _cctally_core.current_authority()
+        seen.append((type(conn).__name__, a.kind if a else None))
+        return real(conn, ref, provider)
+
+    monkeypatch.setattr(_lib_accounts, "resolve_account_ref", spy)
+    with _cctally_core.establish_authority("process"):
+        key, rc = app.resolve_account_filter(
+            argparse.Namespace(account="alice"), "claude", needs_cache=True)
+    assert (key, rc) == (ka, None)
+    assert seen == [("_QueryConnection", "query")]

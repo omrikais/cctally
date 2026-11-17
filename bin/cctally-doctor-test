@@ -22,6 +22,17 @@
 #     so it bumps with every release. We redact to a stable placeholder.
 #   - The PATH check is host-PATH dependent; the harness exports a
 #     scratch-HOME-relative PATH to make the check deterministic.
+#
+# Free-space pin (#947, the shell twin of #870): every doctor invocation runs
+# through tests/fixtures/doctor/_free_disk_bootstrap.py, which replaces
+# `_cctally_retention._disk_usage` with a pinned reading and then loads and
+# runs bin/cctally. Ordinary scenarios are pinned at DEFAULT_FREE_DISK_BYTES
+# (the default policy's 10 GiB free-disk floor, which passes because the rule
+# is strict); a scenario that needs another value carries a builder-generated
+# `.free-disk-bytes` file (one non-negative decimal integer). A status other
+# than 0 or 2 (97 = the bootstrap could not pin or load the binary) FAILs the
+# case with the first 20 stderr lines and never writes a golden or
+# expected.exit, even under CCTALLY_DOCTOR_REGENERATE.
 
 set -uo pipefail
 # #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
@@ -34,6 +45,20 @@ case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CCTALLY="$REPO_ROOT/bin/cctally"
+# #947: the shared free-disk bootstrap, addressed through its committed path
+# like _canonicalize.py. Checked before anything is staged or run, so a
+# missing bootstrap can regenerate nothing.
+BOOTSTRAP="$REPO_ROOT/tests/fixtures/doctor/_free_disk_bootstrap.py"
+if [ ! -f "$BOOTSTRAP" ] || [ ! -r "$BOOTSTRAP" ]; then
+    echo "cctally-doctor-test: free-disk bootstrap missing or unreadable: $BOOTSTRAP" >&2
+    exit 1
+fi
+# The free-disk reading every scenario gets unless its `.free-disk-bytes`
+# says otherwise: exactly the default retention policy's floor (10240 MiB),
+# pinned at the passing boundary (`free + reclaimable < floor` fails). Keep it
+# a literal: deriving it from DEFAULT_POLICY would let a policy change move
+# the pin along with the floor and hide the change from every golden.
+DEFAULT_FREE_DISK_BYTES=10737418240
 # Generated fixture inputs are staged out of tree (#529 S3). The committed
 # tree is the read-only template; nothing under it is written during a run.
 FIXTURE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cctally-doctor-fixstage.XXXXXX") || exit 1
@@ -125,9 +150,53 @@ canonicalize() {
     python3 "$REPO_ROOT/tests/fixtures/doctor/_canonicalize.py" "$scratch"
 }
 
+# resolve_free_disk_bytes <scenario-dir>: print the free-disk reading to pin
+# for the scenario: its `.free-disk-bytes` (one line of decimal digits, with
+# an optional trailing newline) or DEFAULT_FREE_DISK_BYTES when the file is
+# absent. Read as data, never sourced. Returns non-zero for an empty,
+# malformed or unreadable file.
+resolve_free_disk_bytes () {
+    local file="$1/.free-disk-bytes"
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+        printf '%s' "$DEFAULT_FREE_DISK_BYTES"
+        return 0
+    fi
+    [ -f "$file" ] && [ -r "$file" ] || return 1
+    local content
+    # The trailing sentinel keeps every newline: $(...) would strip them all
+    # and accept "N\n\n".
+    content=$(cat "$file" && printf x) || return 1
+    content=${content%x}
+    content=${content%$'\n'}
+    case "$content" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s' "$content"
+}
+
+# check_doctor_status <name> <label> <status> <stderr-file>: the one status
+# rule for every doctor invocation (#947), applied before any regeneration or
+# comparison. `cctally doctor` exits 0 or 2; any other status FAILs the case,
+# prints the first 20 stderr lines and returns 1 so the caller writes neither
+# a golden nor expected.exit.
+check_doctor_status () {
+    local name="$1" label="$2" rc="$3" stderr_file="$4"
+    case "$rc" in
+        0|2) return 0 ;;
+    esac
+    if [ "$rc" = "97" ]; then
+        echo "FAIL $name/$label (free-disk bootstrap failed, exit 97)"
+    else
+        echo "FAIL $name/$label (exit $rc)"
+    fi
+    head -n 20 "$stderr_file" 2>/dev/null | sed 's/^/    /'
+    fail_count=$((fail_count + 1))
+    return 1
+}
+
 run_mode () {
-    # name, mode-label, flags, golden-suffix
-    local name="$1" label="$2" flags="$3" suffix="$4"
+    # name, mode-label, flags, golden-suffix, pinned free-disk bytes
+    local name="$1" label="$2" flags="$3" suffix="$4" free="$5"
     local dir="$FIXTURES/$name"
     local golden="$GOLDEN_ROOT/$name/expected.$suffix"
     # Fresh scratch per mode: the post-command update hook
@@ -160,16 +229,29 @@ run_mode () {
     # scenario this writes a `warning: ignoring corrupt …` line to
     # stderr. Letting that line into stdout would break json.tool parse
     # for the JSON mode and add a host-specific path to every other
-    # mode's golden. Discard stderr; doctor's user-facing output is
-    # 100% on stdout per spec.
-    local raw
+    # mode's golden. Stderr goes to its own file, kept only for the
+    # failure excerpt (#947); doctor's user-facing output is 100% on
+    # stdout per spec. The status is captured for the status rule.
+    local raw rc stderr_file="$scratch/doctor.stderr"
     raw=$(HOME="$scratch" TZ=Etc/UTC \
           PATH="$fake_path" \
           CODEX_HOME="$fake_codex_home" \
           CCTALLY_DOCTOR_FIXTURE_PLATFORM=darwin \
           CCTALLY_AS_OF="$AS_OF" \
           NO_COLOR=1 \
-          "$CCTALLY" doctor $flags 2>/dev/null) || true
+          "$PY_CLEAN_BIN/python3" "$BOOTSTRAP" "$CCTALLY" "$free" \
+          doctor $flags 2>"$stderr_file")
+    rc=$?
+    check_doctor_status "$name" "$label" "$rc" "$stderr_file" || return 1
+    # Exit 2 is also argparse's usage status, and a usage error prints nothing
+    # on stdout: doctor always prints a report, so empty stdout FAILs and is
+    # never regenerated into a golden (#947).
+    if [ -z "$raw" ]; then
+        echo "FAIL $name/$label (no output)"
+        head -n 20 "$stderr_file" 2>/dev/null | sed 's/^/    /'
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
 
     local actual
     if [ "$suffix" = "json" ]; then
@@ -210,7 +292,8 @@ run_mode () {
 }
 
 run_exit_code () {
-    local name="$1"
+    # name, pinned free-disk bytes
+    local name="$1" free="$2"
     local dir="$FIXTURES/$name"
     local scratch="$SCRATCH_ROOT/${name}-exit"
     mkdir -p "$scratch"
@@ -224,13 +307,17 @@ run_exit_code () {
     local fake_path; fake_path=$(compute_fake_path "$scratch")
     local fake_codex_home; fake_codex_home=$(compute_fake_codex_home "$scratch" "$dir")
     local exit_file="$GOLDEN_ROOT/$name/expected.exit"
-    local actual_exit
+    local actual_exit stderr_file="$scratch/doctor.stderr"
 
     HOME="$scratch" TZ=Etc/UTC PATH="$fake_path" CODEX_HOME="$fake_codex_home" \
         CCTALLY_DOCTOR_FIXTURE_PLATFORM=darwin \
         CCTALLY_AS_OF="$AS_OF" NO_COLOR=1 \
-        "$CCTALLY" doctor --json >/dev/null 2>&1
+        "$PY_CLEAN_BIN/python3" "$BOOTSTRAP" "$CCTALLY" "$free" \
+        doctor --json >/dev/null 2>"$stderr_file"
     actual_exit=$?
+    # The status rule runs before the regenerate branch, so an unexpected
+    # status is never written to expected.exit (#947).
+    check_doctor_status "$name" "exit" "$actual_exit" "$stderr_file" || return 1
 
     if [ -n "$REGENERATE" ]; then
         echo "$actual_exit" > "$exit_file"
@@ -279,11 +366,19 @@ for d in "$FIXTURES"/*/; do
             *) continue ;;
         esac
     fi
-    run_mode "$name" "default" ""          "txt"
-    run_mode "$name" "quiet"   "--quiet"   "quiet.txt"
-    run_mode "$name" "verbose" "--verbose" "verbose.txt"
-    run_mode "$name" "json"    "--json"    "json"
-    run_exit_code "$name"
+    # #947: the free-disk pin is resolved once per scenario and passed to
+    # all four modes and the exit-code run; a bad override skips the scenario
+    # with one counted failure.
+    if ! free_bytes=$(resolve_free_disk_bytes "${d%/}"); then
+        echo "FAIL $name (malformed .free-disk-bytes)"
+        fail_count=$((fail_count + 1))
+        continue
+    fi
+    run_mode "$name" "default" ""          "txt"         "$free_bytes"
+    run_mode "$name" "quiet"   "--quiet"   "quiet.txt"   "$free_bytes"
+    run_mode "$name" "verbose" "--verbose" "verbose.txt" "$free_bytes"
+    run_mode "$name" "json"    "--json"    "json"        "$free_bytes"
+    run_exit_code "$name" "$free_bytes"
 done
 
 echo "----"

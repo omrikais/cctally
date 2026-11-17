@@ -22,6 +22,7 @@ import {
   _resetForTests as _resetKeymap,
 } from '../store/keymap';
 import { stubMobileMedia } from '../test-utils/mobileMedia';
+import sourceFixture from '../../__tests__/fixtures/envelope.json';
 import type {
   Envelope,
   ProjectDetail,
@@ -1194,5 +1195,38 @@ describe('ProjectsModal — disabled window pills under a non-Claude source (#55
     expect(
       container.querySelectorAll('.projects-controls .pill:not([disabled])').length,
     ).toBe(2);
+  });
+});
+
+// #923 S2 — a source row's display label reaches the ranked bars whole (the
+// basename of `app (a/b)` is `b)`), and both the bars and the table cell render
+// it as base and suffix spans with the source chip outside the label.
+describe('ProjectsModal source labels (#923 S2)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders a Codex display label whole in the ranked bars and the table', () => {
+    const env = structuredClone(sourceFixture) as unknown as Envelope;
+    env.sources!.codex.data!.projects!.rows[0].label = 'app (a/b)';
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'projects' });
+    const { container } = render(<ProjectsModal />);
+    const bar = container.querySelector('[data-series-key="project:codex-alpha"]')!;
+    expect(bar.querySelector('.rk-label')!.textContent).toBe('app (a/b)');
+    expect(bar.querySelector('.rk-label .pl-suffix')?.textContent).toBe(' (a/b)');
+    expect(bar.getAttribute('title')).toBe('app (a/b)');
+    const cell = screen.getByTestId('projects-table-row').querySelector('td.project')!;
+    expect(cell.querySelector('.project-label')?.textContent).toBe('app (a/b)');
+    expect(cell.querySelector('.project-label .pl-suffix')?.textContent).toBe(' (a/b)');
+    expect(cell.querySelector('.project-label .source-chip')).toBeNull();
+    expect(cell.querySelector('.source-chip')?.textContent).toBe('Codex');
   });
 });

@@ -141,6 +141,7 @@ loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
 spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 assert str(mod.APP_DIR).startswith(os.environ["HOME"]), "harness isolation broken"
 mod.APP_DIR.mkdir(parents=True, exist_ok=True)
 conn = mod.open_db()
@@ -200,6 +201,7 @@ loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
 spec = importlib.util.spec_from_loader("cctally_mod", loader)
 mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
 loader.exec_module(mod)
+__import__("sys").modules["_cctally_core"].establish_script_owner()  # the driver is its own process owner (#787 / #861)
 conn = mod.open_db()
 n = conn.execute("SELECT COUNT(*) FROM weekly_usage_snapshots").fetchone()[0]
 conn.close()

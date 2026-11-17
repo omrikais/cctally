@@ -8,12 +8,14 @@ import json
 import multiprocessing as mp
 import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from conftest import load_script, redirect_paths
+from _codex_zstd_fixtures import token_records, write_rollout
 from _lib_codex_hooks import (
     acquire_due_lifecycle_locks,
     codex_hook_roots,
@@ -1176,3 +1178,716 @@ def test_deferral_liveness_doctor_reader_and_rollover(tmp_path, monkeypatch):
     row = lifecycle()[h.root_key]
     assert (row["success_count_24h"], row["error_count_24h"]) == (1, 0)
     assert row["last_tick_at"] is not None
+
+
+# ── #1069: the hook acknowledges only an applied or current projection ──────
+
+def _stub_hook_legs(ns, monkeypatch, projections, *, budget_calls=None):
+    """Stub the sync and the reconcile; ``projections`` yields one result per
+    tick. The budget leg stays real unless the caller replaces it."""
+    class Cache:
+        def close(self):
+            pass
+
+    monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
+    monkeypatch.setitem(
+        ns, "sync_codex_cache",
+        lambda conn, *, lock_timeout, **_budget: SimpleNamespace(
+            lock_contended=False))
+    results = iter(projections)
+    monkeypatch.setitem(
+        ns, "reconcile_codex_quota_projection", lambda **kwargs: next(results))
+    if budget_calls is not None:
+        monkeypatch.setitem(
+            ns, "maybe_record_codex_budget_milestone",
+            lambda saved, **kwargs: budget_calls.append(1) or 0)
+
+
+def _projection(status, *, blocks=0, milestones=0):
+    return SimpleNamespace(
+        blocks_upserted=blocks, milestones_upserted=milestones,
+        blocks_orphaned=0, milestones_orphaned=0, alerts_dispatched=0,
+        status=status)
+
+
+def _markers(ns, *roots):
+    marker_dir = ns["APP_DIR"] / "codex-hook-tick"
+    return [(marker_dir / f"{_root_key(root)}.last-success").exists()
+            for root in roots]
+
+
+@pytest.mark.parametrize("status", [
+    "deferred_verify", "deferred_model", "contended", "unavailable"])
+def test_an_unapplied_projection_leaves_the_hook_unacknowledged(
+    runtime, monkeypatch, status,
+):
+    """Detects a deferred or contended projection acknowledged as done: the
+    lifecycle success marker throttles the next turn for 15 s, so stamping it
+    over a projection that applied nothing leaves the window stale until an
+    unrelated tick. The budget leg still runs (it does not depend on the
+    projection); the tick logs a ``noop`` naming the status."""
+    ns, first, second = runtime
+    budget: list = []
+    _stub_hook_legs(ns, monkeypatch, [_projection(status)], budget_calls=budget)
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+    assert budget == [1], "the budget leg did not run"
+    assert _markers(ns, first, second) == [False, False]
+    log = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
+    assert "result=noop" in log and f"reason=projection_{status}" in log, log
+    assert "result=success" not in log
+
+
+def test_an_empty_store_tick_is_current_and_acknowledged(runtime, monkeypatch):
+    """Detects a fresh install whose hook never acknowledges a root (#1069
+    Q4): with no quota observation and no projected row the real pass owes
+    nothing, so it is ``current`` and the tick marks lifecycle success instead
+    of handing a whole-history pass of nothing to the verify worker."""
+    ns, first, second = runtime
+    import _cctally_quota
+    import _cctally_update
+
+    spawned: list = []
+    monkeypatch.setattr(
+        _cctally_update, "_spawn_detached",
+        lambda command: spawned.append(command) or True)
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+
+    log = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
+    assert _markers(ns, first, second) == [True, True], log
+    assert "result=success" in log, log
+    assert _cctally_quota.CODEX_QUOTA_VERIFY_COMMAND not in spawned
+
+
+def test_repeated_unapplied_hooks_converge_once_the_blocker_clears(
+    runtime, monkeypatch,
+):
+    """Detects an unacknowledged hook that either spawns a worker per tick or
+    never recovers: repeated deferred ticks stay unacknowledged while the
+    verify hand-off's attempt throttle bounds the spawns to one, and the first
+    tick after the blocker clears acknowledges."""
+    ns, first, second = runtime
+    import _cctally_quota
+    import _cctally_update
+    spawned: list = []
+    monkeypatch.setattr(
+        _cctally_update, "_spawn_detached",
+        lambda command: spawned.append(command) or True)
+
+    def deferring():
+        _cctally_quota._defer_codex_quota_verification()
+        return _projection("deferred_verify")
+
+    ticks = iter([deferring, deferring, lambda: _projection("published")])
+
+    class Cache:
+        def close(self):
+            pass
+
+    monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
+    monkeypatch.setitem(
+        ns, "sync_codex_cache",
+        lambda conn, *, lock_timeout, **_budget: SimpleNamespace(
+            lock_contended=False))
+    monkeypatch.setitem(
+        ns, "reconcile_codex_quota_projection",
+        lambda **kwargs: next(ticks)())
+    monkeypatch.setitem(
+        ns, "maybe_record_codex_budget_milestone", lambda saved, **kw: 0)
+
+    for _ in range(2):
+        assert ns["cmd_hook_tick"](_hook_args()) == 0
+        assert _markers(ns, first, second) == [False, False]
+    assert spawned == [_cctally_quota.CODEX_QUOTA_VERIFY_COMMAND], spawned
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+    assert _markers(ns, first, second) == [True, True]
+
+
+def test_a_budget_failure_after_a_publication_keeps_its_counts(
+    runtime, monkeypatch,
+):
+    """Detects lost projection evidence: a budget-leg exception after a
+    committed publication logged the error line with zero projection counts,
+    hiding that the quota projection did land. No success marker either way."""
+    ns, first, second = runtime
+    _stub_hook_legs(ns, monkeypatch, [_projection(
+        "published", blocks=3, milestones=5)])
+
+    def fail_budget(saved, **kwargs):
+        raise RuntimeError("budget boom")
+
+    monkeypatch.setitem(ns, "maybe_record_codex_budget_milestone", fail_budget)
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+    assert _markers(ns, first, second) == [False, False]
+    lines = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text().splitlines()
+    errors = [line for line in lines if "result=error" in line]
+    assert errors and all(
+        " blocks=3 " in line and " milestones=5 " in line for line in errors), (
+        lines)
+
+
+# ── #1070 T11: a hook whose alert work is pending (spec §5.6, Q13, Q16) ────
+
+def _lock_is_free(path: Path) -> bool:
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
+
+
+def test_an_alert_work_pending_tick_stays_unacknowledged_and_requests_the_worker(
+    runtime, monkeypatch,
+):
+    """Detects an activation the hook acknowledges, or a worker requested
+    while the hook still holds the lifecycle locks the worker needs: a tick
+    whose projection carries ``alert_work_pending`` runs its budget leg, logs
+    ``result=noop reason=alert_work_pending`` with the committed projection's
+    status and counts, stamps no success marker, and requests the verify
+    worker only after releasing every lifecycle lock."""
+    ns, first, second = runtime
+    import _cctally_quota
+
+    budget: list = []
+    projection = _projection("published", blocks=3, milestones=5)
+    projection.alert_work_pending = True
+    _stub_hook_legs(ns, monkeypatch, [projection], budget_calls=budget)
+    lock_dir = ns["APP_DIR"] / "codex-hook-tick"
+    free_at_request: list = []
+
+    def request():
+        free_at_request.append([
+            _lock_is_free(lock_dir / f"{_root_key(root)}.lock")
+            for root in (first, second)])
+        return "spawned"
+
+    monkeypatch.setattr(_cctally_quota, "_defer_codex_quota_verification", request)
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+    assert budget == [1], "the budget leg did not run"
+    assert _markers(ns, first, second) == [False, False]
+    assert free_at_request == [[True, True]], free_at_request
+    log = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
+    lines = [line for line in log.splitlines() if "source_root_key=" in line]
+    assert lines and all(
+        "result=noop" in line and "reason=alert_work_pending" in line
+        and " blocks=3 " in line and " milestones=5 " in line
+        and "projection=published" in line for line in lines), lines
+
+
+def test_concurrent_hooks_reserve_one_verify_spawn(runtime, monkeypatch):
+    """Detects a throttle defeated by concurrent hooks (Q16): every hook that
+    observes pending alert work requests the worker, so the marker's check and
+    stamp are serialized — a hook that loses the reservation is throttled and
+    neither stamps nor spawns."""
+    ns, _first, _second = runtime
+    import _cctally_quota
+    import _cctally_update
+
+    spawned: list = []
+    monkeypatch.setattr(
+        _cctally_update, "_spawn_detached",
+        lambda command: spawned.append(command) or True)
+    app_dir = ns["APP_DIR"]
+    app_dir.mkdir(parents=True, exist_ok=True)
+    reservation = app_dir / _cctally_quota.CODEX_QUOTA_VERIFY_RESERVATION_NAME
+    marker = app_dir / _cctally_quota.CODEX_QUOTA_VERIFY_MARKER_NAME
+    held = os.open(reservation, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert _cctally_quota._defer_codex_quota_verification() == "throttled"
+        assert spawned == [] and not marker.exists()
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    assert _cctally_quota._defer_codex_quota_verification() == "spawned"
+    assert _cctally_quota._defer_codex_quota_verification() == "throttled"
+    assert spawned == [_cctally_quota.CODEX_QUOTA_VERIFY_COMMAND]
+
+
+# ── #1034: the hook's execution core is shared with the drain settlement ────
+
+def _lifecycle_lines(ns):
+    path = ns["APP_DIR"] / "logs" / "hook-tick.log"
+    if not path.exists():
+        return []
+    return [line for line in path.read_text().splitlines()
+            if "source_root_key=" in line]
+
+
+@pytest.mark.parametrize("failing", ["success_marker", "pending_alert_line"])
+def test_a_failing_acknowledgement_is_an_error_line_not_an_escape(
+    runtime, monkeypatch, capsys, failing,
+):
+    """Detects a hook that escapes or keeps its lifecycle locks when the
+    acknowledgement fails (#1034 spec §5.1): a marker write's ``os.open`` or
+    a log write can raise after the projection committed, and outside the
+    wrapper's exception boundary that exception would reach Codex as a hook
+    failure, leave the per-root locks to process exit, and drop the verify
+    request a pending activation owes. The line keeps the projection's
+    counts, and the error detail carries no filesystem path."""
+    ns, first, second = runtime
+    import _cctally_quota
+
+    record = sys.modules["_cctally_record"]
+    projection = _projection("published", blocks=3, milestones=5)
+    if failing == "pending_alert_line":
+        projection.alert_work_pending = True
+    _stub_hook_legs(ns, monkeypatch, [projection])
+    monkeypatch.setitem(
+        ns, "maybe_record_codex_budget_milestone", lambda saved, **kw: 0)
+    failure = OSError("x", "y", "/Users/someone/p")
+    if failing == "success_marker":
+        def fail_marker(locks):
+            raise failure
+        monkeypatch.setattr(record, "mark_lifecycle_success", fail_marker)
+    else:
+        real_line = record._hook_tick_log_line
+        calls = {"n": 0}
+
+        def fail_first_line(line):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise failure
+            return real_line(line)
+        monkeypatch.setattr(record, "_hook_tick_log_line", fail_first_line)
+    requested: list = []
+    monkeypatch.setattr(_cctally_quota, "_defer_codex_quota_verification",
+                        lambda: requested.append(1) or "spawned")
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+    lines = _lifecycle_lines(ns)
+    keys = sorted(_root_key(root) for root in (first, second))
+    assert sorted(
+        line.split("source_root_key=")[1].split()[0] for line in lines) == keys
+    assert all("result=error" in line and " blocks=3 " in line
+               and " milestones=5 " in line for line in lines), lines
+    assert all("/Users" not in line and "someone" not in line
+               for line in lines), lines
+    roots = codex_hook_roots([first, second])
+    again = acquire_due_lifecycle_locks(
+        ns["APP_DIR"], roots, now=dt.datetime.now().timestamp(),
+        throttle_seconds=0)
+    try:
+        assert len(again) == 2, "a lifecycle lock outlived the hook"
+    finally:
+        release_lifecycle_locks(again)
+    assert requested == ([1] if failing == "pending_alert_line" else []), (
+        requested)
+
+
+def test_the_verify_request_follows_the_lock_release(runtime, monkeypatch):
+    """Detects a verify worker requested while the hook still holds the
+    lifecycle locks the worker's activation needs (#1070 Q13, kept by #1034's
+    extraction): the worker would lose its throttle window to an
+    ``alert_lifecycle_contended`` run."""
+    ns, _first, _second = runtime
+    import _cctally_quota
+
+    record = sys.modules["_cctally_record"]
+    projection = _projection("published", blocks=1)
+    projection.alert_work_pending = True
+    _stub_hook_legs(ns, monkeypatch, [projection])
+    monkeypatch.setitem(
+        ns, "maybe_record_codex_budget_milestone", lambda saved, **kw: 0)
+    order: list = []
+    real_release = record.release_lifecycle_locks
+    monkeypatch.setattr(
+        record, "release_lifecycle_locks",
+        lambda locks: order.append("release") or real_release(locks))
+    monkeypatch.setattr(_cctally_quota, "_defer_codex_quota_verification",
+                        lambda: order.append("verify") or "spawned")
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+    assert order == ["release", "verify"], order
+
+
+# ── #1034: the settlement kind of the core (spec §5.1) ──────────────────────
+
+def _run_core(ns, *, kind="settlement"):
+    """Run the shared core over every configured root, holding every root's
+    lifecycle lock the way the drain settlement does. Detached workers the
+    core requests are recorded by the caller's patch, never spawned."""
+    record = sys.modules["_cctally_record"]
+    roots = record._codex_lifecycle_roots()
+    locks = acquire_due_lifecycle_locks(
+        ns["APP_DIR"], roots, now=time.time(), throttle_seconds=0)
+    assert roots and len(locks) == len(roots), (roots, locks)
+    try:
+        return record._run_codex_lifecycle_core(
+            locks, roots, transcript_path="", kind=kind)
+    finally:
+        release_lifecycle_locks(locks)
+
+
+def _no_spawns(monkeypatch):
+    monkeypatch.setattr(sys.modules["_cctally_update"], "_spawn_detached",
+                        lambda command: True)
+
+
+def _quota_rollout(path, *, session, used, minute):
+    """One rollout with spend and one weekly quota observation."""
+    records = token_records(2, session_id=session)
+    records.append({
+        "timestamp": f"2026-07-20T11:{minute:02d}:00.000Z",
+        "type": "event_msg", "payload": {"type": "token_count", "info": {
+            "rate_limits": {"limit_id": "codex", "limit_name": "codex",
+                            "primary": {"used_percent": used,
+                                        "window_minutes": 10080,
+                                        "resets_at": 1785150000}}}}})
+    write_rollout(path, records)
+
+
+def _sync_all(ns):
+    """Ingest without the sync-internal reporting reconcile, which would
+    consume the change ledger the case needs the core to own."""
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn, quota_reconcile="defer")
+    finally:
+        conn.close()
+
+
+def _eligible_reconcile(ns, **kwargs):
+    record = sys.modules["_cctally_record"]
+    keys = tuple(root.source_root_key
+                 for root in record._codex_lifecycle_roots())
+    return ns["reconcile_codex_quota_projection"](
+        source_root_keys=keys, alert_eligible_root_keys=keys,
+        now=dt.datetime.now(dt.timezone.utc), **kwargs)
+
+
+def _scoped_units(scopes):
+    """The units a scoped pass loaded; a whole-history pass fails the caller."""
+    assert all(scope is not None for _kwargs, scope in scopes), (
+        "the pass was whole-history, so it proves nothing about the scope")
+    return sum(int(scope["final_unit_count"]) for _kwargs, scope in scopes)
+
+
+def _next_eligible_scope_units(ns):
+    """The units the next eligible scoped reconcile (the hook's arguments)
+    loads: zero when the ledger range it owes is empty."""
+    import _cctally_quota as quota
+    from helpers.quota_projection_dump import scope_recorder
+    with scope_recorder(quota) as scopes:
+        result = _eligible_reconcile(ns, full_pass="defer")
+    assert result.status in ("published", "current"), result
+    return _scoped_units(scopes)
+
+
+def _hold_cache_writer_flocks():
+    import _cctally_core as core
+    fds = []
+    for lock_path in (core.CACHE_LOCK_PATH, core.CACHE_LOCK_CODEX_PATH):
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        fds.append(fd)
+    return fds
+
+
+def _release_fds(fds):
+    for fd in reversed(fds):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@pytest.mark.parametrize("kind", ["settlement", "hook"])
+def test_a_settlement_contention_publishes_no_waiting_request(
+    runtime, monkeypatch, kind,
+):
+    """Detects a settlement that feeds the drain admission gate a waiting
+    request (#1034 R-b): it runs inside the drain process, so its own request
+    would make the drain's continuation wait out the request's 60 s lifetime
+    while no hook is waiting. The hook control keeps publishing its own."""
+    ns, _first, _second = runtime
+    _no_spawns(monkeypatch)
+    import _lib_codex_drain_admission as drain_adm
+    ns["open_cache_db"]().close()
+    fds = _hold_cache_writer_flocks()
+    try:
+        outcome = _run_core(ns, kind=kind)
+    finally:
+        _release_fds(fds)
+    assert outcome.result == "noop" and outcome.reconciled is False, outcome
+    requests = drain_adm.fresh_requests(ns["APP_DIR"])
+    if kind == "settlement":
+        assert outcome.reason == "sync_contended", outcome
+        assert outcome.drain_request == "" and not requests, requests
+    else:
+        assert outcome.drain_request == "published" and requests, outcome
+
+
+def test_an_unusable_pin_consumes_no_observation(tmp_path, monkeypatch):
+    """Detects a settlement that consumes journal observations on an unproven
+    snapshot (#1034 Q1/Q4): the reconcile's journal pipeline runs a pending
+    Claude observation's dollar axes, which read Codex spend; with prune debt
+    pending the snapshot is not final, so a settlement that entered the
+    reconcile would evaluate those axes on a partial total and advance the
+    journal past the observation. The hook control consumes it."""
+    import _cctally_journal as jr
+    import _lib_journal as jl
+    from test_968_gate_reader_contracts import BudgetHarness
+    h = BudgetHarness(tmp_path, monkeypatch, codex_budget={
+        "amount_usd": 1000.0, "period": "calendar-month",
+        "alerts_enabled": True, "projected_enabled": True,
+        "alert_thresholds": [90]}, claude={
+        "weekly_usd": 1000.0, "period": "calendar-month",
+        "alerts_enabled": True, "projected_enabled": True,
+        "alert_thresholds": [90]})
+    h.rollout("seed", 3)
+    h.seed_sync()
+    conn = h.cache_conn()
+    try:
+        conn.execute(
+            "INSERT INTO codex_prune_debt (source_path, source_root_key, "
+            "recorded_at_utc) VALUES (?, ?, '2026-07-20T00:00:00+00:00')",
+            (str(h.root / "sessions" / "gone.jsonl"), h.root_key))
+        conn.commit()
+    finally:
+        conn.close()
+    record = sys.modules["_cctally_record"]
+    reached: list = []
+    real_axes = record._run_dollar_axes
+    monkeypatch.setattr(record, "_run_dollar_axes",
+                        lambda *a, **k: reached.append(1) or real_axes(*a, **k))
+    reconciles: list = []
+    real_reconcile = h.ns["reconcile_codex_quota_projection"]
+    monkeypatch.setitem(
+        h.ns, "reconcile_codex_quota_projection",
+        lambda **kw: reconciles.append(1) or real_reconcile(**kw))
+    jr.append_record(jl.make_obs(
+        at="2026-07-25T11:59:00Z", src="record-usage", provider="claude",
+        payload={"weekly_percent": 12.0, "source": "statusline",
+                 "resets_at": int(dt.datetime(
+                     2026, 7, 28, tzinfo=dt.timezone.utc).timestamp())},
+        account=None))
+
+    def cursor():
+        stats = h.ns["open_db"]()
+        try:
+            return jr._read_cursor(stats)
+        finally:
+            stats.close()
+
+    before = cursor()
+    outcome = _run_core(h.ns, kind="settlement")
+    assert (outcome.result, outcome.reason) == ("noop", "pin_prune_debt"), (
+        outcome)
+    assert outcome.reconciled is False and outcome.pinned is False
+    assert reconciles == [] and reached == [], (reconciles, reached)
+    assert cursor() == before, "the settlement consumed the observation"
+
+    control = _run_core(h.ns, kind="hook")
+    assert control.reconciled and reconciles == [1], control
+    assert cursor() != before, (
+        "the hook control did not consume the observation, so the settlement "
+        "case proves nothing")
+
+
+def test_a_budget_failure_after_publication_keeps_the_projection(
+    runtime, monkeypatch,
+):
+    """Detects a settlement whose budget-leg failure hides or undoes its
+    committed publication (#1034 §5.5): the outcome must stay ``error`` with
+    the reconcile's own ``published`` status and counts, and the publication
+    must stand, so the next hook owes none of the ledger the settlement
+    consumed."""
+    ns, first, _second = runtime
+    _no_spawns(monkeypatch)
+    import _cctally_quota as quota
+    from helpers.quota_projection_dump import scope_recorder
+    _quota_rollout(first / "sessions" / "a.jsonl", session="a", used=10,
+                   minute=10)
+    _sync_all(ns)
+    assert _eligible_reconcile(ns).status == "published"
+    _quota_rollout(first / "sessions" / "b.jsonl", session="b", used=20,
+                   minute=20)
+    _sync_all(ns)
+
+    def fail_budget(saved, **kwargs):
+        raise RuntimeError("budget boom")
+
+    real_budget = ns["maybe_record_codex_budget_milestone"]
+    monkeypatch.setitem(ns, "maybe_record_codex_budget_milestone", fail_budget)
+    with scope_recorder(quota) as scopes:
+        outcome = _run_core(ns, kind="settlement")
+    assert outcome.result == "error" and "budget boom" in outcome.error, outcome
+    assert outcome.reconciled is True and outcome.pinned is True, outcome
+    assert outcome.projection.status == "published", outcome.projection
+    assert outcome.projection.generation, outcome.projection
+    assert _scoped_units(scopes) > 0, "the settlement owed no ledger range"
+    monkeypatch.setitem(ns, "maybe_record_codex_budget_milestone", real_budget)
+    assert _next_eligible_scope_units(ns) == 0
+
+
+def _budget_deferring(ns, monkeypatch):
+    def defer(saved, **kwargs):
+        policy = sys.modules["_cctally_cache"]._active_hook_codex_read_policy()
+        policy.record_deferral("codex_budget", "ingest_incomplete")
+        return 0
+    monkeypatch.setitem(ns, "maybe_record_codex_budget_milestone", defer)
+
+
+def _budget_contended(ns, monkeypatch):
+    monkeypatch.setattr(sys.modules["_cctally_journal"], "run_stats_ingest",
+                        lambda **kwargs: SimpleNamespace(ran=False))
+
+
+_POST_RECONCILE_CASES = {
+    # case: (projection status, alert work pending, budget patch,
+    #        expected budget_completed, expected request_verify)
+    "budget_contended": ("published", False, _budget_contended, False, False),
+    "budget_deferred": ("published", False, _budget_deferring, False, False),
+    "alert_pending": ("published", True, None, True, True),
+    "deferred_verify": ("deferred_verify", False, None, True, False),
+    "deferred_model": ("deferred_model", False, None, True, False),
+    "contended": ("contended", False, None, True, False),
+    "unavailable": ("unavailable", False, None, True, False),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_POST_RECONCILE_CASES))
+def test_post_reconcile_noops_keep_their_own_token(runtime, monkeypatch, case):
+    """Detects a post-reconcile ``noop`` confused with a decline before the
+    reconcile (#1034 V1): the hook returns ``noop`` for budget contention, a
+    budget deferral, pending alert work and every unapplied status alike, so
+    without ``reconciled`` the settlement would report a committed
+    publication as ``not_ready`` and lose its status and counts."""
+    ns, _first, _second = runtime
+    _no_spawns(monkeypatch)
+    status, pending, patch, completed, verify = _POST_RECONCILE_CASES[case]
+    projection = _projection(status, blocks=2, milestones=1)
+    projection.alert_work_pending = pending
+    monkeypatch.setitem(ns, "reconcile_codex_quota_projection",
+                        lambda **kwargs: projection)
+    monkeypatch.setitem(
+        ns, "maybe_record_codex_budget_milestone", lambda saved, **kw: 0)
+    if patch is not None:
+        patch(ns, monkeypatch)
+
+    outcome = _run_core(ns, kind="settlement")
+
+    assert outcome.result == "noop" and outcome.pinned is True, outcome
+    assert outcome.reconciled is True, outcome
+    assert outcome.projection is projection
+    assert outcome.budget_completed is completed, outcome
+    assert outcome.request_verify is verify, outcome
+
+
+def _pinning_sync(stats):
+    """A stubbed budgeted sync that pins the active read policy on ``stats``,
+    as the real sync does after its last commit, and returns them."""
+    import _cctally_core
+    cache_mod = sys.modules["_cctally_cache"]
+
+    def sync(conn, **kwargs):
+        policy = cache_mod._active_hook_codex_read_policy()
+        policy.pin(db_path=_cctally_core.CACHE_DB_PATH, stats=stats,
+                   scope=None)
+        return stats
+    return sync
+
+
+@pytest.mark.parametrize("kind", ["settlement", "hook"])
+def test_a_settlement_replay_decline_still_requests_the_replay_drain(
+    runtime, monkeypatch, kind,
+):
+    """Detects a byte-zero replay left to nobody (#1034 §5.1: the replay
+    declines and the replay-drain request are identical for both kinds): a
+    walk that deferred an armed replay before its refill started passes the
+    settlement's early probe and fails its pin with ``pin_replay_pending``,
+    and on a hook-only install no other caller ever requests the unbudgeted
+    drain, so Codex ingest would freeze behind the settlement's decline. The
+    hook control requests it after its reconcile."""
+    ns, _first, _second = runtime
+    cache_mod = sys.modules["_cctally_cache"]
+    spawned: list = []
+    update = sys.modules["_cctally_update"]
+    monkeypatch.setattr(update, "_spawn_detached",
+                        lambda command: spawned.append(command) or True)
+    monkeypatch.setattr(
+        update, "_spawn_detached_with_pid",
+        lambda command, env=None: spawned.append(command) or os.getpid())
+    ns["open_cache_db"]().close()
+    stats = SimpleNamespace(lock_contended=False,
+                            deferred_reason="replay_pending",
+                            replay_refill=False, backlog_files=0)
+    monkeypatch.setitem(ns, "sync_codex_cache", _pinning_sync(stats))
+    monkeypatch.setitem(ns, "reconcile_codex_quota_projection",
+                        lambda **kwargs: _projection("published"))
+    monkeypatch.setitem(
+        ns, "maybe_record_codex_budget_milestone", lambda saved, **kw: 0)
+
+    outcome = _run_core(ns, kind=kind)
+
+    if kind == "settlement":
+        assert (outcome.result, outcome.reason) == (
+            "noop", "pin_replay_pending"), outcome
+        assert outcome.reconciled is False, outcome
+    else:
+        assert outcome.reconciled is True, outcome
+    assert spawned.count(cache_mod.CODEX_REPLAY_DRAIN_COMMAND) == 1, spawned
+
+
+def test_a_settlement_pin_decline_names_a_policy_never_pinned(
+    runtime, monkeypatch,
+):
+    """Detects a misleading decline reason on the drain line (#1034 F12): a
+    sync that returned uncontended without pinning its read policy left the
+    policy's ``sync_contended`` default, so the settlement reported a
+    contention that never happened. A policy never pinned is ``not_pinned``."""
+    ns, _first, _second = runtime
+    _no_spawns(monkeypatch)
+    monkeypatch.setitem(
+        ns, "sync_codex_cache",
+        lambda conn, **kwargs: SimpleNamespace(lock_contended=False))
+    outcome = _run_core(ns, kind="settlement")
+    assert (outcome.result, outcome.reason) == ("noop", "pin_not_pinned"), (
+        outcome)
+    assert outcome.reconciled is False, outcome
+
+
+def test_a_raising_epoch_hand_off_is_a_silent_error_line(
+    runtime, monkeypatch, capsys,
+):
+    """Detects a non-silent hook exit that held the lifecycle locks until
+    process exit (#1034 F4, an accepted contract change): the epoch-rebuild
+    hand-off now runs inside the shared core's exception boundary, so a
+    hand-off that raises must become one ``result=error`` lifecycle line per
+    root with exit 0 and nothing on stdout or stderr, and the locks must be
+    released before the hook returns."""
+    ns, first, second = runtime
+    record = sys.modules["_cctally_record"]
+    monkeypatch.setattr(record, "_stats_epoch_rebuild_pending", lambda: True)
+
+    def fail_hand_off():
+        raise OSError(13, "Permission denied", "/Users/someone/p")
+    monkeypatch.setattr(record, "_defer_stats_epoch_rebuild", fail_hand_off)
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+    lines = _lifecycle_lines(ns)
+    keys = sorted(_root_key(root) for root in (first, second))
+    assert sorted(
+        line.split("source_root_key=")[1].split()[0] for line in lines) == keys
+    assert all("result=error" in line and "sync=error" in line
+               for line in lines), lines
+    assert all("/Users" not in line for line in lines), lines
+    roots = codex_hook_roots([first, second])
+    again = acquire_due_lifecycle_locks(
+        ns["APP_DIR"], roots, now=dt.datetime.now().timestamp(),
+        throttle_seconds=0)
+    try:
+        assert len(again) == 2, "a lifecycle lock outlived the hook"
+    finally:
+        release_lifecycle_locks(again)

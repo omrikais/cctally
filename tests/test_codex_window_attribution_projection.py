@@ -90,7 +90,8 @@ def _threshold_events(ns, account_key):
 
 
 def _seed_window(ns, *, reset=RESET, raws=RAWS, account_key=None,
-                 key=WEEK_KEY, root=ROOT, offset_base=100, used_percents=None):
+                 key=WEEK_KEY, root=ROOT, offset_base=100, used_percents=None,
+                 observed_model="gpt-5"):
     conn = ns["open_cache_db"]()
     try:
         conn.execute(
@@ -109,12 +110,12 @@ def _seed_window(ns, *, reset=RESET, raws=RAWS, account_key=None,
                 " limit_name, window_minutes, used_percent, resets_at_utc,"
                 " observed_model, account_key, canonical_resets_at_utc) "
                 "VALUES ('codex',?,?,?,?,'primary',?,'codex',NULL,?,?,?,"
-                "        'gpt-5',?,?)",
+                "        ?,?,?)",
                 (root, f"/codex/{root}/rollout.jsonl", offset_base + index,
                  _z(reset - dt.timedelta(days=6, hours=index)), key, WEEK,
                  (float(index + 1) * 5.0 if used_percents is None
                   else float(used_percents[index])),
-                 _z(raw), account_key, _z(reset)),
+                 _z(raw), observed_model, account_key, _z(reset)),
             )
         conn.commit()
     finally:
@@ -262,7 +263,12 @@ def test_a_certificate_is_never_stamped_at_a_revision_the_pass_never_saw(env):
     later reconcile short-circuited on it, and the attribution never reached
     ``quota_window_blocks`` until an unrelated physical mutation dirtied the
     group. Declining to stamp is the fail-safe direction and matches the
-    physical-sequence guard right beside it."""
+    physical-sequence guard right beside it.
+
+    #1069: the leg now validates its preparation inside the cycle, after that
+    step 3, and re-prepares against the revision the op moved, so the pass
+    publishes the attribution at once and its certificate carries the
+    revision the RE-PREPARATION computed against — never the stale one."""
     ns, quota, cache_mod, jr, jl = env
     _seed_window(ns)
     quota.reconcile_codex_quota_projection(now=NOW)
@@ -283,18 +289,17 @@ def test_a_certificate_is_never_stamped_at_a_revision_the_pass_never_saw(env):
     quota.reconcile_codex_quota_projection(now=NOW)
     assert _revision(ns) == 1, "the pass's own ingest cycle replayed the op"
 
+    assert [row["account_key"] for row in _blocks(ns)] == [ACCT_A], (
+        "the pass applied its revision-0 preparation over the attribution its "
+        "own cycle materialized")
     conn = ns["open_cache_db"]()
     try:
-        assert quota.load_codex_quota_projection_certificate(conn) is None, (
-            "the pass computed against revision 0 and the revision is now 1, "
-            "so its certificate must be declined rather than stamped at 1")
+        payload = quota._codex_quota_projection_certificate_payload(conn)
+        assert quota._certificate_attribution_revision(payload) == 1, (
+            "the certificate must carry the revision the published pass "
+            "computed against")
     finally:
         conn.close()
-
-    # And because it was declined, the very next pass applies the attribution
-    # instead of short-circuiting on a certificate that never saw it.
-    quota.reconcile_codex_quota_projection(now=NOW)
-    assert [row["account_key"] for row in _blocks(ns)] == [ACCT_A]
 
 
 def test_a_pre_500_certificate_still_reads_as_current_without_attributions(env):
@@ -409,6 +414,60 @@ def test_an_attribution_reaches_quota_window_blocks(env):
     assert ("unattributed", True) in _all_blocks(ns), (
         "the obsolete block is swept, which is what stops one window rendering "
         "twice at the same reset instant")
+
+
+SPARK_MODEL = "gpt-5.3-codex-spark"
+SPARK_KEY = json.dumps({
+    "limitId": "codex", "modelPool": SPARK_MODEL, "observedSlot": "primary",
+    "source": "codex", "sourceRootKey": ROOT, "windowMinutes": WEEK,
+}, sort_keys=True, separators=(",", ":"))
+
+
+def test_an_attribution_over_a_two_pool_window_loads_the_complete_unit(env):
+    """Detects #1071's attribution twin: an attribution over the standard
+    window of a two-pool weekly unit re-projected the unit from the standard
+    spelling's rows alone, so the sweep orphaned the Spark sibling block the
+    assertion never owned. Ownership sentinels: the rows the assertion owns
+    change owner; the rows in the same unit it does not own keep theirs."""
+    ns, quota, _cache_mod, jr, jl = env
+    from helpers.quota_projection_dump import (
+        canonical_projection_dump, raw_load_recorder)
+
+    _seed_window(ns)  # the standard pool, offsets 100-101
+    _seed_window(ns, key=SPARK_KEY, offset_base=200,
+                 observed_model=SPARK_MODEL)  # the Spark pool, same unit
+    quota.reconcile_codex_quota_projection(now=NOW)
+    primed = _all_blocks(ns)
+    assert primed == [("unattributed", False), ("unattributed", False)], primed
+
+    _record_attribution(ns, jr, jl)
+    with raw_load_recorder(quota) as loaded:
+        quota.reconcile_codex_quota_projection(now=NOW)
+    assert loaded.unbounded_calls == 0, "premise: the pass was scoped"
+    assert {offset for _path, offset in loaded.row_identities} == {
+        100, 101, 200, 201}, (
+        f"the attribution pass loaded {sorted(loaded.row_identities)}, not the "
+        f"unit's complete two-pool population")
+
+    conn = ns["open_db"]()
+    try:
+        live = sorted(
+            ("spark" if "modelPool" in str(row[0]) else "standard", str(row[1]))
+            for row in conn.execute(
+                "SELECT logical_limit_key, account_key FROM quota_window_blocks"
+                " WHERE source='codex' AND orphaned_at IS NULL"))
+        scoped = canonical_projection_dump(conn)
+    finally:
+        conn.close()
+    assert live == [("spark", "unattributed"), ("standard", ACCT_A)], live
+
+    quota.reconcile_codex_quota_projection(now=NOW, force_full=True)
+    conn = ns["open_db"]()
+    try:
+        oracle = canonical_projection_dump(conn)
+    finally:
+        conn.close()
+    assert scoped == oracle
 
 
 def test_a_retraction_reaches_quota_window_blocks_too(env):

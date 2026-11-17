@@ -20,7 +20,7 @@ import _lib_codex_conversation_query as q  # noqa: E402
 import _lib_conversation_dispatch as disp  # noqa: E402
 from _codex_zstd_fixtures import (  # noqa: E402
     conversation_records, token_records, write_rollout, zstd_bytes)
-from conftest import load_script, redirect_paths  # noqa: E402
+from conftest import as_process_owner, load_script, redirect_paths  # noqa: E402
 from test_codex_bounded_ingest import _auth_json  # noqa: E402
 from test_codex_publication_barrier import (  # noqa: E402,F401 (env is a fixture)
     HOLDS, OTHER_SESSION, REAL_RESOLVE, SESSION, _cache, _certificate,
@@ -1842,7 +1842,8 @@ def test_publication_planning_reads_one_cache_snapshot_between_key_facts(env, mo
             # Separate cache writer connection: the commit occurs while the
             # conversation planner is paused, before it reads the next key.
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as worker:
-                worker.submit(_sync, ns).result(timeout=60)
+                # A concurrent `cctally` writer process (#787 / #861).
+                worker.submit(as_process_owner(_sync), ns).result(timeout=60)
             assert all(_certificate(ns, k)["revision"] > old[k]["revision"] for k in keys)
         return result
 

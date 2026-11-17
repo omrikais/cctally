@@ -224,7 +224,9 @@ class _State:
         self.t = array.array("q")
         self.b = array.array("q")
         self.p = array.array("q")
-        self.ex = tuple(array.array("q") for _ in range(6))
+        # start_ns, end_ns, start_bytes, end_bytes, rows, ended wall, kind
+        # (the index into `_budget.EXCLUSION_KINDS`).
+        self.ex = tuple(array.array("q") for _ in range(7))
         self.ledger = array.array("q")
         self.ledger_observed = False
         self.publications = 0
@@ -232,6 +234,10 @@ class _State:
         self.cold_startup_bytes = None
         self.last_status = "not_sampled"
         self.open = {}
+        # #1094 C2: index-maintenance intervals still running, by interval
+        # token: (start_ns, start_bytes or -1). At most one per running
+        # verification step.
+        self.open_exclusions = {}
         self.next_token = 1
         self.hysteresis = _budget.HysteresisState()
         self.last_hysteresis_ns = None
@@ -383,21 +389,54 @@ def end_interval(interval: Interval) -> IntervalObservation:
         process_write_bytes=delta, status=status, overlap=overlap)
 
 
-def mark_deletion(observation: IntervalObservation, *, rows: int) -> None:
-    """Record one deletion operation's BEGIN-to-COMMIT interval."""
+def _mark_exclusion(observation: IntervalObservation, *, rows: int,
+                    kind: str, token: "int | None" = None) -> None:
     state = _STATE
     wall = int(state.wall_s())
+    code = _budget.EXCLUSION_KINDS.index(kind)
     with _LOCK:
+        if token is not None:
+            # The open exclusion becomes the completed one under one lock, so
+            # no evaluation sees the interval in neither form.
+            state.open_exclusions.pop(token, None)
         columns = state.ex
         for column, value in zip(columns, (
                 observation.started_ns, observation.ended_ns,
                 -1 if observation.start_bytes is None else observation.start_bytes,
                 -1 if observation.end_bytes is None else observation.end_bytes,
-                max(0, int(rows)), wall)):
+                max(0, int(rows)), wall, code)):
             column.append(int(value))
         while len(columns[0]) > EXCLUSION_CAPACITY:
             for column in columns:
                 del column[0]
+
+
+def mark_deletion(observation: IntervalObservation, *, rows: int) -> None:
+    """Record one deletion operation's BEGIN-to-COMMIT interval."""
+    _mark_exclusion(observation, rows=rows, kind="deletion")
+
+
+def open_index_maintenance(interval: Interval) -> None:
+    """Register a conversation FTS verification interval that has just begun
+    as an open index-maintenance exclusion (#1094 C2): until
+    `mark_index_maintenance` completes it, the steady statistic excludes it
+    from its start through the evaluation time, and no publication advances
+    the excess-write hysteresis."""
+    with _LOCK:
+        _STATE.open_exclusions[interval.token] = (
+            int(interval.started_ns),
+            -1 if interval.start_bytes is None else int(interval.start_bytes))
+
+
+def mark_index_maintenance(observation: IntervalObservation, *,
+                           interval: "Interval | None" = None) -> None:
+    """Record one conversation FTS verification interval (#1094 F1): its
+    check and any rebuild are excluded from the steady statistic like a
+    deletion, and reported apart from deletions. ``interval`` is the one
+    `open_index_maintenance` registered; its open exclusion is replaced by
+    this completed one atomically."""
+    _mark_exclusion(observation, rows=0, kind="index_maintenance",
+                    token=None if interval is None else interval.token)
 
 
 def _samples_locked():
@@ -407,18 +446,31 @@ def _samples_locked():
         for t, b, p in zip(state.t, state.b, state.p))
 
 
-def _deletions_locked():
-    s, e, sb, eb, rows, wall = _STATE.ex
-    return tuple(
+#: An open exclusion's end bytes: it has written everything up to the
+#: evaluation's last sample, so the overlap clips it to that sample.
+_OPEN_END_BYTES = 1 << 62
+
+
+def _deletions_locked(now_ns):
+    s, e, sb, eb, rows, wall, kind = _STATE.ex
+    completed = tuple(
         _budget.DeletionInterval(a, b, None if c < 0 else c,
-                                 None if d < 0 else d, r, w)
-        for a, b, c, d, r, w in zip(s, e, sb, eb, rows, wall))
+                                 None if d < 0 else d, r, w,
+                                 _budget.EXCLUSION_KINDS[k])
+        for a, b, c, d, r, w, k in zip(s, e, sb, eb, rows, wall, kind))
+    # #1094 C2: a running step is excluded through the evaluation time.
+    running = tuple(
+        _budget.DeletionInterval(start, max(start, int(now_ns)),
+                                 None if start_bytes < 0 else start_bytes,
+                                 _OPEN_END_BYTES, 0, None, "index_maintenance")
+        for start, start_bytes in _STATE.open_exclusions.values())
+    return completed + running
 
 
 def _steady_locked(now_ns):
     state = _STATE
     return _budget.steady_statistic(
-        _samples_locked(), _deletions_locked(), now_ns=now_ns,
+        _samples_locked(), _deletions_locked(now_ns), now_ns=now_ns,
         warm_admitted_ns=state.warm_admitted_ns,
         counter_status=state.last_status)
 
@@ -439,7 +491,10 @@ def note_publication(*, cold: bool) -> None:
             if not state.hold_placed or state.released_by is not None:
                 state.warm_admitted_ns = now
                 state.cold_startup_bytes = reading.value
-        if (state.last_hysteresis_ns is None
+        # #1094 C2: no evaluation during a running index-maintenance step
+        # moves the hysteresis.
+        if not state.open_exclusions and (
+                state.last_hysteresis_ns is None
                 or now - state.last_hysteresis_ns
                 >= HYSTERESIS_EVALUATION_SPACING_NS):
             state.hysteresis = _budget.advance(
@@ -502,7 +557,8 @@ def state_for_budget() -> tuple:
     """Every object this module retains, for the tick-stats state budget."""
     state = _STATE
     return (state.t, state.b, state.p, state.ledger, state.ex[0],
-            state.ex[1:], state.open, state.hysteresis, state.local_instance,
+            state.ex[1:], state.open, state.open_exclusions,
+            state.hysteresis, state.local_instance,
             state.cold_startup_bytes, state.last_status, state.reclaim_refusal,
             state.released_by, state.residual_counts, state.last_pass)
 
@@ -1015,7 +1071,13 @@ def observe_accounting_tick(*, ended_ns, census_complete, residuals) -> None:
 def observe_conversation_pass(pass_info, *, started_ns, seq) -> "str | None":
     """Feed one completed conversation pass to the evaluator; returns its
     release verdict. A pass counts only if it started after the end of the
-    first accounting-census-complete tick (same monotonic clock)."""
+    first accounting-census-complete tick (same monotonic clock).
+
+    #1094 D6: while the pass reports ``fts_pending`` (the conversation FTS
+    verification is due in this process and has produced no outcome other
+    than ``busy``) the verdict is withheld, vetoing both ``drained`` and
+    ``settled``; the evaluator still observes the pass, so the first pass
+    after the step settles releases on the chain as it stands."""
     state = _STATE
     with _LOCK:
         drain = state.drain
@@ -1038,6 +1100,8 @@ def observe_conversation_pass(pass_info, *, started_ns, seq) -> "str | None":
         state.last_pass = (int(seq), census, counted, digest_hash(drain.digest))
         if counted:
             state.residual_counts = drain.counts
+        if info.get("fts_pending"):
+            return None
         return verdict
 
 
@@ -1080,6 +1144,7 @@ def write_io_payload(*, now_ns=None, now_utc=None, limits=None) -> dict:
     maintenance = (_budget.maintenance_statistic(maintenance_ledger(), wall)
                    .as_wire() if observed else None)
     last_wall = stat.last_excluded_wall_s
+    maintenance_wall = stat.last_excluded_maintenance_wall_s
     return {
         "status": "ok" if last_status == "ok" else "unavailable",
         "reason": None if last_status == "ok" else last_status,
@@ -1099,6 +1164,15 @@ def write_io_payload(*, now_ns=None, now_utc=None, limits=None) -> dict:
             "bytes": stat.excluded_bytes,
             "lastEndedAt": (None if last_wall is None else _budget.iso_z(
                 dt.datetime.fromtimestamp(last_wall, UTC))),
+        },
+        # #1094 F1 (additive): the conversation FTS verification's intervals,
+        # also subtracted from `bytesWritten` but not deletions.
+        "excludedIndexMaintenance": {
+            "operations": stat.excluded_maintenance_operations,
+            "bytes": stat.excluded_maintenance_bytes,
+            "lastEndedAt": (None if maintenance_wall is None
+                            else _budget.iso_z(dt.datetime.fromtimestamp(
+                                maintenance_wall, UTC))),
         },
         "coldStartup": {
             "bytes": cold, "admitted": admitted,

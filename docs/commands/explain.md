@@ -150,7 +150,7 @@ These layers are distinct and never mixed, because a report-establishment failur
 
 **Report-establishment errors** end the request and produce exit 3 (or, on the dashboard, a 4xx or 5xx status): `range_unresolved`, `account_unresolved`, `store_unavailable`, `generation_incoherent`.
 
-A relative `--window` token needs the subscription-week anchor, which is a read of `weekly_usage_snapshots` in stats.db. Every way that read can fail is `store_unavailable` at exit 3, including a stored timestamp that is not text: stats.db is a non-STRICT SQLite database, so a BLOB survives in a column declared `TEXT` and the parse raises a type error. That is a statement about the store, not about the `--window` token the user wrote.
+A relative `--window` token needs the subscription-week anchor, which is a read of `weekly_usage_snapshots` in stats.db. Every way that read can fail is `store_unavailable` at exit 3, including a stored timestamp that is not text: stats.db is a non-STRICT SQLite database, so a BLOB survives in a column declared `TEXT` and the parse raises a type error. That is a statement about the store, not about the `--window` token the user wrote. The one exception is a store with nothing to anchor on: when stats.db does not exist yet, or holds no usage snapshot, the token cannot be resolved and the command exits 2 with `cannot resolve week token …: no subscription-week anchor available (run record-usage first)`, as an unresolvable token always has.
 
 **Evidence-withheld reasons** are field-level and closed on the server. They are published in this precedence order, and the overall verdict reports the highest-precedence cause among its withheld classes:
 

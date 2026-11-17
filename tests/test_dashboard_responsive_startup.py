@@ -13,8 +13,9 @@ ORDERING test. The old one skipped whenever the ``large`` bench fixture was
 absent, and nothing in the suite or CI ever built that path, so it never ran.
 The replacement holds the full builder on a barrier and asserts the order —
 bind, accept, hydrating frame, then a non-hydrating frame only after release —
-over the session-scoped ``small_corpus``, which is built rather than skipped.
+over a private ``small`` corpus, which is built rather than skipped.
 """
+import dataclasses
 import datetime as dt
 import ipaddress
 import json
@@ -22,6 +23,7 @@ import pathlib
 import shutil
 import socket
 import sqlite3
+import sys
 import threading
 import time
 import types
@@ -29,8 +31,7 @@ from http.server import BaseHTTPRequestHandler
 
 import pytest
 
-from conftest import (  # type: ignore
-    copy_shared_corpus, load_script, redirect_paths)
+from conftest import load_script, redirect_paths  # type: ignore
 
 from tests._support_http import (
     PRESENCE_BACKSTOP_SECONDS, shorten_sse_keepalive,
@@ -39,6 +40,13 @@ from tests._support_http import (
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BIN = REPO / "bin" / "cctally"
 OK_AS_OF = dt.datetime(2026, 4, 16, 14, 0, tzinfo=dt.timezone.utc)
+
+
+def _as_cli_main(command, args):
+    """Run a CLI command on a test-started thread the way the CLI main thread
+    runs it: at `process` (#787 / #861 spec 5.1)."""
+    with sys.modules["_cctally_core"].establish_authority("process"):
+        return command(args)
 
 
 def _dash_mod():
@@ -406,20 +414,18 @@ def _remaining(deadline: float) -> float:
     return max(1.0, deadline - time.monotonic())
 
 
-def _load_with_corpus(monkeypatch, tmp_path, small_corpus):
-    """Point every provider/home root at a private COPY of the bench corpus.
+def _load_with_corpus(monkeypatch, private_corpus):
+    """Point every provider/home root at a private `small` bench corpus.
 
-    The whole corpus root is copied, not just its data dir: `sync_cache` prunes
-    cached rows whose source JSONL has gone, so pointing CLAUDE_CONFIG_DIR at an
-    empty directory would empty the very corpus this test needs. The copy also
-    keeps the shared session-scoped corpus clean — the dashboard writes WAL and
-    ingest state into whatever data dir it is given.
+    The corpus comes from the `private_corpus` fixture, which BUILDS it at its
+    own root (#1099): every store names that root's own provider files, so the
+    authoritative build's first sync is the corpus's unchanged walk rather than
+    a re-ingest of every file under new identities. It is private because the
+    dashboard writes WAL and ingest state into whatever data dir it is given,
+    and every provider/home root points into it because `sync_cache` prunes
+    cached rows whose source JSONL has gone.
     """
-    #741: the copy goes through `conftest.copy_shared_corpus`, the ONE copier.
-    # It resolves the source root, excludes the SQLite sidecars, and holds the
-    # scale's build lock SHARED for the whole walk, so no copy races a rebuild.
-    root = tmp_path / "corpus"
-    copy_shared_corpus(small_corpus, root)
+    root = pathlib.Path(private_corpus("small")).parent
     for lock in (root / "data").glob("*.lock"):
         try:
             lock.unlink()
@@ -529,7 +535,7 @@ def _sse_frames(port, deadline):
 
 
 def test_bind_precedes_the_full_build_and_hydration_clears(
-    monkeypatch, tmp_path, small_corpus
+    monkeypatch, private_corpus
 ):
     """Bind-before-build, proven as an EVENT ORDER rather than a duration.
 
@@ -547,10 +553,10 @@ def test_bind_precedes_the_full_build_and_hydration_clears(
     boundary, so the old test could only compare two wall-clock durations, and
     it guarded on `LARGE_FIXTURE ... .exists()` where nothing in the suite or CI
     ever built that path — so it SKIPPED, silently, from the day it was written.
-    The corpus now arrives from the session-scoped `small_corpus` fixture, which
-    builds it and fails rather than skipping.
+    The corpus now arrives from the `private_corpus` fixture, which builds it
+    and fails rather than skipping.
     """
-    ns = _load_with_corpus(monkeypatch, tmp_path, small_corpus)
+    ns = _load_with_corpus(monkeypatch, private_corpus)
     dash = _dash_mod()
     before_handlers = set(threading.enumerate())
 
@@ -596,7 +602,7 @@ def test_bind_precedes_the_full_build_and_hydration_clears(
         ["dashboard", "--port", "0", "--no-browser", "--host", "127.0.0.1"])
     outcome = []
     server_thread = threading.Thread(
-        target=lambda: outcome.append(dash.cmd_dashboard(args)),
+        target=lambda: outcome.append(_as_cli_main(dash.cmd_dashboard, args)),
         daemon=True, name="s1-dashboard-under-test")
     server_thread.start()
     frames = None
@@ -688,7 +694,7 @@ def test_bind_precedes_the_full_build_and_hydration_clears(
 
 
 def test_no_sync_over_an_older_epoch_index_fills_once_the_rebuild_completes(
-    monkeypatch, tmp_path, small_corpus
+    monkeypatch, private_corpus
 ):
     """#932: a frozen dashboard leaves its deferred empty frame once the
     older-epoch stats rebuild completes.
@@ -713,7 +719,7 @@ def test_no_sync_over_an_older_epoch_index_fills_once_the_rebuild_completes(
     thread, which would let an in-flight attempt submit to a retired verifier
     or publish into a closed hub.
     """
-    ns = _load_with_corpus(monkeypatch, tmp_path, small_corpus)
+    ns = _load_with_corpus(monkeypatch, private_corpus)
     dash = _dash_mod()
     import sys as _sys
     from types import SimpleNamespace
@@ -722,7 +728,7 @@ def test_no_sync_over_an_older_epoch_index_fills_once_the_rebuild_completes(
     before_handlers = set(threading.enumerate())
     deadline = time.monotonic() + _WHOLE_TEST_BUDGET_S
 
-    # The copied corpus index is current; put it one epoch behind.
+    # The built corpus index is current; put it one epoch behind.
     conn = sqlite3.connect(core.DB_PATH)
     try:
         conn.execute(f"PRAGMA user_version = {core.STATS_INDEX_EPOCH - 1}")
@@ -788,7 +794,7 @@ def test_no_sync_over_an_older_epoch_index_fills_once_the_rebuild_completes(
          "--no-sync", "--sync-interval", str(int(interval))])
     outcome = []
     server_thread = threading.Thread(
-        target=lambda: outcome.append(dash.cmd_dashboard(args)),
+        target=lambda: outcome.append(_as_cli_main(dash.cmd_dashboard, args)),
         daemon=True, name="932-frozen-dashboard-under-test")
     server_thread.start()
     frames = None
@@ -1044,9 +1050,15 @@ def test_a2_progress_cb_publishes_under_perf_tracing(monkeypatch, tmp_path):
 
 
 def test_a2_warm_sync_yields_single_publish(monkeypatch, tmp_path):
-    # Empty CLAUDE dir → the real sync_cache finishes far under T → the throttle
-    # never fires → exactly one publish (the final, hydrating=False).
+    # A sync that finishes before T publishes exactly one frame, the final
+    # hydrating=False one. T is set out of reach, so the real sync over an
+    # empty CLAUDE dir cannot cross it however loaded the runner is: under a
+    # 4-worker quick gate the empty-store sync once took over the real 2.0 s
+    # and published a hydrating partial (#787 landing). The throttle firing
+    # is covered with T patched to 0 by test_a2_progressive_multi_frame.
     ns = _load_with_empty_roots(monkeypatch, tmp_path)
+    import _cctally_tui as tui
+    monkeypatch.setattr(tui, "_A2_PARTIAL_THROTTLE_S", 3600.0)
     ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
     hub = _CapturingHub()
     locked = ns["_make_run_sync_now_locked"](
@@ -1249,3 +1261,234 @@ def test_a2_decouple_declines_unconfirmed_cache_corruption(
         )
     )
     assert incidents == []
+
+
+# ---------------------------------------------------------------------------
+# #787 / #861 revision 34: the startup heap freeze (L1) and A2 over a coherent
+# frame (L2).
+# ---------------------------------------------------------------------------
+
+def _built_source_bundle(tui):
+    """A source bundle a complete build would carry: the bootstrap shape with
+    both provider generations named by a real (non-``hydrating:``) version."""
+    seed = tui._tui_hydrating_source_bundle()
+    claude = dataclasses.replace(
+        seed.sources["claude"], data_version="built:claude")
+    codex = dataclasses.replace(
+        seed.sources["codex"], data_version="built:codex")
+    return dataclasses.replace(seed, sources={
+        "claude": claude, "codex": codex,
+        "all": tui.compose_all_state(claude, codex)})
+
+
+def _startup_frames(ns, tui):
+    """Every frame shape a dashboard publishes around its first build."""
+    empty = ns["_empty_dashboard_snapshot"]()
+    seed = dataclasses.replace(
+        empty, source_bundle=tui._tui_hydrating_source_bundle(),
+        hydrating=True)
+    complete = dataclasses.replace(
+        empty, source_bundle=_built_source_bundle(tui),
+        last_sync_at=EMPTY_NOW, hydrating=False)
+    return {
+        "seed": seed,
+        # A first build that kept a pending frame republishes the seed's data
+        # with the latch cleared (`_tui_kept_frame`-style), and a crash over
+        # the seed publishes a frame with no source bundle at all.
+        "kept_over_seed": dataclasses.replace(
+            seed, hydrating=False, last_sync_error="stats-open: busy"),
+        "crash_over_seed": dataclasses.replace(
+            empty, hydrating=False, last_sync_error="snapshot: boom"),
+        "a2_partial_copy": dataclasses.replace(complete, hydrating=True),
+        "refused_leg": dataclasses.replace(complete, store_leg_failed=True),
+        "complete": complete,
+    }
+
+
+def test_heap_freeze_runs_once_after_the_first_complete_publication(
+        monkeypatch, tmp_path):
+    """L1, the trigger. Failure it detects: the freeze running on a frame
+    that is not a complete build (the hydrating seed, an A2 partial copy, a
+    frame kept over the seed after a failed first build, a crash over the
+    seed, or a build that recorded a refused store leg), which would freeze
+    the bootstrap heap and leave every later full collection traversing the
+    real build's millions of objects; running more than once, which freezes
+    every later snapshot's cyclic garbage and grows RSS; or freezing before
+    collecting, which freezes the startup garbage itself."""
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
+    import _cctally_tui as tui
+    dash = _dash_mod()
+    frames = _startup_frames(ns, tui)
+    calls = []
+    heap = dash._StartupHeapFreeze(
+        collect=lambda: calls.append("collect"),
+        freeze=lambda: calls.append("freeze"))
+    hub = dash.SSEHub(on_publish=heap.observe)
+    worker = threading.Thread(target=heap.run, daemon=True,
+                              name=dash._StartupHeapFreeze.THREAD_NAME)
+    worker.start()
+    try:
+        for name in ("seed", "a2_partial_copy", "kept_over_seed",
+                     "crash_over_seed", "refused_leg"):
+            hub.publish(frames[name])
+            assert not heap.requested(), (
+                f"a {name!r} publication requested the freeze")
+        assert calls == []
+        hub.publish(frames["complete"])
+        worker.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+        assert not worker.is_alive(), "the freeze worker never finished"
+        assert calls == ["collect", "freeze"]
+        hub.publish(frames["complete"])
+        hub.publish(dataclasses.replace(frames["complete"],
+                                        generated_at=EMPTY_NOW))
+        assert calls == ["collect", "freeze"], "a later publication froze again"
+    finally:
+        heap.stop()
+        worker.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+
+
+def test_heap_freeze_stop_before_a_complete_publication_freezes_nothing(
+        monkeypatch, tmp_path):
+    """L1, shutdown. Failure it detects: a dashboard that never published a
+    complete frame (a first build that keeps failing) either leaking its
+    freeze worker past shutdown or freezing on the way out."""
+    _load_with_empty_roots(monkeypatch, tmp_path)
+    dash = _dash_mod()
+    calls = []
+    heap = dash._StartupHeapFreeze(
+        collect=lambda: calls.append("collect"),
+        freeze=lambda: calls.append("freeze"))
+    worker = threading.Thread(target=heap.run, daemon=True,
+                              name=dash._StartupHeapFreeze.THREAD_NAME)
+    worker.start()
+    heap.stop()
+    worker.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+    assert not worker.is_alive()
+    assert calls == []
+
+
+@pytest.mark.parametrize("no_sync", [False, True], ids=["sync", "no-sync"])
+def test_dashboard_freezes_its_heap_once_after_the_first_complete_frame(
+        monkeypatch, tmp_path, no_sync):
+    """L1, the wiring in both modes. Failure it detects: `cmd_dashboard`
+    never freezing its startup heap (every full collection then traverses
+    about 2.6 million objects and holds the GIL for 580-820 ms, the cause of
+    the interactive admissions over AD1's 500 ms bound); freezing before the
+    first complete publication (on the sync-mode seed); freezing again on a
+    later tick; or a frozen (`--no-sync`) dashboard, which has no sync
+    thread, never reaching the freeze."""
+    import gc
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
+    import _cctally_tui as tui
+    dash = _dash_mod()
+    deadline = time.monotonic() + _WHOLE_TEST_BUDGET_S
+    before_handlers = set(threading.enumerate())
+    frames = _startup_frames(ns, tui)
+    monkeypatch.setitem(ns, "_tui_build_snapshot",
+                        lambda **kw: dataclasses.replace(frames["complete"]))
+
+    published = []
+    real_publish = dash.SSEHub.publish
+
+    def recording_publish(self, snapshot):
+        published.append(
+            not snapshot.hydrating
+            and tui._tui_dashboard_frame_is_coherent(snapshot))
+        return real_publish(self, snapshot)
+
+    monkeypatch.setattr(dash.SSEHub, "publish", recording_publish)
+    calls = []
+    frozen = threading.Event()
+
+    def spy_collect(*a, **k):
+        calls.append(("collect", sum(published)))
+        return 0
+
+    def spy_freeze():
+        calls.append(("freeze", sum(published)))
+        frozen.set()
+
+    monkeypatch.setattr(gc, "collect", spy_collect)
+    monkeypatch.setattr(gc, "freeze", spy_freeze)
+
+    stop = threading.Event()
+    monkeypatch.setattr(
+        dash, "_dashboard_wait_for_signal",
+        lambda *a, **k: stop.wait(timeout=_remaining(deadline)))
+    argv = ["dashboard", "--port", "0", "--no-browser", "--host", "127.0.0.1",
+            "--sync-interval", "1"]
+    if no_sync:
+        argv.append("--no-sync")
+    args = ns["build_parser"]().parse_args(argv)
+    outcome = []
+    server_thread = threading.Thread(
+        target=lambda: outcome.append(_as_cli_main(dash.cmd_dashboard, args)),
+        daemon=True, name="l1-dashboard-under-test")
+    server_thread.start()
+    try:
+        assert frozen.wait(timeout=_remaining(deadline)), (
+            f"the dashboard never froze its heap; published={published}")
+        if not no_sync:
+            assert published[0] is False, "premise: the seed is published first"
+            # Two more complete ticks after the freeze.
+            target = sum(published) + 2
+            while sum(published) < target and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert sum(published) >= target, "the sync thread stopped ticking"
+    finally:
+        stop.set()
+        teardown_deadline = time.monotonic() + _TEARDOWN_BUDGET_S
+        server_thread.join(timeout=_remaining(teardown_deadline))
+        for name in ("dashboard-heap-freeze", "dashboard-conversations-sync"):
+            _await_handler_exit(before_handlers, deadline=teardown_deadline,
+                                name_contains=name)
+    assert outcome == [0]
+    # Exactly one collection then one freeze, both after (at least) the first
+    # complete publication and never repeated by the later ticks.
+    assert [c[0] for c in calls] == ["collect", "freeze"], calls
+    assert all(seen >= 1 for _, seen in calls), calls
+
+
+@pytest.mark.parametrize("held", ["seed", "complete"])
+def test_a2_progressive_fill_applies_to_the_first_build_only(
+        monkeypatch, tmp_path, held):
+    """L2. Failure it detects: a Claude ingest that runs past the A2 throttle
+    while a coherent frame is already held (behind a cache vacuum's
+    exclusive hold, for example) publishing a `hydrating=True` copy, so
+    `/api/data` and every client report a dashboard that has long been
+    complete as hydrating; and, for the seed, the progressive fill of a
+    first build stopping after its first partial (a coherence check made per
+    progress call would see that partial as the held coherent frame)."""
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
+    import _cctally_tui as tui
+    monkeypatch.setattr(tui, "_A2_PARTIAL_THROTTLE_S", 0.0)
+    frames = _startup_frames(ns, tui)
+    ref = ns["_SnapshotRef"](frames[held])
+    hub = _CapturingHub()
+    builds = []
+
+    def build(**kw):
+        builds.append(kw.get("skip_sync"))
+        return dataclasses.replace(frames["complete"])
+
+    def slow_sync(conn, *, progress=None, **kw):
+        if progress is not None:
+            progress(None)
+            progress(None)
+        return None
+
+    monkeypatch.setitem(ns, "_tui_build_snapshot", build)
+    monkeypatch.setitem(ns, "sync_cache", slow_sync)
+    locked = ns["_make_run_sync_now_locked"](
+        ref=ref, hub=hub, pinned_now=EMPTY_NOW, display_tz_pref_override=None,
+    )
+    locked(skip_sync=False)
+    hydrating = [s for s in hub.published if s.hydrating]
+    if held == "seed":
+        assert len(hydrating) == 2, (
+            f"the first build's progressive fill stopped: {hub.published}")
+    else:
+        assert hydrating == [], (
+            "a hydrating copy was published over a coherent frame")
+        assert builds == [True], "a partial build ran over a coherent frame"
+    assert hub.published[-1].hydrating is False

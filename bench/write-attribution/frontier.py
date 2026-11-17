@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -94,17 +95,107 @@ CURSOR_FIELDS = ("last_byte_offset", "size_bytes", "device_id", "inode",
 
 # ── the tested tree's leaf libraries ──────────────────────────────────────
 
+#: The harness repository's own leaves (the one holding bench/write-attribution).
+HARNESS_BIN = HERE.parents[1] / "bin"
+#: (libs field, module, may the harness's copy stand in for a tree without
+#: one). A tree that predates #968 has no container leaf and one before the
+#: publication barrier has no barrier leaf (`56e66f07a` has neither); its
+#: product then reads no compressed or archived rollout and never defers. The
+#: identity leaf always comes from the tree.
+LEAVES = (("rc", "_lib_codex_rollout_container", True),
+          ("ident", "_lib_source_identity", False),
+          ("barrier", "_lib_codex_publication_barrier", True))
+
+
+class LeafRefusal(RuntimeError):
+    """The harness's stand-in leaves cannot judge this input for the tree."""
+
+
+def _same_file(module, path) -> bool:
+    origin = getattr(module, "__file__", None)
+    return origin is not None and os.path.realpath(origin) == \
+        os.path.realpath(path)
+
+
+def tree_leaf(tree, name: str, *, fallback: bool = True):
+    """(module, provenance) for one stdlib-only leaf by its bare name: the
+    tree's own whenever its bin/ has the file ("tree"), otherwise, when
+    `fallback` allows, the harness's copy loaded by file path and registered
+    in `sys.modules` under the bare name so later bare imports resolve to it
+    ("harness"). That is safe only because the tree has no module of that
+    name; a module of the name loaded from anywhere else refuses."""
+    bin_dir = pathlib.Path(tree or DEFAULT_TREE) / "bin"
+    own = bin_dir / f"{name}.py"
+    if own.is_file():
+        if str(bin_dir) not in sys.path:
+            sys.path.insert(0, str(bin_dir))
+        module = importlib.import_module(name)
+        if not _same_file(module, own):
+            raise ImportError(f"{name} is loaded from {module.__file__}, not "
+                              f"the tested tree's {own}", name=name)
+        return module, "tree"
+    harness = HARNESS_BIN / f"{name}.py"
+    if not fallback or not harness.is_file():
+        raise ModuleNotFoundError(f"No module named {name!r} in {bin_dir}",
+                                  name=name)
+    loaded = sys.modules.get(name)
+    if loaded is not None:
+        if not _same_file(loaded, harness):
+            raise ImportError(f"{name} is loaded from {loaded.__file__}, "
+                              f"neither the tested tree's {own} nor the "
+                              f"harness's {harness}", name=name)
+        return loaded, "harness"
+    spec = importlib.util.spec_from_file_location(name, harness)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module, "harness"
+
+
 def load_libs(tree=None) -> SimpleNamespace:
-    """The tree's container, identity and barrier leaves (stdlib-only). A
-    module already imported (catchup.py loaded the tree) is reused."""
-    bin_dir = str(pathlib.Path(tree or DEFAULT_TREE) / "bin")
-    if bin_dir not in sys.path:
-        sys.path.insert(0, bin_dir)
-    rc = importlib.import_module("_lib_codex_rollout_container")
-    ident = importlib.import_module("_lib_source_identity")
-    barrier = importlib.import_module("_lib_codex_publication_barrier")
-    return SimpleNamespace(rc=rc, ident=ident, barrier=barrier,
-                           pairs=defined_pairs(barrier))
+    """The tree's container, identity and barrier leaves (stdlib-only), each
+    the tree's own when it has one (a module already imported from it, as
+    when catchup.py loaded the tree, is reused) and otherwise the harness's
+    (`tree_leaf`); `provenance` names which, per leaf."""
+    loaded, provenance = {}, {}
+    for field, name, fallback in LEAVES:
+        loaded[field], provenance[field] = tree_leaf(tree, name,
+                                                     fallback=fallback)
+    return SimpleNamespace(**loaded, pairs=defined_pairs(loaded["barrier"]),
+                           provenance=provenance,
+                           tree=str(pathlib.Path(tree or DEFAULT_TREE)))
+
+
+def harness_leaf_problem(homes, libs) -> "str | None":
+    """With the harness's container leaf standing in, the tree predates
+    compressed and archived rollouts and its product reads neither: the
+    first such input under a configured Codex home's walk or archive root,
+    named, because judging it with the harness's semantics (or dropping it)
+    would hold the tree's drain to input it never sees."""
+    if (getattr(libs, "provenance", None) or {}).get("rc") != "harness":
+        return None
+    for configured in homes:
+        locations = libs.rc.home_locations(configured)
+        if locations is None:
+            continue
+        walk = pathlib.Path(locations.walk_root)
+        found = sorted((p for p in walk.glob("**/*.jsonl.zst")), key=str)
+        archive = locations.archive_root
+        if archive is not None:
+            found += sorted((p for p in pathlib.Path(archive).rglob("*")
+                             if p.is_file()), key=str)
+        if found:
+            kind = ("a compressed rollout" if str(found[0]).endswith(".zst")
+                    else "an archived rollout")
+            return (f"tree {libs.tree} has no _lib_codex_rollout_container, "
+                    f"so its product reads no compressed or archived Codex "
+                    f"rollout; the harness's leaf will not judge {kind} for "
+                    f"it: {found[0]}")
+    return None
 
 
 def defined_pairs(barrier) -> frozenset:
@@ -287,6 +378,9 @@ def capture(roots, libs) -> dict:
             entries.append({"provider": "claude", "logical": str(path),
                             **facts})
     homes = [r.logical for r in roots if r.kind == "codex-home"]
+    refusal = harness_leaf_problem(homes, libs)
+    if refusal is not None:
+        raise LeafRefusal(refusal)
     seen = set()
     for provider, location, root_key in codex_providers(homes, libs):
         for logical in sorted(codex_logicals(location, libs, skipped), key=str):

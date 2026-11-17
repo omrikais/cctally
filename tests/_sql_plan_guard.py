@@ -197,12 +197,29 @@ def capture_sql_plans(*, roots=(BIN_DIR,), temp_store=None):
     real_connect = sqlite3.connect
     recorder = _Recorder(roots)
 
+    composed: dict = {}
+
     def connect(*args, **kwargs):
-        if "factory" in kwargs or len(args) > 5:
+        if len(args) > 5:
             raise AssertionError(
                 "the #901 plan guard cannot see a connection opened with a "
-                "custom factory; open it with plain sqlite3.connect")
-        kwargs["factory"] = PlanConnection
+                "positional factory; pass it as factory=")
+        factory = kwargs.get("factory")
+        if factory is None or factory is PlanConnection:
+            kwargs["factory"] = PlanConnection
+        elif isinstance(factory, type) and issubclass(factory,
+                                                      sqlite3.Connection):
+            # #787: a query session's connection class (it refuses
+            # maintenance statements) keeps its own overrides beneath the
+            # recorder's.
+            if factory not in composed:
+                composed[factory] = type(
+                    f"Plan{factory.__name__}", (PlanConnection, factory), {})
+            kwargs["factory"] = composed[factory]
+        else:
+            raise AssertionError(
+                "the #901 plan guard cannot see a connection opened with a "
+                "non-Connection factory; open it with plain sqlite3.connect")
         conn = real_connect(*args, **kwargs)
         if temp_store is not None:
             sqlite3.Connection.execute(conn, f"PRAGMA temp_store = {temp_store}")

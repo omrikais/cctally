@@ -485,6 +485,10 @@ def _seed_http_cache(ns):
     _cc._recompute_conversation_sessions(cache)
     cache.commit()
     cache.close()
+    # The dashboard's startup owner creates the conversation store (and
+    # bridges these legacy cache rows into it) before bind; a request thread
+    # never creates a store (#787 spec 5.8).
+    ns["open_conversations_db"]().close()
 
 
 def _boot(ns, tmp_path, monkeypatch):

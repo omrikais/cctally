@@ -146,6 +146,10 @@ def test_projection_select_plans_never_build_history_sized_temp_structures(
         conn.close()
     store = importlib.import_module("_cctally_store")
     monkeypatch.setattr(store, "WRITER_TEMP_STORE", temp_store)
+    # #787 / #861: the projection reads in a query session, which selects its
+    # own temp store at connect.
+    access = importlib.import_module("_cctally_store_access")
+    monkeypatch.setattr(access, "QUERY_TEMP_STORE", temp_store)
     with guard.capture_sql_plans(temp_store=temp_store) as recorder:
         result = app._read_db_projection_once(account_key="unattributed")
     statements = _projection_statements(recorder)
@@ -198,6 +202,28 @@ def test_caught_up_foreground_claude_hook_keeps_memory_policy(
     _assert_recurring_plans(recorder)
 
 
+def _read_in_scan_order(monkeypatch, sl, reverse):
+    """Run the projection's snapshot with SQLite's unordered scans reversed.
+
+    #787 / #861 AD21: the projection reads one `query(command)` session
+    (`open_command_session("stats")`), not `open_db`, so the scan order is set
+    on that session's connection. A count proves the projection took it."""
+    access = sl._store_access
+    real_open = access.open_command_session
+    taken = []
+
+    def open_in_scan_order(primary, **kwargs):
+        session, phase = real_open(primary, **kwargs)
+        if primary == "stats":
+            session.conn.execute(
+                f"PRAGMA reverse_unordered_selects = {int(reverse)}")
+            taken.append(primary)
+        return session, phase
+
+    monkeypatch.setattr(access, "open_command_session", open_in_scan_order)
+    return taken
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("active", ["account-a", "account-b"])
 def test_projection_is_independent_of_insertion_and_scan_order(
@@ -237,15 +263,9 @@ def test_projection_is_independent_of_insertion_and_scan_order(
         conn.commit()
     finally:
         conn.close()
-    real_open = sl.open_db
-
-    def open_in_scan_order():
-        conn = real_open()
-        conn.execute(f"PRAGMA reverse_unordered_selects = {int(reverse)}")
-        return conn
-
-    monkeypatch.setattr(sl, "open_db", open_in_scan_order)
+    taken = _read_in_scan_order(monkeypatch, sl, reverse)
     projection = app._read_db_projection_once(account_key=active)
+    assert taken == ["stats"], "the projection left the scan-order seam"
     assert projection.seven_day.percent == 22
     assert projection.seven_day.captured_at == now - 10
     assert projection.five_hour.percent == 33
@@ -282,15 +302,9 @@ def test_projection_preserves_weekly_credit_and_five_hour_reset_floors(
     finally:
         conn.close()
     sl = importlib.import_module("_cctally_statusline")
-    real_open = sl.open_db
-
-    def open_in_scan_order():
-        conn = real_open()
-        conn.execute(f"PRAGMA reverse_unordered_selects = {int(reverse)}")
-        return conn
-
-    monkeypatch.setattr(sl, "open_db", open_in_scan_order)
+    taken = _read_in_scan_order(monkeypatch, sl, reverse)
     projection = app._read_db_projection_once(account_key="unattributed")
+    assert taken == ["stats"], "the projection left the scan-order seam"
     assert projection.seven_day.percent == 20
     assert projection.seven_day.reset_generation == floor
     assert projection.five_hour.percent == 5
@@ -403,6 +417,10 @@ def test_f2_render_path_does_no_journal_cutover_or_index_work(app, monkeypatch):
     assert not core.ACCOUNT_BOUND_CUTOVER_CACHE_PATH.exists()
     assert not list(core.JOURNAL_DIR.glob("*.jsonl"))
     for statement in recorder.statements:
+        # #787 / #861: a query session's own identity read (5.13 step 6)
+        # validates through `_cctally_store`; it reads, and is no index work.
+        if "_cctally_store_access._read_store" in statement.call_sites:
+            continue
         assert not any(site.startswith(("_cctally_journal.", "_cctally_store."))
                        for site in statement.call_sites), statement
     candidates = list((core.STATUSLINE_ACCOUNT_BOUND_DIR / "accounts").glob(

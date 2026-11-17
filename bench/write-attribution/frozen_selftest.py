@@ -676,6 +676,16 @@ def settle(prefix: pathlib.Path, timeout: float = 30.0) -> list:
         time.sleep(0.1)
 
 
+# #1042: files whose content holds wall-clock floats, so their byte count
+# varies by a few characters between two identical launches (a float's repr
+# drops trailing zeros). #1080's quota-index sidecar meta records `birth` and
+# `index_birth` as epoch floats. They form their own class, compared within
+# `VARIABLE_WIDTH_SLACK` bytes instead of exactly.
+VARIABLE_WIDTH_PREFIXES = (".quota-observation-keys",)
+VARIABLE_WIDTH_CLASS = "variable-width"
+VARIABLE_WIDTH_SLACK = 16
+
+
 def byte_classes(prefix: pathlib.Path) -> dict:
     """Per-store byte classes from every exit snapshot under `prefix`."""
     out = {}
@@ -686,9 +696,23 @@ def byte_classes(prefix: pathlib.Path) -> dict:
         for name, (written, _calls) in lines[-1]["paths"].items():
             base = os.path.basename(name)
             key = ("temp" if base.startswith("etilqs_") else
-                   base if base.split("-")[0] in STORES else "other")
+                   base if base.split("-")[0] in STORES else
+                   VARIABLE_WIDTH_CLASS if base.startswith(VARIABLE_WIDTH_PREFIXES)
+                   else "other")
             out[key] = out.get(key, 0) + written
     return out
+
+
+def byte_classes_equal(got: dict, control: dict) -> bool:
+    """Every class equal, except the variable-width class: present on both
+    sides or on neither, within `VARIABLE_WIDTH_SLACK` bytes."""
+    rest = lambda d: {k: v for k, v in d.items() if k != VARIABLE_WIDTH_CLASS}
+    if rest(got) != rest(control):
+        return False
+    a, b = got.get(VARIABLE_WIDTH_CLASS), control.get(VARIABLE_WIDTH_CLASS)
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) <= VARIABLE_WIDTH_SLACK
 
 
 # ── the probe (runs INSIDE the launch) ────────────────────────────────────
@@ -1266,7 +1290,8 @@ class SelfTest:
                    and str(t.memory) not in blob and str(t.memory_file) not in blob,
                    "the run ingested a file under the memory directory link")
         got = byte_classes(prefix)
-        self.check("frozen.byteClassesEqualControl", got == self.control_bytes,
+        self.check("frozen.byteClassesEqualControl",
+                   byte_classes_equal(got, self.control_bytes),
                    {"frozen": got, "control": self.control_bytes})
         if not red:
             fam = self.family(self.receipts)
