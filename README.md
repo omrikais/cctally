@@ -30,14 +30,13 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.118.2** (2026-11-07)
+**Latest stable: v1.120.1** (2026-11-17)
 
-Highlights from the `v1.117.2` to `v1.118.2` stable upgrade:
+Highlights from the `v1.118.2` to `v1.120.1` stable upgrade:
 
-- The Codex hooks that `cctally setup` installs no longer re-read the whole quota history to resolve reset anchors, so recording new Codex usage stays fast on a long history.
-- The dashboard and TUI now regroup a project within about a minute after a git worktree is removed, a repository is created or moved, or a folder becomes a repository; previously they kept the old grouping until restarted.
+- With an older SQLite, as many Linux distributions ship, upgrading an old install whose `cache.db` is damaged no longer shows a database migration error; the upgrade waits until the cache is repaired, as it already did with newer SQLite.
 
-[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.118.2)
+[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.120.1)
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
