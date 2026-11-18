@@ -30,13 +30,15 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.120.1** (2026-11-17)
+**Latest stable: v1.122.0** (2026-11-18)
 
-Highlights from the `v1.118.2` to `v1.120.1` stable upgrade:
+Highlights from the `v1.120.1` to `v1.122.0` stable upgrade:
 
-- With an older SQLite, as many Linux distributions ship, upgrading an old install whose `cache.db` is damaged no longer shows a database migration error; the upgrade waits until the cache is repaired, as it already did with newer SQLite.
+- Codex cost reports price `gpt-6.2-astra`, `gpt-6.2-sol`, `gpt-6.2-astra-law` and `gpt-6-cyber` from their published rate cards instead of falling back to `gpt-5` rates, including usage recorded before you upgrade.
+- Claude cost reports price `claude-fable-5-2` and `claude-mythos-5-2`, including Fast mode, instead of counting them at $0, and `statusline` uses their 1M context window.
+- The `dashboard` no longer briefly drops its `stats.db` locks while checking the database version, which could let the status line write at the same moment a page was reading or a refresh was writing.
 
-[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.120.1)
+[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.122.0)
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
