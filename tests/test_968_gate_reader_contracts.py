@@ -101,6 +101,672 @@ def test_root_evidence_protects_history_and_relative_fixture_paths(
         assert {".codex/sessions/fixture.jsonl", "/unknown/history.jsonl"} <= {row.source_path for row in rows}
         monkeypatch.setenv("CODEX_HOME", f"{a},{b}")
         assert len(ns["get_codex_entries"](START, END, skip_sync=True)) == 3
+        # #1108 T6: the extracted predicate is exactly the inline rule
+        # `iter_codex_entries` applies, for every row it covers, plus a BLOB
+        # absolute path and an unregistered absolute root.
+        cache = sys.modules["_cctally_cache"]
+        monkeypatch.setenv("CODEX_HOME", str(b))
+        scope = cache._codex_prune_scope(cache._discover_codex_files_with_roots())
+        conn.execute(
+            "INSERT INTO codex_session_entries (source_path,line_offset,timestamp_utc,session_id,model,"
+            "input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,source_root_key) "
+            "VALUES (?,1,?,'ghost','gpt-5',1,0,1,0,2,'ghost-root')",
+            ("/ghost/unregistered.jsonl", START.isoformat()))
+        conn.commit()
+        kept = {row.source_path for row in ns["iter_codex_entries"](
+            conn, START, END, root_scope=scope)}
+        stored = conn.execute(
+            "SELECT source_root_key, source_path FROM codex_session_entries").fetchall()
+        assert {path for root, path in stored
+                if not cache.codex_row_withheld(scope, root, path)} == kept
+        expect_withheld = replacement == "recognized"
+        assert ("/ghost/unregistered.jsonl" not in kept) is expect_withheld
+        assert cache.codex_row_withheld(
+            scope, "ghost-root", b"/ghost/blob.jsonl") is expect_withheld
+        assert not cache.codex_row_withheld(scope, "ghost-root", b"rel/blob.jsonl")
+        assert not cache.codex_row_withheld(scope, None, "/unknown/history.jsonl")
+        assert not cache.codex_row_withheld(None, "ghost-root", "/ghost/x.jsonl")
+        assert cache.codex_root_withheld(scope, "ghost-root") is expect_withheld
+        assert not cache.codex_root_withheld(scope, None)
+        for key in scope.configured_root_keys:
+            assert not cache.codex_root_withheld(scope, key)
+        assert cache.codex_root_scope_identity(None) is None
+        assert cache.codex_root_scope_identity(scope) == (
+            tuple(sorted(scope.configured_root_keys)),
+            bool(scope.recognized_root_keys))
+        # #1108 T6, the dashboard readers: the qualified kernel and the rooted
+        # fallback keep exactly the predicate's population. A BLOB absolute
+        # path joins the rows; a NULL identity is kept and still meets the
+        # rooted reader's existing typed refusal.
+        analytics = sys.modules["_cctally_source_analytics"]
+        conn.execute(
+            "INSERT INTO codex_session_entries (source_path,line_offset,timestamp_utc,session_id,model,"
+            "input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,source_root_key) "
+            "VALUES (?,2,?,'ghost','gpt-5',1,0,1,0,2,'ghost-root')",
+            (b"/ghost/blob.jsonl", START.isoformat()))
+        conn.commit()
+        expected = {(root, path) for root, path in conn.execute(
+            "SELECT source_root_key, source_path FROM codex_session_entries")
+            if not cache.codex_row_withheld(scope, root, path)}
+        previous = conn.row_factory
+        try:
+            rows, _inherited = analytics._read_qualified_codex_rows(
+                conn, START, END, None, None, root_scope=scope)
+        finally:
+            conn.row_factory = previous
+        assert {(row["source_root_key"], row["source_path"])
+                for row in rows} == expected
+        with pytest.raises(analytics.QualifiedMetadataUnavailable):
+            analytics.load_cached_rooted_codex_accounting_entries(
+                START, END, speed="standard", cache_conn=conn,
+                root_scope=scope)
+        conn.execute("DELETE FROM codex_session_entries WHERE source_root_key IS NULL"
+                     " OR typeof(source_path) = 'blob'")
+        conn.commit()
+        rooted = analytics.load_cached_rooted_codex_accounting_entries(
+            START, END, speed="standard", cache_conn=conn, root_scope=scope)
+        assert {(row.source_root_key, row.source_path) for row in rooted} == {
+            (root, path) for root, path in expected
+            if root is not None and isinstance(path, str)}
+    finally:
+        conn.close()
+
+
+def _scope_store(tmp_path, monkeypatch):
+    """A synced current root `a` plus a cache connection (#1108 T3)."""
+    ns = _runtime(tmp_path, monkeypatch)
+    a = tmp_path / "a"
+    write_rollout(a / "sessions" / "a.jsonl", token_records(1, session_id="a"))
+    monkeypatch.setenv("CODEX_HOME", str(a))
+    conn = ns["open_cache_db"]()
+    ns["sync_codex_cache"](conn, maintenance="caller")
+    return ns, sys.modules["_cctally_cache"], a, conn
+
+
+def _register_root(conn, key, path):
+    conn.execute(
+        "INSERT INTO codex_source_roots (source_root_key, canonical_root_path,"
+        " first_seen_utc, last_seen_utc) VALUES (?,?,?,?)",
+        (key, path, START.isoformat(), START.isoformat()))
+    conn.commit()
+
+
+def _counting_discover(cache, calls):
+    real = cache._discover_codex_files_with_roots
+
+    def discover():
+        calls.append(1)
+        return real()
+    return discover
+
+
+def test_codex_read_scope_steady_state_runs_no_filesystem_probe(
+    tmp_path, monkeypatch,
+):
+    """#1108 T3: with no withholding candidate the resolver touches no
+    rollout. Failure it detects: an owner tick paying canonical discovery and
+    the recognition probe on every build of an ordinary store."""
+    ns, cache, _a, conn = _scope_store(tmp_path, monkeypatch)
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("steady state must not probe the filesystem")
+
+    monkeypatch.setattr(cache, "_discover_codex_files_with_roots", refuse)
+    monkeypatch.setattr(cache, "_codex_file_is_recognizable", refuse)
+    try:
+        assert cache.resolve_codex_read_scope(
+            conn, sync_stats=None, retained=None, now_monotonic=100.0,
+        ) == (None, None)
+    finally:
+        conn.close()
+
+
+def test_codex_read_scope_resolution_freshness(tmp_path, monkeypatch):
+    """#1108 T3: candidate and configured-key changes rediscover at once,
+    unchanged evidence is reused only within the bound, and a whole-walk sync
+    scope is used only while young. Failures it detects: stale withholding
+    after a root change, an expired sync renewing evidence, and discovery on
+    every tick while candidates exist."""
+    ns, cache, a, conn = _scope_store(tmp_path, monkeypatch)
+    bound = cache.CODEX_READ_SCOPE_MAX_AGE_S
+    calls: list = []
+    discover = _counting_discover(cache, calls)
+
+    def resolve(now, retained=None, sync_stats=None):
+        return cache.resolve_codex_read_scope(
+            conn, sync_stats=sync_stats, retained=retained,
+            now_monotonic=now, discover=discover)
+
+    try:
+        # Only an unregistered absolute root's rows: no short-circuit.
+        conn.execute(
+            "INSERT INTO codex_session_entries (source_path,line_offset,timestamp_utc,session_id,model,"
+            "input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,source_root_key) "
+            "VALUES ('/ghost/old.jsonl',1,?,'ghost','gpt-5',1,0,1,0,2,'ghost-root')",
+            (START.isoformat(),))
+        conn.commit()
+        scope, evidence = resolve(1000.0)
+        assert scope is not None and scope.recognized_root_keys
+        assert evidence.candidate_root_keys == frozenset({"ghost-root"})
+        assert evidence.observed_at == 1000.0 and len(calls) == 1
+        # Unchanged (K, C) within the bound: reused, anchor unchanged.
+        again, kept = resolve(1000.0 + bound, retained=evidence)
+        assert again is scope and kept is evidence and len(calls) == 1
+        # Past the bound: rediscovered.
+        _scope, aged = resolve(1000.0 + bound + 1, retained=evidence)
+        assert len(calls) == 2 and aged.observed_at == 1000.0 + bound + 1
+        # A candidate change rediscovers at once.
+        _register_root(conn, "retired-root", "/retired")
+        _scope, widened = resolve(1001.0 + bound, retained=aged)
+        assert len(calls) == 3
+        assert widened.candidate_root_keys == {"ghost-root", "retired-root"}
+        # A configured-key change rediscovers at once.
+        b = tmp_path / "b"
+        write_rollout(b / "sessions" / "b.jsonl", token_records(1, session_id="b"))
+        monkeypatch.setenv("CODEX_HOME", f"{a},{b}")
+        moved, rekeyed = resolve(1002.0 + bound, retained=widened)
+        assert len(calls) == 4
+        assert rekeyed.configured_root_keys == moved.configured_root_keys
+        assert source_root_key(str(b)) in moved.configured_root_keys
+
+        # A fresh whole-walk sync scope is used without discovery and keeps
+        # its own anchor; an expired one is rejected though it arrived now.
+        sync = ns["sync_codex_cache"](conn, maintenance="caller")
+        assert sync.whole_walk_scope is not None
+        assert sync.whole_walk_scope.configured_root_keys == moved.configured_root_keys
+        observed = sync.whole_walk_scope_observed_at
+        used, from_sync = resolve(observed + bound, sync_stats=sync)
+        assert used is sync.whole_walk_scope and len(calls) == 4
+        assert from_sync.observed_at == observed
+        reused, still = resolve(observed + bound, retained=from_sync)
+        assert reused is used and still.observed_at == observed
+        _scope, fresh = resolve(observed + bound + 1, sync_stats=sync,
+                                retained=from_sync)
+        assert len(calls) == 5 and fresh.observed_at == observed + bound + 1
+        # A targeted sync exposes no whole-walk scope.
+        targeted = ns["sync_codex_cache"](
+            conn, maintenance="caller",
+            only_paths=[str(b / "sessions" / "b.jsonl")])
+        assert targeted.whole_walk_scope is None
+        assert targeted.whole_walk_scope_observed_at is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("flip", ["gains_envelope", "displaced"])
+def test_codex_read_scope_recognition_flip_is_seen_after_the_bound(
+    tmp_path, monkeypatch, flip,
+):
+    """#1108 T3: a recognition change that moves neither K nor C (an envelope
+    appended to an existing file; a recognition witness displaced by 32 newer
+    unrecognizable files) is seen on the first resolution past the bound.
+    Failure it detects: canonical evidence retained indefinitely."""
+    ns, cache, a, conn = _scope_store(tmp_path, monkeypatch)
+    bound = cache.CODEX_READ_SCOPE_MAX_AGE_S
+    b = tmp_path / "b"
+    rollout = b / "sessions" / "b.jsonl"
+    if flip == "gains_envelope":
+        write_rollout(rollout, [{"type": "future-record", "payload": {}}])
+    else:
+        write_rollout(rollout, token_records(1, session_id="b"))
+    monkeypatch.setenv("CODEX_HOME", str(b))
+    calls: list = []
+    discover = _counting_discover(cache, calls)
+    try:
+        first, evidence = cache.resolve_codex_read_scope(
+            conn, sync_stats=None, retained=None, now_monotonic=10.0,
+            discover=discover)
+        assert bool(first.recognized_root_keys) is (flip == "displaced")
+        if flip == "gains_envelope":
+            with rollout.open("a", encoding="utf-8") as fh:
+                for record in token_records(1, session_id="b"):
+                    fh.write(json.dumps(record) + "\n")
+        else:
+            for index in range(cache._CODEX_ROOT_RECOGNITION_MAX_FILES):
+                write_rollout(b / "sessions" / f"z-{index:02d}.jsonl",
+                              [{"type": "future-record", "payload": {}}])
+        held, _ = cache.resolve_codex_read_scope(
+            conn, sync_stats=None, retained=evidence,
+            now_monotonic=10.0 + bound, discover=discover)
+        assert held is first and len(calls) == 1
+        flipped, _ = cache.resolve_codex_read_scope(
+            conn, sync_stats=None, retained=evidence,
+            now_monotonic=10.0 + bound + 1, discover=discover)
+        assert len(calls) == 2
+        assert bool(flipped.recognized_root_keys) is (flip == "gains_envelope")
+    finally:
+        conn.close()
+
+
+# ── #1108 T3: the no-lag gate (spec §3.2 step 2a) ────────────────────────────
+# Each case drives real syncs over one rollout `r.jsonl` and resolves the
+# scope a dashboard owner would read under. Failure every case detects: a
+# frame that withholds a retired copy holding progress no current copy has
+# (an empty or short Codex section), or one that stops withholding a
+# retired copy every current copy has caught up with (a doubled section).
+
+
+def _gate_store(tmp_path, monkeypatch):
+    ns = _runtime(tmp_path, monkeypatch)
+    return ns, sys.modules["_cctally_cache"]
+
+
+def _home(monkeypatch, *roots):
+    monkeypatch.setenv("CODEX_HOME", ",".join(str(root) for root in roots))
+
+
+def _fresh(cache, conn):
+    """A fresh resolution: no sync stats and no retained evidence."""
+    return cache.resolve_codex_read_scope(
+        conn, sync_stats=None, retained=None, now_monotonic=1_000.0)
+
+
+def _from_sync(cache, conn, stats):
+    """Step 3: the sync's own discovery against this post-sync connection."""
+    assert stats.whole_walk_scope is not None
+    return cache.resolve_codex_read_scope(
+        conn, sync_stats=stats, retained=None,
+        now_monotonic=stats.whole_walk_scope_observed_at)
+
+
+def _visible(cache, conn, scope):
+    return sorted(
+        (str(path), offset, root) for path, offset, root in conn.execute(
+            "SELECT source_path, line_offset, source_root_key "
+            "FROM codex_session_entries")
+        if not cache.codex_row_withheld(scope, root, path))
+
+
+def _cursors(conn):
+    return {str(path): (root, offset, complete)
+            for path, root, offset, complete in conn.execute(
+                "SELECT path, source_root_key, last_byte_offset, ingest_complete "
+                "FROM codex_session_files")}
+
+
+def _budget_stopped_sync(ns, cache, conn, monkeypatch):
+    """A real budgeted walk whose budget runs out right after the first
+    record it reads, so the file commits a partial cursor."""
+    real_iter = cache._iter_codex_fused_records_with_offsets
+    state = {"expired": False}
+
+    def iterate(*args, **kwargs):
+        for emission in real_iter(*args, **kwargs):
+            yield emission
+            state["expired"] = True
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cache, "_iter_codex_fused_records_with_offsets", iterate)
+        patch.setattr(cache, "_walk_clock",
+                      lambda: 1e9 if state["expired"] else 0.0)
+        stats = ns["sync_codex_cache"](
+            conn, maintenance="caller", budget_seconds=1_000.0)
+    assert stats.budget_exhausted, "non-vacuity: the walk was not budget-stopped"
+    return stats
+
+
+def test_no_lag_gate_return_after_drain_waits_for_re_ingest(tmp_path, monkeypatch):
+    """(i) A->B, B's walk completes, the drain deletes A's cursors, B->A: no
+    withholding until A is re-ingested."""
+    ns, cache = _gate_store(tmp_path, monkeypatch)
+    a, b = tmp_path / "a", tmp_path / "b"
+    write_rollout(a / "sessions" / "r.jsonl", token_records(2, session_id="r"))
+    _home(monkeypatch, a)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        a.rename(b)
+        _home(monkeypatch, b)
+        caught_up = ns["sync_codex_cache"](conn, maintenance="caller")
+        assert _from_sync(cache, conn, caught_up)[0] is not None
+        cache.run_codex_prune_drain(wait_for_requests=False)
+        assert all(root != source_root_key(str(a))
+                   for root, _o, _c in _cursors(conn).values()), (
+            "non-vacuity: the drain left the retired root's cursors")
+        before = _visible(cache, conn, None)
+        assert before, "non-vacuity: the relocated copy holds no rows"
+        b.rename(a)
+        _home(monkeypatch, a)
+        scope, _evidence = _fresh(cache, conn)
+        assert scope is None, "withheld a retired copy A has no cursor for"
+        assert _visible(cache, conn, scope) == before
+        re_ingest = ns["sync_codex_cache"](conn, maintenance="caller")
+        assert _from_sync(cache, conn, re_ingest)[0] is not None
+        scope, _evidence = _fresh(cache, conn)
+        assert scope is not None and scope.recognized_root_keys
+        assert {root for _p, _o, root in _visible(cache, conn, scope)} == {
+            source_root_key(str(a))}
+    finally:
+        conn.close()
+
+
+def test_no_lag_gate_partial_walks(tmp_path, monkeypatch):
+    """(ii) A budget-stopped re-ingest walk blocks (its own discovery against
+    the post-sync store); once the relocation completed, a budget-stopped
+    APPEND (`ingest_complete = 0`) only moves the current copy further ahead,
+    so a freshly evaluated gate still withholds."""
+    ns, cache = _gate_store(tmp_path, monkeypatch)
+    a, b = tmp_path / "a", tmp_path / "b"
+    write_rollout(a / "sessions" / "r.jsonl", token_records(3, session_id="r"))
+    _home(monkeypatch, a)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        a.rename(b)
+        _home(monkeypatch, b)
+        rollout = str(b / "sessions" / "r.jsonl")
+        partial = _budget_stopped_sync(ns, cache, conn, monkeypatch)
+        assert _cursors(conn)[rollout][2] == 0, "non-vacuity: no partial cursor"
+        assert _from_sync(cache, conn, partial)[0] is None
+        assert _fresh(cache, conn)[0] is None
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        _root, caught_up, _complete = _cursors(conn)[rollout]
+        write_rollout(b / "sessions" / "r.jsonl", token_records(6, session_id="r"))
+        appended = _budget_stopped_sync(ns, cache, conn, monkeypatch)
+        _root, progress, complete = _cursors(conn)[rollout]
+        assert complete == 0 and progress > caught_up, (
+            f"non-vacuity: no partial append was committed "
+            f"({caught_up=} {progress=} {complete=})")
+        assert _from_sync(cache, conn, appended)[0] is not None
+        scope, _evidence = _fresh(cache, conn)
+        assert scope is not None and scope.recognized_root_keys
+        assert {root for _p, _o, root in _visible(cache, conn, scope)} == {
+            source_root_key(str(b))}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("order", ["requalified_away", "deduplicated_into"])
+def test_no_lag_gate_overlapping_roots(tmp_path, monkeypatch, order):
+    """(iii) Parent A completes, then `[B, A]` requalifies the files to B,
+    then `[A]` alone: blocked until A re-owns them. (iv) `[A, B]` keeps B's
+    files under A, then `[B]` alone: blocked. B is a directory A walks, so
+    both roots see `r.jsonl` and the current owner has no own cursor; A's
+    own rollout keeps A recognized while B owns `r.jsonl`."""
+    ns, cache = _gate_store(tmp_path, monkeypatch)
+    a = tmp_path / "a"
+    nested = a / "sessions" / "2026"
+    shared = str(nested / "r.jsonl")
+    write_rollout(nested / "r.jsonl", token_records(2, session_id="r"))
+    write_rollout(a / "sessions" / "own.jsonl", token_records(1, session_id="o"))
+    conn = ns["open_cache_db"]()
+    try:
+        if order == "requalified_away":
+            _home(monkeypatch, a)
+            ns["sync_codex_cache"](conn, maintenance="caller")
+            _home(monkeypatch, nested, a)
+            owner, alone = nested, a
+        else:
+            _home(monkeypatch, a, nested)
+            owner, alone = a, nested
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        assert _cursors(conn)[shared][0] == source_root_key(str(owner)), (
+            "non-vacuity: unexpected owner")
+        before = _visible(cache, conn, None)
+        assert before, "non-vacuity: no rows"
+        _home(monkeypatch, alone)
+        scope, _evidence = _fresh(cache, conn)
+        assert scope is None, "withheld the only copy of the rows"
+        assert _visible(cache, conn, scope) == before
+        if order == "requalified_away":
+            re_owned = ns["sync_codex_cache"](conn, maintenance="caller")
+            assert _cursors(conn)[shared][0] == source_root_key(str(a)), (
+                "non-vacuity: A did not re-own")
+            assert _from_sync(cache, conn, re_owned)[0] is not None
+            assert len(_visible(cache, conn, _fresh(cache, conn)[0])) == len(before)
+    finally:
+        conn.close()
+
+
+def test_no_lag_gate_return_after_growth(tmp_path, monkeypatch):
+    """(v) A ingested to X; A->B; append Y; B ingested to X+Y with A's debt
+    pending; B->A; before A is re-ingested its cursor stops at X, behind
+    B's X+Y, so the gate blocks and B's Y stays visible."""
+    ns, cache = _gate_store(tmp_path, monkeypatch)
+    a, b = tmp_path / "a", tmp_path / "b"
+    write_rollout(a / "sessions" / "r.jsonl", token_records(2, session_id="r"))
+    _home(monkeypatch, a)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        a.rename(b)
+        write_rollout(b / "sessions" / "r.jsonl", token_records(4, session_id="r"))
+        _home(monkeypatch, b)
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        cursors = _cursors(conn)
+        x = cursors[str(a / "sessions" / "r.jsonl")][1]
+        x_plus_y = cursors[str(b / "sessions" / "r.jsonl")][1]
+        assert x < x_plus_y, f"non-vacuity: no growth ({cursors!r})"
+        b.rename(a)
+        _home(monkeypatch, a)
+        scope, _evidence = _fresh(cache, conn)
+        assert scope is None, "withheld B, whose copy is ahead of A's"
+        grown = [row for row in _visible(cache, conn, scope)
+                 if row[2] == source_root_key(str(b)) and row[1] >= x]
+        assert grown, "B's appended rows are hidden"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_no_lag_gate_caught_up_store_withholds_on_first_resolution(
+    tmp_path, monkeypatch, compressed,
+):
+    """(vi) A fresh process over a caught-up store withholds on its first
+    resolution, also when the current copy is the `.jsonl.zst` twin of the
+    retired plain copy (progress is the decoded-stream offset)."""
+    ns, cache = _gate_store(tmp_path, monkeypatch)
+    a, b = tmp_path / "a", tmp_path / "b"
+    write_rollout(a / "sessions" / "r.jsonl", token_records(2, session_id="r"))
+    _home(monkeypatch, a)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        a.rename(b)
+        if compressed:
+            compress_in_place(b / "sessions" / "r.jsonl")
+        _home(monkeypatch, b)
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        cursors = _cursors(conn)
+        assert cursors[str(b / "sessions" / "r.jsonl")][1] == (
+            cursors[str(a / "sessions" / "r.jsonl")][1]), cursors
+    finally:
+        conn.close()
+    fresh = ns["open_cache_db"]()
+    try:
+        scope, _evidence = _fresh(cache, fresh)
+        assert scope is not None and scope.recognized_root_keys
+        assert {root for _p, _o, root in _visible(cache, fresh, scope)} == {
+            source_root_key(str(b))}
+    finally:
+        fresh.close()
+
+
+def test_no_lag_gate_ignores_rollouts_without_a_retired_copy(tmp_path, monkeypatch):
+    """(vii) A brand-new rollout under a current root, and an unrelated home
+    switch (#108's deliberate A -> C scoping), never block."""
+    ns, cache = _gate_store(tmp_path, monkeypatch)
+    a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+    write_rollout(a / "sessions" / "r.jsonl", token_records(2, session_id="r"))
+    _home(monkeypatch, a)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        a.rename(b)
+        _home(monkeypatch, b)
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        write_rollout(b / "sessions" / "new.jsonl", token_records(1, session_id="n"))
+        scope, _evidence = _fresh(cache, conn)
+        assert scope is not None and scope.recognized_root_keys
+        write_rollout(c / "sessions" / "other.jsonl",
+                      token_records(1, session_id="o"))
+        _home(monkeypatch, c)
+        scope, _evidence = _fresh(cache, conn)
+        assert scope is not None and scope.recognized_root_keys
+        assert _visible(cache, conn, scope) == []
+    finally:
+        conn.close()
+
+
+def test_no_lag_gate_covers_unrecognized_configured_roots(tmp_path, monkeypatch):
+    """Mixed recognition: configured A is recognized, B was relocated to C,
+    and 32 newer unrecognizable files under C push C's recognizable rollout
+    out of the bounded recognition probe. A's recognition authorizes
+    withholding every retired root, B included, so C's copy of B's rollout
+    must be checked too: before C is ingested it lags, and B stays visible.
+    Failure it detects: B's rows vanishing because the gate looked only at
+    rollouts under recognized roots."""
+    ns, cache = _gate_store(tmp_path, monkeypatch)
+    a, b, c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+    write_rollout(a / "sessions" / "own.jsonl", token_records(1, session_id="o"))
+    write_rollout(b / "sessions" / "r.jsonl", token_records(2, session_id="r"))
+    _home(monkeypatch, a, b)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        before = _visible(cache, conn, None)
+        b.rename(c)
+        for index in range(cache._CODEX_ROOT_RECOGNITION_MAX_FILES):
+            write_rollout(c / "sessions" / f"z-{index:02d}.jsonl",
+                          [{"type": "future-record", "payload": {}}])
+        _home(monkeypatch, a, c)
+        probe = cache._codex_prune_scope(cache._discover_codex_files_with_roots())
+        assert probe.recognized_root_keys == {source_root_key(str(a))}, (
+            "non-vacuity: C must be configured but unrecognized")
+        scope, _evidence = _fresh(cache, conn)
+        assert scope is None, "withheld B, whose only current copy lags"
+        assert _visible(cache, conn, scope) == before
+    finally:
+        conn.close()
+
+
+def test_no_lag_gate_retained_verdict_never_outlives_cursor_growth(
+    tmp_path, monkeypatch,
+):
+    """The retained-owner round trip: retired A and current B both ingested
+    through X, and the owner retains a lag-free verdict for K={B}, C={A}.
+    Between ticks B->A, Y is appended, A is ingested through X+Y, then A->B
+    before B is re-ingested. The next resolution sees the same K and C within
+    the bound, so it may reuse the discovery, but the verdict is evaluated
+    against the current cursors and blocks. Failure it detects: a retained
+    verdict withholding A and hiding Y."""
+    ns, cache = _gate_store(tmp_path, monkeypatch)
+    a, b = tmp_path / "a", tmp_path / "b"
+    write_rollout(a / "sessions" / "r.jsonl", token_records(2, session_id="r"))
+    _home(monkeypatch, a)
+    conn = ns["open_cache_db"]()
+    calls: list = []
+    discover = _counting_discover(cache, calls)
+    try:
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        a.rename(b)
+        _home(monkeypatch, b)
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        scope, evidence = cache.resolve_codex_read_scope(
+            conn, sync_stats=None, retained=None, now_monotonic=100.0,
+            discover=discover)
+        assert scope is not None and evidence.lag_free, (
+            "non-vacuity: the caught-up copy must withhold first")
+        b.rename(a)
+        write_rollout(a / "sessions" / "r.jsonl", token_records(4, session_id="r"))
+        _home(monkeypatch, a)
+        ns["sync_codex_cache"](conn, maintenance="caller")
+        a.rename(b)
+        _home(monkeypatch, b)
+        cursors = _cursors(conn)
+        x = cursors[str(b / "sessions" / "r.jsonl")][1]
+        assert x < cursors[str(a / "sessions" / "r.jsonl")][1], (
+            f"non-vacuity: A did not grow past B ({cursors!r})")
+        held, kept = cache.resolve_codex_read_scope(
+            conn, sync_stats=None, retained=evidence, now_monotonic=101.0,
+            discover=discover)
+        assert len(calls) == 1, "non-vacuity: the discovery was not reused"
+        assert (kept.configured_root_keys, kept.candidate_root_keys) == (
+            evidence.configured_root_keys, evidence.candidate_root_keys)
+        assert kept.observed_at == evidence.observed_at
+        assert held is None, "a retained verdict hid A's growth"
+        grown = [row for row in _visible(cache, conn, held)
+                 if row[2] == source_root_key(str(a)) and row[1] >= x]
+        assert grown, "A's appended rows are hidden"
+    finally:
+        conn.close()
+
+
+def _new_rollout_round_trip(ns, cache, tmp_path, monkeypatch, conn):
+    """Retired A and current B caught up on `r.jsonl`; returns B's sync stats
+    and a resolution's evidence taken then. Afterwards, between ticks, B->A,
+    a NEW rollout `n.jsonl` is created and ingested under A, then A->B before
+    B is re-ingested: `n` is a retired-root cursor the evidence's discovery
+    never saw, and B holds no copy of it yet."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    write_rollout(a / "sessions" / "r.jsonl", token_records(2, session_id="r"))
+    _home(monkeypatch, a)
+    ns["sync_codex_cache"](conn, maintenance="caller")
+    a.rename(b)
+    _home(monkeypatch, b)
+    caught_up = ns["sync_codex_cache"](conn, maintenance="caller")
+    scope, evidence = cache.resolve_codex_read_scope(
+        conn, sync_stats=None, retained=None, now_monotonic=100.0)
+    assert scope is not None and evidence.lag_free, (
+        "non-vacuity: the caught-up copy must withhold first")
+    b.rename(a)
+    write_rollout(a / "sessions" / "n.jsonl", token_records(2, session_id="n"))
+    _home(monkeypatch, a)
+    ns["sync_codex_cache"](conn, maintenance="caller")
+    a.rename(b)
+    _home(monkeypatch, b)
+    new_retired = str(a / "sessions" / "n.jsonl")
+    assert _cursors(conn)[new_retired][0] == source_root_key(str(a)), (
+        "non-vacuity: n was not ingested under the retired root")
+    assert str(b / "sessions" / "n.jsonl") not in _cursors(conn), (
+        "non-vacuity: B already holds n")
+    return caught_up, evidence, new_retired
+
+
+@pytest.mark.parametrize("source", ["retained", "sync"])
+def test_no_lag_gate_reused_discovery_never_hides_a_new_rollout(
+    tmp_path, monkeypatch, source,
+):
+    """#1108 V1: the new-rollout variant of the retained-owner round trip.
+    K and C are unchanged and inside the bound, so the reused discovery (the
+    retained evidence's, or the tick's whole-walk sync's) holds only
+    `r.jsonl`, and `n`'s retired copy is never compared. Failure it detects:
+    A withheld on that stale discovery, so `n`'s accounting vanishes from
+    the frame (and every idle tick that reuses it)."""
+    ns, cache = _gate_store(tmp_path, monkeypatch)
+    conn = ns["open_cache_db"]()
+    try:
+        caught_up, evidence, new_retired = _new_rollout_round_trip(
+            ns, cache, tmp_path, monkeypatch, conn)
+        if source == "retained":
+            held, _kept = cache.resolve_codex_read_scope(
+                conn, sync_stats=None, retained=evidence, now_monotonic=101.0)
+        else:
+            held, _kept = cache.resolve_codex_read_scope(
+                conn, sync_stats=caught_up, retained=None,
+                now_monotonic=caught_up.whole_walk_scope_observed_at)
+        assert held is None, "a stale discovery withheld the new rollout"
+        assert any(path == new_retired
+                   for path, _o, _r in _visible(cache, conn, held)), (
+            "n's accounting is hidden")
+    finally:
+        conn.close()
+
+
+def test_build_recheck_downgrades_on_a_new_retired_root_cursor(
+    tmp_path, monkeypatch,
+):
+    """#1108 V1, the build-read variant: a new retired-root cursor appears
+    between the owner's resolution and the build's pinned read. Failure it
+    detects: the build's binding re-check (`codex_read_scope_lags`) judged
+    the resolution's discovery lag-free and applied the scope, hiding `n`."""
+    ns, cache = _gate_store(tmp_path, monkeypatch)
+    conn = ns["open_cache_db"]()
+    try:
+        _caught_up, evidence, _new = _new_rollout_round_trip(
+            ns, cache, tmp_path, monkeypatch, conn)
+        assert cache.codex_read_scope_lags(conn, evidence), (
+            "the build applied a scope whose discovery missed a new rollout")
     finally:
         conn.close()
 

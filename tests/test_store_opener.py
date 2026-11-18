@@ -19,8 +19,9 @@ therefore grabs the fresh sibling modules from ``sys.modules`` AFTER
 ``load_script()`` and monkeypatches those.
 """
 import sqlite3
-import types
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -56,33 +57,145 @@ def _fresh_siblings():
     return sys.modules["_cctally_store"], sys.modules["_cctally_db"]
 
 
-def test_raw_epoch_probe_reads_the_header_without_opening_sqlite(
+def _family(path: Path) -> dict:
+    """Every member of `path`'s SQLite family that exists, by suffix."""
+    return {suffix: Path(f"{path}{suffix}").read_bytes()
+            for suffix in ("", "-wal", "-shm", "-journal")
+            if Path(f"{path}{suffix}").exists()}
+
+
+def _copy_family(path: Path, dest_dir: Path) -> Path:
+    dest_dir.mkdir()
+    dest = dest_dir / path.name
+    for suffix, data in _family(path).items():
+        Path(f"{dest}{suffix}").write_bytes(data)
+    return dest
+
+
+def test_epoch_hint_reads_a_wal_header_without_materializing_sidecars(
     tmp_path, monkeypatch
 ):
-    """The deferred-epoch probe must not bypass maintenance opener fencing."""
+    """#1100: the deferred-epoch hint replaced its raw descriptor read (which
+    dropped this process's own SQLite locks on close) with an immutable
+    read, and must still leave a sidecar-less WAL-header family exactly as it
+    was. Detects: a hint read that creates -wal/-shm beside a previous-epoch
+    family, which the #538 transition must find cold."""
     path = tmp_path / "stats.db"
     conn = sqlite3.connect(path)
     try:
-        conn.execute("PRAGMA journal_mode=DELETE")
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        conn.execute("CREATE TABLE t (x)")
         conn.execute("PRAGMA user_version=1009")
         conn.commit()
     finally:
         conn.close()
+    before = _family(path)
+    assert set(before) == {""} and before[""][18:20] == b"\x02\x02"
 
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     store, _db = _fresh_siblings()
-
-    def forbidden_connect(*_args, **_kwargs):
-        raise AssertionError("raw epoch probe opened SQLite")
-
-    # #630 S2: patch the IMPORTER's reference, never the shared
-    # stdlib module object, which every other importer and every
-    # concurrent thread resolves through.
-    _iso_sqlite3 = types.SimpleNamespace(**vars(store.sqlite3))
-    _iso_sqlite3.connect = forbidden_connect
-    monkeypatch.setattr(store, "sqlite3", _iso_sqlite3)
     assert store._raw_user_version(path) == 1009
+    assert _family(path) == before
+
+    # Control: an ordinary read-only SQLite open of a copy does create them,
+    # so the assertion above can tell the two reads apart.
+    copy = _copy_family(path, tmp_path / "control")
+    control = sqlite3.connect(f"{copy.as_uri()}?mode=ro", uri=True)
+    try:
+        control.execute("SELECT count(*) FROM sqlite_master").fetchall()
+        assert set(_family(copy)) > {""}
+    finally:
+        control.close()
+
+
+def test_epoch_hint_never_rolls_back_a_hot_journal(tmp_path, monkeypatch):
+    """#1100: the hint reads the main file's header and never rolls back a
+    hot -journal. Detects: a hint read that recovers (and so mutates) a
+    crash-left family outside the guarded opener's maintenance fence."""
+    path = tmp_path / "stats.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("CREATE TABLE t (x)")
+        conn.execute("PRAGMA user_version=1009")
+        conn.commit()
+    finally:
+        conn.close()
+    size = path.stat().st_size
+    # A writer that dies mid-transaction after its pages spilled into the
+    # main file: the journal is hot and the main file inconsistent.
+    code = "\n".join([
+        "import os, sqlite3",
+        f"c = sqlite3.connect({str(path)!r}, isolation_level=None)",
+        "c.execute('PRAGMA synchronous=OFF')",
+        "c.execute('PRAGMA cache_size=5')",
+        "c.execute('BEGIN IMMEDIATE')",
+        "c.execute('CREATE TABLE crash (x)')",
+        ("c.execute(\"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 "
+         "FROM n WHERE i<400) INSERT INTO crash SELECT randomblob(3000) "
+         "FROM n\")"),
+        "os._exit(0)",
+    ])
+    subprocess.run([sys.executable, "-c", code], check=True)
+    journal = Path(f"{path}-journal")
+    assert journal.read_bytes()[:8] != b"\0" * 8
+    assert path.stat().st_size > size
+    before = _family(path)
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    store, _db = _fresh_siblings()
+    assert store._raw_user_version(path) == 1009
+    assert _family(path) == before
+
+    # Control: an ordinary open of a copy rolls the journal back.
+    copy = _copy_family(path, tmp_path / "control")
+    control = sqlite3.connect(copy)
+    try:
+        control.execute("SELECT count(*) FROM sqlite_master").fetchall()
+    finally:
+        control.close()
+    assert _family(copy) != before
+
+
+def test_epoch_hint_does_not_wait_on_the_maintenance_fence(
+    tmp_path, monkeypatch
+):
+    """#1100: the hint reads without the guarded opener's maintenance-shared
+    wait, so an ordinary open can still decide to defer while a rebuild
+    holds maintenance. Detects: a hint that blocks every stats open behind a
+    running rebuild."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    store, _db = _fresh_siblings()
+    path = _cctally_core.DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA user_version=1009")
+        conn.commit()
+    finally:
+        conn.close()
+    lock_path = _cctally_core.STATS_LOCK_MAINTENANCE_PATH
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import fcntl,sys\n"
+         "f=open(sys.argv[1],'w')\n"
+         "fcntl.flock(f,fcntl.LOCK_EX)\n"
+         "print('held',flush=True)\n"
+         "sys.stdin.read()\n",
+         str(lock_path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        started = time.monotonic()
+        assert store._raw_user_version(path) == 1009
+        elapsed = time.monotonic() - started
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=30)
+    assert elapsed < store._STATS_OPEN_MAINTENANCE_WAIT_S / 5
 
 
 # --------------------------------------------------------------------------

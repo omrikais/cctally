@@ -358,9 +358,18 @@ _HEADER_CACHE_LOCK = threading.Lock()
 _HEADER_CACHE_MAX = 64
 _HEADER_PROBE_TIMEOUT_S = 2.0
 _USR_BIN_HEAD = "/usr/bin/head"
-#: The interpreter fallback's program (AD19): reads exactly 20 bytes.
-_HEADER_PROBE_SCRIPT = ("import sys;sys.stdout.buffer.write("
-                        "open(sys.argv[1],'rb').read(20))")
+
+
+def _header_probe_script(length: int) -> str:
+    """The interpreter fallback's program (AD19), reading exactly LENGTH
+    bytes (#1100: 20 for the WAL-header check, 64 for the user-version
+    fallback)."""
+    return ("import sys;sys.stdout.buffer.write("
+            f"open(sys.argv[1],'rb').read({int(length)}))")
+
+
+#: The interpreter fallback's 20-byte program (AD19).
+_HEADER_PROBE_SCRIPT = _header_probe_script(20)
 #: The probe's program choice, decided once per process (AD19): True for
 #: /usr/bin/head, False for the interpreter fallback, None until decided.
 _HEAD_ARGV0: "bool | None" = None
@@ -375,15 +384,16 @@ def _usr_bin_head_usable() -> bool:
     return stat.S_ISREG(st.st_mode) and os.access(_USR_BIN_HEAD, os.X_OK)
 
 
-def _header_probe_argv(path) -> "list[str]":
-    """Exactly one of the two AD19 argv shapes; PATH is never consulted."""
+def _header_probe_argv(path, length: int = 20) -> "list[str]":
+    """Exactly one of the two AD19 argv shapes, reading LENGTH bytes; PATH is
+    never consulted."""
     global _HEAD_ARGV0
     if _HEAD_ARGV0 is None:
         _HEAD_ARGV0 = bool(_usr_bin_head_usable())
     if _HEAD_ARGV0:
-        return [_USR_BIN_HEAD, "-c", "20", str(path)]
-    return [sys.executable, "-I", "-S", "-B", "-c", _HEADER_PROBE_SCRIPT,
-            str(path)]
+        return [_USR_BIN_HEAD, "-c", str(int(length)), str(path)]
+    return [sys.executable, "-I", "-S", "-B", "-c",
+            _header_probe_script(length), str(path)]
 
 
 #: AD19 (spec revision 13): the cleanup reserve inside the probe's deadline.
@@ -441,15 +451,20 @@ def _reap_header_probe(proc, deadline: float) -> None:
                 pass
 
 
-def _run_header_probe(path) -> "bytes | None":
-    """The header bytes from the AD19 child, or None (fail closed)."""
+def _run_header_probe(path, length: int = 20) -> "bytes | None":
+    """The first LENGTH header bytes from the AD19 child, or None (fail
+    closed)."""
     deadline = _header_probe_deadline()
     reserve = _HEADER_PROBE_CLEANUP_RESERVE_S
     if deadline - time.monotonic() < reserve:
         return None                 # refuse without spawning
+    # The 20-byte call keeps its one-argument shape (#1100): only the
+    # user-version fallback passes a length.
+    argv = (_header_probe_argv(path) if length == 20
+            else _header_probe_argv(path, length))
     try:
         proc = subprocess.Popen(
-            _header_probe_argv(path), shell=False, env={},
+            argv, shell=False, env={},
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, close_fds=True)
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -536,7 +551,37 @@ def seed_header_verdicts(entries, *, learned: bool = False) -> None:
                 _HEADER_PROBED[key] = verdict
 
 
-def _stats_header_kind(path: pathlib.Path) -> "str | None":
+def _classify_header_bytes(out: bytes) -> str:
+    """The verdict for at least the first 20 header bytes of a non-empty
+    file: ``"wal"``, ``"rollback"`` or ``"invalid"`` (not an SQLite
+    header). The one classification both `_stats_header_kind` modes use."""
+    if len(out) < 20 or out[:16] != b"SQLite format 3\x00":
+        return "invalid"
+    return "wal" if (out[18] == 2 or out[19] == 2) else "rollback"
+
+
+def _header_verdict(st, out: bytes) -> "str | None":
+    """The verdict for the probe output OUT of a file whose pre-probe stat
+    is ST, or None for a short read (fail closed)."""
+    if not st.st_size:
+        return "rollback"
+    if len(out) < min(20, st.st_size):
+        return None                 # short read: fail closed
+    return _classify_header_bytes(out)
+
+
+def _remember_header_verdict(key: tuple, result: str) -> None:
+    with _HEADER_CACHE_LOCK:
+        if len(_HEADER_CACHE) >= _HEADER_CACHE_MAX:
+            _HEADER_CACHE.clear()
+        if len(_HEADER_PROBED) >= _HEADER_CACHE_MAX:
+            _HEADER_PROBED.clear()
+        _HEADER_CACHE[key] = result
+        _HEADER_PROBED[key] = result
+
+
+def _stats_header_kind(path: pathlib.Path, *,
+                       fresh: bool = False) -> "str | None":
     """Whether stats.db's main header declares WAL, read WITHOUT a descriptor
     in this process (spec 5.6, AD19).
 
@@ -552,33 +597,37 @@ def _stats_header_kind(path: pathlib.Path) -> "str | None":
     mtime_ns, ctime_ns). Returns ``"wal"``, ``"rollback"`` (an empty file
     included), ``"invalid"`` (not an SQLite header) or None when it cannot be
     read (a spawn error, a timeout, a non-zero exit or short output: fail
-    closed as ``unavailable``)."""
+    closed as ``unavailable``).
+
+    FRESH (#1100, the maintenance callers' legacy-WAL check) skips the cache
+    lookup, because a same-size change within timestamp granularity can keep
+    a stat key and a stale verdict would weaken that detection. It stats the
+    path again after the child and returns None, caching and recording
+    nothing, when the identity moved: that capture certifies nothing. A
+    verdict it does accept is cached as an ordinary probe's."""
     try:
         st = os.stat(path)
     except OSError:
         return None
     key = _header_stat_key(st)
-    with _HEADER_CACHE_LOCK:
-        if key in _HEADER_CACHE:
-            return _HEADER_CACHE[key]
+    if not fresh:
+        with _HEADER_CACHE_LOCK:
+            if key in _HEADER_CACHE:
+                return _HEADER_CACHE[key]
     out = _run_header_probe(path)
     if out is None:
         return None
-    if not st.st_size:
-        result = "rollback"
-    elif len(out) < min(20, st.st_size):
-        return None                 # short read: fail closed
-    elif len(out) < 20 or out[:16] != b"SQLite format 3\x00":
-        result = "invalid"
-    else:
-        result = "wal" if (out[18] == 2 or out[19] == 2) else "rollback"
-    with _HEADER_CACHE_LOCK:
-        if len(_HEADER_CACHE) >= _HEADER_CACHE_MAX:
-            _HEADER_CACHE.clear()
-        if len(_HEADER_PROBED) >= _HEADER_CACHE_MAX:
-            _HEADER_PROBED.clear()
-        _HEADER_CACHE[key] = result
-        _HEADER_PROBED[key] = result
+    if fresh:
+        try:
+            after = os.stat(path)
+        except OSError:
+            return None
+        if _header_stat_key(after) != key:
+            return None             # the capture straddled a change
+    result = _header_verdict(st, out)
+    if result is None:
+        return None
+    _remember_header_verdict(key, result)
     return result
 
 

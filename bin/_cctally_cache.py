@@ -2930,7 +2930,12 @@ def _codex_stable_absence(path: str, root: "CodexProviderRoot", *,
     return "unknown"
 
 
-def _codex_prune_scope(files: list[CodexDiscoveredFile]) -> _CodexPruneScope:
+def codex_configured_root_keys() -> frozenset[str]:
+    """The live configured root keys ``K`` (#1108 spec §3.2 step 1).
+
+    The same canonicalization ``_codex_prune_scope`` applies: each configured
+    home is resolved, so a symlink relocation changes its key.
+    """
     configured: set[str] = set()
     for raw_root in _cctally()._codex_home_roots():
         try:
@@ -2938,6 +2943,11 @@ def _codex_prune_scope(files: list[CodexDiscoveredFile]) -> _CodexPruneScope:
             configured.add(source_root_key(str(provider_root)))
         except (OSError, TypeError, ValueError):
             continue
+    return frozenset(configured)
+
+
+def _codex_prune_scope(files: list[CodexDiscoveredFile]) -> _CodexPruneScope:
+    configured = set(codex_configured_root_keys())
     recognized: set[str] = set()
     checked_per_root: dict[str, int] = {}
     # Discovery is stable oldest-first for Codex's dated rollout paths. Probe
@@ -2957,6 +2967,388 @@ def _codex_prune_scope(files: list[CodexDiscoveredFile]) -> _CodexPruneScope:
         configured_root_keys=frozenset(configured),
         recognized_root_keys=frozenset(recognized),
     )
+
+
+# ── #1108: the current-root read scope ──────────────────────────────────────
+# One predicate, extracted from `iter_codex_entries`, decides which retained
+# rows a presentation read withholds while a relocated root's identities wait
+# in `codex_prune_debt`. The scope grants read filtering only: it never
+# certifies an ingest, and never touches the frontier or the debt hold.
+
+#: How long canonical scope evidence may be reused while neither the
+#: configured keys nor the withholding candidates change (spec §3.2 step 4).
+CODEX_READ_SCOPE_MAX_AGE_S: float = 60.0
+
+
+def codex_row_withheld(scope: "_CodexPruneScope | None",
+                       source_root_key: "str | None",
+                       source_path: "str | bytes") -> bool:
+    """Whether a presentation read withholds this row (#1108 spec §3.1).
+
+    True only with positive recognizable-root evidence, an identity outside
+    the configured roots, and an absolute path; NULL identities and relative
+    fixture paths are always kept.
+    """
+    return (
+        scope is not None
+        and bool(scope.recognized_root_keys)
+        and source_root_key is not None
+        and source_root_key not in scope.configured_root_keys
+        and os.path.isabs(source_path)
+    )
+
+
+def codex_root_withheld(scope: "_CodexPruneScope | None",
+                        root_key: "str | None") -> bool:
+    """``codex_row_withheld`` without the path clause, for quota root sets."""
+    return (
+        scope is not None
+        and bool(scope.recognized_root_keys)
+        and root_key is not None
+        and root_key not in scope.configured_root_keys
+    )
+
+
+def codex_root_scope_identity(
+    scope: "_CodexPruneScope | None",
+) -> "tuple[tuple[str, ...], bool] | None":
+    """The one identity every signature and reuse key uses for a scope."""
+    if scope is None:
+        return None
+    return (tuple(sorted(scope.configured_root_keys)),
+            bool(scope.recognized_root_keys))
+
+
+def codex_root_scope_sql(scope: "_CodexPruneScope | None",
+                         alias: str) -> "tuple[str, tuple[str, ...]]":
+    """The SQL complement of ``codex_row_withheld`` over ``alias`` (§3.3).
+
+    Empty (so the statement is byte-identical) unless the scope can withhold.
+    The ``CAST`` makes a BLOB path agree with ``os.path.isabs``.
+    """
+    if scope is None or not scope.recognized_root_keys:
+        return "", ()
+    keys = tuple(sorted(scope.configured_root_keys))
+    if keys:
+        member = (f" OR {alias}.source_root_key IN "
+                  f"({','.join('?' for _ in keys)})")
+    else:
+        member = ""
+    return (
+        f" AND ({alias}.source_root_key IS NULL{member}"
+        f" OR substr(CAST({alias}.source_path AS TEXT), 1, 1) <> '/')",
+        keys,
+    )
+
+
+@dataclass(frozen=True)
+class CodexReadScopeEvidence:
+    """A canonical scope with its age anchor and the ``(K, C)`` it matched.
+
+    ``observed_at`` is the monotonic instant taken immediately before the
+    scope's discovery began; retaining or reusing the evidence never moves it.
+    ``discovered`` is that discovery as ``(logical path, root key)`` pairs,
+    kept so the no-lag gate (spec §3.2 step 2a) can be re-evaluated against
+    the CURRENT cursors on every resolution and on the build's own pinned
+    read: the age bound governs reuse of the discovery, never of the verdict.
+    ``lag_free`` is the verdict of the resolution that returned this evidence:
+    False means some current copy lags a retired copy (or the discovery
+    missed a newer retired cursor), so that resolution reads under no scope.
+    ``retired_witness`` is the set of cursor paths outside the configured
+    roots, read immediately BEFORE the discovery began (the ``observed_at``
+    anchoring): a retired-root cursor absent from it, whose rollout the
+    discovery does not hold either, appeared after the discovery and makes
+    the discovery stale. ``None`` means no witness, so any such cursor does.
+    """
+
+    scope: _CodexPruneScope
+    observed_at: float
+    configured_root_keys: frozenset[str]
+    candidate_root_keys: frozenset[str]
+    lag_free: bool = True
+    discovered: "tuple[tuple[str, str], ...]" = ()
+    retired_witness: "frozenset[str] | None" = None
+
+    @property
+    def read_scope(self) -> "_CodexPruneScope | None":
+        """The scope a read uses under this evidence."""
+        return self.scope if self.lag_free else None
+
+
+def codex_withholding_candidates(
+    cache_conn: sqlite3.Connection,
+    configured_root_keys: frozenset[str],
+) -> frozenset[str]:
+    """Root keys outside ``K`` in the accounting rows or the registry.
+
+    One index seek per distinct ``codex_session_entries.source_root_key``
+    (a skip scan over ``idx_codex_entries_root_path``), then the registry.
+    """
+    keys: set[str] = set()
+    row = cache_conn.execute(
+        "SELECT MIN(source_root_key) FROM codex_session_entries "
+        "WHERE source_root_key IS NOT NULL"
+    ).fetchone()
+    while row is not None and row[0] is not None:
+        keys.add(row[0])
+        row = cache_conn.execute(
+            "SELECT MIN(source_root_key) FROM codex_session_entries "
+            "WHERE source_root_key > ?", (row[0],)
+        ).fetchone()
+    keys.update(
+        key for (key,) in cache_conn.execute(
+            "SELECT source_root_key FROM codex_source_roots")
+        if key is not None)
+    return frozenset(keys - set(configured_root_keys))
+
+
+def codex_retired_cursor_witness(
+    cache_conn: sqlite3.Connection,
+    configured_root_keys: frozenset[str],
+) -> frozenset[str]:
+    """The cursor paths outside ``configured_root_keys`` (#1108 V1).
+
+    Read immediately before a discovery begins, so the no-lag gate can tell
+    a retired-root cursor the discovery already accounts for from one that
+    appeared after it (``CodexReadScopeEvidence.retired_witness``). A set of
+    paths rather than a ``MAX(rowid)``: the cursor table reuses a deleted
+    maximum rowid, so a rowid witness can miss a newer row.
+    """
+    keys = sorted(configured_root_keys)
+    member = (f" AND source_root_key NOT IN ({','.join('?' for _ in keys)})"
+              if keys else "")
+    return frozenset(
+        str(cursor_path) for (cursor_path,) in cache_conn.execute(
+            "SELECT path FROM codex_session_files "
+            "WHERE source_root_key IS NOT NULL" + member, keys))
+
+
+#: The no-lag gate's three verdicts (#1108 spec §3.2 step 2a, V1).
+_CODEX_GATE_WITHHOLD = "withhold"
+_CODEX_GATE_LAG = "lag"
+_CODEX_GATE_STALE = "stale"
+
+
+def _codex_read_scope_verdict(
+    cache_conn: sqlite3.Connection,
+    scope: _CodexPruneScope,
+    candidate_root_keys: frozenset[str],
+    discovered: "Iterable[tuple[str, str]]",
+    retired_witness: "frozenset[str] | None",
+) -> str:
+    """The no-lag gate (#1108 spec §3.2 step 2a): whether withholding the
+    retired roots would hide progress that only a retired copy holds.
+
+    ``discovered`` is the scope's own discovery as ``(logical path, root
+    key)`` pairs. A rollout's identity is the file name of its logical path,
+    which survives compression and archive moves and carries the rollout's
+    UUID. Recognition of some configured root is what authorizes withholding
+    at all, but it withholds EVERY retired root, so the check covers rollouts
+    under every configured root ``R``, recognized or not: for each one that
+    also appears by identity in a cursor under a candidate (retired) root,
+    the current copy must hold its own cursor (that logical path,
+    ``source_root_key = R``) whose progress is at least the largest retired
+    copy's, or the verdict is ``lag``. A rollout with no retired copy never
+    blocks.
+
+    A discovery may authorize withholding only while it accounts for every
+    retired-root cursor that existed when it was taken (V1). A retired cursor
+    whose rollout the discovery does not hold, and whose path is absent from
+    ``retired_witness`` (read before the discovery), appeared after it: a
+    rollout created and ingested under a retired root during a round trip
+    the reused discovery never saw. The verdict is then ``stale``, which a
+    resolution answers with a new discovery and a build with no scope. A
+    retired-only rollout the witness holds (#108's unrelated home) stays
+    withheld.
+
+    Progress is ``last_byte_offset``: the committed offset in the DECODED
+    stream, which a plain ``.jsonl`` and its ``.jsonl.zst`` twin share (the
+    walk seeks that offset in ``open_decoded`` for either container, and the
+    line anchor proves the prefix equal across a compression). It is
+    comparable across containers; ``size_bytes`` is the scan target, not
+    committed progress, and ``decoded_size_bytes`` is NULL on plain cursors.
+
+    Cache-side only: one read of the retired roots' cursors and, when any
+    exists, one of the configured roots' cursors. Nothing is persisted.
+    """
+    if not scope.recognized_root_keys or not candidate_root_keys:
+        return _CODEX_GATE_WITHHOLD
+    retired_keys = sorted(candidate_root_keys)
+    retired: dict[str, int] = {}
+    retired_paths: list[str] = []
+    for cursor_path, offset in cache_conn.execute(
+            "SELECT path, last_byte_offset FROM codex_session_files "
+            f"WHERE source_root_key IN ({','.join('?' for _ in retired_keys)})",
+            retired_keys):
+        identity = os.path.basename(str(cursor_path))
+        progress = int(offset or 0)
+        if progress > retired.get(identity, -1):
+            retired[identity] = progress
+        retired_paths.append(str(cursor_path))
+    if not retired:
+        return _CODEX_GATE_WITHHOLD
+    current_discovered = [
+        (str(logical), root) for logical, root in discovered
+        if root in scope.configured_root_keys
+    ]
+    held = {os.path.basename(logical) for logical, _root in current_discovered}
+    for cursor_path in retired_paths:
+        if os.path.basename(cursor_path) in held:
+            continue
+        if retired_witness is None or cursor_path not in retired_witness:
+            return _CODEX_GATE_STALE
+    pending = [
+        (logical, root) for logical, root in current_discovered
+        if os.path.basename(logical) in retired
+    ]
+    if not pending:
+        return _CODEX_GATE_WITHHOLD
+    current_keys = sorted(scope.configured_root_keys)
+    current: dict[tuple[str, str], int] = {
+        (str(cursor_path), root): int(offset or 0)
+        for cursor_path, root, offset in cache_conn.execute(
+            "SELECT path, source_root_key, last_byte_offset "
+            "FROM codex_session_files WHERE source_root_key IN "
+            f"({','.join('?' for _ in current_keys)})", current_keys)
+    } if current_keys else {}
+    for logical, root in pending:
+        own = current.get((logical, root))
+        if own is None or own < retired[os.path.basename(logical)]:
+            return _CODEX_GATE_LAG
+    return _CODEX_GATE_WITHHOLD
+
+
+def resolve_codex_read_scope(
+    cache_conn: sqlite3.Connection,
+    *,
+    sync_stats: "CodexIngestStats | None",
+    retained: "CodexReadScopeEvidence | None",
+    now_monotonic: float,
+    discover: "Callable[[], list[CodexDiscoveredFile]] | None" = None,
+) -> "tuple[_CodexPruneScope | None, CodexReadScopeEvidence | None]":
+    """The scope an owner tick reads under, and the evidence to retain.
+
+    #1108 spec §3.2 steps 1-5, in order: live ``K``; the candidate set ``C``
+    (empty means no scope, with no discovery and no recognition probe); this
+    tick's whole-walk sync scope when its keys equal ``K``, its age is within
+    ``CODEX_READ_SCOPE_MAX_AGE_S`` and it carries a retired-cursor witness;
+    the retained evidence while ``(K, C)`` is unchanged and young enough;
+    otherwise canonical discovery, anchored to ``now_monotonic`` (taken by
+    the caller before this call, so the anchor precedes the discovery) with
+    its witness read before the discovery as well.
+
+    Step 2a, the no-lag gate (``_codex_read_scope_verdict``), is evaluated on
+    the same discovery as the scope: the sync's discovered list against this
+    post-sync connection, or the canonical discovery. Reused evidence keeps
+    its discovery (and its age anchor) but never its verdict: the gate is
+    re-evaluated against this connection's cursors on every resolution, so a
+    round trip between ticks that grows a retired copy blocks at once. A
+    lagging copy resolves to no scope. A reused discovery the gate finds
+    stale (a retired-root cursor newer than its witness, for a rollout it
+    does not hold) is not used: the resolution falls through to the next
+    step, and a fresh canonical discovery that is already stale reads under
+    no scope.
+    """
+    configured = codex_configured_root_keys()
+    candidates = codex_withholding_candidates(cache_conn, configured)
+    if not candidates:
+        return None, None
+    sync_scope = getattr(sync_stats, "whole_walk_scope", None)
+    sync_observed = getattr(sync_stats, "whole_walk_scope_observed_at", None)
+    sync_discovered = getattr(sync_stats, "whole_walk_discovered", None)
+    sync_witness = getattr(sync_stats, "whole_walk_retired_witness", None)
+    if (
+        sync_scope is not None and sync_observed is not None
+        and sync_discovered is not None
+        and sync_witness is not None
+        and sync_witness[0] == configured
+        and sync_scope.configured_root_keys == configured
+        and now_monotonic - sync_observed <= CODEX_READ_SCOPE_MAX_AGE_S
+    ):
+        discovered = tuple(sync_discovered)
+        verdict = _codex_read_scope_verdict(
+            cache_conn, sync_scope, candidates, discovered, sync_witness[1])
+        if verdict != _CODEX_GATE_STALE:
+            evidence = CodexReadScopeEvidence(
+                scope=sync_scope, observed_at=sync_observed,
+                configured_root_keys=configured,
+                candidate_root_keys=candidates,
+                lag_free=verdict == _CODEX_GATE_WITHHOLD,
+                discovered=discovered, retired_witness=sync_witness[1])
+            return evidence.read_scope, evidence
+    if (
+        retained is not None
+        and retained.configured_root_keys == configured
+        and retained.candidate_root_keys == candidates
+        and now_monotonic - retained.observed_at <= CODEX_READ_SCOPE_MAX_AGE_S
+    ):
+        verdict = _codex_read_scope_verdict(
+            cache_conn, retained.scope, candidates, retained.discovered,
+            retained.retired_witness)
+        if verdict != _CODEX_GATE_STALE:
+            lag_free = verdict == _CODEX_GATE_WITHHOLD
+            if lag_free != retained.lag_free:
+                retained = _dc_replace(retained, lag_free=lag_free)
+            return retained.read_scope, retained
+    witness = codex_retired_cursor_witness(cache_conn, configured)
+    files = (discover or _discover_codex_files_with_roots)()
+    scope = _codex_prune_scope(files)
+    discovered = tuple(
+        (str(item.source_path), item.source_root_key) for item in files)
+    evidence = CodexReadScopeEvidence(
+        scope=scope, observed_at=now_monotonic,
+        configured_root_keys=configured, candidate_root_keys=candidates,
+        lag_free=_codex_read_scope_verdict(
+            cache_conn, scope, candidates, discovered, witness,
+        ) == _CODEX_GATE_WITHHOLD,
+        discovered=discovered, retired_witness=witness)
+    return evidence.read_scope, evidence
+
+
+def codex_read_scope_lags(
+    cache_conn: sqlite3.Connection,
+    evidence: "CodexReadScopeEvidence",
+) -> bool:
+    """Whether the no-lag gate blocks ``evidence`` on ``cache_conn`` now.
+
+    The build's binding check (#1108 spec §3.2 step 2a): the source build
+    re-evaluates the resolved scope on its own pinned read, with the
+    resolution's discovery and witness, so the scope it applies is lag-free
+    on exactly the snapshot it publishes. Candidates are re-read on that
+    connection. A discovery that is stale on this read (V1: a retired-root
+    cursor newer than its witness) blocks as a lag does: the build never
+    discovers.
+    """
+    candidates = codex_withholding_candidates(
+        cache_conn, evidence.configured_root_keys)
+    return _codex_read_scope_verdict(
+        cache_conn, evidence.scope, candidates, evidence.discovered,
+        evidence.retired_witness) != _CODEX_GATE_WITHHOLD
+
+
+def codex_cli_read_scope(
+    present_root_keys: "Callable[[frozenset[str]], Iterable[str | None]]",
+    *,
+    sync_stats: "CodexIngestStats | None" = None,
+) -> "_CodexPruneScope | None":
+    """The scope a CLI presentation read withholds under (#1108 §3.5, §3.6).
+
+    ``present_root_keys(K)`` names the root keys the read's population can
+    hold. When none lies outside the live configured keys ``K``, nothing can
+    be withheld, so the scope is ``None`` and no discovery runs. Otherwise the
+    command's own whole-walk sync scope is used when it computed one for the
+    same ``K``, else canonical discovery, the cost ``get_codex_entries`` pays
+    on every report. The dashboard's retained evidence is owner-local and
+    never consulted here.
+    """
+    configured = codex_configured_root_keys()
+    if not any(key is not None and key not in configured
+               for key in present_root_keys(configured)):
+        return None
+    scope = getattr(sync_stats, "whole_walk_scope", None)
+    if scope is not None and scope.configured_root_keys == configured:
+        return scope
+    return _codex_prune_scope(_discover_codex_files_with_roots())
 
 
 def _partition_codex_prune_candidates(
@@ -15946,6 +16338,19 @@ class CodexIngestStats:
     # The status writer already observes capability for unresolved work.
     # Explicit adapters reuse it; unchanged accepted generations never probe.
     container_decoder: "str | None" = None
+    # #1108 spec §3.2 step 3: the scope this sync computed from a discovery of
+    # every configured root, with the monotonic instant taken immediately
+    # before that discovery began. Never set on a targeted, contended,
+    # early-return or rebuild path; a read filter only, never certification.
+    whole_walk_scope: "_CodexPruneScope | None" = None
+    whole_walk_scope_observed_at: "float | None" = None
+    # The same discovery as ``(logical path, root key)`` pairs, for the
+    # no-lag gate (spec §3.2 step 2a); set exactly with ``whole_walk_scope``.
+    whole_walk_discovered: "tuple[tuple[str, str], ...] | None" = None
+    # #1108 V1: ``(K, retired cursor paths)`` read immediately before that
+    # discovery began (``codex_retired_cursor_witness``). Without it the
+    # resolver never uses the whole-walk scope.
+    whole_walk_retired_witness: "tuple[frozenset[str], frozenset[str]] | None" = None
     # #982 spec 4.1 steps 4 and 7: a heal walk piece's own report. The files
     # it ingested (or reset), whether its ``_ingest_limit`` stopped it before
     # the next such file, the census files it examined successfully
@@ -17451,6 +17856,19 @@ def _sync_codex_cache_locked(
                     files = _qualify_codex_targets(only_paths)
                 else:
                     discovery_skips: dict = {}
+                    # #1108 V1: the retired-cursor witness, read before the
+                    # discovery with the anchor, so the read scope can tell a
+                    # retired cursor this discovery accounts for from a newer
+                    # one. A failed read leaves no witness (no step 3).
+                    whole_walk_witness = None
+                    try:
+                        _witness_keys = codex_configured_root_keys()
+                        whole_walk_witness = (
+                            _witness_keys,
+                            codex_retired_cursor_witness(conn, _witness_keys))
+                    except sqlite3.Error:
+                        whole_walk_witness = None
+                    whole_walk_observed_at = time.monotonic()
                     files = _discover_codex_files_with_roots(
                         skipped=discovery_skips)
                     stats.archive_unmapped = discovery_skips.get(
@@ -17480,6 +17898,11 @@ def _sync_codex_cache_locked(
             active_root_keys = {item.source_root_key for item in files}
             prune_scope = _codex_prune_scope(files)
             ordinary_prune_scope = prune_scope
+            stats.whole_walk_scope = prune_scope
+            stats.whole_walk_scope_observed_at = whole_walk_observed_at
+            stats.whole_walk_discovered = tuple(
+                (str(item.source_path), item.source_root_key) for item in files)
+            stats.whole_walk_retired_witness = whole_walk_witness
             # #901 Amendment 20 W1: one retained collection serves both the
             # orphan partition and the protection partition.
             try:
@@ -22752,14 +23175,9 @@ def iter_codex_entries(
             params.append(account_key)
     sql += "ORDER BY timestamp_utc ASC"
     entries: list[CodexEntry] = []
+    withholding = root_scope is not None and bool(root_scope.recognized_root_keys)
     for row in conn.execute(sql, params):
-        if (
-            root_scope is not None
-            and root_scope.recognized_root_keys
-            and row[9] is not None
-            and row[9] not in root_scope.configured_root_keys
-            and os.path.isabs(row[8])
-        ):
+        if withholding and codex_row_withheld(root_scope, row[9], row[8]):
             continue
         entries.append(CodexEntry(
             timestamp=dt.datetime.fromisoformat(row[0]),

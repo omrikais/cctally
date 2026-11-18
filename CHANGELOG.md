@@ -5,6 +5,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.122.0] - 2026-11-18
+
+### Added
+- Codex cost reports price `gpt-6.2-astra`, `gpt-6.2-sol`, `gpt-6.2-astra-law` and `gpt-6-cyber` from their published rate cards instead of falling back to `gpt-5` rates, including usage recorded before you upgrade.
+- Claude cost reports price `claude-fable-5-2` and `claude-mythos-5-2`, including Fast mode, instead of counting them at $0, and `statusline` uses their 1M context window.
+
+### Fixed
+- The `dashboard` no longer briefly drops its `stats.db` locks while checking the database version, which could let the status line write at the same moment a page was reading or a refresh was writing.
+- After a Codex home is moved or renamed, the dashboard, `codex quota` and the `--source codex` reports no longer count its sessions, projects, totals and quota history twice until cleanup finishes.
+- `cctally codex percent-breakdown --account` now shows the chosen account's cycle and rejects an unknown account, instead of ignoring the flag.
+- Codex requests over 272K input tokens on `gpt-6-astra-law` are priced at its long-context rates instead of its standard rates.
+- `cctally pricing-check` no longer reports GPT-5.6 Sol's promotional pricing as expired before it ends on November 30, 2026.
+
+## [1.121.0] - 2026-11-18
+
+### Added
+- Codex cost reports price `gpt-6.2-astra`, `gpt-6.2-sol`, `gpt-6.2-astra-law` and `gpt-6-cyber` from their published rate cards instead of falling back to `gpt-5` rates, including usage recorded before you upgrade.
+- Claude cost reports price `claude-fable-5-2` and `claude-mythos-5-2`, including Fast mode, instead of counting them at $0, and `statusline` uses their 1M context window.
+
+### Fixed
+- The `dashboard` no longer briefly drops its `stats.db` locks while checking the database version, which could let the status line write at the same moment a page was reading or a refresh was writing.
+- After a Codex home is moved or renamed, the dashboard, `codex quota` and the `--source codex` reports no longer count its sessions, projects, totals and quota history twice until cleanup finishes.
+- `cctally codex percent-breakdown --account` now shows the chosen account's cycle and rejects an unknown account, instead of ignoring the flag.
+- Codex requests over 272K input tokens on `gpt-6-astra-law` are priced at its long-context rates instead of its standard rates.
+- `cctally pricing-check` no longer reports GPT-5.6 Sol's promotional pricing as expired before it ends on November 30, 2026.
+
 ## [1.120.1] - 2026-11-17
 
 ### Fixed

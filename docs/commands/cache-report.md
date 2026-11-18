@@ -38,8 +38,9 @@ without relabeling it as Claude cache behavior.
 - **Eval** — which of the four evaluation states the row is in (see [Evaluation states](#evaluation-states))
 
 Claude financial fields use each retained response's effective
-`message.usage.speed`. Current Opus 5/4.8 fast rows use the 2x fast rate;
-historical retained Opus 4.6/4.7 fast rows use 6x. Cache reads and both
+`message.usage.speed`. Current Opus 5.5/5/4.8, Fable 5.2 and Mythos 5.2
+fast rows use the 2x fast rate; historical retained Opus 4.6/4.7 fast rows
+use 6x. Cache reads and both
 cache-write TTLs stack on that effective base rate, so Total, Saved, Wasted,
 and Net remain internally consistent. Standard, missing, malformed, unsupported,
 and recorded-cost rows keep their existing behavior; Claude has no inferred or

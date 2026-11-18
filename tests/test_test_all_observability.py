@@ -1530,18 +1530,20 @@ def validate_export(lines, roots=None):
 '''
 
 
-def _scrub_log(tmp_path, log_lines, reason, kernel=EVIDENCE_KERNEL):
+def _scrub_log(tmp_path, log_lines, reason, kernel=EVIDENCE_KERNEL,
+               subject="alpha"):
     """Run the aggregator's embedded `scrub-log` mode over one subject log.
 
     `kernel` is the module the shim re-exports, so a case that needs a broken
     transformer rather than an injected violation supplies a mangled copy.
+    `subject` names the log and the bridge's subject argument.
     """
     source = RUNNER.read_text(encoding="utf-8")
     bridge = _aggregator_bridge(source)
 
     shim = tmp_path / "_lib_test_evidence_shim.py"
     shim.write_text(_VALIDATOR_SHIM, encoding="utf-8")
-    logfile = tmp_path / "alpha.log"
+    logfile = tmp_path / ("%s.log" % subject)
     logfile.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
 
     env = dict(
@@ -1559,7 +1561,7 @@ def _scrub_log(tmp_path, log_lines, reason, kernel=EVIDENCE_KERNEL):
             "-",
             str(shim),
             "scrub-log",
-            "alpha",
+            subject,
             str(logfile),
         ],
         input=bridge,
@@ -1845,7 +1847,7 @@ def test_an_undecodable_log_leaves_no_export_at_all(tmp_path):
 
 
 def _embedded_export(tmp_path, log_lines, extra_env=None,
-                     kernel=EVIDENCE_KERNEL):
+                     kernel=EVIDENCE_KERNEL, subject="alpha"):
     """The aggregator's OWN export mode, over a log this test controls.
 
     `EV_COVERAGE_NOTE` reaches the extract HEADER unscrubbed — it is the
@@ -1859,10 +1861,10 @@ def _embedded_export(tmp_path, log_lines, extra_env=None,
     (evidence / "export").mkdir(parents=True)
     logs = tmp_path / "logs"
     logs.mkdir()
-    log = logs / "alpha.log"
+    log = logs / ("%s.log" % subject)
     log.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
     listing = tmp_path / "failed-subjects"
-    listing.write_text("alpha\t%s\n" % log, encoding="utf-8")
+    listing.write_text("%s\t%s\n" % (subject, log), encoding="utf-8")
     env = dict(os.environ, LC_ALL="C", TZ="Etc/UTC")
     env.update({
         "EV_FAILED_LIST": str(listing),
@@ -1882,6 +1884,121 @@ def _embedded_export(tmp_path, log_lines, extra_env=None,
 # transformer: it reaches the extract through the header, which the aggregator
 # writes itself.
 REFUSED_HEADER_NOTE = "1 failed, 100 sprocketed in 45.67s"
+
+
+def _embedded_private_detail(tmp_path, log_lines, subject):
+    """The aggregator's OWN `private-detail` mode over one subject log; returns
+    the private file it appended to, and the bridge's result."""
+    bridge = _aggregator_bridge(RUNNER.read_text(encoding="utf-8"))
+    log = tmp_path / ("%s.log" % subject)
+    log.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+    listing = tmp_path / "failed-subjects"
+    listing.write_text("%s\t%s\n" % (subject, log), encoding="utf-8")
+    target = tmp_path / "failure-detail.txt"
+    env = dict(os.environ, LC_ALL="C", TZ="Etc/UTC",
+               EV_FAILED_LIST=str(listing), EV_RUN_ID="r-1")
+    result = subprocess.run(
+        [sys.executable, "-", str(EVIDENCE_KERNEL), "private-detail", str(target)],
+        input=bridge, env=env, capture_output=True, text=True, check=False,
+    )
+    return target, result
+
+
+# #1109: the controller's session-violation block, as tests/conftest.py prints
+# it ahead of pytest's report, in a long `-q` leg log and a short one.
+_SV_HEADERS = (
+    "isolation contract violated after the reporting test finished (#529 S4):",
+    "temp hygiene violated outside any single test (#963):",
+)
+_SV_DIAGNOSTICS = (
+    "  write violation: open -> /Users/someone/secret-1109/late.txt "
+    "(node=<no active test> worker=main pid=4242)",
+    "  temp hygiene: /tmp/x/stray left 1 entry by <session backstop>",
+)
+
+
+def _session_block_log(long):
+    progress = ["." * 72 + "  [ 50%%] %d" % i for i in range(400 if long else 2)]
+    warnings_lines = ["  tests/test_w.py:3: UserWarning: w%d" % i
+                      for i in range(1500 if long else 2)]
+    return (
+        progress
+        + [_SV_HEADERS[0], _SV_DIAGNOSTICS[0], "    written by thread 'late-writer'",
+           "  3 passed in 0.10s", _SV_HEADERS[1], _SV_DIAGNOSTICS[1], "",
+           "=" * 30 + " warnings summary " + "=" * 30]
+        + warnings_lines
+        + ["26565 passed, 3810 warnings in 1331.15s"]
+    )
+
+
+def _bridge_scrub_context(env, real):
+    """The ScrubContext the bridge's `_context()` builds from `env`."""
+    ev = _ev_kernel()
+    roots = {
+        "repo": env.get("EV_REPO_ROOT", ""), "home": env.get("HOME", ""),
+        "tmp": "/tmp", "private-tmp": "/private/tmp",
+        "runner-temp": env.get("RUNNER_TEMP", ""), "tmpdir": env.get("TMPDIR", ""),
+    }
+    roots = {k: v.rstrip("/") for k, v in roots.items() if v and v.rstrip("/")}
+    if not real:
+        return ev, ev.ScrubContext(roots=roots)
+    return ev, ev.ScrubContext(
+        roots=roots,
+        is_public_path=ev.build_disclosure_predicate(str(REPO)),
+        known_tokens=ev.build_known_tokens(str(REPO)),
+    )
+
+
+def _assert_session_headers(ev, ctx, lines):
+    for header, diagnostic in zip(_SV_HEADERS, _SV_DIAGNOSTICS):
+        assert header in lines, lines[:12]
+        at = lines.index(header)
+        assert lines[at + 1] == ev.scrub_line(diagnostic, ctx), lines[at:at + 2]
+    assert "secret-1109" not in "\n".join(lines)
+
+
+@pytest.mark.parametrize("subject,long", [
+    ("pytest", True), ("benchmark", True), ("pytest", False),
+])
+def test_the_bridge_routes_a_session_block_to_every_surface(tmp_path, subject, long):
+    """#1109. Failure it detects: bridge wiring that never reaches the
+    kernel's session branch (a subject key other than pytest/benchmark, or a
+    mode that bypasses it), so the console and export lose the block's headers
+    and the private file loses its body, or the payload reaches a sanitized
+    surface."""
+    log_lines = _session_block_log(long)
+
+    scrub_dir = tmp_path / "scrub"
+    scrub_dir.mkdir()
+    res = _scrub_log(scrub_dir, log_lines, "", subject=subject)
+    assert res.returncode == 0, res.stderr
+    ev, closed = _bridge_scrub_context(
+        dict(os.environ, HOME=str(scrub_dir / "home"),
+             EV_REPO_ROOT=str(scrub_dir / "repo")), real=False)
+    _assert_session_headers(ev, closed, res.stdout.splitlines())
+
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    evidence, res = _embedded_export(
+        export_dir, log_lines, extra_env={"EV_REPO_ROOT": str(REPO)},
+        subject=subject)
+    assert res.returncode == 0, res.stderr
+    exported = (evidence / "export" / "failure-context.txt").read_text(
+        encoding="utf-8").splitlines()
+    ev, real = _bridge_scrub_context(dict(os.environ, EV_REPO_ROOT=str(REPO)),
+                                     real=True)
+    _assert_session_headers(ev, real, exported)
+    sidecar = json.loads((evidence / "validator-redactions.json").read_text())
+    assert sidecar["redacted"] == 0 and not sidecar["refused"], sidecar
+
+    detail_dir = tmp_path / "detail"
+    detail_dir.mkdir()
+    target, res = _embedded_private_detail(detail_dir, log_lines, subject)
+    assert res.returncode == 0, res.stderr
+    private = target.read_text(encoding="utf-8")
+    for header in _SV_HEADERS:
+        assert header in private.splitlines()
+    assert "secret-1109" in private
 
 
 def test_a_refused_extract_line_is_replaced_and_the_rest_is_published(tmp_path):

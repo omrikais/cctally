@@ -791,7 +791,7 @@ This is **never automatic** and always explicit. VACUUM needs exclusive access: 
 
 `0` reclaimed (or the DB is absent — nothing to do); `3` (staged) the target is
 in use (stop the dashboard / other cctally processes and retry), a maintenance
-operation is already running, or free disk is below the required margin.
+operation is already running, or free disk is below the required margin, or stats.db's header could not be read (retry).
 
 ## `cctally db reindex-search [--check] [--json]`
 

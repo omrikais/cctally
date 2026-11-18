@@ -1077,8 +1077,19 @@ def test_review_t6_typed_fallback_reaches_command_boundary(
     ns, *_ = estate
     adapter = ns["_cctally_source_analytics"]
     utc = dt.timezone.utc
+    # Since #1108 a presentation load withholds an observation whose root is
+    # not a configured Codex root, and a withheld week never reaches the
+    # undecodable rollout. The observation therefore carries the estate's own
+    # configured root key, so every route must fail closed at the decoder.
+    conn = ns["open_cache_db"]()
+    try:
+        root_key = conn.execute(
+            "SELECT source_root_key FROM codex_session_files "
+            "WHERE source_root_key IS NOT NULL LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
     identity = QuotaWindowIdentity(
-        source="codex", source_root_key="review-root", logical_limit_key="primary",
+        source="codex", source_root_key=root_key, logical_limit_key="primary",
         observed_slot="primary", window_minutes=7 * 24 * 60)
     observation = QuotaObservation(
         identity=identity, captured_at=dt.datetime(2026, 7, 20, 11, tzinfo=utc),

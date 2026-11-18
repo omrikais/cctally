@@ -73,6 +73,69 @@ def _seed_real_codex_cli_data(tmp_path: Path, monkeypatch):
     return ns
 
 
+def _codex_entry_root_keys(ns) -> set[str]:
+    conn = ns["open_cache_db"]()
+    try:
+        return {key for (key,) in conn.execute(
+            "SELECT DISTINCT source_root_key FROM codex_session_entries")}
+    finally:
+        conn.close()
+
+
+def _relocated_codex_store(tmp_path: Path, monkeypatch, *, as_of: str,
+                           corpus: str | None = None):
+    """A real Codex home renamed after its ingest, with prune debt pending (#1108).
+
+    The renamed home is re-ingested under its new root key while the old
+    root's identities wait in `codex_prune_debt`; the detached drain a
+    command's own sync requests is held off by the patched spawn. Returns
+    ``(ns, old_key, new_key, drain)``: ``drain()`` runs the real prune drain
+    and a projection reconcile, which is the drained oracle.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    update = sys.modules["_cctally_update"]
+    monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+    monkeypatch.setattr(update, "_spawn_detached_with_pid",
+                        lambda command, **_kw: os.getpid())
+    cache = sys.modules["_cctally_cache"]
+    old, new = tmp_path / "provider-old", tmp_path / "provider-new"
+    rollout = old / "sessions" / "2026" / "07" / "14" / "rollout.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        corpus if corpus is not None
+        else (CODEX_CORPUS / "modern-full.jsonl").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CCTALLY_AS_OF", as_of)
+    now = dt.datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+    keys = []
+    for home in (old, new):
+        if home is new:
+            old.rename(new)
+        monkeypatch.setenv("CODEX_HOME", str(home))
+        (key,) = cache.codex_configured_root_keys()
+        keys.append(key)
+        conn = ns["open_cache_db"]()
+        try:
+            ns["sync_codex_cache"](conn, maintenance="caller")
+        finally:
+            conn.close()
+    ns["reconcile_codex_quota_projection"](now=now)
+    old_key, new_key = keys
+    assert old_key != new_key
+    assert _codex_entry_root_keys(ns) == {old_key, new_key}, (
+        "non-vacuity: the relocation did not leave both roots' rows")
+
+    def drain() -> None:
+        cache.run_codex_prune_drain(wait_for_requests=False)
+        assert _codex_entry_root_keys(ns) == {new_key}, (
+            "non-vacuity: the drain did not remove the retired root")
+        ns["reconcile_codex_quota_projection"](now=now)
+
+    return ns, old_key, new_key, drain
+
+
 def _seed_real_provider_cli_data(tmp_path: Path, monkeypatch):
     """Seed both providers through their real cache-ingest paths."""
     ns = _seed_real_codex_cli_data(tmp_path, monkeypatch)
@@ -207,11 +270,13 @@ def _install_provider_entries(ns, monkeypatch, entries):
     return adapter
 
 
-def _provider_quota_observations() -> tuple[QuotaObservation, ...]:
+def _provider_quota_observations(
+    root_key: str = "root-a",
+) -> tuple[QuotaObservation, ...]:
     """Two native points create detail rows for one selected Codex block."""
     utc = dt.timezone.utc
     identity = QuotaWindowIdentity(
-        source="codex", source_root_key="root-a", logical_limit_key="primary",
+        source="codex", source_root_key=root_key, logical_limit_key="primary",
         observed_slot="primary", window_minutes=7 * 24 * 60,
     )
     reset_at = dt.datetime(2026, 7, 21, tzinfo=utc)
@@ -411,6 +476,81 @@ def test_raw_codex_provider_commands_execute_against_real_fused_cache(
     assert wire["source"] == "codex"
     assert wire["status"] in {"ok", "empty", "partial"}
     assert "/synthetic/root-a" not in repr(wire)
+
+
+_RELOCATED_ANALYTICS_ARGV = [
+    ["codex", "project", "--since", "2026-07-14", "--until", "2026-07-15", "--json"],
+    ["codex", "cache-report", "--since", "2026-07-14", "--until", "2026-07-15", "--json"],
+    ["codex", "diff", "--a", "2026-07-13..2026-07-13", "--b", "2026-07-14..2026-07-14", "--json"],
+    ["codex", "report", "--weeks", "1", "--json"],
+]
+
+
+@pytest.mark.parametrize("argv", _RELOCATED_ANALYTICS_ARGV)
+def test_relocated_codex_root_counts_once_in_cli_analytics_while_debt_is_pending(
+    tmp_path, monkeypatch, capsys, argv,
+):
+    """#1108 T7 (D3): the qualified analytics twin withholds retired roots.
+
+    Failure it detects: after a Codex home's canonical path changes, its
+    rollouts are re-ingested under the new root key while the old rows wait
+    for the prune drain. `get_codex_entries` already withholds them, but the
+    qualified reader behind `project`, `cache-report` and `diff`, and the
+    quota observations behind `project` and `report`, read every retained
+    root, so each figure counted twice until the drain ran.
+    """
+    ns, _old_key, _new_key, drain = _relocated_codex_store(
+        tmp_path, monkeypatch, as_of="2026-07-15T12:00:00Z")
+
+    assert ns["main"](argv) == 0
+    pending = capsys.readouterr().out
+    drain()
+    assert ns["main"](argv) == 0
+    drained = capsys.readouterr().out
+
+    assert json.loads(drained)["status"] != "empty", (
+        f"non-vacuity: the drained oracle carries no Codex data: {drained!r}")
+    assert pending == drained
+
+
+@pytest.mark.parametrize("argv", _RELOCATED_ANALYTICS_ARGV)
+def test_cli_analytics_without_retired_roots_are_unchanged_by_the_root_scope(
+    tmp_path, monkeypatch, capsys, argv,
+):
+    """#1108 T7 control: a store with no retired root reads exactly as before.
+
+    Failure it detects: the current-root scope changing CLI output, or adding
+    rollout discovery, when no retained row lies outside the configured
+    roots. The opted-in command equals the same command with the scope forced
+    off, byte for byte, with the same number of discoveries.
+    """
+    ns = _seed_real_codex_cli_data(tmp_path, monkeypatch)
+    adapter = ns["_cctally_source_analytics"]
+    cache = sys.modules["_cctally_cache"]
+    real_load = adapter.load_qualified_codex_entries
+    real_discover = cache._discover_codex_files_with_roots
+    outputs: list[str] = []
+    discoveries: list[int] = []
+
+    def counting_discover(*args, **kwargs):
+        discoveries[-1] += 1
+        return real_discover(*args, **kwargs)
+
+    monkeypatch.setattr(cache, "_discover_codex_files_with_roots", counting_discover)
+    for scoped in (True, False):
+        def load(*args, _scoped=scoped, **kwargs):
+            if not _scoped:
+                kwargs["current_roots_only"] = False
+            return real_load(*args, **kwargs)
+
+        monkeypatch.setattr(adapter, "load_qualified_codex_entries", load)
+        discoveries.append(0)
+        assert ns["main"](argv) == 0
+        outputs.append(capsys.readouterr().out)
+
+    assert json.loads(outputs[0])["status"] != "empty"
+    assert outputs[0] == outputs[1]
+    assert discoveries[0] == discoveries[1]
 
 
 def test_real_codex_project_allocates_one_s2_logical_block_by_root_cost(
@@ -786,7 +926,13 @@ def test_real_all_source_populated_share_keeps_provider_rows_separate_and_ordere
     ns = _seed_real_provider_cli_data(tmp_path, monkeypatch)
     _seed_real_claude_report_data(ns)
     adapter = ns["_cctally_source_analytics"]
-    monkeypatch.setattr(adapter, "load_codex_quota_observations", _provider_quota_observations)
+    # The injected quota belongs to the configured provider root: an
+    # unconfigured root beside a recognized one is a retired root, whose
+    # observations a presentation read withholds (#1108).
+    (provider_key,) = sys.modules["_cctally_cache"].codex_configured_root_keys()
+    monkeypatch.setattr(
+        adapter, "load_codex_quota_observations",
+        lambda *_args, **_kwargs: _provider_quota_observations(provider_key))
 
     assert ns["main"]([*argv, "--format", "md", "--output", "-"]) == 0
     rendered = capsys.readouterr().out

@@ -3361,8 +3361,11 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     # a large detached rebuild that opener can wait for its bounded 5-second
     # guard; a statusline arriving mid-replay would otherwise pay that delay
     # (and can reach more than one stats opener in a single render). The probe
-    # reads only the fixed user_version field in the main-file header; it never
-    # opens SQLite or bypasses the maintenance opener fence. Missing, invalid-
+    # reads only the fixed user_version field in the main-file header, through
+    # a transient `immutable=1` connection outside the maintenance opener fence
+    # (no lock, no journal read, no sidecar) and, only for a file SQLite
+    # rejects, a 64-byte AD19 child; it never raw-opens stats.db in-process,
+    # which would drop this process's SQLite locks (#1100). Missing, invalid-
     # header and legacy indexes retain their established guarded-open paths.
     # The post-open epoch gate below remains a race-closing defense if the
     # version changes after this probe.

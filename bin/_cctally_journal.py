@@ -17671,11 +17671,20 @@ def find_account_bound_cutover(*, publish=False):
 
 
 def _stats_journal_cutover_pending() -> bool:
+    """Whether stats.db still awaits its one-time journal cutover (a legacy
+    `user_version`). #1100: an epoch the lock-safe hint could not read is
+    unknown, so absence of the cutover is unproven: it raises
+    `AccountBoundCutoverUnavailable` (never `AccountBoundCutoverDeferred`,
+    which means a KNOWN legacy index and lets a stamped append continue)."""
     import _cctally_store
     path = _cctally_core.DB_PATH
     if not pathlib.Path(path).exists():
         return False
-    version = _cctally_store._raw_user_version(path)
+    version = _cctally_store._stats_user_version_hint(path)
+    if version is None:
+        # One argument: `str()` is then exactly the existing refusal
+        # sentence (no `[Errno N]` prefix) wherever a CLI prints it.
+        raise AccountBoundCutoverUnavailable("stats.db could not be read")
     return 0 < version <= _cctally_core.LEGACY_STATS_HEAD
 
 

@@ -70,6 +70,178 @@ def test_shared_pending_probe_classifies_only_readable_post_legacy_mismatch(
     path.write_bytes(b"not a sqlite database")
     assert store.stats_epoch_rebuild_pending(path) is False
 
+    # #1100: the hint's lock-safe read keeps the raw reader's classification.
+    # A header shorter than 64 bytes, magic included, and an empty file are
+    # not pending (no user_version to read).
+    path.write_bytes(b"SQLite format 3\x00" + b"\x00" * 40)
+    assert store.stats_epoch_rebuild_pending(path) is False
+    path.write_bytes(b"")
+    assert store.stats_epoch_rebuild_pending(path) is False
+    # A user_version with the top bit set reads unsigned, as the header
+    # bytes do (SQLite reports it signed).
+    path.unlink()
+    _stamp(path, -2147483647)
+    assert store._raw_user_version(path) == 0x80000001
+    assert store.stats_epoch_rebuild_pending(path) is True
+
+
+
+@pytest.mark.parametrize("shape", ["directory", "permission-denied"])
+def test_a_deterministically_unreadable_store_keeps_its_raw_classification(
+    runtime, monkeypatch, shape,
+):
+    """A stats.db path that is a directory, or a file this user cannot read,
+    made the raw reader's `open()` raise, so it was -1 (no epoch). The
+    lock-safe hint keeps that: -1, not pending, and not legacy, so the
+    account-bound cutover is established as before. Detects: a hint that
+    calls such a store unknown, which would refuse every stamped journal
+    append (the status line's recording) for as long as the store stays
+    unreadable (#1100)."""
+    import _cctally_journal as journal
+    import _cctally_store_access as access
+
+    _ns, core, _db, store = runtime
+    path = core.DB_PATH
+    if path.exists():
+        path.unlink()
+    if shape == "directory":
+        path.mkdir()
+    else:
+        if os.geteuid() == 0:
+            pytest.skip("root reads a mode-000 file")
+        _stamp(path, core.LEGACY_STATS_HEAD)
+        path.chmod(0)
+    calls = []
+    monkeypatch.setattr(access, "_run_header_probe",
+                        lambda target, *a, **kw: calls.append(target))
+    try:
+        assert store._stats_user_version_hint(path) == -1
+        assert store._raw_user_version(path) == -1
+        assert store.stats_epoch_rebuild_pending(path, if_unknown=None) is False
+        assert journal._stats_journal_cutover_pending() is False
+        assert calls == []          # decided without spawning the child
+    finally:
+        if shape == "permission-denied":
+            path.chmod(0o600)
+
+
+def _damaged_header(path, version: int) -> None:
+    """A stats.db at `version` whose header carries an invalid page size:
+    the magic and user_version bytes are intact, but SQLite rejects the
+    file, so only the 64-byte child fallback can read its epoch."""
+    if path.exists():
+        path.unlink()
+    _stamp(path, version)
+    data = bytearray(path.read_bytes())
+    data[16:18] = b"\x00\x03"
+    path.write_bytes(bytes(data))
+    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro&immutable=1", uri=True)
+    try:
+        # Creating the connection alone proves nothing: the read must fail.
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("PRAGMA user_version").fetchone()
+    finally:
+        conn.close()
+
+
+def _journal_bytes(core) -> dict:
+    journal_dir = pathlib.Path(core.JOURNAL_DIR)
+    if not journal_dir.exists():
+        return {}
+    return {child.name: child.read_bytes()
+            for child in sorted(journal_dir.iterdir()) if child.is_file()}
+
+
+@pytest.mark.parametrize("head", [True, False], ids=["head", "interpreter"])
+def test_damaged_header_keeps_the_raw_reader_classification(
+    runtime, monkeypatch, tmp_path, head,
+):
+    """#1100: a magic-prefixed header that SQLite rejects is classified from
+    its bytes, as the raw reader classified it, on both AD19 backends.
+    Detects: a damaged legacy index read as "not legacy", which would let
+    the account-bound cutover be established before the one-time journal
+    cutover exports it, or a damaged wrong-epoch index never deferred."""
+    _ns, core, _db, store = runtime
+    import _cctally_journal as journal
+    import _cctally_store_access as access
+
+    monkeypatch.setattr(access, "_HEAD_ARGV0", head)
+    if not head:
+        # The suite's isolation guard refuses a real -I/-S interpreter
+        # child under its own name; a link it does not recognize runs it.
+        link_dir = tmp_path / "probe-bin"
+        link_dir.mkdir()
+        link = link_dir / "probe-interp"
+        link.symlink_to(os.path.realpath(sys.executable))
+        monkeypatch.setattr(access.sys, "executable", str(link))
+    path = core.DB_PATH
+
+    _damaged_header(path, core.STATS_INDEX_EPOCH - 1)
+    assert store._raw_user_version(path) == core.STATS_INDEX_EPOCH - 1
+    assert store.stats_epoch_rebuild_pending(path) is True
+
+    _damaged_header(path, core.LEGACY_STATS_HEAD)
+    assert journal._stats_journal_cutover_pending() is True
+
+
+def test_unreadable_damaged_header_is_unknown_to_every_consumer(
+    runtime, monkeypatch,
+):
+    """#1100: a header SQLite rejects and the child cannot read is unknown,
+    never a definite epoch. Detects: an unreadable stats.db authorizing the
+    durable account-bound cutover, a stamped record written before that
+    fence, or the epoch worker and doctor treating a file they could not
+    read as current."""
+    _ns, core, _db, store = runtime
+    import _cctally_journal as journal
+    import _cctally_store_access as access
+    import _lib_doctor
+    import _lib_journal
+
+    monkeypatch.setattr(access, "_run_header_probe",
+                        lambda path, *a, **kw: None)
+    path = core.DB_PATH
+
+    _damaged_header(path, core.LEGACY_STATS_HEAD)
+    assert store._stats_user_version_hint(path) is None
+    assert store._raw_user_version(path) == -1
+    with pytest.raises(journal.AccountBoundCutoverUnavailable) as raised:
+        journal._stats_journal_cutover_pending()
+    # A CLI that prints the error shows the existing refusal sentence, with
+    # no errno prefix (spec 5.3).
+    assert str(raised.value) == "stats.db could not be read"
+    before = _journal_bytes(core)
+    record = _lib_journal.make_op(at=core.now_utc_iso(), src="test", payload={
+        "kind": "account_label", "provider": "claude",
+        "account_key": "x" * 32, "label": "work"})
+    with pytest.raises(journal.AccountBoundCutoverUnavailable):
+        journal.append_record(record)
+    assert _journal_bytes(core) == before
+    with pytest.raises(journal.AccountBoundCutoverUnavailable):
+        journal.ensure_account_bound_cutover()
+    assert _journal_bytes(core) == before
+
+    _damaged_header(path, core.STATS_INDEX_EPOCH - 1)
+    assert store.stats_epoch_rebuild_pending() is False
+    assert store.stats_epoch_rebuild_pending(if_unknown=None) is None
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=30))
+    store._write_epoch_marker(since.isoformat().replace("+00:00", "Z"))
+    monkeypatch.setattr(
+        store, "resolve_stats_epoch_mismatch",
+        lambda: pytest.fail("the worker resolved an epoch it could not read"))
+    assert store._stats_epoch_rebuild_body() == "error"
+    assert store._stats_epoch_rebuild_marker_path().exists()
+    assert "result=error" in (
+        core.LOG_DIR / "stats-epoch-rebuild.log").read_text()
+
+    snapshot = store.rebuild_worker_snapshot("epoch")
+    assert snapshot["pending"]["present"] is True
+    assert snapshot["pending"]["indexPending"] is None
+    assessed = _lib_doctor.assess_rebuild_worker(
+        "epoch", snapshot, dt.datetime.now(dt.timezone.utc))
+    assert assessed["severity"] == "warn"
+    assert "pending" in assessed["details"]["rows"]
+
 
 def test_live_wrong_epoch_open_defers_without_inline_resolver(
     runtime, monkeypatch,
@@ -424,7 +596,8 @@ def test_worker_closes_resolver_connection_and_clears_marker_on_success(
         def close(self):
             calls.append("close")
 
-    monkeypatch.setattr(store, "stats_epoch_rebuild_pending", lambda: True)
+    monkeypatch.setattr(store, "stats_epoch_rebuild_pending",
+                        lambda **_kw: True)
     monkeypatch.setattr(
         store,
         "resolve_stats_epoch_mismatch",
@@ -443,7 +616,8 @@ def test_worker_failure_stays_retryable_and_logs_sanitized_error(
     _ns, core, _db, store = runtime
     marker = core.APP_DIR / "stats-epoch-rebuild.pending"
     marker.touch()
-    monkeypatch.setattr(store, "stats_epoch_rebuild_pending", lambda: True)
+    monkeypatch.setattr(store, "stats_epoch_rebuild_pending",
+                        lambda **_kw: True)
 
     def fail():
         raise OSError(5, "input/output failure", "/private/secret=stats.db")

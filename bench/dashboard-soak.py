@@ -4581,7 +4581,8 @@ def _verified_artifact(reference: dict, directory: pathlib.Path, *, kind: str,
                 for arg in command["argv"])):
         raise ValueError(f"{name} provenance command argv/exitCode invalid")
     executable = pathlib.Path(command["argv"][0]).name
-    if (command["argv"][0] != "bin/cctally-test-remote"
+    remote_wrapper = "bin/cctally-test-remote"  # mirror-private-ok: compared as text with a provenance argv, never opened or run
+    if (command["argv"][0] != remote_wrapper
             and executable not in {"python", "python3"}
             and not executable.startswith("python3.")):
         raise ValueError(f"{name} provenance command is not an executable probe")

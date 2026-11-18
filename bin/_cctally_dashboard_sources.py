@@ -19,6 +19,7 @@ from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 from _cctally_core import get_week_start_name
+from _cctally_cache import codex_root_scope_identity, codex_root_withheld
 from _cctally_quota import (
     QuotaProjectionIncomplete,
     assert_projection_readable,
@@ -1064,6 +1065,23 @@ def _resolve_codex_weekly_cycle(
     return cycles
 
 
+def codex_quota_roots(
+    active_roots: Iterable[str], root_scope: object | None,
+) -> tuple[str, ...]:
+    """The registry roots a DISPLAYED Codex quota read may name (#1108 §3.4).
+
+    A root the read scope withholds (a retired root while its prune debt is
+    pending) is dropped before every bounded read, so it can neither take a
+    row cap nor merge its percent or boundaries into the current root's.
+    Physical consumers (projection coherence, the ingest backlog) keep the
+    registry roots. ``None`` withholds nothing, so the tuple is unchanged.
+    """
+    return tuple(
+        root for root in active_roots
+        if not codex_root_withheld(root_scope, root)
+    )
+
+
 def resolve_codex_cycle_detail_identity(
     cache_conn,
     *,
@@ -1071,6 +1089,7 @@ def resolve_codex_cycle_detail_identity(
     now_utc: dt.datetime,
     account_key: str | None = None,
     stats_conn=None,
+    root_scope: object | None = None,
 ):
     """The live-cycle identity for a per-request Codex cycle-DETAIL read (#373).
 
@@ -1101,6 +1120,10 @@ def resolve_codex_cycle_detail_identity(
     sibling's: an unarmed guard is today's honest degrade, a foreign boundary is
     a wrong answer. ``None`` keeps the merged representative and is byte-stable.
 
+    ``root_scope`` (#1108) is the published snapshot's read scope: the live
+    boundary is resolved from current roots only, as the source build does.
+    The cycle LOOKUP keys (``source_root_keys``) stay every retained root.
+
     Degrades to a bare-roots identity — today's behaviour — whenever no live
     cycle resolves. The clip guard stays unarmed on that identity by design
     (``_boundary_has_live_reset``), so the detail keeps clipping as it did
@@ -1119,6 +1142,7 @@ def resolve_codex_cycle_detail_identity(
                 "SELECT source_root_key FROM codex_source_roots"
             )
         ))
+        active_roots = codex_quota_roots(active_roots, root_scope)
         if not active_roots:
             return identity
         observations = _cached_codex_quota_observations(
@@ -1603,6 +1627,10 @@ class DashboardReadContext:
     #: share path and the per-request cycle-detail route, neither of which
     #: computes a build signature.
     stats_identity: tuple[str, str, str] | None = None
+    #: #1108 spec §3.2: the owner tick's resolved current-root read scope
+    #: (a ``_CodexPruneScope``), or ``None`` for no withholding. Request paths
+    #: pass the published snapshot's scope and never discover.
+    codex_root_scope: object | None = None
 
     def __post_init__(self) -> None:
         for name in ("range_start", "now_utc"):
@@ -3333,15 +3361,22 @@ def _quota_wire(
     if cycle is None or now_utc is None:
         return ()
     assert_projection_readable(stats_conn)
+    # #1108: the cycle's root eligibility is applied AHEAD of the `LIMIT`, so a
+    # root outside the cycle (a retired root whose prune debt is pending)
+    # cannot fill the cap with newer blocks the loop below would discard.
+    cycle_roots = tuple(sorted({str(root) for root in cycle.source_root_keys}))
+    if not cycle_roots:
+        return ()
     try:
         rows = stats_conn.execute(
             "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, "
             "limit_name, resets_at_utc, nominal_start_at_utc, current_percent, orphaned_at, "
             "account_key "
             "FROM quota_window_blocks WHERE source='codex' AND window_minutes=300 "
+            f"AND source_root_key IN ({','.join('?' for _ in cycle_roots)}) "
             "ORDER BY resets_at_utc DESC, source_root_key, logical_limit_key, observed_slot "
             "LIMIT ?",
-            (SOURCE_HISTORY_LIMIT,),
+            (*cycle_roots, SOURCE_HISTORY_LIMIT),
         ).fetchall()
     except sqlite3.Error:
         return ()
@@ -7566,6 +7601,7 @@ def _probe_codex_detail_metadata_health_leg(
             end=max(context.now_utc, accounting_end)
             if accounting_end is not None else context.now_utc,
             inventory=inventory,
+            root_scope=context.codex_root_scope,
         )
     except (sqlite3.Error, RuntimeError) as exc:
         return build_metadata_health("transient_read_failure"), exc
@@ -7618,6 +7654,7 @@ def _capture_codex_accounting(
             return load_cached_rooted_codex_accounting_entries(
                 accounting_start, accounting_end, speed=context.speed,
                 cache_conn=context.cache_conn,
+                root_scope=context.codex_root_scope,
             )
         except QualifiedMetadataUnavailable as exc:
             # A failed SQLite read has no trustworthy rows. Keep the typed
@@ -7644,6 +7681,8 @@ def _capture_codex_accounting(
                     tuple(str(root) for root in path_scope.roots),
                     active_roots,
                     _cache_database_identity(context.cache_conn),
+                    # #1108: a scope change starts the carrier cold.
+                    codex_root_scope_identity(context.codex_root_scope),
                 ),
                 # #1059: one observing memo per load, so every spelling the
                 # qualified resolution visits is registered for the regroup
@@ -7657,6 +7696,7 @@ def _capture_codex_accounting(
                     inventory=inventory,
                     project_resolver_cache=(
                         _lib_snapshot_cache.observing_project_memo()),
+                    root_scope=context.codex_root_scope,
                 ),
                 load_paths=lambda identities: load_qualified_codex_entries(
                     accounting_start,
@@ -7668,6 +7708,7 @@ def _capture_codex_accounting(
                     inventory=inventory,
                     project_resolver_cache=(
                         _lib_snapshot_cache.observing_project_memo()),
+                    root_scope=context.codex_root_scope,
                 ),
                 path_of=lambda entry: (
                     str(entry.source_root_key), str(entry.source_path),
@@ -7964,7 +8005,8 @@ def capture_codex_source_state(
         ))
         with _lib_perf.phase("source.quota"):
             quota_observations = tuple(_cached_codex_quota_observations(
-                source_root_keys=active_roots,
+                source_root_keys=codex_quota_roots(
+                    active_roots, context.codex_root_scope),
                 cache_conn=context.cache_conn,
                 stats_conn=context.stats_conn,
                 stats_identity=context.stats_identity,
@@ -8003,6 +8045,7 @@ def capture_codex_source_state(
                     start=accounting_start,
                     end=accounting_end,
                     inventory=inventory,
+                    root_scope=context.codex_root_scope,
                 )
             except sqlite3.Error as exc:
                 failed_legs = (*failed_legs, "accounting_health")
@@ -8032,7 +8075,8 @@ def capture_codex_source_state(
             )
         try:
             accounting_exists = has_cached_codex_accounting_entries(
-                cache_conn=context.cache_conn)
+                cache_conn=context.cache_conn,
+                root_scope=context.codex_root_scope)
             accounting_exists_error = None
         except Exception as exc:
             # This probe is semantically relevant only when quota evidence
@@ -8102,6 +8146,7 @@ def capture_codex_source_state(
                 accounting_end,
                 speed=context.speed,
                 cache_conn=context.cache_conn,
+                root_scope=context.codex_root_scope,
             )
         )
         with _lib_perf.phase("source.models"):
@@ -8250,6 +8295,8 @@ def _build_codex_source_state(
             )
         ))
     )
+    # #1108 §3.4: every DISPLAYED quota read names only current roots.
+    quota_roots = codex_quota_roots(active_roots, context.codex_root_scope)
     # This read is a function of the tick instant, so it does NOT reuse across
     # ticks and the cross-build memo above cannot help it. Both bounds move
     # with `context.now_utc`, which in production is the tick's wall clock
@@ -8284,7 +8331,7 @@ def _build_codex_source_state(
         capture.quota_observations
         if capture is not None
         else _cached_codex_quota_observations(
-            source_root_keys=active_roots,
+            source_root_keys=quota_roots,
             cache_conn=context.cache_conn,
             stats_conn=context.stats_conn,
             stats_identity=context.stats_identity,
@@ -8357,6 +8404,7 @@ def _build_codex_source_state(
                 start=accounting_start,
                 end=accounting_end,
                 inventory=builder_inventory,
+                root_scope=context.codex_root_scope,
             )
         except sqlite3.Error as exc:
             builder_failed_legs = (*builder_failed_legs, "accounting_health")
@@ -8514,7 +8562,8 @@ def _build_codex_source_state(
         accounting_exists = capture.accounting_exists
     elif cycle is None:
         accounting_exists = has_cached_codex_accounting_entries(
-            cache_conn=context.cache_conn)
+            cache_conn=context.cache_conn,
+            root_scope=context.codex_root_scope)
     else:
         accounting_exists = False
     cycle_failure = cycle is None and accounting_exists
@@ -8537,6 +8586,7 @@ def _build_codex_source_state(
                 speed=context.speed,
                 cache_conn=context.cache_conn,
                 source_root_keys=cycle.source_root_keys,
+                root_scope=context.codex_root_scope,
             )
         )
         cycle_entries, cycle_cost_usd = _build_codex_cycle_accounting(
@@ -8570,6 +8620,8 @@ def _build_codex_source_state(
         metadata_incomplete,
         context.speed,
         active_roots,
+        # #1108: the read scope names the population as much as its roots do.
+        codex_root_scope_identity(context.codex_root_scope),
     )
     # #681: the durable path delta updates only the affected account partitions.
     # A quota/stat-only generation returns the prior fold directly.  The parent
@@ -8683,7 +8735,7 @@ def _build_codex_source_state(
         changed_new=changed_new_visible,
         cache_key=("parent",),
         semantic_signature=period_signature,
-        source_root_keys=active_roots,
+        source_root_keys=quota_roots,
         active_cycle=cycle,
         now_utc=context.now_utc,
         display_tz_name=context.display_tz_name,
@@ -8931,6 +8983,7 @@ def _build_codex_source_state(
                     accounting_end,
                     speed=context.speed,
                     cache_conn=context.cache_conn,
+                    root_scope=context.codex_root_scope,
                 )
             accounts_wire, hero_cycles_wire, combined_accounting = _codex_accounts_wire(
                 context,
@@ -8991,7 +9044,9 @@ def _build_codex_source_state(
                 visible_accounting_entries=visible_accounting_entries,
                 visible_rows_by_account=visible_rows_by_account,
                 visible_entries_by_account=visible_entries_by_account,
-                active_roots=active_roots,
+                # The children's weekly views and the projection-only account
+                # discovery are displayed quota reads (#1108 §3.4).
+                active_roots=quota_roots,
                 accounting_end=accounting_end,
                 metadata_incomplete=metadata_incomplete,
                 conversation_metadata=conversation_metadata,

@@ -738,10 +738,10 @@ def test_codex_source_routes_bound_real_relational_reads_over_retained_history(
         return result
 
     def _traced_scoped(start, end, *, speed, matches_project_key,
-                       cache_conn=None, group="git-root"):
+                       cache_conn=None, group="git-root", root_scope=None):
         result = original_scoped(
             start, end, speed=speed, matches_project_key=matches_project_key,
-            cache_conn=cache_conn, group=group,
+            cache_conn=cache_conn, group=group, root_scope=root_scope,
         )
         scoped_calls.append({
             "start": start, "end": end,

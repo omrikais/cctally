@@ -1482,7 +1482,11 @@ def host_lock_opener(lock_path=None):
         bindir = str(REPO / "bin")
         if bindir not in sys.path:
             sys.path.insert(0, bindir)
-        module = importlib.import_module("_lib_runner_host")
+        # Waived (#1116): runner tooling the mirror leaves out: on a public
+        # clone the import fails and acquire_host_lock refuses at once, with no
+        # retry and no lock inode created.
+        module = importlib.import_module(
+            "_lib_runner_host")  # mirror-private-ok: runner tooling the mirror leaves out
         if lock_path is None:
             return module.open_host_lock()
         return module.open_host_lock(str(lock_path))

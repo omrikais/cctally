@@ -2940,10 +2940,22 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # corrupt owner record) as "not alive" instead of raising. A liveness
     # answer for a marker's owner; no statement against stats.db changed, so
     # the contract and its MAINT inert rule stand.
+    # Seventeenth delta (#1100, base 01be5d771): the AD19 header probe in
+    # `_cctally_store_access`. `+ computed-by` `_classify_header_bytes`,
+    # `_header_verdict` and `_remember_header_verdict` (the classification,
+    # empty/short-read rules and cache/AD30 writes, moved out of
+    # `_stats_header_kind` unchanged) and `_header_probe_script` (the
+    # interpreter program, now length-parameterized and byte-identical at
+    # 20); `- binding _HEADER_PROBE_SCRIPT` (reached through that function
+    # now; the constant stays); `~ _header_probe_argv`, `_run_header_probe`
+    # and the `_HEAD_ARGV0` assignment (the length parameter; byte-identical
+    # argv at 20) and `~ _stats_header_kind` (the fresh mode). They spawn a
+    # child that reads header bytes and classify them; no statement against
+    # stats.db changed, so the contract and its MAINT inert rule stand.
     AccessContract(
         function='_cctally_journal:_rebuild_stats_index_locked',
         sql_fingerprint='dynamic:_cctally_journal:_rebuild_stats_index_locked#1',
-        sql_shape='sha256:4d6be00c40aaeb91',
+        sql_shape='sha256:e12bd43113b57132',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',

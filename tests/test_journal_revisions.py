@@ -1466,8 +1466,11 @@ def test_epoch_resolver_serializes_maintenance_then_ingest(
         "_heal_flock_blocking",
         lambda path: calls.append("maintenance") or 21,
     )
+    # #1100: the resolver's locked re-check reads the user-version hint.
     monkeypatch.setattr(
-        store, "_raw_user_version", lambda path: core.STATS_INDEX_EPOCH - 1
+        store,
+        "_stats_user_version_hint",
+        lambda path: calls.append("epoch-check") or core.STATS_INDEX_EPOCH - 1,
     )
     monkeypatch.setattr(
         jr,
@@ -1506,6 +1509,7 @@ def test_epoch_resolver_serializes_maintenance_then_ingest(
     assert isinstance(result, FakeConnection)
     assert calls == [
         "maintenance",
+        "epoch-check",
         "ingest",
         "rebuild",
         "release-ingest",

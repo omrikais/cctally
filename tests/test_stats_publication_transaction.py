@@ -1265,6 +1265,109 @@ finally:
     assert not shm.exists()
 
 
+def _family_bytes(db: pathlib.Path) -> dict:
+    return {suffix: pathlib.Path(f"{db}{suffix}").read_bytes()
+            for suffix in ("", "-journal", "-wal", "-shm")
+            if pathlib.Path(f"{db}{suffix}").exists()}
+
+
+def test_header_only_legacy_wal_beside_a_live_holder_refuses_publication(
+    ns, tmp_path
+):
+    """#1100: a destination whose header alone declares WAL (no -wal or
+    -shm) is still the legacy family; the WAL-header check now reads it
+    through the AD19 child, and publication must refuse beside a live holder
+    before touching it. Detects: legacy detection lost on the publication
+    path when only the header carries it, which would convert a family an
+    older process still has open.
+
+    The publication step is called directly: through `rebuild_stats_index`
+    the destination's earlier read-only SQLite opens (the derivation-state
+    and selector reads) already materialize -wal/-shm on a WAL-header file,
+    so there the sidecar leg decides, not the header."""
+    import _cctally_core
+    import _cctally_journal as jr
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    scratch = tmp_path / "scratch.db"
+    scratch.write_bytes(db.read_bytes())
+    conn = sqlite3.connect(str(db))
+    try:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    finally:
+        conn.close()
+    before = _family_bytes(db)
+    assert set(before) == {""} and before[""][18:20] == b"\x02\x02"
+    ready = tmp_path / "header-holder.ready"
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import pathlib, sys, time\n"
+         "handle = open(sys.argv[1], 'rb')\n"
+         "pathlib.Path(sys.argv[2]).write_text('held\\n')\n"
+         "while True:\n"
+         "    time.sleep(0.1)\n",
+         str(db), str(ready)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        _await_marker(ready, holder)
+        with pytest.raises(jr.JournalError,
+                           match="rollback-journal transition declined"):
+            jr._publish_rebuilt_stats_index(
+                scratch=scratch, destination=db, preserve_existing=True,
+                context=jr.RebuildContext(trigger="test-fixture"),
+                high_water=None, record={})
+        assert _family_bytes(db) == before
+        assert not _publication_marker(_cctally_core.APP_DIR).exists()
+    finally:
+        holder.terminate()
+        try:
+            holder.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.communicate(timeout=10)
+
+
+def test_unreadable_destination_header_refuses_publication_untouched(
+    ns, monkeypatch
+):
+    """#1100: when the AD19 child cannot read the destination's header,
+    publication cannot tell a legacy WAL family from a rollback index, so it
+    refuses with the typed refusal before Phase 1. Detects: a publication
+    that proceeds (and may convert a live legacy family) when it cannot tell
+    the format, or one that leaves a marker or record owing a verdict."""
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_store
+    import _cctally_store_access
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    before = _family_bytes(db)
+    records = _rebuild_records(_cctally_core.LOG_DIR)
+    checked = []
+    real_check = _cctally_store._stats_legacy_wal_family_present
+
+    def recording_check(path):
+        checked.append(pathlib.Path(path))
+        return real_check(path)
+
+    monkeypatch.setattr(_cctally_store, "_stats_legacy_wal_family_present",
+                        recording_check)
+    monkeypatch.setattr(_cctally_store_access, "_run_header_probe",
+                        lambda path, *a, **kw: None)
+    with pytest.raises(_cctally_core.StoreUnavailable) as info:
+        jr.rebuild_stats_index(
+            context=jr.RebuildContext(trigger="test-fixture"))
+    assert _cctally_core.store_refusal_text(info.value) == (
+        "stats.db could not be read")
+    assert checked and checked[-1] == db, (
+        "the refusal did not come from the destination's legacy-WAL check")
+    assert _family_bytes(db) == before
+    assert not _publication_marker(_cctally_core.APP_DIR).exists()
+    assert _rebuild_records(_cctally_core.LOG_DIR) == records
+
+
 def test_a_failed_post_publication_verdict_is_durable_and_refuses_the_next_open(
     ns,
 ):

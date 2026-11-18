@@ -84,6 +84,10 @@ FAMILY_ALIASES: dict[str, str] = {
     "claude-mythos-5": "claude-mythos-5",
     "claude-mythos-5-1": "claude-mythos-5-1",
     "claude-mythos-preview": "claude-mythos-5",
+    # The -2 point releases (#1118), each its own canonical family on the
+    # same #704 grounds as -1.
+    "claude-fable-5-2": "claude-fable-5-2",
+    "claude-mythos-5-2": "claude-mythos-5-2",
     # The 5.5 generation (#978). Each is its OWN canonical family, on the
     # #704 precedent: pooling one into the family it follows would assert
     # equal per-unit consumption, which nothing here establishes.
@@ -117,6 +121,8 @@ FAMILY_PARTICIPATION: dict[str, str] = {
     "claude-fable-5-1": "general",
     "claude-mythos-5": "general",
     "claude-mythos-5-1": "general",
+    "claude-fable-5-2": "general",
+    "claude-mythos-5-2": "general",
     "claude-opus-5-5": "general",
     "claude-sonnet-5-5": "general",
     "claude-haiku-5-5": "general",
@@ -131,6 +137,12 @@ _PROVENANCE_55: str = (
     "operator-supplied in #978 (2026-10-18), confirmed by the 2026-10-20 "
     "handoff: participates in the general weekly meter; modelled with the "
     "selected coefficient era's shared token-class coefficients"
+)
+
+_PROVENANCE_52: str = (
+    "operator-supplied 2026-11-18 (#1118): drains a dedicated pool AND the "
+    "general weekly meter on the same terms as claude-fable-5-1 / "
+    "claude-mythos-5-1; only the general draining is modelled"
 )
 
 FAMILY_PROVENANCE: dict[str, str] = {
@@ -155,6 +167,8 @@ FAMILY_PROVENANCE: dict[str, str] = {
         "general weekly meter on the same terms as claude-mythos-5; only "
         "the general draining is modelled"
     ),
+    "claude-fable-5-2": _PROVENANCE_52,
+    "claude-mythos-5-2": _PROVENANCE_52,
     # Participation is the operator's statement, never the API price card.
     "claude-opus-5-5": _PROVENANCE_55,
     "claude-sonnet-5-5": _PROVENANCE_55,
@@ -401,12 +415,14 @@ def max_fit_population_days() -> int:
             - int(TRUST["min_detect_baseline_days"]))
 
 #: The out-of-scope marker section 21 requires. Section 26 extends it from
-#: Fable 5 to Mythos on the same terms: all three families drain a dedicated
-#: pool AS WELL as the general weekly meter, and only the general draining is
-#: modelled here.
+#: Fable 5 to Mythos on the same terms, and the 5.1 point releases and, in
+#: #1118, the 5.2 releases join on the operator's statements: every family
+#: named drains a dedicated pool AS WELL as the general weekly meter, and only
+#: the general draining is modelled here.
 DEDICATED_POOL_SCOPE_NOTE: str = (
-    "out-of-scope: claude-fable-5, claude-fable-5-1, claude-mythos-5, "
-    "claude-mythos-5-1 and claude-mythos-preview also drain dedicated pools; "
+    "out-of-scope: claude-fable-5, claude-fable-5-1, claude-fable-5-2, "
+    "claude-mythos-5, claude-mythos-5-1, claude-mythos-5-2 and "
+    "claude-mythos-preview also drain dedicated pools; "
     "only general-quota draining is modelled"
 )
 
@@ -449,7 +465,7 @@ def constants_fingerprint() -> str:
 #: constant above without re-pinning this line is caught rather than silently
 #: invalidating every persisted calibration.
 QUOTA_MODEL_CONSTANTS_FINGERPRINT: str = (
-    "dfdd6a7de768802d3008d88bab453db6480812dc266187c593c3d4604554d42f"
+    "b5dc8dfece0f2b25a9734629bb11b22dee6f6a4d87ab3bf75951b567da134086"
 )
 
 

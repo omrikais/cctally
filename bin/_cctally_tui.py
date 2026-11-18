@@ -1560,6 +1560,96 @@ _TUI_BUILD_QUERY: "contextvars.ContextVar" = contextvars.ContextVar(
     "cctally_tui_build_query", default=None)
 
 
+class _TuiCodexReadScopeOwner:
+    """Owner-local state of the #1108 current-root read-scope resolver.
+
+    ``retained`` is the canonical evidence the last resolution returned;
+    ``sync_stats`` is this tick's Codex ingest result, handed from the
+    decoupled ingest to the build that follows it and consumed once. One
+    instance lives on the dashboard's locked rebuild body, next to its
+    ingest frontier, and is reached only under that body's lock.
+    """
+
+    __slots__ = ("retained", "sync_stats")
+
+    def __init__(self) -> None:
+        self.retained = None
+        self.sync_stats = None
+
+
+#: The owner state of the build running in this context (#1108). Set only by
+#: the dashboard's locked rebuild body around its builds, so a request thread
+#: never reads it; a build with none resolves from scratch and retains nothing.
+_TUI_CODEX_SCOPE_OWNER: "contextvars.ContextVar" = contextvars.ContextVar(
+    "cctally_tui_codex_scope_owner", default=None)
+
+
+def _tui_codex_scope_clock() -> float:
+    """The resolver's monotonic clock (a seam for the age-bound tests)."""
+    return time.monotonic()
+
+
+def _tui_resolve_codex_read_scope(sync_stats=None):
+    """Resolve this tick's Codex read scope (#1108 spec §3.2)."""
+    return _tui_resolve_codex_read_scope_evidence(sync_stats)[0]
+
+
+def _tui_resolve_codex_read_scope_evidence(sync_stats=None):
+    """This tick's Codex read scope and the evidence it was resolved from.
+
+    Runs once per owner build, before the dispatch-key comparison, over one
+    cache read unit. The clock is read BEFORE resolution, so a scope this
+    call discovers is anchored no later than its discovery began. The
+    evidence carries the discovery the source build re-checks the no-lag gate
+    with on its own pinned read (`_tui_build_source_bundle`).
+    """
+    owner = _TUI_CODEX_SCOPE_OWNER.get()
+    if owner is None:
+        owner = _TuiCodexReadScopeOwner()
+    stats = sync_stats if sync_stats is not None else owner.sync_stats
+    now_monotonic = _tui_codex_scope_clock()
+    cache_mod = _cctally()._load_sibling("_cctally_cache")
+    conn = _tui_open_cache_read()
+    try:
+        scope, evidence = cache_mod.resolve_codex_read_scope(
+            conn, sync_stats=stats, retained=owner.retained,
+            now_monotonic=now_monotonic)
+    finally:
+        conn.close()
+    # Consumed only by a resolution that succeeded: one that raised leaves
+    # the tick's whole-walk scope for the build that follows it.
+    owner.sync_stats = None
+    owner.retained = evidence
+    return scope, evidence
+
+
+def _tui_codex_root_scope_identity(scope):
+    return _cctally()._load_sibling(
+        "_cctally_cache").codex_root_scope_identity(scope)
+
+
+def _tui_published_codex_root_scope(bundle, attempted):
+    """The read scope ``bundle``'s Codex generation was built under (#1108 V3).
+
+    Read from the generation's own ``clock_data`` stamp, so a bundle retained
+    across a lost race or a failed rebuild keeps ITS scope. ``attempted``
+    (the scope this tick applied) answers only for a bundle whose Codex
+    carries no stamp: none at all, an unavailable state, or the seed.
+    """
+    codex = (bundle.sources.get("codex")
+             if isinstance(bundle, SourceDashboardBundle) else None)
+    clock = getattr(codex, "clock_data", None)
+    if isinstance(clock, Mapping) and _CODEX_ROOT_SCOPE_KEY in clock:
+        return clock[_CODEX_ROOT_SCOPE_KEY]
+    return attempted
+
+
+def _tui_dispatch_key_with_applied_scope(dispatch_key, applied_scope):
+    """``dispatch_key`` with its sixth element, the read-scope identity,
+    naming the scope the published Codex was APPLIED under (#1108)."""
+    return (*dispatch_key[:5], _tui_codex_root_scope_identity(applied_scope))
+
+
 class _TuiBuildQueryScope:
     """The snapshot build's `query(interactive)` phase (#787 / #861 spec 5.12).
 
@@ -1841,6 +1931,11 @@ class DataSnapshot:
     # Every copy of a frame (idle, kept, crash, republish) carries it. Never
     # published; trailing default for the positional constructors.
     store_leg_failed: bool = False
+    #: #1108 spec §3.2: the owner tick's resolved current-root read scope
+    #: (a ``_CodexPruneScope``, or None for no withholding). Private and never
+    #: published; the detail route and the share render read it so a request
+    #: path never discovers. Every copy of a frame carries it.
+    codex_root_scope: Any | None = None
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -4582,6 +4677,11 @@ def _tui_retain_refused_partial(
 #: accounting moves the process's consumed token past every generation it did
 #: not publish.
 _CODEX_QUOTA_DEPENDENCY_KEY = "codex_quota_dependency"
+#: #1108 V3: the server-only ``clock_data`` key a Codex generation carries the
+#: read scope it was BUILT under in. It travels with the generation through
+#: every reuse, degrade, retention and clock refresh, so a published bundle
+#: always names its own scope, never the scope a later attempt certified.
+_CODEX_ROOT_SCOPE_KEY = "codex_root_scope"
 
 
 def _tui_cache_file_before_open() -> "tuple[int, int] | None":
@@ -4825,8 +4925,23 @@ def _tui_build_source_bundle(
     evidence_eligible_at: dt.datetime | None = None,
     claude_input_identity,
     codex_speed: str | None = None,
+    codex_root_scope=None,
+    codex_scope_evidence=None,
 ) -> SourceDashboardBundle:
     """Build one frozen source bundle after the dashboard's coordinated ingest.
+
+    ``codex_root_scope`` (#1108 spec §3.2) is the tick's resolved current-root
+    read scope: it reaches ``DashboardReadContext`` and its identity enters
+    ``codex_version`` (only when set, so other stores keep their bytes).
+    With ``codex_scope_evidence`` (the resolution's evidence), a non-``None``
+    scope is first re-checked against the no-lag gate on this build's own
+    pinned cache read; when a current copy now lags, Codex is built under no
+    scope. The scope actually APPLIED is reported as
+    ``attempt["codex_root_scope_applied"]`` and stamped on the Codex
+    generation this build constructs (``_CODEX_ROOT_SCOPE_KEY``). The caller
+    records the RETURNED bundle's scope (``_tui_published_codex_root_scope``)
+    in the snapshot and its dispatch key: a bundle retained across a lost
+    race keeps the scope it was built under.
 
     ``claude_input_identity`` (#1050 spec 4.5 items 3-5), REQUIRED with no
     default, is ``(SnapshotSignature, ContentRevision)``: the dispatch read
@@ -4915,6 +5030,20 @@ def _tui_build_source_bundle(
             # ROLLBACK, so it is an upper bound on the hold rather than the
             # hold, and no document may quote it as one.
             pin_started_ns = time.monotonic_ns()
+        # #1108 spec §3.2 step 2a: bind the gate to the snapshot this build
+        # publishes. A cursor that moved between the owner's resolution and
+        # this pin can make a current copy lag a retired one; withholding the
+        # retired root would then hide its progress, so the build reads under
+        # no scope. An unreadable check withholds nothing either.
+        if codex_root_scope is not None and codex_scope_evidence is not None:
+            try:
+                if c._load_sibling("_cctally_cache").codex_read_scope_lags(
+                        cache_conn, codex_scope_evidence):
+                    codex_root_scope = None
+            except sqlite3.Error:
+                codex_root_scope = None
+        if attempt is not None:
+            attempt["codex_root_scope_applied"] = codex_root_scope
         if common_range_start is None:
             # Resolved through the SAME helper the callers use, with no daily
             # panel. A bare `now_utc - 30 days` here is a microsecond-precise
@@ -5054,6 +5183,15 @@ def _tui_build_source_bundle(
             f"{semantics.codex_identity}{_acct_suffix}{_backlog_suffix}"
             f"{_aggregate_suffix}"
         )
+        # #1108: a read scope names the Codex population, so it refuses exact
+        # reuse of a generation built under another scope. Absent (and so
+        # byte-neutral) whenever no scope is resolved.
+        _scope_identity = _tui_codex_root_scope_identity(codex_root_scope)
+        if _scope_identity is not None:
+            codex_version = (
+                f"{codex_version}:s"
+                + hashlib.sha256(repr(_scope_identity).encode("utf-8"))
+                .hexdigest()[:16])
         # #582: the dedicated accounting ledger is deliberately absent from
         # the published version string (byte-stable API contract), but an
         # id-stable token/account/project mutation still has to bypass exact
@@ -5346,6 +5484,7 @@ def _tui_build_source_bundle(
                     codex_quota_projected_thresholds=semantics.codex_quota_projected_thresholds,
                     cache_report_anomaly_threshold_pp=semantics.cache_report_anomaly_threshold_pp,
                     stats_identity=(stats_digest, accounts_digest, claude_digest),
+                    codex_root_scope=codex_root_scope,
                 )
                 if codex_split_seams_unpatched:
                     codex_scope_cm = codex_path_scope()
@@ -5573,6 +5712,8 @@ def _tui_build_source_bundle(
                     clock_data={
                         **(codex.clock_data or {}),
                         _CODEX_QUOTA_DEPENDENCY_KEY: codex_dependency,
+                        # #1108 V3: the scope this generation was built under.
+                        _CODEX_ROOT_SCOPE_KEY: codex_root_scope,
                     },
                 )
                 codex_built_this_tick = True
@@ -5784,8 +5925,12 @@ def _tui_source_bundle_can_idle(
     codex_dependency: "tuple | None",
     codex_ingest_degraded: bool = False,
     now_utc: dt.datetime | None = None,
+    codex_root_scope_changed: bool = False,
 ) -> bool:
     """Return whether both physical provider generations are safe to retain.
+
+    ``codex_root_scope_changed`` (#1108 spec §3.2): a generation built under
+    another current-root read scope is never retained.
 
     A stable dispatch key alone cannot prove that a previously unavailable or
     degraded provider remains unavailable: a projection certificate can be
@@ -5818,6 +5963,8 @@ def _tui_source_bundle_can_idle(
     """
     global _PARTIAL_RETRY_STATE
     if not isinstance(bundle, SourceDashboardBundle):
+        return False
+    if codex_root_scope_changed:
         return False
     physical_states: dict[str, SourceDashboardState] = {}
     for source in ("claude", "codex"):
@@ -6280,6 +6427,8 @@ def _tui_build_snapshot_once(
         claude_ingest_failed = False
         codex_ingest_contended = False
         codex_ingest_failed = False
+        # #1108: this build's own Codex ingest result, when it ran one.
+        codex_sync_stats = None
         _tick = _tick_stats.current()
         with _perf.phase("sync") as _p_sync:
             _p_sync.set_meta(ingest=do_ingest)
@@ -6347,6 +6496,7 @@ def _tui_build_snapshot_once(
                         if precompute_envelope:
                             codex_ingest, codex_error = results[1]
                             if codex_error is None:
+                                codex_sync_stats = codex_ingest
                                 codex_ingest_contended = bool(
                                     getattr(codex_ingest, "lock_contended", False)
                                 )
@@ -6456,6 +6606,11 @@ def _tui_build_snapshot_once(
         # #1050: this tick's resolved Codex tier, captured with the dispatch
         # read below (`None` off the dashboard path, which builds no sources).
         codex_speed = None
+        # #1108 spec §3.2: this tick's current-root read scope, resolved
+        # before the dispatch comparison (`None` off the dashboard path), and
+        # the evidence the source build re-checks it with.
+        codex_read_scope = None
+        codex_read_evidence = None
         if precompute_envelope:
             # The last published provider generation is independently useful
             # when calculating today's signature fails.  Read it before the
@@ -6490,6 +6645,16 @@ def _tui_build_snapshot_once(
             # Codex construction and every Codex cycle stamp below.
             with _perf.phase("signature"):
                 codex_speed = _tui_resolve_codex_speed()
+                try:
+                    codex_read_scope, codex_read_evidence = (
+                        _tui_resolve_codex_read_scope_evidence(
+                            codex_sync_stats))
+                except _TuiStoreRefusalPending:
+                    raise
+                except Exception as exc:
+                    capture_failure("codex-read-scope", "cache", exc)
+                    codex_read_scope = None
+                    codex_read_evidence = None
                 try:
                     _revision_sink: list = []
                     dispatch_sig, codex_dependency = (
@@ -6568,9 +6733,12 @@ def _tui_build_snapshot_once(
                 # #1050 spec 4.7: the resolved Codex tier is the fifth element;
                 # whole-key equality is the idle gate and the snapshot memo
                 # treats the key as opaque.
+                # #1108 spec §3.2: the read scope's identity is the sixth
+                # element, so a filesystem-only recognition flip never idles.
                 dispatch_key = (
                     dispatch_sig, render_key, codex_dependency,
                     calibration_dependency, codex_speed,
+                    _tui_codex_root_scope_identity(codex_read_scope),
                 )
                 # #300: carry the change signal onto the non-idle snapshot built
                 # below. (The idle path returns `idle_snap`, which inherits the
@@ -6611,9 +6779,17 @@ def _tui_build_snapshot_once(
                             codex_dependency=codex_dependency,
                             claude_input_identity=claude_input_identity,
                             codex_speed=codex_speed,
+                            codex_root_scope=codex_read_scope,
+                            codex_scope_evidence=codex_read_evidence,
                         )
                         assert _sc is not None
-                        _sc.store_dispatch_state(dispatch_key, idle_snap)
+                        # #1108: the key records the scope the published
+                        # Codex was built under, which the adapter's own
+                        # gate check may have downgraded.
+                        _sc.store_dispatch_state(
+                            _tui_dispatch_key_with_applied_scope(
+                                dispatch_key, idle_snap.codex_root_scope),
+                            idle_snap)
                     if _tick is not None:
                         _tick.set_dispatch("idle")   # §1.4: the reuse branch
                     _p_snapshot.__exit__(None, None, None)
@@ -7250,6 +7426,7 @@ def _tui_build_snapshot_once(
             store_leg_failed=any(
                 failure.database != "other"
                 for failure in sync_failures[read_failures_start:]),
+            codex_root_scope=codex_read_scope,
         )
         if precompute_envelope:
             source_bundle: SourceDashboardBundle | None = None
@@ -7309,6 +7486,8 @@ def _tui_build_snapshot_once(
                         claude_input_identity=claude_input_identity,
                         codex_speed=codex_speed,
                         attempt=source_attempt,
+                        codex_root_scope=codex_read_scope,
+                        codex_scope_evidence=codex_read_evidence,
                     )
                 if source_bundle is None:
                     raise RuntimeError("source bundle builder returned no bundle")
@@ -7334,11 +7513,23 @@ def _tui_build_snapshot_once(
                 source_bundle = _tui_retain_failed_source_bundle(
                     prior_source_bundle, dispatch_key=dispatch_key,
                 )
+            # #1108 V3: the scope the PUBLISHED bundle's Codex was built under
+            # is the one the snapshot (request paths) and the dispatch key
+            # carry, so a later tick resolving another scope rebuilds. A
+            # bundle retained across a lost race or a failed build keeps its
+            # own scope, never this attempt's.
+            codex_read_scope = _tui_published_codex_root_scope(
+                source_bundle,
+                source_attempt.get("codex_root_scope_applied", codex_read_scope))
+            if dispatch_key is not None:
+                dispatch_key = _tui_dispatch_key_with_applied_scope(
+                    dispatch_key, codex_read_scope)
             snap = dataclasses.replace(
                 snap,
                 last_sync_error=("; ".join(errors) if errors else None),
                 sync_failures=tuple(sync_failures),
                 source_bundle=source_bundle,
+                codex_root_scope=codex_read_scope,
             )
         # #268 M5.1: record the (signature+render key, snapshot) so the next
         # dashboard tick can idle-short-circuit when nothing changed. Full-build
@@ -7884,7 +8075,9 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                              stats_heal_attempted=False,
                              codex_dependency,
                              claude_input_identity,
-                             codex_speed=None):
+                             codex_speed=None,
+                             codex_root_scope=None,
+                             codex_scope_evidence=None):
     """Fresh snapshot reusing ``prior``'s heavy rows, re-patching only the
     time-derived fields + the doctor payload / envelope precompute on each idle
     tick (spec §3 idle path).
@@ -7987,6 +8180,10 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                         codex_ingest_failed or codex_ingest_contended
                     ),
                     now_utc=now_utc,
+                    codex_root_scope_changed=(
+                        _tui_codex_root_scope_identity(
+                            getattr(prior, "codex_root_scope", None))
+                        != _tui_codex_root_scope_identity(codex_root_scope)),
                 )
                 and not codex_decision_deadline_passed(prior_codex, now_utc)
             ):
@@ -8062,6 +8259,8 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                         prior, "evidence_eligible_at", None),
                     claude_input_identity=claude_input_identity,
                     codex_speed=codex_speed,
+                    codex_root_scope=codex_root_scope,
+                    codex_scope_evidence=codex_scope_evidence,
                 )
         except _StatsSnapshotCorruption:
             raise
@@ -8111,6 +8310,12 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                 _tui_withdraw_codex_quota_dependency(prior.source_bundle)
                 if source_attempt.get("codex_pass") else prior.source_bundle
             )
+    # #1108 V3: the scope the kept or rebuilt bundle's Codex was built under,
+    # never the scope this adapter attempted when it kept the prior bundle.
+    if source_bundle is not None:
+        codex_root_scope = _tui_published_codex_root_scope(
+            source_bundle,
+            source_attempt.get("codex_root_scope_applied", codex_root_scope))
     return dataclasses.replace(
         prior,
         current_week=current_week,
@@ -8131,6 +8336,7 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
         # unchanged (data stable) → force the hydration latch clear even if
         # ``prior`` was a hydrating seed/partial.
         hydrating=False,
+        codex_root_scope=codex_root_scope,
     )
 
 
@@ -10710,19 +10916,29 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
         # never reach it and take the span at `_tui_build_snapshot`'s standalone
         # boundary instead. The span subtracts any ingest nested inside it.
         tick = _tick_stats.current()
-        if tick is None:
-            snapshot = sys.modules["cctally"]._tui_build_snapshot(
-                now_utc=pinned_now, skip_sync=skip_sync,
-                display_tz_pref_override=display_tz_pref_override,
-                precompute_envelope=True, runtime_bind=runtime_bind,
-            )
-        else:
-            with tick.build_span():
+        # #1108 spec §3.2: the owner's retained read-scope evidence lives
+        # beside the ingest frontier and is visible only to this lock's builds.
+        scope_owner = getattr(_locked, "_codex_read_scope_owner", None)
+        if scope_owner is None:
+            scope_owner = _TuiCodexReadScopeOwner()
+            _locked._codex_read_scope_owner = scope_owner
+        scope_token = _TUI_CODEX_SCOPE_OWNER.set(scope_owner)
+        try:
+            if tick is None:
                 snapshot = sys.modules["cctally"]._tui_build_snapshot(
                     now_utc=pinned_now, skip_sync=skip_sync,
                     display_tz_pref_override=display_tz_pref_override,
                     precompute_envelope=True, runtime_bind=runtime_bind,
                 )
+            else:
+                with tick.build_span():
+                    snapshot = sys.modules["cctally"]._tui_build_snapshot(
+                        now_utc=pinned_now, skip_sync=skip_sync,
+                        display_tz_pref_override=display_tz_pref_override,
+                        precompute_envelope=True, runtime_bind=runtime_bind,
+                    )
+        finally:
+            _TUI_CODEX_SCOPE_OWNER.reset(scope_token)
         # #684: this is the complete dashboard publisher boundary. Schedule
         # snapshot-cache admission only after every builder has finished; a
         # source-local call can run before later builders mutate the estate and
@@ -10879,6 +11095,7 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 publish_prior = False
                 accounting_recorded = False
                 initial_cache_identity = None
+                result_by_provider: dict = {}
                 try:
                     # The standalone ingest tree is frozen before the final
                     # _build(skip_sync=True) resets the thread collector. A2
@@ -11098,6 +11315,14 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 # mid-ingest cannot split one ingest across two tracing states,
                 # and A2 partial builds never consume it.
                 _perf.apply_pending()
+                # #1108 spec §3.2 step 3: this tick's Codex sync stats reach
+                # the build below, which uses its whole-walk scope only when
+                # that walk discovered every configured root recently enough.
+                scope_owner = getattr(_locked, "_codex_read_scope_owner", None)
+                if scope_owner is None:
+                    scope_owner = _TuiCodexReadScopeOwner()
+                    _locked._codex_read_scope_owner = scope_owner
+                scope_owner.sync_stats = result_by_provider.get("codex")
                 kept = False
                 if publish_prior:
                     snap = prior_snapshot

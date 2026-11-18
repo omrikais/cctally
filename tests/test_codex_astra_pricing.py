@@ -234,6 +234,14 @@ def test_pricing_coverage_and_drift_scope_accept_sol_61_as_directly_priced():
 TERRA_61 = "gpt-6.1-terra"
 ROSALIND = "gpt-6-rosalind"
 ASTRA_LAW = "gpt-6-astra-law"
+# #1118: each was a live `missing_from_us` finding on 2026-11-17 and priced at
+# the `gpt-5` fallback ($0.18 for the standard vector below) with
+# isFallback=true. Cards written from OpenAI's model and pricing pages (read
+# 2026-11-17), cross-checked against LiteLLM's openai-provider rows.
+ASTRA_62 = "gpt-6.2-astra"
+SOL_62 = "gpt-6.2-sol"
+ASTRA_LAW_62 = "gpt-6.2-astra-law"
+CYBER_6 = "gpt-6-cyber"
 _MTOK = 1e6
 
 NEW_GPT6_CARDS = {
@@ -253,12 +261,53 @@ NEW_GPT6_CARDS = {
         "cache_read_input_token_cost_above_272k_tokens": 3.00 / _MTOK,
         "output_cost_per_token_above_272k_tokens": 112.50 / _MTOK,
     },
-    # Promotional "at least through December 31, 2026"; no long-context
-    # column is published, so no tier is inferred.
+    # Promotional "at least through December 31, 2026". The long-context tier
+    # ($20 / $2 / $75) was published on 2026-11-17 (#1118); at #989's
+    # 2026-11-05 capture only the base rates were listed.
     ASTRA_LAW: {
         "input_cost_per_token": 10.00 / _MTOK,
         "cache_read_input_token_cost": 1.00 / _MTOK,
         "output_cost_per_token": 50.00 / _MTOK,
+        "input_cost_per_token_above_272k_tokens": 20.00 / _MTOK,
+        "cache_read_input_token_cost_above_272k_tokens": 2.00 / _MTOK,
+        "output_cost_per_token_above_272k_tokens": 75.00 / _MTOK,
+    },
+    # Standard $8 / $0.40 / $40; above 272K input, 2x input/cache and 1.5x
+    # output for the full request. Fast is 2x (vendor-published).
+    ASTRA_62: {
+        "input_cost_per_token": 8.00 / _MTOK,
+        "cache_read_input_token_cost": 0.40 / _MTOK,
+        "output_cost_per_token": 40.00 / _MTOK,
+        "input_cost_per_token_above_272k_tokens": 16.00 / _MTOK,
+        "cache_read_input_token_cost_above_272k_tokens": 0.80 / _MTOK,
+        "output_cost_per_token_above_272k_tokens": 60.00 / _MTOK,
+    },
+    SOL_62: {
+        "input_cost_per_token": 2.00 / _MTOK,
+        "cache_read_input_token_cost": 0.10 / _MTOK,
+        "output_cost_per_token": 10.00 / _MTOK,
+        "input_cost_per_token_above_272k_tokens": 4.00 / _MTOK,
+        "cache_read_input_token_cost_above_272k_tokens": 0.20 / _MTOK,
+        "output_cost_per_token_above_272k_tokens": 15.00 / _MTOK,
+    },
+    # Promotional "at least through December 31, 2026", the only published
+    # Standard rate; identical to GPT-6.2 Astra.
+    ASTRA_LAW_62: {
+        "input_cost_per_token": 8.00 / _MTOK,
+        "cache_read_input_token_cost": 0.40 / _MTOK,
+        "output_cost_per_token": 40.00 / _MTOK,
+        "input_cost_per_token_above_272k_tokens": 16.00 / _MTOK,
+        "cache_read_input_token_cost_above_272k_tokens": 0.80 / _MTOK,
+        "output_cost_per_token_above_272k_tokens": 60.00 / _MTOK,
+    },
+    # Daybreak Red access; above 272K input $40 / $4 / $150.
+    CYBER_6: {
+        "input_cost_per_token": 20.00 / _MTOK,
+        "cache_read_input_token_cost": 2.00 / _MTOK,
+        "output_cost_per_token": 100.00 / _MTOK,
+        "input_cost_per_token_above_272k_tokens": 40.00 / _MTOK,
+        "cache_read_input_token_cost_above_272k_tokens": 4.00 / _MTOK,
+        "output_cost_per_token_above_272k_tokens": 150.00 / _MTOK,
     },
 }
 
@@ -272,7 +321,9 @@ def test_new_gpt6_cards_are_direct_vendor_cards(model, capsys):
     card = pricing.CODEX_MODEL_PRICING[model]
     assert card.keys() == NEW_GPT6_CARDS[model].keys()
     for field, rate in NEW_GPT6_CARDS[model].items():
-        assert card[field] == pytest.approx(rate), field
+        # Per-token rates are ~1e-7, so a relative-only default would accept
+        # nothing tighter than the rate's own rounding; pin it absolutely.
+        assert card[field] == pytest.approx(rate, abs=1e-15), field
     assert resolved is card
     assert is_fallback is False
     assert pricing._is_codex_fallback(model) is False
@@ -291,16 +342,33 @@ def test_new_gpt6_cards_are_direct_vendor_cards(model, capsys):
         (ROSALIND, "fast", 3.42),        # fallback-contract: no vendor fast tier
         (ASTRA_LAW, "standard", 1.14),
         (ASTRA_LAW, "fast", 2.28),       # fallback-contract: no vendor fast tier
+        # #1118: 60,000 x rate + 40,000 x cached rate + 10,000 x output rate,
+        # each from the vendor's per-MTok literal.
+        (ASTRA_62, "standard",
+         (60_000 * 8.00 + 40_000 * 0.40 + 10_000 * 40.00) / _MTOK),   # 0.896
+        (ASTRA_62, "fast", 2 * 0.896),   # vendor: Fast is 2x Standard
+        (SOL_62, "standard",
+         (60_000 * 2.00 + 40_000 * 0.10 + 10_000 * 10.00) / _MTOK),   # 0.224
+        (SOL_62, "fast", 2 * 0.224),     # vendor: Fast is 2x Standard
+        (ASTRA_LAW_62, "standard",
+         (60_000 * 8.00 + 40_000 * 0.40 + 10_000 * 40.00) / _MTOK),   # 0.896
+        (ASTRA_LAW_62, "fast", 2 * 0.896),  # compatibility: no vendor fast tier
+        (CYBER_6, "standard",
+         (60_000 * 20.00 + 40_000 * 2.00 + 10_000 * 100.00) / _MTOK),  # 2.28
+        (CYBER_6, "fast", 2 * 2.28),     # compatibility: no vendor fast tier
     ],
 )
 def test_new_gpt6_standard_and_fast_costs(model, speed, expected, capsys):
+    # The warning is emitted by the cost function, once per name, so the set
+    # is cleared and the cost function itself is called (#1118).
     pricing._unknown_codex_model_warnings.discard(model)
 
     cost = pricing._calculate_codex_entry_cost(
         model, 100_000, 40_000, 10_000, 2_000, speed=speed,
     )
 
-    assert cost == pytest.approx(expected)
+    assert cost == pytest.approx(expected, abs=1e-9)
+    assert pricing._is_codex_fallback(model) is False
     assert "unknown model" not in capsys.readouterr().err
 
 
@@ -313,10 +381,28 @@ def test_new_gpt6_standard_and_fast_costs(model, speed, expected, capsys):
         (TERRA_61, 272_001, 0, 10_000, 0.619002),
         (ROSALIND, 272_000, 0, 10_000, 4.83),
         (ROSALIND, 272_001, 0, 10_000, 9.28503),
-        # No published long-context tier: base rates throughout.
-        (ASTRA_LAW, 400_000, 100_000, 20_000, 4.1),
+        # Long-context tier published 2026-11-17 (#1118): 300,000 x $20 +
+        # 100,000 x $2 + 20,000 x $75 per MTok. Before it, $4.10 at base.
+        (ASTRA_LAW, 400_000, 100_000, 20_000,
+         (300_000 * 20.00 + 100_000 * 2.00 + 20_000 * 75.00) / _MTOK),  # 7.70
         # Terra's cached input is 5% of input, not the usual 10% (0.01).
         (TERRA_61, 100_000, 100_000, 0, 0.005),
+        # #1118: the one-token step past 272,000 inclusive input reprices the
+        # whole request, output included.
+        (ASTRA_62, 272_000, 40_000, 10_000,
+         (232_000 * 8.00 + 40_000 * 0.40 + 10_000 * 40.00) / _MTOK),   # 2.272
+        (ASTRA_62, 272_001, 40_000, 10_000,
+         (232_001 * 16.00 + 40_000 * 0.80 + 10_000 * 60.00) / _MTOK),  # 4.344016
+        (ASTRA_LAW_62, 272_000, 40_000, 10_000,
+         (232_000 * 8.00 + 40_000 * 0.40 + 10_000 * 40.00) / _MTOK),   # 2.272
+        (ASTRA_LAW_62, 272_001, 40_000, 10_000,
+         (232_001 * 16.00 + 40_000 * 0.80 + 10_000 * 60.00) / _MTOK),  # 4.344016
+        (SOL_62, 272_000, 40_000, 10_000,
+         (232_000 * 2.00 + 40_000 * 0.10 + 10_000 * 10.00) / _MTOK),   # 0.568
+        (SOL_62, 272_001, 40_000, 10_000,
+         (232_001 * 4.00 + 40_000 * 0.20 + 10_000 * 15.00) / _MTOK),   # 1.086004
+        (CYBER_6, 272_001, 40_000, 10_000,
+         (232_001 * 40.00 + 40_000 * 4.00 + 10_000 * 150.00) / _MTOK),  # 10.94004
     ],
 )
 def test_new_gpt6_long_context_and_cached_rates(
@@ -326,7 +412,24 @@ def test_new_gpt6_long_context_and_cached_rates(
         model, input_tokens, cached_tokens, output_tokens, 0,
     )
 
-    assert cost == pytest.approx(expected)
+    assert cost == pytest.approx(expected, abs=1e-9)
+
+
+@pytest.mark.parametrize("model", [ASTRA_62, SOL_62, ASTRA_LAW_62])
+@pytest.mark.parametrize("input_tokens", [272_000, 272_001])
+def test_gpt62_fast_doubles_each_side_of_the_context_boundary(
+    model, input_tokens,
+):
+    # #1118: Fast is applied once, to the tier the inclusive input selects.
+    standard = pricing._calculate_codex_entry_cost(
+        model, input_tokens, 40_000, 10_000, 0,
+    )
+    fast = pricing._calculate_codex_entry_cost(
+        model, input_tokens, 40_000, 10_000, 0, speed="fast",
+    )
+
+    assert standard > 0.5
+    assert fast == pytest.approx(2 * standard, abs=1e-9)
 
 
 def test_coverage_and_drift_scope_accept_the_new_gpt6_cards():

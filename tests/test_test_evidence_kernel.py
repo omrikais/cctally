@@ -2064,6 +2064,8 @@ TRANSFORMER_CLASSIFIERS = (
     "_STRUCTURED_VERBATIM", "_STRUCTURED_PREFIX", "_SECTION_RULE_RE",
     "_MARKER_PREFIX_RE", "_EXCEPTION_RE", "_TRACEBACK_RE", "_DIFF_HEADER_RE",
     "scrub_line", "_is_ordinary", "unknown_vocabulary",
+    # #1109: the contextual header emission decides what the extract shows.
+    "SESSION_VIOLATION_HEADERS", "_SGR_RE", "pytest_session_violation_ranges",
 )
 
 
@@ -5454,3 +5456,407 @@ def test_private_detail_parses_pathological_lines_in_linear_time():
     block = K.build_private_failure_detail(
         [("pytest", "logs/pytest.log", log)], run_id="r1")
     assert "E   assert 0" in block
+
+
+# --------------------------------------------- the session-violation block (#1109)
+#
+# `tests/conftest.py` `pytest_sessionfinish` prints the controller's
+# session-level violations ahead of everything `pytest_terminal_summary`
+# prints, so in a real bulk leg the block sits behind about 370 progress lines
+# and ahead of a long `warnings summary`: outside both marker-less windows.
+
+_SV_ISOLATION_HEADER = (
+    "isolation contract violated after the reporting test finished (#529 S4):"
+)
+_SV_HYGIENE_HEADER = "temp hygiene violated outside any single test (#963):"
+_SV_PAYLOAD = "secret-1109"
+_SV_ISOLATION_DIAGNOSTIC = (
+    "  write violation: open -> /Users/someone/secret-1109/late.txt "
+    "(node=<no active test> worker=main pid=4242)"
+)
+_SV_HYGIENE_DIAGNOSTIC = (
+    "  temp hygiene: /tmp/x/stray left 1 entry by <session backstop>"
+)
+# Indented, so it is block continuation rather than pytest's counts line, and
+# kept verbatim by the counters rule under every context.
+_SV_CONTINUATION = "  3 passed in 0.10s"
+_SV_COUNTS = "26565 passed, 9 skipped, 3810 warnings in 1331.15s"
+_SV_STORM_RE = re.compile(r"^  1\d{4} passed in 0\.10s$")
+
+
+def _session_violation_log(*, failures=0, sgr=False, storm=0):
+    """A `-q -rfE` bulk-leg log carrying the controller's session block.
+
+    400 progress lines, the agentmem line, the block (both headers), then
+    optionally a FAILURES region, a 1,500-line warnings summary, optionally
+    the short test summary, and the counts line. `sgr` wraps the block as
+    `write_line(..., red=True)` prints it; `storm` adds distinct continuation
+    lines under the isolation header.
+    """
+    lines = ["." * 72 + "  [%3d%%]" % (i * 100 // 400) for i in range(1, 401)]
+    lines.append("agentmem contract: required — agentmem is present, so the "
+                 "agentmem-gated tests ran")
+    block = [
+        _SV_ISOLATION_HEADER,
+        _SV_ISOLATION_DIAGNOSTIC,
+        "    written by thread 'late-writer'",
+        "    started at tests/test_x.py:10",
+        "    write stack: tests/test_x.py:12 in late",
+        _SV_CONTINUATION,
+    ]
+    block += ["  %d passed in 0.10s" % (10000 + i) for i in range(storm)]
+    block += [_SV_HYGIENE_HEADER, _SV_HYGIENE_DIAGNOSTIC]
+    if sgr:
+        block[0] = "\x1b[31m" + block[0]
+        block[-1] = block[-1] + "\x1b[0m"
+    lines += block
+    lines.append("")
+    if failures:
+        lines.append("=" * 30 + " FAILURES " + "=" * 30)
+        for k in range(failures):
+            lines += [
+                "_" * 20 + " test_f%d " % k + "_" * 20,
+                "",
+                "    def test_f%d():" % k,
+                ">       assert False",
+                "E   AssertionError: decisive %d" % k,
+                "",
+                "tests/test_f.py:%d: AssertionError" % (k + 1),
+            ]
+    lines.append("=" * 30 + " warnings summary " + "=" * 30)
+    warnings_lines = []
+    i = 0
+    while len(warnings_lines) < 1500:
+        warnings_lines += [
+            "tests/test_w.py::test_w[%d]" % i,
+            "  tests/test_w.py:3: UserWarning: w%d" % i,
+            "    warnings.warn(...)",
+            "",
+        ]
+        i += 1
+    lines += warnings_lines[:1500]
+    if failures:
+        lines.append("=" * 25 + " short test summary info " + "=" * 25)
+        lines += ["FAILED tests/test_f.py::test_f%d - AssertionError: decisive %d"
+                  % (k, k) for k in range(failures)]
+        lines.append("%d failed, %s" % (failures, _SV_COUNTS))
+    else:
+        lines.append(_SV_COUNTS)
+    return lines
+
+
+def _sv_block(lines):
+    """The block's own lines, as the builder printed them (no SGR)."""
+    return lines[lines.index(_SV_ISOLATION_HEADER):
+                 lines.index(_SV_HYGIENE_DIAGNOSTIC) + 1]
+
+
+_SV_REAL_CTX = []
+
+
+def _sv_real_ctx():
+    """The repository's real disclosure context, built once."""
+    if not _SV_REAL_CTX:
+        _SV_REAL_CTX.append(K.ScrubContext(
+            roots=ROOTS,
+            is_public_path=K.build_disclosure_predicate(str(REPO)),
+            known_tokens=K.build_known_tokens(str(REPO)),
+        ))
+    return _SV_REAL_CTX[0]
+
+
+def _sv_closed_ctx():
+    return K.ScrubContext(roots=ROOTS)
+
+
+def _sv_ctx(name):
+    return _sv_real_ctx() if name == "real" else _sv_closed_ctx()
+
+
+def _sv_extract(subject, lines, ctx):
+    """`build_scrubbed_extract` with the bridge's own call shape
+    (`_subject_windows` → `allocate_budget` with BLOCK_OVERHEAD_LINES)."""
+    windows = K.select_failure_windows(lines, failing=True)
+    hard = sum(w["end"] - w["start"] + 1 for w in windows if w["kind"] == "hard")
+    supplemental = sum(
+        w["end"] - w["start"] + 1 for w in windows if w["kind"] != "hard")
+    alloc = K.allocate_budget(
+        [{"name": subject, "hard": hard + 2, "supplemental": supplemental}])
+    out = K.build_scrubbed_extract(
+        {subject: lines}, ctx, alloc,
+        log_names={subject: "logs/%s.log" % subject},
+        clusters={subject: windows},
+    )
+    return out, alloc
+
+
+def test_private_detail_keeps_a_session_violation_block_ahead_of_a_long_warning_section():
+    """Detects #1109: a controller session-violation block outside the first
+    40 and last 200 lines of a no-failing-node log is lost from the private
+    detail, so a `pytest-no-failing-node-ids` failure reaches the maintainer
+    with no cause."""
+    lines = _session_violation_log()
+    start = lines.index(_SV_ISOLATION_HEADER)
+    assert K.WINDOW_BEFORE_LINES < start < len(lines) - K.WINDOW_AFTER_LINES
+    detail = set(K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", lines)], run_id="r1"))
+    missing = [line for line in _sv_block(lines) if line not in detail]
+    assert not missing, missing
+
+
+def test_private_detail_keeps_the_session_block_beside_parsed_failures():
+    """Detects the loss when named failures coexist: every section parses, so
+    the raw-window fallback never runs and the session block never renders."""
+    lines = _session_violation_log(failures=2)
+    detail = set(K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", lines)], run_id="r1"))
+    for k in range(2):
+        assert "E   AssertionError: decisive %d" % k in detail
+    missing = [line for line in _sv_block(lines) if line not in detail]
+    assert not missing, missing
+
+
+@pytest.mark.parametrize("subject,ctx_name,failures", [
+    ("pytest", "real", 0),
+    ("pytest", "closed", 0),
+    ("benchmark", "real", 0),
+    ("benchmark", "closed", 0),
+    ("pytest", "real", 2),
+])
+def test_scrubbed_extract_keeps_the_session_headers_and_their_first_diagnostics(
+        subject, ctx_name, failures):
+    """Detects a console/export loss of the session block, body lines dropped
+    behind retained headers, failing node names pushed out by the session
+    reservation, and any disclosure of the block's private payload."""
+    lines = _session_violation_log(failures=failures)
+    ctx = _sv_ctx(ctx_name)
+    out, _alloc = _sv_extract(subject, lines, ctx)
+    for header, diagnostic in ((_SV_ISOLATION_HEADER, _SV_ISOLATION_DIAGNOSTIC),
+                               (_SV_HYGIENE_HEADER, _SV_HYGIENE_DIAGNOSTIC)):
+        assert header in out, out[:12]
+        at = out.index(header)
+        assert out[at + 1] == K.scrub_line(diagnostic, ctx), out[at:at + 2]
+    assert _SV_CONTINUATION in out
+    assert lines[-1] in out
+    if failures:
+        for line in lines:
+            if line.startswith("FAILED "):
+                assert K.scrub_line(line, ctx) in out, line
+    assert _SV_PAYLOAD not in "\n".join(out)
+    assert K.validate_export(out, ROOTS) == []
+
+
+@pytest.mark.parametrize("ctx_name", ["real", "closed"])
+def test_the_scrubber_alone_never_admits_a_session_header(ctx_name):
+    """Detects global header admission (R2, F1): were `scrub_line` itself to
+    keep a header, every lookalike in every log would become legible, and an
+    extract-equals-scrub check could not tell."""
+    ctx = _sv_ctx(ctx_name)
+    assert K.SESSION_VIOLATION_HEADERS == (_SV_ISOLATION_HEADER, _SV_HYGIENE_HEADER)
+    for header in K.SESSION_VIOLATION_HEADERS:
+        for line in (header, "\x1b[31m" + header, "\x1b[31m" + header + "\x1b[0m"):
+            assert K.scrub_line(line, ctx) != header, line
+
+
+_SV_SHORT_BLOCK = [_SV_ISOLATION_HEADER, _SV_ISOLATION_DIAGNOSTIC,
+                   _SV_HYGIENE_HEADER, _SV_HYGIENE_DIAGNOSTIC]
+_SV_LOOKALIKES = {
+    # A test's captured output in a FAILURES section.
+    "captured": _SV_SHORT_BLOCK + [
+        "", "=" * 20 + " FAILURES " + "=" * 20, "_" * 10 + " test_c " + "_" * 10,
+        "-" * 10 + " Captured stdout call " + "-" * 10,
+        _SV_ISOLATION_HEADER, "  write violation: captured",
+        "=" * 10 + " short test summary info " + "=" * 10,
+        "FAILED tests/t.py::test_c - assert 0", "1 failed in 0.10s",
+    ],
+    # The per-test header (#529 S4) is a different sentence.
+    "per-test": _SV_SHORT_BLOCK + [
+        "", "isolation contract violated by this test (#529 S4):",
+        "  write violation: per-test", "1 passed in 0.10s",
+    ],
+    "after-counts": _SV_SHORT_BLOCK + [
+        "", "1 passed in 0.10s", _SV_ISOLATION_HEADER, _SV_HYGIENE_HEADER,
+    ],
+    "indented": _SV_SHORT_BLOCK + [
+        "", "  " + _SV_ISOLATION_HEADER, "1 passed in 0.10s",
+    ],
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_SV_LOOKALIKES))
+def test_a_session_header_lookalike_keeps_todays_scrub(kind):
+    """Detects lookalike recognition: a header-looking line the finder must
+    not recognise (captured output, a per-test header, text after the counts
+    line, an indented header-like line outside any block) emitted legibly, in
+    a log whose real block does activate the session branch."""
+    lines = _SV_LOOKALIKES[kind]
+    ranges = K.pytest_session_violation_ranges(lines)
+    assert [(start, header) for start, _stop, header in ranges] == [(0, 0), (2, 1)]
+    lookalikes = [idx for idx in range(len(_SV_SHORT_BLOCK), len(lines))
+                  if "contract violated" in lines[idx] or "hygiene violated" in lines[idx]]
+    assert lookalikes  # non-vacuity
+    for ctx_name in ("real", "closed"):
+        ctx = _sv_ctx(ctx_name)
+        out, alloc = _sv_extract("pytest", lines, ctx)
+        assert len(lines) <= alloc["pytest"] - 1  # the whole-fit path
+        assert out[1] == _SV_ISOLATION_HEADER and out[3] == _SV_HYGIENE_HEADER
+        for idx in lookalikes:
+            assert out[1 + idx] == K.scrub_line(lines[idx], ctx), (idx, out[1 + idx])
+
+
+def test_a_session_header_in_a_harness_log_keeps_todays_scrub():
+    """Detects the session branch leaking to harness subjects: the block is
+    pytest controller output, so a harness log keeps today's bytes."""
+    lines = _SV_SHORT_BLOCK + ["FAIL alpha: stdout diverged"]
+    for ctx_name in ("real", "closed"):
+        ctx = _sv_ctx(ctx_name)
+        out, _alloc = _sv_extract("alpha", lines, ctx)
+        assert out == ["---- alpha ----"] + [K.scrub_line(line, ctx) for line in lines]
+
+
+def test_an_sgr_wrapped_session_block_is_recognised_and_emitted_plain():
+    """Detects colour blindness: `write_line(..., red=True)` opens an SGR
+    sequence on the first header and resets after the last block line, and
+    the block must still be found, whole, and its headers emitted plain."""
+    lines = _session_violation_log(sgr=True)
+    ranges = K.pytest_session_violation_ranges(lines)
+    first = lines.index("\x1b[31m" + _SV_ISOLATION_HEADER)
+    last = lines.index(_SV_HYGIENE_DIAGNOSTIC + "\x1b[0m")
+    assert [header for _start, _stop, header in ranges] == [0, 1]
+    assert ranges[0][0] == first and ranges[-1][1] == last + 1
+    for ctx_name in ("real", "closed"):
+        out, _alloc = _sv_extract("pytest", lines, _sv_ctx(ctx_name))
+        assert _SV_ISOLATION_HEADER in out and _SV_HYGIENE_HEADER in out
+
+
+@pytest.mark.parametrize("taint", [
+    lambda h: "\x1b[31m" + h + " extra",
+    lambda h: "\x1b]0;t\x07" + h,
+    lambda h: h + "\x07",
+    lambda h: "\x1b[31m" + "/Users/x " + h,
+], ids=["sgr-appended-text", "osc", "bel", "private-text-in-sgr"])
+def test_a_tainted_session_header_is_not_recognised(taint):
+    """Detects a free field in the SGR path: only SGR parameters may be
+    discarded, so appended text, an OSC or BEL control, or private text
+    between SGR sequences leaves the line on the ordinary scrub."""
+    for header in K.SESSION_VIOLATION_HEADERS:
+        tainted = taint(header)
+        lines = _SV_SHORT_BLOCK + ["", tainted, "  write violation: x",
+                                   "1 passed in 0.10s"]
+        ranges = K.pytest_session_violation_ranges(lines)
+        assert [start for start, _stop, _header in ranges] == [0, 2], tainted
+        for ctx_name in ("real", "closed"):
+            ctx = _sv_ctx(ctx_name)
+            out, _alloc = _sv_extract("pytest", lines, ctx)
+            emitted = out[1 + lines.index(tainted)]
+            assert emitted == K.scrub_line(tainted, ctx)
+            assert emitted != header
+
+
+def test_a_session_violation_storm_is_bounded_and_keeps_both_headers():
+    """Detects an unbounded or header-losing render of a 2,000-line block, and
+    an extract whose priority selection or omission count is wrong."""
+    lines = _session_violation_log(storm=2000)
+    block_lines = _sv_block(lines)
+    assert len(block_lines) > K.PER_SUBJECT_LINE_CAP  # non-vacuity
+    for max_bytes in (K.DETAIL_MAX_BYTES, 8192):
+        detail = K.build_private_failure_detail(
+            [("pytest", "logs/pytest.log", lines)], run_id="r1",
+            max_bytes=max_bytes)
+        assert _detail_size(detail) <= max_bytes
+        assert _SV_ISOLATION_HEADER in detail and _SV_HYGIENE_HEADER in detail
+    detail = K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", lines)], run_id="r1")
+    present = set(detail)
+    # The 1 MiB share holds far more than 600 lines, so the cap is what binds.
+    assert sum(1 for line in block_lines if line in present) == K.PER_SUBJECT_LINE_CAP
+    assert _SV_ISOLATION_DIAGNOSTIC in present and _SV_HYGIENE_DIAGNOSTIC in present
+    assert any(re.fullmatch(r"\[… \d+ lines omitted …\]", line) for line in detail)
+
+    ctx = _sv_real_ctx()
+    out, alloc = _sv_extract("pytest", lines, ctx)
+    assert len(out) <= alloc["pytest"]
+    for header, diagnostic in ((_SV_ISOLATION_HEADER, _SV_ISOLATION_DIAGNOSTIC),
+                               (_SV_HYGIENE_HEADER, _SV_HYGIENE_DIAGNOSTIC)):
+        at = out.index(header)
+        assert out[at + 1] == K.scrub_line(diagnostic, ctx), out[at:at + 2]
+    (notice,) = [line for line in out if line.startswith("[OMITTED: ")]
+    omitted = int(re.match(r"\[OMITTED: (\d+) lines", notice).group(1))
+    assert omitted == len(lines) - (len(out) - 2)
+    after = out[out.index(notice) + 1:]
+    assert not [line for line in after if _SV_STORM_RE.match(line)], after[:5]
+    assert lines[-1] in after
+
+
+def test_an_indented_header_inside_a_block_is_continuation_text():
+    """Detects indentation stripped for recognition (#1109 review F4): a
+    block's continuation line that reads like a header would start a new
+    block and be emitted as a legible constant."""
+    lines = [_SV_ISOLATION_HEADER, _SV_ISOLATION_DIAGNOSTIC,
+             "  " + _SV_ISOLATION_HEADER, _SV_HYGIENE_HEADER,
+             _SV_HYGIENE_DIAGNOSTIC, "1 passed in 0.10s"]
+    assert K.pytest_session_violation_ranges(lines) == [(0, 3, 0), (3, 5, 1)]
+    for ctx_name in ("real", "closed"):
+        ctx = _sv_ctx(ctx_name)
+        out, _alloc = _sv_extract("pytest", lines, ctx)
+        assert out[1] == _SV_ISOLATION_HEADER and out[4] == _SV_HYGIENE_HEADER
+        assert out[3] == K.scrub_line(lines[2], ctx) != _SV_ISOLATION_HEADER
+
+
+def _sv_marker_cluster_log(*, summary):
+    """An INTERNALERROR traceback directly ahead of a 62-line session block,
+    so the block falls inside the traceback's marker cluster, then a long
+    warnings summary. With `summary`, a short test summary adds a second,
+    latest cluster that holds the counts line; without it, the counts line
+    lies outside every cluster. Every line is distinct."""
+    lines = ["progress %d" % i for i in range(400)]
+    lines.append("INTERNALERROR> Traceback (most recent call last):")
+    lines += ['INTERNALERROR>   File "/x/m%d.py", line 1, in f' % i
+              for i in range(29)]
+    lines += [_SV_ISOLATION_HEADER, _SV_ISOLATION_DIAGNOSTIC]
+    lines += ["    frame %d" % i for i in range(58)]
+    lines += [_SV_HYGIENE_HEADER, _SV_HYGIENE_DIAGNOSTIC, ""]
+    lines.append("=" * 30 + " warnings summary " + "=" * 30)
+    lines += ["tests/test_w.py::test_w[%d]" % i for i in range(1500)]
+    if summary:
+        lines.append("=" * 25 + " short test summary info " + "=" * 25)
+        lines += ["FAILED tests/test_f.py::test_f%d - AssertionError" % k
+                  for k in range(2)]
+        lines.append("2 failed, " + _SV_COUNTS)
+    else:
+        lines.append(_SV_COUNTS)
+    return lines
+
+
+@pytest.mark.parametrize("summary", [False, True],
+                         ids=["one-cluster", "two-clusters"])
+def test_the_session_reservation_never_pays_for_a_cluster_line_twice(
+        monkeypatch, summary):
+    """Detects session-branch budget waste (#1109 review F1, F2): session or
+    counts lines inside a marker cluster's slice are paid for twice, so an
+    INTERNALERROR traceback beside a large block, the earliest cluster, or the
+    reserved counts line outside every cluster is dropped from the extract.
+    The selection is the subject, so `scrub_line` is the identity here."""
+    monkeypatch.setattr(K, "scrub_line", lambda line, ctx: line)
+    lines = _sv_marker_cluster_log(summary=summary)
+    windows = K.select_failure_windows(lines, failing=True)
+    ranges = K.pytest_session_violation_ranges(lines)
+    first, last = ranges[0][0], ranges[-1][1] - 1
+    # Non-vacuity: the block lies inside the first cluster, and the counts
+    # line lies inside the latest cluster only when there is a summary.
+    assert windows[0]["start"] < first and last < windows[0]["end"]
+    assert (windows[-1]["end"] == len(lines) - 1) is summary
+    out, alloc = _sv_extract("pytest", lines, K.ScrubContext(roots=ROOTS))
+    assert len(out) == len(set(out)) == alloc["pytest"]  # nothing wasted or repeated
+    for line in lines[first:last + 1] + [lines[-1]]:
+        assert line in out, line
+    for line in lines:
+        if line.startswith("INTERNALERROR"):
+            assert line in out, line
+    if summary:
+        for window in windows:
+            for idx in range(window["start"], window["end"] + 1):
+                assert lines[idx] in out, (idx, lines[idx])
+    (notice,) = [line for line in out if line.startswith("[OMITTED: ")]
+    omitted = int(re.match(r"\[OMITTED: (\d+) lines", notice).group(1))
+    assert omitted == len(lines) - (len(out) - 2)

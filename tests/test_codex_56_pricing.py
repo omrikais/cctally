@@ -66,8 +66,10 @@ SOL_EMBEDDED_CARD = {
     "output_cost_per_token_above_272k_tokens": 4.5e-05,
 }
 
-# D2: OpenAI guarantees the promotional rate "at least through" this date.
-SOL_SUPPRESSION_EXPIRY = "2026-11-21"
+# D2: OpenAI's pricing page (read 2026-11-17, #1118) says the promotional
+# pricing "is available until November 30, 2026"; before that it guaranteed
+# the rate only "at least through November 21, 2026".
+SOL_SUPPRESSION_EXPIRY = "2026-11-30"
 
 # `expired_allowlist_entries` compares strictly, so the suppressions stay valid
 # THROUGH the guaranteed date and become actionable the following day. Derived
@@ -317,6 +319,14 @@ def test_session_metrics_rate_card_matches_the_authoritative_table():
     assert metrics.CACHED_INPUT_FACTORS["gpt-6.1-terra"] == 0.05
     assert metrics.PRICING["gpt-6-rosalind"] == (15.0, 75.0)
     assert metrics.PRICING["gpt-6-astra-law"] == (10.0, 50.0)
+    # #1118: the 6.2 cards read cached input at 5% of input; Cyber at the
+    # default 10% (the parity loop below and the $21.00 aggregate cover it).
+    assert metrics.PRICING["gpt-6.2-astra"] == (8.0, 40.0)
+    assert metrics.PRICING["gpt-6.2-sol"] == (2.0, 10.0)
+    assert metrics.PRICING["gpt-6.2-astra-law"] == (8.0, 40.0)
+    assert metrics.PRICING["gpt-6-cyber"] == (20.0, 100.0)
+    for model in ("gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"):
+        assert metrics.CACHED_INPUT_FACTORS[model] == 0.05, model
     for model, (input_per_mtok, output_per_mtok) in metrics.PRICING.items():
         card = pricing.CODEX_MODEL_PRICING[pricing._canonical_codex_model(model)]
         assert input_per_mtok == pytest.approx(
@@ -339,7 +349,18 @@ def test_session_metrics_rate_card_matches_the_authoritative_table():
 
 @requires_session_metrics
 @pytest.mark.parametrize(
-    ("model", "expected"), [("gpt-6.1-sol", 2.05), ("gpt-6-sol", 2.10)],
+    ("model", "expected"),
+    [
+        ("gpt-6.1-sol", 2.05),
+        ("gpt-6-sol", 2.10),
+        # #1118: an aggregate at short Standard rates (the estimator has no
+        # long-context tier), not one request: 0.5M noncached + 0.5M cached at
+        # the model's factor + 0.1M output. A missing row estimates $0.
+        ("gpt-6.2-astra", 8.20),
+        ("gpt-6.2-sol", 2.05),
+        ("gpt-6.2-astra-law", 8.20),
+        ("gpt-6-cyber", 21.00),
+    ],
 )
 def test_session_metrics_uses_each_sol_models_cached_input_rate(model, expected):
     metrics = _load_session_metrics()

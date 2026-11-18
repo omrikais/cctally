@@ -1543,12 +1543,14 @@ def test_the_ledger_is_worker_private(guarded):
     assert pathlib.Path(path).parent.parent == iso.session_dir()
 
 
-def _nested_pytest(module_path, tmp_path, synthetic, extra_args=(), **env_extra):
+def _nested_pytest(module_path, tmp_path, synthetic, extra_args=(),
+                   pythonpath_extra=(), **env_extra):
     env = _fresh_env(
         tmp_path,
         CCTALLY_DATA_DIR=str(synthetic),
         PYTHONPATH=os.pathsep.join(
-            [str(REPO_ROOT / "tests"), str(REPO_ROOT / "bin")]
+            [str(REPO_ROOT / "tests"), str(REPO_ROOT / "bin"),
+             *pythonpath_extra]
         ),
         **env_extra,
     )
@@ -1681,6 +1683,152 @@ def test_a_late_violation_fails_the_run_including_under_xdist(tmp_path, jobs):
         "fail it\n" + proc.stdout + proc.stderr
     )
     assert "isolation contract violated" in proc.stdout, proc.stdout + proc.stderr
+
+
+# #1109: a write no test owns. A `pytest_sessionfinish(tryfirst=True)` plugin
+# runs before tests/conftest.py's own session-finish hook reads the ledgers, so
+# the write reaches no test's report and fails the session with no failing
+# node. (This nested child inherits the launching test's node through
+# CCTALLY_ISOLATION_NODE, so its ledger line names that node, with
+# `worker=main`; a top-level run records `node=<no active test>`.) The filler stands in for a bulk leg's progress
+# output, which is what puts the block outside the first 40 lines.
+_UNATTRIBUTED_LATE_PLUGIN = """\
+import os
+
+import pytest
+
+import _lib_test_isolation as iso
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionfinish(session):
+    try:
+        open({victim!r}, "w").write("x")
+    except iso.ProductionWriteBlocked:
+        pass
+    if not os.environ.get("PYTEST_XDIST_WORKER"):
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        for i in range(60):
+            reporter.write_line("filler %d" % i)
+"""
+
+_MANY_WARNINGS_MODULE = """\
+import warnings
+
+
+def test_warns_many_times():
+    for i in range(300):
+        warnings.warn("w1109 %d" % i, UserWarning)
+"""
+
+_SESSION_ISOLATION_HEADER = (
+    "isolation contract violated after the reporting test finished (#529 S4):"
+)
+
+
+def _evidence_kernel():
+    """bin/_lib_test_evidence.py, loaded once under its own module name."""
+    import importlib.util
+
+    name = "_lib_test_evidence"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, REPO_ROOT / "bin" / "_lib_test_evidence.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)  # never leave a half-loaded kernel registered
+        raise
+    return module
+
+
+def test_an_unattributed_session_violation_survives_into_the_retained_detail(tmp_path):
+    """#1109. Failure it detects: the controller's session-violation block,
+    printed behind the progress output and ahead of a long warnings summary,
+    is dropped from the retained private detail and the scrubbed extract, or
+    the producer's header drifts from the vocabulary the evidence kernel
+    recognises, so a no-failing-node leg failure reaches the maintainer with
+    no cause."""
+    pytest.importorskip("xdist")
+    K = _evidence_kernel()
+    synthetic = tmp_path / "nested-prod"
+    synthetic.mkdir()
+    victim = synthetic / "late-1109.txt"
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    (plugins / "p1109_late_plugin.py").write_text(
+        _UNATTRIBUTED_LATE_PLUGIN.format(victim=str(victim)))
+    module = tmp_path / "test_nested_session_violation.py"
+    module.write_text(_MANY_WARNINGS_MODULE)
+    proc = _nested_pytest(
+        module, tmp_path, synthetic,
+        extra_args=("-rfE", "-n", "2", "-p", "p1109_late_plugin"),
+        pythonpath_extra=(str(plugins),),
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1, output
+    lines = proc.stdout.splitlines()
+    assert not [line for line in lines if re.match(r"^(FAILED|ERROR) ", line)], output
+    # Non-vacuity before any retention claim: the block must sit outside both
+    # marker-less windows, or today's head/tail would keep it by accident.
+    assert _SESSION_ISOLATION_HEADER in lines, output
+    at = lines.index(_SESSION_ISOLATION_HEADER)
+    assert K.WINDOW_BEFORE_LINES < at < len(lines) - K.WINDOW_AFTER_LINES, (
+        at, len(lines))
+    # The controller's own late write. Launched from inside a test, the child
+    # inherits that test's node through CCTALLY_ISOLATION_NODE, so the write
+    # names the launching test rather than `<no active test>`; `worker=main`
+    # is what marks it as the controller's.
+    assert any("write violation" in line and "worker=main" in line
+               for line in lines[at:]), output
+
+    detail = K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", lines)], run_id="r1")
+    # By name: the ledger may record the resolved form of a temp path.
+    assert any("write violation" in line and victim.name in line
+               for line in detail), "\n".join(detail)
+
+    windows = K.select_failure_windows(lines, failing=True)
+    hard = sum(w["end"] - w["start"] + 1 for w in windows if w["kind"] == "hard")
+    supplemental = sum(
+        w["end"] - w["start"] + 1 for w in windows if w["kind"] != "hard")
+    alloc = K.allocate_budget(
+        [{"name": "pytest", "hard": hard + 2, "supplemental": supplemental}])
+    ctx = K.ScrubContext(roots={"home": str(tmp_path / "fake-home"),
+                                "repo": str(REPO_ROOT), "tmp": "/tmp"})
+    extract = K.build_scrubbed_extract(
+        {"pytest": lines}, ctx, alloc, log_names={"pytest": "logs/pytest.log"},
+        clusters={"pytest": windows})
+    assert _SESSION_ISOLATION_HEADER in extract, extract
+
+
+def test_the_session_violation_message_is_the_finders_protocol():
+    """#1109. Failure it detects: the producer's block drifting from what the
+    evidence kernel recognises (either header reworded, a problem lost, the
+    continuation indentation changed), which silently drops the block from the
+    retained failure detail again."""
+    import conftest
+
+    K = _evidence_kernel()
+    first = "write violation: open -> /x/a (node=n worker=main pid=1)"
+    second = ("write violation: open -> /x/b (node=n worker=gw0 pid=2)"
+              "\n    written by thread 't'\n    write stack: s")
+    message = conftest._session_violation_message(
+        [first, second, "temp hygiene: a", "temp hygiene: b"])
+    assert message == (
+        "isolation contract violated after the reporting test finished "
+        "(#529 S4):\n  " + first + "\n  " + second
+        + "\ntemp hygiene violated outside any single test (#963):"
+        "\n  temp hygiene: a\n  temp hygiene: b"
+    )
+    assert conftest._session_violation_message([]) == ""
+    lines = message.splitlines()
+    ranges = K.pytest_session_violation_ranges(lines)
+    assert ranges == [(0, 5, 0), (5, len(lines), 1)], ranges
+    assert (lines[0], lines[5]) == K.SESSION_VIOLATION_HEADERS
 
 
 def test_a_nested_run_is_not_aggregated_into_its_launching_session(tmp_path):

@@ -503,6 +503,32 @@ def _announce_agentmem_contract(session) -> None:
         print(message, file=sys.stderr)
 
 
+def _session_violation_message(problems):
+    """The controller's session-violation block, as `pytest_sessionfinish`
+    prints it.
+
+    Its two headers are a protocol, not incidental wording:
+    `bin/_lib_test_evidence.py` recognises exactly these lines
+    (SESSION_VIOLATION_HEADERS) to keep the block in the retained failure
+    detail (#1109), and tests/test_isolation_contract.py holds the copies in
+    agreement. Returns "" for no problems.
+    """
+    isolation = [p for p in problems if not p.startswith(_hyg.HYGIENE_PREFIX)]
+    hygiene = [p for p in problems if p.startswith(_hyg.HYGIENE_PREFIX)]
+    blocks = []
+    if isolation:
+        blocks.append(
+            "isolation contract violated after the reporting test finished "
+            "(#529 S4):\n  " + "\n  ".join(isolation)
+        )
+    if hygiene:
+        blocks.append(
+            "temp hygiene violated outside any single test (#963):\n  "
+            + "\n  ".join(hygiene)
+        )
+    return "\n".join(blocks)
+
+
 def pytest_sessionfinish(session, exitstatus):
     """Late arrivals fail the SESSION, because their test's report is final.
 
@@ -534,20 +560,7 @@ def pytest_sessionfinish(session, exitstatus):
     if not problems:
         return
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
-    isolation = [p for p in problems if not p.startswith(_hyg.HYGIENE_PREFIX)]
-    hygiene = [p for p in problems if p.startswith(_hyg.HYGIENE_PREFIX)]
-    blocks = []
-    if isolation:
-        blocks.append(
-            "isolation contract violated after the reporting test finished "
-            "(#529 S4):\n  " + "\n  ".join(isolation)
-        )
-    if hygiene:
-        blocks.append(
-            "temp hygiene violated outside any single test (#963):\n  "
-            + "\n  ".join(hygiene)
-        )
-    message = "\n".join(blocks)
+    message = _session_violation_message(problems)
     if reporter is not None:
         reporter.write_line(message, red=True)
     else:  # pragma: no cover - only when the terminal plugin is disabled

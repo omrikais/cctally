@@ -24,7 +24,7 @@ COMPOSITION SUPPORT   radii are EFFECTIVE: max(observed spread, materiality floo
   token-class radius         0.0020   (observed 0.0000)
   forecast family distance   0.0500   (outside the family radius)
   forecast family effect     4.55%   (within 5.00%: admitted by family rate bounds)
-  out-of-scope: claude-fable-5, claude-fable-5-1, claude-mythos-5, claude-mythos-5-1 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled
+  out-of-scope: claude-fable-5, claude-fable-5-1, claude-fable-5-2, claude-mythos-5, claude-mythos-5-1, claude-mythos-5-2 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled
 
 DETECTOR
   split                      none

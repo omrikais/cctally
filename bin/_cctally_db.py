@@ -15039,7 +15039,15 @@ def _vacuum_one_db(path, label: str, provider_locked: bool) -> int:
             if stats_store:
                 import _cctally_store
 
-                if _cctally_store._stats_legacy_wal_family_present(path):
+                try:
+                    legacy_wal = (
+                        _cctally_store._stats_legacy_wal_family_present(path))
+                except _cctally_core.StoreUnavailable as exc:
+                    # #1100: the header child could not read stats.db, so its
+                    # format is unknown; refuse without opening it.
+                    eprint("Error: " + _cctally_core.store_refusal_text(exc))
+                    return 3
+                if legacy_wal:
                     eprint(
                         "cctally: stats.db VACUUM declined: the index still uses "
                         "legacy WAL. Stop and restart older cctally processes, "
@@ -15081,7 +15089,8 @@ def cmd_db_vacuum(args: argparse.Namespace) -> int:
     checkpoint keepers to close (#901 W9, Q15) and retries the exclusive
     acquisition for at most 20 s; a handle still open then gets the same
     refusal. Refuses when free disk is below ~2x the file + WAL. Exit 0 on
-    success, 3 when a target is in use or disk is short."""
+    success, 3 when a target is in use or disk is short, or when stats.db's
+    header could not be read to rule out a legacy WAL family (#1100)."""
     # #787 spec 5.1: owner entry, guarded in its own frame.
     _cctally_core.require_capability("MAINTENANCE", entry="cmd_db_vacuum")
     which = getattr(args, "db", "cache")

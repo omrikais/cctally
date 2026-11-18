@@ -34,7 +34,7 @@
 # `expiredSuppressions` is derived from each PRICING_DRIFT_ALLOWLIST entry's
 # optional `expires` date against the `_command_as_of()` seam, and it feeds the
 # actionability predicate, so at the wall clock every golden here would flip on
-# a calendar date with no code change: from 2026-11-22 the six `gpt-5.6-sol`
+# a calendar date with no code change: from 2026-12-01 the six `gpt-5.6-sol`
 # suppressions (#643) expire, offline_clean and degraded_clean go 0 -> 1, and
 # all five JSON goldens gain the entries. Measured across as-of dates from
 # 2026-01-01 to 2027-06-01, `expiredSuppressions` and the exit code it drives
@@ -84,7 +84,7 @@ REGENERATE="${CCTALLY_PRICING_CHECK_REGENERATE:-}"
 # generically by tests/test_pricing_check.py::
 # test_no_suppression_expires_before_the_pricing_snapshot_date, and the cutover
 # itself is asserted in tests/test_codex_56_pricing.py.
-PINNED_AS_OF="2026-11-05T00:00:00Z"
+PINNED_AS_OF="2026-11-17T00:00:00Z"
 
 SNAPSHOT_DATE=$(sed -n \
     's/^PRICING_SNAPSHOT_DATE[[:space:]]*=[[:space:]]*"\([0-9-]*\)".*/\1/p' \

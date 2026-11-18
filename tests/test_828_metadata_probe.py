@@ -334,7 +334,8 @@ def test_828_the_probe_refuses_a_naive_or_inverted_bound(probe_store):
 # === The generation carries one probe, and both detail routes read it ======
 
 
-def _build_generation(ns, cache, *, direct=False, codex_budget=None):
+def _build_generation(ns, cache, *, direct=False, codex_budget=None,
+                      root_scope=None):
     """Build one frozen Codex generation over the probe store."""
     sources = sys.modules["_cctally_dashboard_sources"]
     stats = ns["open_db"]()
@@ -353,6 +354,7 @@ def _build_generation(ns, cache, *, direct=False, codex_budget=None):
             speed=semantics.speed,
             codex_budget=codex_budget if codex_budget is not None
             else semantics.codex_budget,
+            codex_root_scope=root_scope,
         )
         if direct:
             with sources.codex_path_scope() as path_scope:
@@ -1663,3 +1665,152 @@ def _a6_assert_empty_rooted_identity(
         assert sources._codex_identity_map(cache, ()) == {}
     finally:
         cache.close()
+
+
+# === #1108 T4 — a retired root's bad rows neither degrade nor count =========
+
+RETIRED_ROOT_KEY = "retired-root"
+
+
+def _current_root_scope():
+    """A recognized scope whose only configured root is ``ROOT_KEY``."""
+    cache_mod = sys.modules["_cctally_cache"]
+    return cache_mod._CodexPruneScope(
+        configured_root_keys=frozenset({ROOT_KEY}),
+        recognized_root_keys=frozenset({ROOT_KEY}))
+
+
+def _move_bad_rows_to_retired_root(cache, healthy_path):
+    """Re-key every non-healthy thread, alias and entry onto a retired root."""
+    for table, column in (("codex_conversation_threads", "source_path"),
+                          ("codex_session_entries", "source_path"),
+                          ("codex_session_files", "path")):
+        cache.execute(
+            f"UPDATE {table} SET source_root_key=? WHERE {column} != ?",
+            (RETIRED_ROOT_KEY, healthy_path))
+    cache.commit()
+
+
+def _seed_t4_case(ns, tmp_path, monkeypatch, kind, placement):
+    if kind == "malformed_operand":
+        cache = _seed_probe_store(ns, tmp_path, monkeypatch)
+        _insert_entry(
+            cache, source_path=HEALTHY_PATH, line_offset=700,
+            timestamp=_iso(NOW - dt.timedelta(days=5)),
+            conversation_key=HEALTHY_CONVERSATION,
+            input_tokens="not-a-number",
+            source_root_key=(RETIRED_ROOT_KEY if placement == "retired"
+                             else ROOT_KEY))
+        cache.commit()
+        return cache
+    cache = _seed_decode_store(
+        ns, tmp_path, monkeypatch, provenance=kind, age_days=5)
+    if placement == "retired":
+        root = tmp_path / DECODE_ROOT_PATH_NAME
+        _move_bad_rows_to_retired_root(cache, f"{root}/sessions/healthy.jsonl")
+    return cache
+
+
+@pytest.mark.parametrize("placement", ["retired", "current"])
+@pytest.mark.parametrize("kind", ["malformed_operand", "direct", "inherited"])
+def test_1108_a_retired_only_bad_row_neither_forces_the_fallback_nor_counts(
+    tmp_path, monkeypatch, kind, placement,
+):
+    """#1108 T4 (A11). Failure it detects: while a relocated root's rows
+    wait for the prune drain, a malformed operand or undecodable direct or
+    inherited metadata on the RETIRED root degraded the generation to the
+    fallback carrier and inflated the incomplete-row warning, though no
+    published figure reads that row. The same row on a current root still
+    degrades and counts."""
+    ns = load_script()
+    analytics = sys.modules["_cctally_source_analytics"]
+    cache = _seed_t4_case(ns, tmp_path, monkeypatch, kind, placement)
+    scope = _current_root_scope()
+    try:
+        unscoped = analytics.probe_codex_detail_metadata_health(
+            cache_conn=cache, start=NOW - dt.timedelta(days=365), end=NOW)
+        assert unscoped.incomplete_rows > 0, "non-vacuity: no bad row"
+        probe = analytics.probe_codex_detail_metadata_health(
+            cache_conn=cache, start=NOW - dt.timedelta(days=365), end=NOW,
+            root_scope=scope)
+        health = analytics.load_codex_project_metadata_health(
+            cache_conn=cache, start=NOW - dt.timedelta(days=30),
+            end=NOW + dt.timedelta(microseconds=1), root_scope=scope)
+        codex = _build_generation(ns, cache, root_scope=scope)
+        warnings = [w for w in codex.warnings
+                    if w.code == "codex_metadata_incomplete"]
+        if placement == "retired":
+            assert probe.incomplete_rows == 0, probe
+            assert health.incomplete_rows == 0, health
+            assert codex.metadata_health["state"] == "healthy", (
+                codex.metadata_health)
+            assert warnings == []
+            assert codex.data["projects"]["rows"], "the qualified path ran"
+            analytics.load_qualified_codex_entries(
+                NOW - dt.timedelta(days=30), NOW, speed="standard",
+                sync=False, cache_conn=cache, root_scope=scope)
+        else:
+            assert probe.incomplete_rows >= 1, probe
+            assert health.incomplete_rows >= 1, health
+            assert codex.metadata_health["state"] != "healthy", (
+                codex.metadata_health)
+            if kind == "malformed_operand":
+                with pytest.raises(analytics.QualifiedMetadataUnavailable):
+                    analytics.load_qualified_codex_entries(
+                        NOW - dt.timedelta(days=30), NOW, speed="standard",
+                        sync=False, cache_conn=cache, root_scope=scope)
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("bounded", [True, False])
+def test_1108_every_scoped_statement_builds_no_temp_structure(
+    tmp_path, monkeypatch, bounded,
+):
+    """#1108: the recognized-scope variants are new statement texts. Failure
+    it detects: a scoped health, probe, undecodable-seek, overlap, existence
+    or candidate statement that sorts or materializes history (#901 I1), or
+    that stops seeking the index its unscoped twin seeks."""
+    import _cctally_core
+    import _sql_plan_guard as guard
+
+    ns = load_script()
+    analytics = sys.modules["_cctally_source_analytics"]
+    cache_mod = sys.modules["_cctally_cache"]
+    seeded = _seed_decode_store(
+        ns, tmp_path, monkeypatch, provenance="inherited", age_days=5)
+    seeded.close()
+    scope = _current_root_scope()
+    with guard.capture_sql_plans() as recorder:
+        conn = sqlite3.connect(_cctally_core.CACHE_DB_PATH)
+        try:
+            start = NOW - dt.timedelta(days=30) if bounded else None
+            end = NOW if bounded else None
+            analytics.load_codex_project_metadata_health(
+                cache_conn=conn, start=start, end=end, root_scope=scope)
+            analytics.probe_codex_detail_metadata_health(
+                cache_conn=conn, start=NOW - dt.timedelta(days=365), end=NOW,
+                root_scope=scope)
+            analytics.has_cached_codex_accounting_entries(
+                cache_conn=conn, root_scope=scope)
+            cache_mod.codex_withholding_candidates(conn, frozenset({ROOT_KEY}))
+        finally:
+            conn.close()
+    statements = [statement for statement in recorder.statements
+                  if "codex_session_entries" in statement.sql]
+    scoped = [statement for statement in statements
+              if "substr(CAST(entries.source_path AS TEXT), 1, 1)"
+              in statement.sql]
+    assert len(scoped) >= 4, "non-vacuity: the scoped variants did not run"
+    findings = list(guard.temp_findings(statements))
+    assert not findings, guard.format_findings(findings)
+    for statement in scoped:
+        if "idx_codex_entries_conversation" in statement.sql or (
+                "INDEXED BY idx_codex_entries_root_path" in statement.sql):
+            assert not any(step.startswith("SCAN entries")
+                           for step in statement.plan), statement.plan
+    candidate_seeks = [statement for statement in statements
+                       if "MIN(source_root_key)" in statement.sql]
+    assert candidate_seeks and all(
+        any("USING COVERING INDEX" in step for step in statement.plan)
+        for statement in candidate_seeks), [s.plan for s in candidate_seeks]

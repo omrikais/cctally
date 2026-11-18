@@ -19,7 +19,11 @@ from _cctally_core import (
     get_week_start_name,
     parse_iso_datetime,
 )
-from _cctally_cache import CodexHistoryUnavailable, _codex_provider_roots
+from _cctally_cache import (
+    CodexHistoryUnavailable, _codex_provider_roots, codex_cli_read_scope,
+    codex_root_scope_sql, codex_root_withheld, codex_row_withheld,
+    codex_withholding_candidates,
+)
 import _lib_accounts
 from _lib_codex_metadata import (
     DecodedCodexProjectMetadata,
@@ -658,7 +662,7 @@ def _codex_population_reason_sql(
 
 def _codex_overlap_sql(
     cache_conn: sqlite3.Connection, *, include_probe_reasons: bool,
-    bounded: bool, chunk_size: int,
+    bounded: bool, chunk_size: int, scope_sql: str = "",
 ) -> str:
     """The population's complete caller shape, over one chunk of ids.
 
@@ -677,7 +681,7 @@ def _codex_overlap_sql(
        AND threads.source_root_key = entries.source_root_key
      WHERE entries.id IN ({placeholders}){bounds}
        AND ({_codex_population_reason_sql(
-           cache_conn, include_probe_reasons=include_probe_reasons)})
+           cache_conn, include_probe_reasons=include_probe_reasons)}){scope_sql}
 """
 
 
@@ -688,8 +692,13 @@ def count_undecodable_codex_metadata_rows(
     bound_end: "str | None",
     include_probe_reasons: bool,
     inventory: "CodexThreadMetadataInventory | None" = None,
+    root_scope: "object | None" = None,
 ) -> int:
     """Entries this population must count for undecodable project metadata.
+
+    ``root_scope`` (#1108) withholds retired-root rows from the direct and
+    inherited seeks and the overlap subtraction alike, so the partition
+    stays consistent with the aggregate that counts the same population.
 
     Zero-cost on a clean store: both undecodable sets are empty, so no
     per-identity query runs at all and this returns before touching the
@@ -706,6 +715,7 @@ def count_undecodable_codex_metadata_rows(
         return 0
     bounded = bound_start is not None and bound_end is not None
     bounds: tuple = (bound_start, bound_end) if bounded else ()
+    scope_sql, scope_params = codex_root_scope_sql(root_scope, "entries")
 
     affected: set[int] = set()
     seeks = (
@@ -715,10 +725,10 @@ def count_undecodable_codex_metadata_rows(
     for base_sql, identities in seeks:
         if not identities:
             continue
-        sql = _undecodable_entries_sql(base_sql, bounded=bounded)
+        sql = _undecodable_entries_sql(base_sql, bounded=bounded) + scope_sql
         for root_key, second in sorted(identities):
             for entry_id, source_path, conversation_key in cache_conn.execute(
-                sql, (root_key, second, *bounds),
+                sql, (root_key, second, *bounds, *scope_params),
             ):
                 direct = inventory.direct_by_conversation.get(
                     (str(root_key), str(conversation_key or "")))
@@ -735,10 +745,11 @@ def count_undecodable_codex_metadata_rows(
         chunk = ordered[offset:offset + _OVERLAP_ID_CHUNK]
         sql = _codex_overlap_sql(
             cache_conn, include_probe_reasons=include_probe_reasons,
-            bounded=bounded, chunk_size=len(chunk),
+            bounded=bounded, chunk_size=len(chunk), scope_sql=scope_sql,
         )
         already_counted.update(
-            int(row[0]) for row in cache_conn.execute(sql, (*chunk, *bounds))
+            int(row[0]) for row in cache_conn.execute(
+                sql, (*chunk, *bounds, *scope_params))
         )
     return len(affected - already_counted)
 
@@ -790,8 +801,13 @@ def probe_codex_detail_metadata_health(
     start: dt.datetime,
     end: dt.datetime,
     inventory: "CodexThreadMetadataInventory | None" = None,
+    root_scope: "object | None" = None,
 ) -> CodexProjectMetadataHealth:
     """Count rows in ``[start, end)`` the qualified reader would refuse.
+
+    ``root_scope`` (#1108) withholds retired-root rows from every count, so
+    a malformed or undecodable row on a retired root neither forces the
+    fallback nor inflates the warning.
 
     Bounds are REQUIRED and both timezone-aware, unlike
     ``load_codex_project_metadata_health``, which keeps its nullable predicate
@@ -807,8 +823,10 @@ def probe_codex_detail_metadata_health(
     """
     bound_start, bound_end = _probe_bounds(start, end)
     _register_codex_accounting_probe(cache_conn)
+    scope_sql, scope_params = codex_root_scope_sql(root_scope, "entries")
     row = cache_conn.execute(
-        _codex_detail_metadata_probe_sql(cache_conn), (bound_start, bound_end),
+        _codex_detail_metadata_probe_sql(cache_conn) + scope_sql,
+        (bound_start, bound_end, *scope_params),
     ).fetchone()
     if row is None or len(row) != 2:
         raise RuntimeError("Codex detail metadata probe returned no partition")
@@ -824,6 +842,7 @@ def probe_codex_detail_metadata_health(
         bound_end=bound_end,
         include_probe_reasons=True,
         inventory=inventory,
+        root_scope=root_scope,
     )
     if unqualifiable_rows + undecodable_rows > total_rows:
         raise RuntimeError("Codex detail metadata probe partition is invalid")
@@ -903,8 +922,12 @@ def load_codex_project_metadata_health(
     start: dt.datetime | None = None,
     end: dt.datetime | None = None,
     inventory: "CodexThreadMetadataInventory | None" = None,
+    root_scope: "object | None" = None,
 ) -> CodexProjectMetadataHealth:
     """Classify retained Codex accounting in one root-qualified SQL read.
+
+    ``root_scope`` (#1108) restricts the partition to the admitted
+    population; ``None`` (doctor) keeps every retained row.
 
     Bounds are both timezone-aware or both omitted; the omitted form serves the
     all-history doctor check.  The output is an exhaustive, mutually-exclusive
@@ -930,9 +953,10 @@ def load_codex_project_metadata_health(
                else _CODEX_PROJECT_METADATA_HEALTH_LEGACY_SQL)
     else:
         sql = _CODEX_PROJECT_METADATA_HEALTH_PRE_OPERAND_SQL
+    scope_sql, scope_params = codex_root_scope_sql(root_scope, "entries")
     row = cache_conn.execute(
-        sql,
-        (bound_start, bound_start, bound_end, bound_end),
+        sql + scope_sql,
+        (bound_start, bound_start, bound_end, bound_end, *scope_params),
     ).fetchone()
     if row is None or len(row) != (4 if has_operands else 3):
         raise RuntimeError("Codex project metadata health query returned no partition")
@@ -951,6 +975,7 @@ def load_codex_project_metadata_health(
         bound_end=bound_end,
         include_probe_reasons=has_operands,
         inventory=inventory,
+        root_scope=root_scope,
     )
     qualified_rows = (
         total_rows - missing_key_rows - missing_join_rows
@@ -979,8 +1004,12 @@ def load_cached_rooted_codex_accounting_entries(
     cache_conn: sqlite3.Connection,
     source_root_keys: Iterable[str] | None = None,
     account_key: str | None = None,
+    root_scope: "object | None" = None,
 ) -> tuple[RootedCodexAccountingEntry, ...]:
     """Read bounded accounting from one caller-owned cache snapshot only.
+
+    ``root_scope`` (#1108) drops withheld retired-root rows before the
+    usability and identity checks; ``None`` keeps every row.
 
     This reader intentionally never syncs, opens or closes a database, reads
     rollouts, resolves projects, or discovers configured Codex roots.  The
@@ -1032,6 +1061,10 @@ def load_cached_rooted_codex_accounting_entries(
 
     result: list[RootedCodexAccountingEntry] = []
     for row in rows:
+        if root_scope is not None and codex_row_withheld(
+            root_scope, row[3], row[2]
+        ):
+            continue
         # A corrupt operand cannot contribute cost or tokens. The generation's
         # bounded probes count this physical row once; keep every other row.
         if not _codex_accounting_row_usable(
@@ -1089,16 +1122,25 @@ def load_cached_rooted_codex_accounting_entries(
     return tuple(result)
 
 
-def has_cached_codex_accounting_entries(*, cache_conn: sqlite3.Connection) -> bool:
+def has_cached_codex_accounting_entries(
+    *, cache_conn: sqlite3.Connection, root_scope: "object | None" = None,
+) -> bool:
     """Return whether any retained Codex accounting exists without range filtering.
 
     This intentionally tiny caller-owned cache read lets a missing native cycle
     fail closed even when the dashboard's visible or budget range is empty.
-    It neither resolves roots nor reads rollout files.
+    It neither resolves roots nor reads rollout files. ``root_scope``
+    (#1108) counts only admitted rows; without it the statement is unchanged.
     """
+    scope_sql, scope_params = codex_root_scope_sql(root_scope, "entries")
     try:
+        if not scope_sql:
+            return cache_conn.execute(
+                "SELECT 1 FROM codex_session_entries LIMIT 1"
+            ).fetchone() is not None
         return cache_conn.execute(
-            "SELECT 1 FROM codex_session_entries LIMIT 1"
+            "SELECT 1 FROM codex_session_entries AS entries WHERE 1"
+            + scope_sql + " LIMIT 1", scope_params,
         ).fetchone() is not None
     except sqlite3.Error as exc:
         raise QualifiedMetadataUnavailable("Codex accounting metadata is unavailable") from exc
@@ -1256,12 +1298,20 @@ def load_qualified_codex_entries(
     inventory: "CodexThreadMetadataInventory | None" = None,
     _on_sync: "Callable[[object], object] | None" = None,
     project_resolver_cache: "dict[object, object] | None" = None,
+    root_scope: "object | None" = None,
+    current_roots_only: bool = False,
 ) -> tuple[QualifiedCodexEntry, ...]:
     """Load exactly one bounded, root-qualified Codex accounting read.
 
     The S1 cache is the sole metadata source.  Unlike unqualified Codex
     accounting readers, this adapter deliberately has no direct-rollout fallback:
     without the relational conversation join it cannot safely attribute projects.
+
+    ``current_roots_only`` (#1108, the CLI twin of ``get_codex_entries``)
+    withholds retired-root rows when no ``root_scope`` is given: the scope
+    comes from this call's own whole-walk sync, else canonical discovery, and
+    is ``None`` (nothing read differently) when no retained root lies outside
+    the configured roots.
 
     An owner function (#787 / #861 census): it may open the owner cache
     connection and sync. A query caller uses `query_qualified_codex_entries`,
@@ -1285,6 +1335,7 @@ def load_qualified_codex_entries(
         conn = cache_conn
     previous_row_factory = conn.row_factory
     try:
+        stats = None
         if sync:
             cache_mod = c._load_sibling("_cctally_cache")
             stats, conn = cache_mod._run_cache_operation_with_recovery(
@@ -1296,8 +1347,12 @@ def load_qualified_codex_entries(
                 raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable")
             if _on_sync is not None:
                 _on_sync(stats)
+        if current_roots_only and root_scope is None:
+            root_scope = codex_cli_read_scope(
+                lambda keys: codex_withholding_candidates(conn, keys),
+                sync_stats=stats)
         rows, inherited_metadata = _read_qualified_codex_rows(
-            conn, start, end, identities, inventory)
+            conn, start, end, identities, inventory, root_scope=root_scope)
     except sqlite3.Error as exc:
         raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable") from exc
     finally:
@@ -1324,6 +1379,7 @@ def query_qualified_codex_entries(
     source_identities: Iterable[tuple[str, str]] | None = None,
     inventory: "CodexThreadMetadataInventory | None" = None,
     project_resolver_cache: "dict[object, object] | None" = None,
+    root_scope: "object | None" = None,
 ) -> tuple[QualifiedCodexEntry, ...]:
     """`load_qualified_codex_entries` for a query caller (#787 / #861 spec
     5.11): the same bounded read and qualification over the caller's cache
@@ -1345,7 +1401,8 @@ def query_qualified_codex_entries(
     previous_row_factory = cache_conn.row_factory
     try:
         rows, inherited_metadata = _read_qualified_codex_rows(
-            cache_conn, start, end, identities, inventory)
+            cache_conn, start, end, identities, inventory,
+            root_scope=root_scope)
     except sqlite3.Error as exc:
         raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable") from exc
     finally:
@@ -1377,11 +1434,21 @@ def _qualified_window_identities(start, end, source_identities):
     }))
 
 
-def _read_qualified_codex_rows(conn, start, end, identities, inventory):
+def _read_qualified_codex_rows(conn, start, end, identities, inventory, *,
+                               root_scope=None):
     """The qualified read kernel both entry points share: the bounded rows
-    and the inherited thread metadata, on ``conn`` (rows as `sqlite3.Row`)."""
+    and the inherited thread metadata, on ``conn`` (rows as `sqlite3.Row`).
+
+    ``root_scope`` (#1108) drops withheld retired-root rows before
+    qualification, so a withheld malformed row cannot raise; the SQL text is
+    unchanged."""
     conn.row_factory = sqlite3.Row
     rows = _load_qualified_codex_rows(conn, start, end, identities)
+    if root_scope is not None:
+        rows = tuple(
+            row for row in rows
+            if not codex_row_withheld(
+                root_scope, row["source_root_key"], row["source_path"]))
     # §4.3: one inventory read per build. The caller supplies the build's
     # own inventory when it has one; its alias leg is unbounded, which is a
     # SUPERSET of the `paths=identities` leg this read would have loaded,
@@ -1641,8 +1708,12 @@ def load_codex_project_scoped_entries(
     matches_project_key,
     cache_conn,
     group: str = "git-root",
+    root_scope: "object | None" = None,
 ) -> tuple[QualifiedCodexEntry, ...]:
     """One project's qualified accounting, without loading the year (#815).
+
+    ``root_scope`` (#1108) drops withheld retired-root rows before
+    qualification, exactly as the unscoped qualified kernel does.
 
     BOTH STAGES RUN UNDER ONE EXPLICIT READ TRANSACTION. Python's ``sqlite3``
     driver does not begin a transaction for a ``SELECT`` — this repository
@@ -1721,6 +1792,11 @@ def load_codex_project_scoped_entries(
         conn.row_factory = previous_row_factory
         if started_transaction:
             conn.rollback()
+    if root_scope is not None:
+        rows = [
+            row for row in rows
+            if not codex_row_withheld(
+                root_scope, row["source_root_key"], row["source_path"])]
     qualified = _qualify_codex_rows(
         rows, inherited_metadata, speed=speed, group=group)
     # THE FINAL GATE. Over-collection above is deliberate, so the scoped read
@@ -2024,15 +2100,39 @@ def _source_entries(
         sync = bool(getattr(args, "_source_analytics_sync", not bool(getattr(args, "offline", False))))
     query_end = end + dt.timedelta(microseconds=1) if inclusive_end else end
     if qualified:
+        warn = _cctally()._load_sibling("_cctally_cache")._warn_compressed_unreadable_once
+
+        def on_sync(stats):
+            warn(stats)
+            # #1108: a later presentation read in the same command (the
+            # project quota blocks) reuses this whole-walk scope.
+            args._codex_sync_stats = stats
+
         values = load_qualified_codex_entries(
             start, query_end, speed=speed, sync=sync, group=group,
-            _on_sync=_cctally()._load_sibling(
-                "_cctally_cache")._warn_compressed_unreadable_once,
+            _on_sync=on_sync, current_roots_only=True,
         )
         return assign_collision_safe_project_labels(values)
     return load_codex_accounting_entries(
         start, query_end, speed=speed, sync=sync, force_direct=force_direct,
     )
+
+
+def _current_root_quota_observations(observations, *, sync_stats=None):
+    """Drop withheld retired-root observations from a presentation load (#1108).
+
+    The predicate tests the loaded population itself (spec §3.6), so a
+    configured root stays visible whether or not it is registered.
+    """
+    observations = tuple(observations)
+    scope = codex_cli_read_scope(
+        lambda _keys: (item.identity.source_root_key for item in observations),
+        sync_stats=sync_stats)
+    if scope is None:
+        return observations
+    return tuple(
+        item for item in observations
+        if not codex_root_withheld(scope, item.identity.source_root_key))
 
 
 def _project_selectors(value: object) -> tuple[str, ...]:
@@ -3287,7 +3387,9 @@ def cmd_source_project(args: object) -> int:
     if supplied_blocks is None:
         try:
             blocks = select_codex_project_blocks(
-                build_blocks(load_codex_quota_observations()),
+                build_blocks(_current_root_quota_observations(
+                    load_codex_quota_observations(),
+                    sync_stats=getattr(args, "_codex_sync_stats", None))),
                 range_start=start, range_end=end, as_of=getattr(args, "as_of", end),
             )
         except (OSError, sqlite3.Error, ValueError):
@@ -3549,6 +3651,7 @@ def cmd_source_report(args: object) -> int:
     supplied_blocks = getattr(args, "blocks", None)
     already_synced = False
     force_direct_accounting = False
+    sync_stats = None
     if getattr(args, "sync_current", False) and supplied_blocks is None:
         c = _cctally()
         try:
@@ -3579,7 +3682,8 @@ def cmd_source_report(args: object) -> int:
     if supplied_blocks is None:
         try:
             blocks = select_codex_report_blocks(
-                build_blocks(load_codex_quota_observations()),
+                build_blocks(_current_root_quota_observations(
+                    load_codex_quota_observations(), sync_stats=sync_stats)),
                 weeks=int(getattr(args, "weeks", 1)),
             )
         except (OSError, sqlite3.Error, ValueError):

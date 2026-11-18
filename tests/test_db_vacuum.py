@@ -168,3 +168,40 @@ def test_vacuum_refuses_legacy_stats_wal_without_opening_it(
     assert ns["cmd_db_vacuum"](argparse.Namespace(db="stats")) == 3
     assert "legacy wal" in capsys.readouterr().err.lower()
     assert path.read_bytes() == before
+
+
+def test_vacuum_refuses_when_the_stats_header_cannot_be_read(
+    tmp_path, monkeypatch, capsys
+):
+    """#1100: the legacy-WAL check reads stats.db's header through the AD19
+    child; when that child cannot run, vacuum refuses with the existing
+    sentence and staged exit 3 before opening stats.db. Detects: a VACUUM
+    that rewrites a family it could not classify (a legacy WAL family
+    converted under a live handle), or one that exits 1 through the uncaught
+    DatabaseError path."""
+    ns = _load(tmp_path, monkeypatch)
+    import _cctally_core
+    import _cctally_db
+    import _cctally_store_access
+
+    path = pathlib.Path(_cctally_core.DB_PATH)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("CREATE TABLE t(x)")
+        conn.commit()
+    finally:
+        conn.close()
+    before = path.read_bytes()
+
+    def forbidden_connect(*_args, **_kwargs):
+        raise AssertionError("vacuum opened a stats.db it could not classify")
+
+    _iso_sqlite3 = types.SimpleNamespace(**vars(_cctally_db.sqlite3))
+    _iso_sqlite3.connect = forbidden_connect
+    monkeypatch.setattr(_cctally_db, "sqlite3", _iso_sqlite3)
+    monkeypatch.setattr(_cctally_store_access, "_run_header_probe",
+                        lambda path, *a, **kw: None)
+    assert ns["cmd_db_vacuum"](argparse.Namespace(db="stats")) == 3
+    assert "Error: stats.db could not be read" in capsys.readouterr().err
+    assert path.read_bytes() == before

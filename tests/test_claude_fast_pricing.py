@@ -56,6 +56,8 @@ def _cost(model: str, speed):
     [
         ("claude-opus-5-5", 2.0),
         ("claude-opus-5", 2.0),
+        ("claude-fable-5-2", 2.0),
+        ("claude-mythos-5-2", 2.0),
         ("anthropic/claude-opus-4-8", 2.0),
         ("claude-opus-4-7", 6.0),
         ("anthropic.claude-opus-4-7-20260416", 6.0),
@@ -69,6 +71,19 @@ def test_effective_fast_rate_matrix_prices_complete_request(model, multiplier):
     assert _cost(model, "fast") == pytest.approx(
         standard * multiplier, abs=1e-15
     )
+
+
+@pytest.mark.parametrize("model", ["claude-fable-5-2", "claude-mythos-5-2"])
+@pytest.mark.parametrize(("speed", "factor"), [("standard", 1), ("fast", 2)])
+def test_claude_52_prices_a_positive_total_at_each_speed(model, speed, factor):
+    """#1118: the ratio matrix above also holds for an unpriced model (0 == 0 x
+    2), so the absolute dollars are pinned too. TOKENS per MTok: 100 x $8 +
+    200 x $40 + 180 5m-write x $10 + 120 1h-write x $16 + 400 read x $0.20 =
+    $0.0126 standard; Fast is 2x ($16 / $80 per MTok base)."""
+    standard = (100 * 8.00 + 200 * 40.00 + 180 * 10.00 + 120 * 16.00
+                + 400 * 0.20) / 1e6
+    assert _cost(model, speed) == pytest.approx(factor * standard, abs=1e-12)
+    assert _cost(model, speed) > 0
 
 
 @pytest.mark.parametrize("speed", [None, "standard", "", "FAST", "turbo", 1])

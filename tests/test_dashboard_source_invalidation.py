@@ -5095,8 +5095,11 @@ def test_836_versions_carry_no_new_fragment_without_retired_or_pending_rows(
         conn.close()
     snap, envelope, _ = _836_tick(ns836, _836_T)
     assert stats_sig.claude_weekly_retired_digest == ""
-    assert envelope["data_version"] == ns836["_snapshot_data_version"](stats_sig)
-    assert not re.search(r"\.r[0-9a-f]{64}$", envelope["data_version"])
+    assert snap.data_version == ns836["_snapshot_data_version"](stats_sig)
+    assert not re.search(r"\.r[0-9a-f]{64}$", snap.data_version)
+    import _cctally_dashboard_envelope as dash_env
+    assert envelope["data_version"] == dash_env._wire_data_version(
+        snap.data_version)
     version = _836_claude(snap).data_version
     assert not re.search(r":r[0-9a-f]{64}", version)
     assert not re.search(r":e\d{4}-\d\d-\d\d", version)
@@ -7396,3 +7399,425 @@ def test_1050_codex_stats_only_rewrite_moves_digest_and_stamp(
             "the rewrite moves a Codex stamp")
     finally:
         cache.close()
+
+
+# === #1108: the owner's current-root read scope across reuse gates =========
+
+_1108_NOW = dt.datetime(2026, 7, 20, tzinfo=dt.timezone.utc)
+
+
+def _1108_relocated_store(tmp_path, monkeypatch):
+    """One rollout ingested under root A, then the same rollout under root B.
+
+    The second sync leaves A's identities retained as prune debt (the caller
+    drains nothing), which is the state a relocated Codex home is in until
+    the detached drain runs.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # The corpus's long window made weekly, so each root carries a weekly
+    # quota cycle the figures can follow.
+    corpus = (CORPUS / "modern-full.jsonl").read_text(encoding="utf-8")
+    assert '"window_minutes":10020' in corpus
+    corpus = corpus.replace('"window_minutes":10020', '"window_minutes":10080')
+    roots = {}
+    for name in ("a", "b"):
+        root = tmp_path / f"provider-{name}"
+        rollout = root / "sessions" / "2026" / "07" / "16" / "rollout.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(corpus, encoding="utf-8")
+        roots[name] = root
+    cache = ns["open_cache_db"]()
+    try:
+        for name in ("a", "b"):
+            monkeypatch.setenv("CODEX_HOME", str(roots[name]))
+            ns["sync_codex_cache"](cache, maintenance="caller")
+        assert cache.execute(
+            "SELECT COUNT(DISTINCT source_root_key) FROM codex_session_entries"
+        ).fetchone()[0] == 2, "non-vacuity: the retired root's rows are gone"
+    finally:
+        cache.close()
+    return ns, roots
+
+
+#: The weekly cycles' root keys the latest Codex rebuild resolved. An idle
+#: build resolves none and reuses that rebuild's Codex, so it keeps the value.
+_1108_CYCLE_ROOTS: dict = {"last": None}
+
+
+def _1108_figures(snap):
+    data = snap.source_bundle.sources["codex"].data or {}
+    sessions = (data.get("sessions") or {}).get("rows") or ()
+    projects = (data.get("projects") or {}).get("rows") or ()
+    quota = data.get("quota") or {}
+    return {
+        "sessions": (len(sessions),
+                     sum(int(row.get("total_tokens") or 0) for row in sessions)),
+        "projects": (len(projects),
+                     sum(int(row.get("total_tokens") or 0) for row in projects)),
+        # The quota results: each history's identity key (root-qualified),
+        # the window count, and the roots the resolved cycles name.
+        "quota_histories": tuple(sorted(
+            str(row.get("key")) for row in quota.get("histories") or ())),
+        "quota_windows": (quota.get("summary") or {}).get("window_count"),
+        "cycle_roots": _1108_CYCLE_ROOTS["last"],
+    }
+
+
+def _1108_cold_reset(ns):
+    import _lib_snapshot_cache as sc
+
+    for name in ("reset_dispatch_state", "reset_group_a_state",
+                 "reset_session_cache_state",
+                 "reset_codex_accounting_cache_state"):
+        getattr(sc, name)()
+    sources = sys.modules["_cctally_dashboard_sources"]
+    sources.reset_codex_account_scope_cache()
+    sources.reset_codex_quota_observation_cache()
+    ns["_cctally_tui"]._tui_reset_partial_retry_state()
+
+
+def _1108_build(ns, owner=None):
+    tui = ns["_cctally_tui"]
+    sources = sys.modules["_cctally_dashboard_sources"]
+    real_resolve = sources._resolve_codex_weekly_cycle
+    resolved: list = []
+
+    def resolve(*args, **kwargs):
+        result = real_resolve(*args, **kwargs)
+        resolved.extend(
+            root for cycle in result or () for root in cycle.source_root_keys)
+        return result
+
+    sources._resolve_codex_weekly_cycle = resolve
+    token = tui._TUI_CODEX_SCOPE_OWNER.set(owner)
+    try:
+        return ns["_tui_build_snapshot"](
+            now_utc=_1108_NOW, skip_sync=True, precompute_envelope=True,
+            runtime_bind="127.0.0.1")
+    finally:
+        tui._TUI_CODEX_SCOPE_OWNER.reset(token)
+        sources._resolve_codex_weekly_cycle = real_resolve
+        if resolved:
+            _1108_CYCLE_ROOTS["last"] = tuple(sorted(set(resolved)))
+
+
+def test_1108_a_filesystem_only_scope_flip_never_reuses_a_stale_generation(
+    tmp_path, monkeypatch,
+):
+    """#1108 T2 (A9). Failure it detects: recognition of the current root is
+    removed, then restored, by filesystem changes alone while every database
+    generation stays unchanged. Without the scope identity in the dispatch
+    key, idle eligibility and `codex_version`, the owner idle-serves (or
+    exactly reuses) the generation built under the other scope, so the
+    retired root stays hidden, or stays doubled, indefinitely. Each warm
+    result must equal a cold build under the same scope."""
+    ns, roots = _1108_relocated_store(tmp_path, monkeypatch)
+    tui = ns["_cctally_tui"]
+    cache_mod = sys.modules["_cctally_cache"]
+    bound = cache_mod.CODEX_READ_SCOPE_MAX_AGE_S
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(tui, "_tui_codex_scope_clock", lambda: clock["t"])
+    sessions_dir = roots["b"] / "sessions"
+    # Outside the configured home: a home with no `sessions/` child is read as
+    # a direct-JSONL root, which would still discover a renamed child tree.
+    hidden_dir = tmp_path / "hidden-provider-b-sessions"
+
+    _1108_cold_reset(ns)
+    recognized = _1108_figures(_1108_build(ns))
+    sessions_dir.rename(hidden_dir)
+    _1108_cold_reset(ns)
+    unrecognized = _1108_figures(_1108_build(ns))
+    hidden_dir.rename(sessions_dir)
+    assert recognized["sessions"][0] > 0
+    assert recognized["quota_histories"] and recognized["cycle_roots"], (
+        f"non-vacuity: no quota histories or resolved cycle: {recognized!r}")
+    assert len(unrecognized["quota_histories"]) == 2 * len(
+        recognized["quota_histories"]), (
+        "the recognized scope must withhold exactly the retired root's quota "
+        f"histories: {recognized!r} {unrecognized!r}")
+    assert unrecognized["sessions"][1] == 2 * recognized["sessions"][1], (
+        "non-vacuity: an unrecognizable current root must withhold nothing: "
+        f"{recognized!r} {unrecognized!r}")
+
+    _1108_cold_reset(ns)
+    owner = tui._TuiCodexReadScopeOwner()
+    first = _1108_build(ns, owner)
+    assert _1108_figures(first) == recognized
+    assert first.codex_root_scope is not None
+    sessions_dir.rename(hidden_dir)
+    clock["t"] += bound / 2
+    held = _1108_build(ns, owner)
+    assert _1108_figures(held) == recognized, (
+        "the bounded reuse window is the stated residual")
+    clock["t"] += bound
+    flipped = _1108_build(ns, owner)
+    assert _1108_figures(flipped) == unrecognized
+    hidden_dir.rename(sessions_dir)
+    clock["t"] += bound + 1
+    restored = _1108_build(ns, owner)
+    assert _1108_figures(restored) == recognized
+    clock["t"] += 1
+    again = _1108_build(ns, owner)
+    assert _1108_figures(again) == recognized
+    assert again.codex_root_scope is restored.codex_root_scope
+
+
+def test_1108_the_build_applies_the_scope_its_own_read_certifies(
+    tmp_path, monkeypatch, request,
+):
+    """#1108 (no-lag gate bound to the published snapshot). Failure it
+    detects: the retired copy's cursor moves ahead of the current copy after
+    the owner resolved its scope but before the source build pins its cache
+    read. The build must re-check the gate on that pinned read and build
+    Codex under no scope, and it must record the scope it APPLIED: a later
+    tick that resolves the original scope again must rebuild, never
+    idle-serve the bundle built under the other scope."""
+    ns, roots = _1108_relocated_store(tmp_path, monkeypatch)
+    tui = ns["_cctally_tui"]
+    cache_mod = sys.modules["_cctally_cache"]
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(tui, "_tui_codex_scope_clock", lambda: clock["t"])
+    retired = str(roots["a"] / "sessions" / "2026" / "07" / "16" / "rollout.jsonl")
+
+    # Opened outside any build: a build's resolution runs under query
+    # authority, where an owner open is refused.
+    writer = ns["open_cache_db"]()
+    request.addfinalizer(writer.close)
+
+    def set_retired_offset(delta):
+        cur = writer.execute(
+            "UPDATE codex_session_files SET last_byte_offset ="
+            " last_byte_offset + ? WHERE path = ?", (delta, retired))
+        assert cur.rowcount == 1, "non-vacuity: no retired cursor"
+        writer.commit()
+
+    _1108_cold_reset(ns)
+    owner = tui._TuiCodexReadScopeOwner()
+    first = _1108_build(ns, owner)
+    recognized = _1108_figures(first)
+    assert first.codex_root_scope is not None
+    real = cache_mod.resolve_codex_read_scope
+
+    def resolve_then_move(conn, **kwargs):
+        result = real(conn, **kwargs)
+        assert result[0] is not None, "non-vacuity: resolution must withhold"
+        set_retired_offset(10_000)
+        return result
+
+    monkeypatch.setattr(cache_mod, "resolve_codex_read_scope", resolve_then_move)
+    clock["t"] += 1
+    # A raw cursor write moves no dispatch signature, so the memo is dropped
+    # to make this tick build, as a real ingest's committed rows would.
+    import _lib_snapshot_cache as sc
+    sc.reset_dispatch_state()
+    downgraded = _1108_build(ns, owner)
+    monkeypatch.setattr(cache_mod, "resolve_codex_read_scope", real)
+    assert downgraded.codex_root_scope is None
+    assert _1108_figures(downgraded)["sessions"][1] == (
+        2 * recognized["sessions"][1]), "the build hid the retired copy"
+    set_retired_offset(-10_000)
+    clock["t"] += 1
+    restored = _1108_build(ns, owner)
+    assert restored.codex_root_scope is not None
+    assert _1108_figures(restored) == recognized, (
+        "a tick resolving the original scope reused the downgraded bundle")
+
+
+def _1108_unscoped_prior(ns, roots, monkeypatch, request):
+    """A published UNSCOPED generation: the retired copy's cursor is ahead,
+    so the owner's resolution blocks. Returns ``(tui, owner, snap, restore)``;
+    ``restore()`` puts the cursor back, so the next resolution certifies a
+    scope while the prior bundle stays the unscoped one."""
+    tui = ns["_cctally_tui"]
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(tui, "_tui_codex_scope_clock", lambda: clock["t"])
+    retired = str(roots["a"] / "sessions" / "2026" / "07" / "16" / "rollout.jsonl")
+    writer = ns["open_cache_db"]()
+    request.addfinalizer(writer.close)
+
+    def move(delta):
+        cur = writer.execute(
+            "UPDATE codex_session_files SET last_byte_offset ="
+            " last_byte_offset + ? WHERE path = ?", (delta, retired))
+        assert cur.rowcount == 1, "non-vacuity: no retired cursor"
+        writer.commit()
+
+    move(10_000)
+    _1108_cold_reset(ns)
+    owner = tui._TuiCodexReadScopeOwner()
+    prior = _1108_build(ns, owner)
+    assert prior.codex_root_scope is None, "non-vacuity: the prior is scoped"
+
+    def restore():
+        move(-10_000)
+        clock["t"] += 1
+    return tui, owner, prior, restore
+
+
+def _1108_race_the_codex_build(tui, monkeypatch):
+    """Move the stats generation once the source build has built Codex, so
+    the build loses the race and returns its PRIOR bundle."""
+    moved = {"stats": False}
+    real_digest = tui.claude_stats_digest
+    monkeypatch.setattr(
+        tui, "claude_stats_digest",
+        lambda conn: real_digest(conn) + (":1108-moved" if moved["stats"] else ""))
+    real_build = tui.build_codex_source_state_from_capture
+
+    def build_then_move(*args, **kwargs):
+        result = real_build(*args, **kwargs)
+        moved["stats"] = True
+        return result
+
+    monkeypatch.setattr(tui, "build_codex_source_state_from_capture", build_then_move)
+    return moved
+
+
+def test_1108_a_race_retained_bundle_keeps_its_own_scope_on_the_full_path(
+    tmp_path, monkeypatch, request,
+):
+    """#1108 V3 (full build). Failure it detects: a build that certified
+    scope S lost the stats generation race and returned the prior UNSCOPED
+    bundle, yet the snapshot and the dispatch key recorded S, so request
+    paths withheld under S beside a Codex built under none, and a later tick
+    resolving S idle-served the unscoped generation."""
+    ns, roots = _1108_relocated_store(tmp_path, monkeypatch)
+    tui, owner, prior, restore = _1108_unscoped_prior(
+        ns, roots, monkeypatch, request)
+    restore()
+    moved = _1108_race_the_codex_build(tui, monkeypatch)
+    raced = _1108_build(ns, owner)
+    assert moved["stats"], "non-vacuity: the certified scope rebuilt no Codex"
+    assert raced.source_bundle.sources["codex"].data == (
+        prior.source_bundle.sources["codex"].data), (
+        "non-vacuity: the race did not return the prior bundle")
+    assert raced.codex_root_scope is None, (
+        "the snapshot names the attempt's scope, not the retained bundle's")
+    import _lib_snapshot_cache as sc
+    key, memo = sc.dispatch_state()
+    assert memo is raced
+    assert key[5] is None, "the dispatch key names the attempt's scope"
+
+
+def test_1108_a_race_retained_bundle_keeps_its_own_scope_on_the_idle_adapter(
+    tmp_path, monkeypatch, request,
+):
+    """#1108 V3 (idle adapter). Failure it detects: the bounded source
+    adapter certified scope S, lost the stats generation race and kept the
+    prior UNSCOPED bundle, yet the idle snapshot (and so its dispatch key)
+    recorded S."""
+    ns, roots = _1108_relocated_store(tmp_path, monkeypatch)
+    tui, _owner, prior, restore = _1108_unscoped_prior(
+        ns, roots, monkeypatch, request)
+    restore()
+    cache_mod = sys.modules["_cctally_cache"]
+    conn = ns["open_cache_db"]()
+    try:
+        scope, evidence = cache_mod.resolve_codex_read_scope(
+            conn, sync_stats=None, retained=None, now_monotonic=2000.0)
+    finally:
+        conn.close()
+    assert scope is not None and evidence.lag_free, (
+        "non-vacuity: the restored cursor must certify a scope")
+    identity = prior.source_bundle.sources["codex"].clock_data[
+        "codex_quota_dependency"]
+    moved = _1108_race_the_codex_build(tui, monkeypatch)
+    stats = ns["open_db"]()
+    try:
+        idle = tui._tui_build_idle_snapshot(
+            prior,
+            claude_input_identity=tui._tui_read_claude_input_identity(stats),
+            now_utc=_1108_NOW, precompute_envelope=False, runtime_bind=None,
+            raw_config={}, errors=[], display_tz_pref_override="utc",
+            source_stats_conn=stats, source_display_tz_name="UTC",
+            source_display_tz=dt.timezone.utc, codex_dependency=identity,
+            codex_root_scope=scope, codex_scope_evidence=evidence)
+    finally:
+        stats.close()
+    assert moved["stats"], "non-vacuity: the adapter rebuilt no Codex"
+    assert idle.source_bundle.sources["codex"].data == (
+        prior.source_bundle.sources["codex"].data), (
+        "non-vacuity: the race did not keep the prior bundle")
+    assert idle.codex_root_scope is None, (
+        "the idle snapshot names the attempt's scope, not the kept bundle's")
+
+
+def test_1108_a_failed_resolution_keeps_the_tick_s_sync_stats(
+    tmp_path, monkeypatch,
+):
+    """#1108 (owner resolver). Failure it detects: the owner consuming the
+    tick's Codex sync stats before resolving, so a resolution that raises
+    loses the whole-walk scope and the next build of the tick pays canonical
+    discovery (or reads a stale retained scope) instead. The stats are
+    consumed only by a resolution that succeeds."""
+    ns, _roots = _1108_relocated_store(tmp_path, monkeypatch)
+    tui = ns["_cctally_tui"]
+    cache_mod = sys.modules["_cctally_cache"]
+    real = cache_mod.resolve_codex_read_scope
+    owner = tui._TuiCodexReadScopeOwner()
+    stats = object()
+    owner.sync_stats = stats
+    received = []
+
+    def failing(conn, **kwargs):
+        received.append(kwargs["sync_stats"])
+        raise RuntimeError("resolution failed")
+
+    def succeeding(conn, **kwargs):
+        received.append(kwargs["sync_stats"])
+        return real(conn, **{**kwargs, "sync_stats": None})
+
+    token = tui._TUI_CODEX_SCOPE_OWNER.set(owner)
+    try:
+        monkeypatch.setattr(cache_mod, "resolve_codex_read_scope", failing)
+        with pytest.raises(RuntimeError):
+            tui._tui_resolve_codex_read_scope()
+        assert owner.sync_stats is stats, "a failed resolution consumed the stats"
+        monkeypatch.setattr(cache_mod, "resolve_codex_read_scope", succeeding)
+        assert tui._tui_resolve_codex_read_scope() is not None
+    finally:
+        tui._TUI_CODEX_SCOPE_OWNER.reset(token)
+    assert received == [stats, stats]
+    assert owner.sync_stats is None and owner.retained is not None
+
+
+def test_1108_request_paths_read_the_published_scope_and_never_discover(
+    tmp_path, monkeypatch,
+):
+    """#1108 T5 (A12). Failure it detects: the detail route or the share
+    render resolving (or ignoring) the read scope on a request thread. Both
+    must carry the published snapshot's scope into their read context, and
+    neither may run rollout discovery or the recognition probe."""
+    ns, _roots = _1108_relocated_store(tmp_path, monkeypatch)
+    _1108_cold_reset(ns)
+    snap = _1108_build(ns)
+    assert snap.codex_root_scope is not None
+    cache_mod = sys.modules["_cctally_cache"]
+    sources = sys.modules["_cctally_dashboard_sources"]
+    dashboard = sys.modules["_cctally_dashboard"]
+    share = sys.modules["_cctally_dashboard_share"]
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("a request path must not discover")
+
+    monkeypatch.setattr(cache_mod, "_discover_codex_files_with_roots", refuse)
+    monkeypatch.setattr(cache_mod, "_codex_file_is_recognizable", refuse)
+    seen = []
+    real_context = sources.DashboardReadContext
+
+    def recording_context(*args, **kwargs):
+        context = real_context(*args, **kwargs)
+        seen.append(context.codex_root_scope)
+        return context
+
+    monkeypatch.setattr(sources, "DashboardReadContext", recording_context)
+    for context in dashboard._codex_detail_context(snap):
+        assert context.codex_root_scope is snap.codex_root_scope
+    state = share._share_codex_state_for_period(
+        snap, panel="daily", options={"period": {"kind": "previous"}})
+    assert state is not None
+    assert seen == [snap.codex_root_scope, snap.codex_root_scope]
+    unscoped = dataclasses.replace(snap, codex_root_scope=None)
+    for context in dashboard._codex_detail_context(unscoped):
+        assert context.codex_root_scope is None

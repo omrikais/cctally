@@ -20,6 +20,7 @@ import hashlib
 import itertools
 import os
 import pathlib
+import re
 import shutil
 import signal
 import json
@@ -1858,9 +1859,10 @@ class _RecordedHdiutil:
 
     def text(self, name):
         data = (HDIUTIL_FIXTURES / name).read_text()
-        for key, value in self.subs.items():
-            data = data.replace(key, value)
-        return data
+        # One pass, longest key first, so a path that holds another key is
+        # never rewritten (#1097).
+        keys = sorted(self.subs, key=len, reverse=True)
+        return re.sub("|".join(map(re.escape, keys)), lambda m: self.subs[m.group(0)], data)
 
     def __call__(self, argv, **_kwargs):
         argv = list(argv)

@@ -110,7 +110,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 bundle = (
-    "# AGENTS.md instructions for /synthetic/root-a/project-red\n"
+    "# AGENTS.md instructions for /synthetic/root-a/project-red\n"  # mirror-private-ok: synthetic transcript text, never read
     "<INSTRUCTIONS>Synthetic agent instructions for the injected context bundle."
     "</INSTRUCTIONS>\n"
     "<environment_context>Synthetic environment context.</environment_context>"

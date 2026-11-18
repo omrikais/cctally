@@ -320,6 +320,57 @@ def test_next_open_recovers_valid_looking_empty_current_epoch_destination(
     assert not list(db.parent.glob("stats.db.rebuilding-????????T??????_??????*"))
 
 
+def test_recovery_with_an_unreadable_destination_header_keeps_the_refusal(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """#1100: when interrupted-rebuild recovery's publication cannot read the
+    live destination's header (the AD19 child cannot run), the owner open
+    fails with the typed refusal, never with the recovery wrapper's
+    "resolve the reported journal problem" guidance. Detects: false
+    remediation telling the user to fix a journal that is not broken."""
+    import importlib
+
+    from conftest import load_script, redirect_paths
+
+    root = tmp_path / "proc"
+    share = root / ".local" / "share" / "cctally"
+    share.mkdir(parents=True)
+    env = _isolated_env(tmp_path)
+    env["CCTALLY_DATA_DIR"] = str(share)
+    db = _seed(env)
+    _create_legacy_interrupted_state(env, db, tmp_path)
+    _install_empty_current_epoch_destination(env, db)
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, root)
+    core = sys.modules["_cctally_core"]
+    db_mod = sys.modules["_cctally_db"]
+    store = importlib.import_module("_cctally_store")
+    access = importlib.import_module("_cctally_store_access")
+    assert pathlib.Path(core.DB_PATH) == db
+    monkeypatch.setattr(access, "_HEADER_CACHE", {})
+    monkeypatch.setattr(access, "_HEADER_PROBED", {})
+    # The cached-mode verdict for the destination's current identity, so only
+    # the publication's fresh read reaches the unavailable child.
+    access.seed_header_verdicts([(access._header_stat_key(os.stat(db)),
+                                  "rollback")])
+    probes: list[str] = []
+    monkeypatch.setattr(access, "_run_header_probe",
+                        lambda path, *a, **kw: probes.append(str(path)))
+    checked: list[pathlib.Path] = []
+    real_check = store._stats_legacy_wal_family_present
+    monkeypatch.setattr(
+        store, "_stats_legacy_wal_family_present",
+        lambda path: checked.append(pathlib.Path(path)) or real_check(path))
+
+    with pytest.raises(core.StoreUnavailable) as info:
+        ns["open_db"]()
+    assert not isinstance(info.value, db_mod.StatsDbMaintenanceError)
+    assert core.store_refusal_text(info.value) == "stats.db could not be read"
+    assert db in checked, "recovery never reached the destination's check"
+    assert str(db) in probes, "the fresh destination probe was not reached"
+
+
 def test_next_open_recovers_partial_destination_with_complete_metadata(
     tmp_path: pathlib.Path,
 ) -> None:

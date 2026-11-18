@@ -74,10 +74,13 @@ def test_no_suppression_expires_before_the_pricing_snapshot_date():
 _CURRENT_GENERATION_RATES = {
     "claude-fable-5":   (1e-05,  5e-05,   1.25e-05, 1e-06),
     "claude-fable-5-1": (1e-05,  5e-05,   1.25e-05, 2.5e-07),
+    # #1118: $8 / $40 / $10 5m write / $0.20 read per MTok (0.025x base input).
+    "claude-fable-5-2": (8e-06,  4e-05,   1e-05,    2e-07),
     "claude-haiku-4-5": (1e-06,  5e-06,   1.25e-06, 1e-07),
     "claude-haiku-5-5": (1e-07,  5e-07,   1.25e-07, 1e-08),
     "claude-mythos-5":  (1e-05,  5e-05,   1.25e-05, 1e-06),
     "claude-mythos-5-1": (1e-05, 5e-05,   1.25e-05, 2.5e-07),
+    "claude-mythos-5-2": (8e-06, 4e-05,   1e-05,    2e-07),
     "claude-opus-4-8":  (5e-06,  2.5e-05, 6.25e-06, 5e-07),
     "claude-opus-5":    (5e-06,  2.5e-05, 6.25e-06, 5e-07),
     "claude-opus-5-5":  (4e-06,  2e-05,   5e-06,    2e-07),
@@ -112,6 +115,23 @@ def test_current_generation_models_priced_at_vendor_rates(model, rates):
     assert not [k for k in got if k.endswith("_above_200k_tokens")]
 
 
+_FLAT_CLAUDE_CARD_KEYS = {
+    "input_cost_per_token",
+    "output_cost_per_token",
+    "cache_creation_input_token_cost",
+    "cache_read_input_token_cost",
+}
+
+
+@pytest.mark.parametrize("model", ["claude-fable-5-2", "claude-mythos-5-2"])
+def test_claude_52_cards_are_flat_four_field_cards(model):
+    """#1118: the full 1M window bills at standard rates, so a stray
+    `_above_200k` / `_above_100k` field or a prompt threshold would reprice
+    long requests that Anthropic bills flat, and a stored 1h write field would
+    shadow the derived 2x rate."""
+    assert set(pricing.CLAUDE_MODEL_PRICING[model]) == _FLAT_CLAUDE_CARD_KEYS
+
+
 @pytest.mark.parametrize("model,rates", sorted(_HISTORICAL_GENERATION_RATES.items()))
 def test_historical_models_retain_vendor_rates(model, rates):
     got = pricing._resolve_model_pricing(model, warn=False)
@@ -131,6 +151,10 @@ def test_historical_models_retain_vendor_rates(model, rates):
     ("claude-sonnet-5-5", 18.60),
     ("claude-mythos-5", 93.50),
     ("claude-mythos-preview", 233.75),
+    # #1118: $8 input + $40 output + 1M 5m write x $10 + 1M 1h write x $16
+    # (derived 2x input) + $0.20 read. An unpriced model reads $0.
+    ("claude-fable-5-2", 8.00 + 40.00 + 10.00 + 16.00 + 0.20),   # 74.20
+    ("claude-mythos-5-2", 8.00 + 40.00 + 10.00 + 16.00 + 0.20),  # 74.20
 ])
 def test_refreshed_models_price_every_cache_tier(model, expected):
     cost = pricing._calculate_entry_cost(
@@ -143,7 +167,7 @@ def test_refreshed_models_price_every_cache_tier(model, expected):
             "cache_read_input_tokens": 1_000_000,
         },
     )
-    assert cost == pytest.approx(expected)
+    assert cost == pytest.approx(expected, abs=1e-9)
 
 
 def test_sonnet_5_permanent_rate_needs_no_drift_suppression():
@@ -363,6 +387,93 @@ def test_committed_snapshot_carries_the_989_identifiers():
                   "gpt-6-rosalind", "gpt-6-astra-law"):
         assert model in scoped, model
         assert scoped[model]["litellm_provider"] == "openai", model
+
+
+_M = 1e6
+# #1118: each was a live `missing_from_us` finding on 2026-11-17, at LiteLLM's
+# values (which agree with the vendor pages). Without these rows the snapshot
+# tests above pass vacuously over the new cards.
+_SCOPED_1118_ROWS = {
+    "gpt-6.2-astra": ("openai", {
+        "input_cost_per_token": 8.00 / _M,
+        "cache_read_input_token_cost": 0.40 / _M,
+        "output_cost_per_token": 40.00 / _M,
+        "input_cost_per_token_above_272k_tokens": 16.00 / _M,
+        "cache_read_input_token_cost_above_272k_tokens": 0.80 / _M,
+        "output_cost_per_token_above_272k_tokens": 60.00 / _M,
+    }),
+    "gpt-6.2-sol": ("openai", {
+        "input_cost_per_token": 2.00 / _M,
+        "cache_read_input_token_cost": 0.10 / _M,
+        "output_cost_per_token": 10.00 / _M,
+        "input_cost_per_token_above_272k_tokens": 4.00 / _M,
+        "cache_read_input_token_cost_above_272k_tokens": 0.20 / _M,
+        "output_cost_per_token_above_272k_tokens": 15.00 / _M,
+    }),
+    "gpt-6.2-astra-law": ("openai", {
+        "input_cost_per_token": 8.00 / _M,
+        "cache_read_input_token_cost": 0.40 / _M,
+        "output_cost_per_token": 40.00 / _M,
+        "input_cost_per_token_above_272k_tokens": 16.00 / _M,
+        "cache_read_input_token_cost_above_272k_tokens": 0.80 / _M,
+        "output_cost_per_token_above_272k_tokens": 60.00 / _M,
+    }),
+    "gpt-6-cyber": ("openai", {
+        "input_cost_per_token": 20.00 / _M,
+        "cache_read_input_token_cost": 2.00 / _M,
+        "output_cost_per_token": 100.00 / _M,
+        "input_cost_per_token_above_272k_tokens": 40.00 / _M,
+        "cache_read_input_token_cost_above_272k_tokens": 4.00 / _M,
+        "output_cost_per_token_above_272k_tokens": 150.00 / _M,
+    }),
+    "claude-fable-5-2": ("anthropic", {
+        "input_cost_per_token": 8.00 / _M,
+        "output_cost_per_token": 40.00 / _M,
+        "cache_creation_input_token_cost": 10.00 / _M,
+        "cache_read_input_token_cost": 0.20 / _M,
+    }),
+    "claude-mythos-5-2": ("anthropic", {
+        "input_cost_per_token": 8.00 / _M,
+        "output_cost_per_token": 40.00 / _M,
+        "cache_creation_input_token_cost": 10.00 / _M,
+        "cache_read_input_token_cost": 0.20 / _M,
+    }),
+    # The long-context tier LiteLLM and OpenAI published by 2026-11-17; the
+    # base fields are #989's.
+    "gpt-6-astra-law": ("openai", {
+        "input_cost_per_token_above_272k_tokens": 20.00 / _M,
+        "cache_read_input_token_cost_above_272k_tokens": 2.00 / _M,
+        "output_cost_per_token_above_272k_tokens": 75.00 / _M,
+    }),
+}
+
+
+@pytest.mark.parametrize("model", sorted(_SCOPED_1118_ROWS))
+def test_committed_snapshot_carries_the_1118_rows(model):
+    import json
+    snap = json.loads((pathlib.Path(__file__).resolve().parent
+                       / "fixtures" / "pricing" / "litellm_scoped.json").read_text())
+    scoped = pc.scope_litellm(snap)
+    provider, fields = _SCOPED_1118_ROWS[model]
+    assert model in scoped, model
+    assert scoped[model]["litellm_provider"] == provider
+    for field, value in fields.items():
+        assert scoped[model].get(field) == pytest.approx(value, abs=1e-15), field
+
+
+def test_offline_coverage_accepts_every_1118_identifier_with_real_predicates():
+    """#1118: positively observed rows of each new ID are not coverage gaps
+    under the shipped resolvers (base: four `fallback`, two `unpriced`)."""
+    observed = [
+        ("claude" if model.startswith("claude-") else "codex", model, 3, 9_000)
+        for model in _SCOPED_1118_ROWS
+    ]
+    gaps = pc.classify_coverage(
+        observed,
+        lambda m: pricing._resolve_model_pricing(m, warn=False),
+        pricing._is_codex_fallback,
+    )
+    assert gaps == []
 
 
 def test_table_shapes_clean_on_live_tables():
@@ -996,14 +1107,18 @@ def test_pricing_check_existence_gap_is_actionable_exit1(tmp_path):
                # LiteLLM clean except for the intentional Preview mismatch.
                CCTALLY_PRICING_LITELLM_FILE=str(_write_litellm(
                    tmp_path, _litellm_with_allowlisted_preview())),
+               # #1118: the two 5.2 IDs Anthropic lists must not be gaps.
                CCTALLY_PRICING_MODELS_FILE=str(
-                   _models_file(tmp_path, ["claude-brand-new-vendor-model"])))
+                   _models_file(tmp_path, ["claude-brand-new-vendor-model",
+                                           "claude-fable-5-2",
+                                           "claude-mythos-5-2"])))
     r = subprocess.run([sys.executable, str(_CCTALLY), "pricing-check", "--json"],
                        capture_output=True, text=True, env=env)
     assert r.returncode == 1, (r.returncode, r.stderr)
     doc = _json.loads(r.stdout)
     assert doc["status"] == "ok"
-    assert "claude-brand-new-vendor-model" in doc["existence"]["unpriced_vendor_models"]
+    assert doc["existence"]["unpriced_vendor_models"] == [
+        "claude-brand-new-vendor-model"]
     assert doc["staleSuppressions"] == []
 
 

@@ -7158,18 +7158,68 @@ def _candidate_text(histories: tuple[QuotaHistory, ...]) -> str:
     )
 
 
+class _QuotaSelection(tuple):
+    """Quota candidates resolved on the current-root population first (#1108).
+
+    The tuple is what the command renders. ``retained`` is the same selection
+    over complete retained history: a later selection step that finds no
+    candidate in the tuple resolves on it instead, exactly as before the
+    current-root scope existed (spec §3.6).
+    """
+
+    def __new__(cls, current, retained):
+        self = super().__new__(cls, current)
+        self.retained = tuple(retained)
+        return self
+
+
+def _narrow(selection, matching):
+    """Apply one selection step current-root first (#1108 spec §3.6).
+
+    Returns ``(population, found)``: ``found`` is ``matching`` over the
+    current-root selection or, when that yields no candidate, over complete
+    retained history; ``population`` is the set it resolved on, which an
+    error lists as its candidates. A plain tuple (an explicit ``--root-key``)
+    has no retained fallback.
+    """
+    retained = getattr(selection, "retained", None)
+    found = tuple(matching(selection))
+    if retained is None:
+        return selection, found
+    if found:
+        return selection, _QuotaSelection(found, matching(retained))
+    found = tuple(matching(retained))
+    return retained, _QuotaSelection(found, found)
+
+
+def _current_root_population(histories, *, sync_stats) -> _QuotaSelection:
+    """Histories with withheld retired roots set aside as the fallback (#1108).
+
+    The predicate tests the loaded population itself, never the registry, so
+    a configured root stays visible whether or not it is registered.
+    """
+    cache_mod = _cctally()._load_sibling("_cctally_cache")
+    scope = cache_mod.codex_cli_read_scope(
+        lambda _keys: (history.identity.source_root_key for history in histories),
+        sync_stats=sync_stats)
+    return _QuotaSelection(
+        (history for history in histories
+         if not cache_mod.codex_root_withheld(scope, history.identity.source_root_key)),
+        histories)
+
+
 def _select_histories(
     histories: tuple[QuotaHistory, ...], *, root_key: str | None, limit_key: str | None,
 ) -> tuple[QuotaHistory, ...]:
-    selected = tuple(
-        history for history in histories
+    population, selected = _narrow(histories, lambda candidates: (
+        history for history in candidates
         if (root_key is None or history.identity.source_root_key == root_key)
         and (limit_key is None or history.identity.logical_limit_key == limit_key)
-    )
+    ))
     if (root_key is not None or limit_key is not None) and not selected:
         raise QuotaCLIError(
             "no quota identity matches the exact selectors; candidates:\n"
-            + _candidate_text(histories)
+            + _candidate_text(population)
         )
     return selected
 
@@ -7177,7 +7227,8 @@ def _select_histories(
 def _sync_and_load(
     args, as_of: dt.datetime, *, current_fresh_only: bool = False,
     reconcile_projection: bool = True,
-) -> tuple[QuotaHistory, ...]:
+):
+    """Return ``(histories, sync_stats)``; ``sync_stats`` is ``None`` unsynced."""
     c = _cctally()
     sync_requested = getattr(args, "sync", None)
     should_sync = (
@@ -7185,11 +7236,12 @@ def _sync_and_load(
         if sync_requested is not None
         else not getattr(args, "no_sync", False)
     )
+    sync_stats = None
     if should_sync:
         cache = c.open_cache_db()
         try:
             cache_mod = c._load_sibling("_cctally_cache")
-            _, cache = cache_mod._run_cache_operation_with_recovery(
+            sync_stats, cache = cache_mod._run_cache_operation_with_recovery(
                 cache,
                 lambda active_conn: c.sync_codex_cache(active_conn),
                 origin="codex.quota.sync",
@@ -7206,7 +7258,7 @@ def _sync_and_load(
             as_of - dt.timedelta(hours=1) if current_fresh_only else None
         ),
     )
-    return build_history(observations)
+    return build_history(observations), sync_stats
 
 
 def _command_context(
@@ -7223,13 +7275,19 @@ def _command_context(
         until = _parse_range_bound(getattr(args, "until", None), display_tz=display_tz, option="--until")
         if since is not None and until is not None and until <= since:
             raise QuotaCLIError("--until must be after --since")
-    histories = _sync_and_load(
+    histories, sync_stats = _sync_and_load(
         args, as_of, current_fresh_only=current_fresh_only,
         reconcile_projection=reconcile_projection,
     )
+    root_key = getattr(args, "root_key", None)
+    if root_key is None:
+        # #1108 §3.6: every selection but an explicit --root-key resolves on
+        # the current-root population first; naming a root is retained-history
+        # navigation and sees the complete history, exactly as before.
+        histories = _current_root_population(histories, sync_stats=sync_stats)
     selected = _select_histories(
         histories,
-        root_key=getattr(args, "root_key", None),
+        root_key=root_key,
         limit_key=getattr(args, "limit_key", None),
     )
     return as_of, since, until, selected
@@ -7251,12 +7309,39 @@ def _resolve_account_and_scope(args, histories):
     if acct_exit is not None:
         return None, acct_exit, histories
     if account_key is not None:
-        histories = type(histories)(
-            h for h in histories
+        _population, histories = _narrow(histories, lambda candidates: (
+            h for h in candidates
             if getattr(h.identity, "account_key", _lib_accounts.UNATTRIBUTED)
             == account_key
-        )
+        ))
     return account_key, None, histories
+
+
+def _narrow_to_range(histories, in_range, *, since, until):
+    """Make ``--since/--until`` eligibility a current-root-first step (#1108).
+
+    Without a bound, or on an explicit ``--root-key`` selection (a plain
+    tuple, complete history), the histories are returned unchanged. Otherwise
+    the histories ``in_range`` accepts are taken from the current-root
+    selection, or from complete retained history when none of the current
+    ones falls in the range, so a historical range only a retired root covers
+    renders its retained rows as before the scope existed.
+    """
+    if (since is None and until is None) or getattr(
+            histories, "retained", None) is None:
+        return histories
+    _population, found = _narrow(histories, lambda candidates: (
+        history for history in candidates if in_range(history)))
+    return found
+
+
+def _history_blocks_in_range(history, *, since, until):
+    """The quota blocks of one history that ``blocks``' range shows."""
+    return [
+        block for block in build_blocks(history.physical_observations)
+        if (since is None or block.last_observed_at >= since)
+        and (until is None or block.first_observed_at < until)
+    ]
 
 
 def _decorate_account(payload: dict[str, object], account_key: "str | None") -> dict:
@@ -7289,6 +7374,10 @@ def cmd_codex_quota_history(args) -> int:
     acct_key, acct_exit, histories = _resolve_account_and_scope(args, histories)
     if acct_exit is not None:
         return acct_exit
+    histories = _narrow_to_range(
+        histories,
+        lambda history: bool(_history_in_range(history, since=since, until=until)),
+        since=since, until=until)
     windows = []
     text_rows = ["Codex quota history · local-rollout"]
     for history in histories:
@@ -7427,6 +7516,11 @@ def cmd_codex_quota_blocks(args) -> int:
     acct_key, acct_exit, histories = _resolve_account_and_scope(args, histories)
     if acct_exit is not None:
         return acct_exit
+    histories = _narrow_to_range(
+        histories,
+        lambda history: bool(_history_blocks_in_range(
+            history, since=since, until=until)),
+        since=since, until=until)
     blocks = []
     text_rows = ["Codex quota blocks · local-rollout"]
     for block in build_blocks(
@@ -7471,21 +7565,38 @@ def cmd_codex_quota_breakdown(args) -> int:
                 + _candidate_text(histories)
             )
         reset_at = _parse_reset_at(args.reset_at)
-        identity = histories[0].identity
-        matching = [
-            block for block in build_blocks(histories[0].physical_observations)
+        population, matching = _narrow(histories, lambda candidates: (
+            block
+            for block in (
+                build_blocks(candidates[0].physical_observations)
+                if len(candidates) == 1 else ()
+            )
             if block.resets_at == reset_at
-        ]
+        ))
+        if len(population) != 1:
+            # #1108: the current root held no such block, and the complete
+            # retained set is ambiguous, exactly as before the scope.
+            raise QuotaCLIError(
+                "breakdown requires selectors resolving to exactly one quota identity; candidates:\n"
+                + _candidate_text(population)
+            )
+        identity = population[0].identity
         if len(matching) != 1:
             raise QuotaCLIError(
                 "--reset-at matches no unique native quota block; candidates:\n"
-                + _candidate_text(histories)
+                + _candidate_text(population)
             )
     except QuotaCLIError as exc:
         return _command_error(exc)
     c = _cctally()
     speed = c._resolve_codex_speed(args.speed)
-    rows = codex_quota_breakdown(identity, reset_at, speed=speed)
+    # #1108 (the twin of V2): an explicit `--account` scopes the accounting
+    # read to that account, as it scopes the identity; without it the read
+    # stays merged and byte-stable (R8).
+    rows = codex_quota_breakdown(
+        identity, reset_at, speed=speed,
+        **({} if acct_key is None else {"account_key": acct_key}),
+    )
     block = matching[0]
     milestones = [
         {
@@ -7525,18 +7636,27 @@ def cmd_codex_percent_breakdown(args) -> int:
             args, current_fresh_only=not bool(reset_value),
             reconcile_projection=bool(getattr(args, "sync", False)),
         )
-        histories = tuple(
-            history for history in selected
+        # #341 / #1108: `--account` scopes the candidates before the weekly,
+        # `--reset-at` and default steps, through the same current-first
+        # narrowing (a bad reference exits 2 with its diagnostic).
+        acct_key, acct_exit, selected = _resolve_account_and_scope(
+            args, selected)
+        if acct_exit is not None:
+            return acct_exit
+        # #1108 §3.6: each step resolves on the current-root selection first
+        # and on the complete retained set when that yields no candidate.
+        _population, histories = _narrow(selected, lambda candidates: (
+            history for history in candidates
             if history.identity.window_minutes == 10_080
-        )
+        ))
         if reset_value:
             reset_at = _parse_reset_at(reset_value)
-            matching = tuple(
+            population, matching = _narrow(histories, lambda candidates: (
                 (history, block)
-                for history in histories
+                for history in candidates
                 for block in build_blocks(history.physical_observations)
                 if block.resets_at == reset_at
-            )
+            ))
         else:
             # #373: a separate model pool is not account-level standard quota,
             # so it must not make the DEFAULT (no-selector) command ambiguous.
@@ -7547,33 +7667,36 @@ def cmd_codex_percent_breakdown(args) -> int:
             # turning into an exit-2 for a window the user genuinely has.
             # The baseline is resolved first because it is the §7.1 label
             # authority for classification.
-            candidates = tuple(
-                (history, select_baseline(history.observations, as_of))
-                for history in histories
-            )
-            standard = tuple(
-                (history, baseline) for history, baseline in candidates
-                if not codex_history_is_model_scoped(history, baseline=baseline)
-            )
-            matching = tuple(
-                (history, block)
-                for history, baseline in (standard or candidates)
-                if (
-                    baseline is not None
-                    and baseline.resets_at > as_of
-                    and quota_freshness(
-                        history.physical_observations, as_of,
-                    ).state == "fresh"
+            def current_cycles(population):
+                candidates = tuple(
+                    (history, select_baseline(history.observations, as_of))
+                    for history in population
                 )
-                for block in build_blocks(history.physical_observations)
-                # CANONICAL on both sides (#416 §4.1) — see above.
-                if block.resets_at == baseline.canonical_resets_at
-            )
+                standard = tuple(
+                    (history, baseline) for history, baseline in candidates
+                    if not codex_history_is_model_scoped(history, baseline=baseline)
+                )
+                return (
+                    (history, block)
+                    for history, baseline in (standard or candidates)
+                    if (
+                        baseline is not None
+                        and baseline.resets_at > as_of
+                        and quota_freshness(
+                            history.physical_observations, as_of,
+                        ).state == "fresh"
+                    )
+                    for block in build_blocks(history.physical_observations)
+                    # CANONICAL on both sides (#416 §4.1) — see above.
+                    if block.resets_at == baseline.canonical_resets_at
+                )
+
+            population, matching = _narrow(histories, current_cycles)
         if len(matching) != 1:
             raise QuotaCLIError(
                 "percent-breakdown matches no unique native 7-day quota cycle; "
                 "use exact selectors or --reset-at for retained history; candidates:\n"
-                + _candidate_text(histories)
+                + _candidate_text(population)
             )
     except QuotaCLIError as exc:
         eprint(f"cctally codex percent-breakdown: {exc}")
@@ -7587,8 +7710,13 @@ def cmd_codex_percent_breakdown(args) -> int:
     except (FileNotFoundError, sqlite3.Error):
         cache = None
     try:
+        # #1108 V2: an explicit `--account` scopes the ladder's accounting
+        # and its five-hour correlation to that account, as it scopes the
+        # cycle; without it both reads stay merged and byte-stable (R8).
+        account_kwargs = {} if acct_key is None else {"account_key": acct_key}
         rows = codex_quota_breakdown(
             history.identity, block.resets_at, speed=speed, cache_conn=cache,
+            **account_kwargs,
         )
         five_hour_observations = load_codex_quota_observations(
             source_root_keys={history.identity.source_root_key},
@@ -7597,6 +7725,12 @@ def cmd_codex_percent_breakdown(args) -> int:
                 rows[0].captured_at - dt.timedelta(hours=6) if rows else as_of
             ),
         )
+        if acct_key is not None:
+            five_hour_observations = tuple(
+                observation for observation in five_hour_observations
+                if getattr(observation.identity, "account_key",
+                           _lib_accounts.UNATTRIBUTED) == acct_key
+            )
         milestone_list = [
             {
                 "percentThreshold": row.percent,
@@ -7628,6 +7762,7 @@ def cmd_codex_percent_breakdown(args) -> int:
         "milestones": milestone_list,
         "generatedAt": _iso_z(as_of),
     }
+    _decorate_account(output, acct_key)  # #341 R8
     if args.json:
         print(json.dumps(stamp_schema_version(output), indent=2))
         return 0

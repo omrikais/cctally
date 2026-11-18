@@ -293,38 +293,68 @@ def test_mythos_drains_the_general_weekly_quota():
     assert qm.normalize_family("claude-mythos-preview") == "claude-mythos-5"
 
 
-def test_fable_and_mythos_point_releases_are_their_own_families():
+#: The Fable / Mythos point releases, each its own canonical family. The 5.2
+#: pair joined on the operator's 2026-11-18 statement (#1118): they drain a
+#: dedicated pool AND the general weekly meter on the same terms as 5.1.
+POINT_RELEASE_FAMILIES = (
+    "claude-fable-5-1", "claude-mythos-5-1",
+    "claude-fable-5-2", "claude-mythos-5-2",
+)
+
+
+@pytest.mark.parametrize("family", POINT_RELEASE_FAMILIES)
+def test_fable_and_mythos_point_releases_are_their_own_families(family):
     # Pooling would assert that per-unit consumption is EQUAL, which the
     # operator's statement about the meter does not establish, and it would
     # make a Fable 5 to 5.1 substitution invisible on the one axis built to
-    # notice it. Mutation: aliasing either -1 spelling onto its base family.
-    assert qm.normalize_family("claude-fable-5-1") == "claude-fable-5-1"
-    assert qm.normalize_family("claude-mythos-5-1") == "claude-mythos-5-1"
-    assert qm.family_participation("claude-fable-5-1") == "general"
-    assert qm.family_participation("claude-mythos-5-1") == "general"
+    # notice it. Mutation: aliasing a point-release spelling onto its base
+    # family, or omitting it so it normalizes to None (#1118 for 5.2).
+    assert qm.normalize_family(family) == family
+    assert qm.family_participation(family) == "general"
     assert qm.normalize_family("claude-mythos-preview") == "claude-mythos-5"
 
 
-def test_point_release_participation_carries_its_operator_provenance():
-    # Mutation: promoting either family to "general" without recording where
-    # the fact came from, which is what FAMILY_PROVENANCE exists to prevent.
-    for family in ("claude-fable-5-1", "claude-mythos-5-1"):
-        assert "operator-supplied" in qm.FAMILY_PROVENANCE[family]
+@pytest.mark.parametrize("family", POINT_RELEASE_FAMILIES)
+def test_point_release_participation_carries_its_operator_provenance(family):
+    # Mutation: promoting a family to "general" without recording where the
+    # fact came from, which is what FAMILY_PROVENANCE exists to prevent, or
+    # dropping the dedicated-pool half of the operator's statement.
+    note = qm.FAMILY_PROVENANCE[family]
+    assert "operator-supplied" in note
+    assert "dedicated" in note
 
 
-def test_a_day_of_only_fable_point_one_usage_is_not_withheld():
+@pytest.mark.parametrize("family", POINT_RELEASE_FAMILIES)
+def test_a_day_of_only_fable_point_one_usage_is_not_withheld(family):
     # The observable consequence of the catalogue entries above: without them
     # this day carries UNSUPPORTED_COMPOSITION and never reaches any fit, and
-    # the share is attributed to the 5.1 family in its own right.
+    # the share is attributed to the point-release family in its own right.
     snaps = [_snap(1, 10.0), _snap(5, 20.0)]
     segs = qm.build_segments(snaps, [])
-    e = qm.EntryRecord(at=DAY.replace(hour=3), model="claude-fable-5-1",
+    e = qm.EntryRecord(at=DAY.replace(hour=3), model=family,
                        fresh=1_000_000, output=0, cache_create_total=0,
                        cache_1h=0, cache_read=0)
     obs = qm.build_daily_series(segs, [e], now=DAY + dt.timedelta(days=2),
                                 newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     assert [o.cause for o in obs] == [None]
-    assert obs[0].family_shares == {"claude-fable-5-1": pytest.approx(1.0)}
+    assert obs[0].family_shares == {family: pytest.approx(1.0)}
+
+
+@pytest.mark.parametrize("family", [
+    "claude-fable-5", "claude-fable-5-1", "claude-fable-5-2",
+    "claude-mythos-5", "claude-mythos-5-1", "claude-mythos-5-2",
+    "claude-mythos-preview",
+])
+def test_the_dedicated_pool_scope_note_names_every_dual_draining_family(family):
+    # The note is published as `method.dedicatedPoolScope`. Regenerated quota
+    # goldens would bless a note that omits a family, so the list is stated
+    # here explicitly (#1118). Matched as a whole comma/space-delimited name,
+    # so `claude-fable-5` cannot be satisfied by `claude-fable-5-1`.
+    names = {
+        token.strip(",;")
+        for token in qm.DEDICATED_POOL_SCOPE_NOTE.replace(":", " ").split()
+    }
+    assert family in names
 
 
 def test_mythos_participation_carries_its_operator_provenance():

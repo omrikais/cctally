@@ -62,6 +62,10 @@ def test_any_1m_marker_reads_as_the_full_window_without_a_warning(
     "claude-fable-5-1",
     "claude-fable-5",
     "claude-mythos-5-1",
+    # #1118: Fable/Mythos 5.2 run in a 1M window; with no family default for
+    # either line, an unregistered bare id renders `N/A`.
+    "claude-fable-5-2",
+    "claude-mythos-5-2",
     "claude-opus-5-5-20261001",
 ])
 def test_current_generation_ids_resolve_to_their_verified_1m_default(

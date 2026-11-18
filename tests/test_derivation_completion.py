@@ -2170,7 +2170,8 @@ def test_an_epoch_rebuild_that_lost_its_obligation_still_wakes(
         exc.result = _types.SimpleNamespace()
         raise exc
 
-    monkeypatch.setattr(st, "stats_epoch_rebuild_pending", lambda *a: True)
+    monkeypatch.setattr(st, "stats_epoch_rebuild_pending",
+                        lambda *a, **_kw: True)
     monkeypatch.setattr(st, "resolve_stats_epoch_mismatch", publishing_resolve)
     marker = []
     monkeypatch.setattr(st, "_unlink_stats_epoch_marker",

@@ -3687,3 +3687,305 @@ def test_a_private_corpus_describes_its_own_tree_and_refreshes_like_its_source(
     problems = _private_corpus_contract_problems(
         private_corpus("small"), _load_build_bench(), capfd)
     assert not problems, "\n".join(problems)
+
+
+def _codex_panel_figures(cctally, snap, bbf):
+    """The Codex figures a relocated root used to double (#1108).
+
+    Every value is one this corpus's single root generation determines: the
+    session and project rows with their token totals, the three period
+    totals and the weekly periods themselves, the per-model token split, the
+    cache report's input tokens, the quota history, window, active-window and
+    milestone counts, the budget domain (spend included), the cycle hero, and
+    under account decoration each account's own sessions, projects, weekly
+    periods and hero.
+    """
+    env = cctally.snapshot_to_envelope(
+        snap, now_utc=bbf.CORPUS_CLOCK_UTC, monotonic_now=0.0,
+        runtime_bind="127.0.0.1")
+    codex = env["sources"]["codex"]
+    data = codex.get("data") or {}
+
+    def rows(scope, section):
+        values = (scope.get(section) or {}).get("rows") or []
+        return (len(values), sum(int(r.get("total_tokens") or 0) for r in values))
+
+    def weekly(scope):
+        return tuple(
+            (row.get("label"), row.get("start_at"), row.get("end_at"),
+             row.get("total_tokens"), row.get("used_pct"))
+            for row in ((scope.get("periods") or {}).get("weekly") or {}).get(
+                "rows") or ())
+
+    def models(scope):
+        split: dict = {}
+        for row in ((scope.get("periods") or {}).get("daily") or {}).get(
+                "rows") or ():
+            for model in row.get("model_breakdowns") or ():
+                name = str(model.get("modelName"))
+                split[name] = split.get(name, 0) + int(
+                    model.get("totalTokens") or 0)
+        return tuple(sorted(split.items()))
+
+    def hero(scope):
+        value = scope.get("hero") or {}
+        return (value.get("total_tokens"), value.get("cost_usd"))
+
+    periods = data.get("periods") or {}
+    quota = data.get("quota") or {}
+    summary = quota.get("summary") or {}
+    return {
+        "availability": codex.get("availability"),
+        "warnings": sorted(str(w.get("code")) for w in codex.get("warnings") or []),
+        "sessions": rows(data, "sessions"),
+        "projects": rows(data, "projects"),
+        **{f"{period}_tokens": (periods.get(period) or {}).get("total_tokens")
+           for period in ("daily", "weekly", "monthly")},
+        "weekly_periods": weekly(data),
+        "models": models(data),
+        "cache_report_input_tokens": sum(
+            int(day.get("input_tokens") or 0)
+            for day in (data.get("cache_report") or {}).get("days") or []),
+        "quota_histories": len(quota.get("histories") or []),
+        "quota_windows": summary.get("window_count"),
+        "active_windows": (data.get("hero") or {}).get("quota", {}).get(
+            "active_window_count"),
+        "quota_milestones": len(quota.get("milestones") or []),
+        "budget": json.dumps(data.get("budget"), sort_keys=True, default=str),
+        "hero": hero(data),
+        "accounts": tuple(sorted(
+            (str(key), rows(scope, "sessions"), rows(scope, "projects"),
+             weekly(scope), hero(scope))
+            for key, scope in (data.get("account_scopes") or {}).items()
+        )),
+    }
+
+
+def _skip_sync_figures(data_dir, bbf):
+    with _corpus_env(data_dir, bbf) as cctally:
+        snap = cctally._cctally_tui._tui_build_snapshot(
+            now_utc=bbf.CORPUS_CLOCK_UTC, skip_sync=True,
+            precompute_envelope=True, runtime_bind="127.0.0.1")
+        return _codex_panel_figures(cctally, snap, bbf)
+
+
+def _published_figures(data_dir, bbf, hub):
+    assert hub.published, "non-vacuity: the refresh published no frame"
+    with _corpus_env(data_dir, bbf) as cctally:
+        return _codex_panel_figures(cctally, hub.published[-1], bbf)
+
+
+def _owner_ticks(data_dir, bbf, monkeypatch, steps, *, force_a2=False):
+    """Run every step through ONE locked owner, so its read-scope evidence is
+    retained across ticks the way a running dashboard retains it.
+
+    Returns each step's Codex-bearing published frames (as figures), each
+    step's every published frame (Codex-bearing or not, A2 partial frames
+    included), every weekly cycle the builds resolved (its
+    `source_root_keys`), and the configured root keys. A frame bears Codex
+    once its source carries rows. `force_a2` drops the A2 throttle to zero,
+    so an ingesting tick also publishes the partial frame built inside its
+    own sync.
+    """
+    with _corpus_env(data_dir, bbf) as cctally:
+        tui = cctally._cctally_tui
+        if force_a2:
+            monkeypatch.setattr(tui, "_A2_PARTIAL_THROTTLE_S", 0.0)
+        dash = cctally._load_sibling("_cctally_dashboard")
+        sources = cctally._load_sibling("_cctally_dashboard_sources")
+        current = cctally._load_sibling(
+            "_cctally_cache").codex_configured_root_keys()
+        cycles = []
+        real_resolve = sources._resolve_codex_weekly_cycle
+
+        def resolve(*args, **kwargs):
+            result = real_resolve(*args, **kwargs)
+            cycles.extend(frozenset(c.source_root_keys) for c in result or ())
+            return result
+
+        monkeypatch.setattr(sources, "_resolve_codex_weekly_cycle", resolve)
+        ref = dash._SnapshotRef(tui._tui_empty_snapshot(bbf.CORPUS_CLOCK_UTC))
+        hub = _CapturingHub()
+        locked = tui._make_run_sync_now_locked(
+            ref=ref, hub=hub, pinned_now=bbf.CORPUS_CLOCK_UTC,
+            display_tz_pref_override=None, runtime_bind="127.0.0.1",
+        )
+        frames = []
+        published = []
+        for step in steps:
+            first = len(hub.published)
+            step(locked)
+            figures = [_codex_panel_figures(cctally, snap, bbf)
+                       for snap in hub.published[first:]]
+            published.append(figures)
+            frames.append([f for f in figures if f["sessions"][0]])
+        monkeypatch.setattr(sources, "_resolve_codex_weekly_cycle", real_resolve)
+    return frames, published, cycles, current
+
+
+@pytest.mark.parametrize("path", ["qualified", "fallback"])
+def test_a_relocated_codex_root_counts_once_while_its_prune_debt_is_pending(
+    private_corpus, monkeypatch, path,
+):
+    """Retired-root rows awaiting the prune drain are not published (#1108).
+
+    Failure it detects: after a configured Codex home's canonical path
+    changes, the ingest re-reads every rollout under the new root key while
+    the old root's rows wait in `codex_prune_debt` for the detached
+    `_codex-prune-drain`. The dashboard read every registered root, so every
+    frame published after that ingest until the drain showed each Codex
+    session, project, period total, model split, budget spend and quota
+    history twice (measured 30 -> 60 sessions, 12 -> 24 quota histories), on
+    the qualified path and on the metadata-incomplete fallback path, while
+    the cycle hero resolved to the retired root's keys. One owner runs the
+    ingesting tick and a warm tick after it; every Codex-bearing frame must
+    equal one root generation, every resolved cycle must name current roots
+    only, and the drain must not move any figure.
+    """
+    bbf = _load_build_bench()
+    data_dir = pathlib.Path(private_corpus("small"))
+    root = data_dir.parent
+    before = _skip_sync_figures(data_dir, bbf)
+    assert before["sessions"][0] > 0 and before["quota_histories"] > 0, (
+        f"non-vacuity: the corpus published no Codex figures: {before!r}")
+    assert before["hero"][0], f"non-vacuity: no cycle hero: {before!r}"
+    assert before["weekly_periods"] and before["models"], (
+        f"non-vacuity: no weekly periods or model split: {before!r}")
+
+    for old in sorted(root.glob("codex-*")):
+        new = root / ("codex-" + str(int(old.name.split("-")[1]) + 5))
+        old.rename(new)
+        bbf.stamp_codex_hook_trust(new)
+
+    def figures(values):
+        return {k: v for k, v in values.items()
+                if k not in ("availability", "warnings")}
+
+    # The window between the relocation and its re-ingest: the new copies
+    # have no cursors yet, so withholding the retired root would publish an
+    # empty Codex section (measured on revision 3: availability "empty",
+    # sessions 0, hero 0). A skip-sync build here keeps one root generation.
+    unsynced = _skip_sync_figures(data_dir, bbf)
+    assert unsynced["availability"] != "empty" and figures(unsynced) == (
+        figures(before)), (
+        "a skip-sync build after the relocation and before any ingest "
+        f"differs from one root generation:\nframe={unsynced!r}\n"
+        f"expected={before!r}")
+    observed = {}
+
+    def ingest(locked):
+        locked(False)
+        conn = sqlite3.connect(str(data_dir / "cache.db"))
+        try:
+            observed["debt"] = conn.execute(
+                "SELECT COUNT(*) FROM codex_prune_debt").fetchone()[0]
+            observed["root_keys"] = conn.execute(
+                "SELECT COUNT(DISTINCT source_root_key) FROM codex_session_entries"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def strip_current_metadata(locked):
+        # One CURRENT-root thread loses its metadata row, so the accounting
+        # window is metadata-incomplete and the dashboard reads the rooted
+        # fallback carrier.
+        conn = sqlite3.connect(str(data_dir / "cache.db"))
+        try:
+            retired = {row[0] for row in conn.execute(
+                "SELECT source_root_key FROM codex_prune_debt")}
+            victim = next(
+                row for row in conn.execute(
+                    "SELECT conversation_key, source_root_key "
+                    "FROM codex_conversation_threads ORDER BY conversation_key")
+                if row[1] not in retired)
+            conn.execute(
+                "DELETE FROM codex_conversation_threads "
+                "WHERE conversation_key=? AND source_root_key=?", victim)
+            conn.commit()
+        finally:
+            conn.close()
+        locked(True)
+
+    steps = [ingest]
+    if path == "fallback":
+        steps += [strip_current_metadata, lambda locked: locked(True)]
+    else:
+        steps += [lambda locked: locked(False)]
+    frames, published, cycles, current = _owner_ticks(
+        data_dir, bbf, monkeypatch, steps, force_a2=True)
+    assert observed["debt"] > 0 and observed["root_keys"] > 2, (
+        f"non-vacuity: no retired root is pending ({observed!r})")
+    # Every frame the ingesting refresh published, the A2 partial frame
+    # built inside its own sync included, is one root generation and never
+    # an empty Codex section.
+    assert len(published[0]) >= 2, (
+        f"non-vacuity: the ingesting tick published no A2 partial frame "
+        f"beside its final frame: {published[0]!r}")
+    for frame in published[0]:
+        assert frame["availability"] != "empty" and figures(frame) == (
+            figures(before)), (
+            "the ingesting refresh published a frame that differs from one "
+            f"root generation:\nframe={frame!r}\nexpected={before!r}")
+    assert all(frames), (
+        f"non-vacuity: a tick published no Codex-bearing frame: {frames!r}")
+    assert cycles, "non-vacuity: no weekly cycle was resolved"
+    stray = [keys for keys in cycles if not keys <= current]
+    assert not stray, (
+        f"a resolved cycle names a retired root: {stray!r} (current "
+        f"{sorted(current)!r})")
+    pending = frames[-1][-1]
+    if path == "fallback":
+        assert pending["availability"] == "partial", (
+            f"non-vacuity: the fallback carrier did not run: {pending!r}")
+
+    with _corpus_env(data_dir, bbf) as cctally:
+        cctally._load_sibling("_cctally_cache").run_codex_prune_drain(
+            wait_for_requests=False)
+    conn = sqlite3.connect(str(data_dir / "cache.db"))
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_prune_debt").fetchone()[0] == 0, (
+            "non-vacuity: the drain left debt behind")
+    finally:
+        conn.close()
+    # The skip-sync build right after the drain also reports
+    # `codex_projection_incoherent` until a reconciling tick runs, which is
+    # the drain's own lifecycle; the figures are what is compared there.
+    drained = _skip_sync_figures(data_dir, bbf)
+
+    oracle = {0: before}
+    for index in range(1, len(frames)):
+        oracle[index] = drained if path == "fallback" else before
+    for index, step_frames in enumerate(frames):
+        for frame in step_frames:
+            assert figures(frame) == figures(oracle[index]), (
+                f"tick {index} published a frame that differs from one root "
+                f"generation:\nframe={frame!r}\nexpected={oracle[index]!r}")
+    assert figures(pending) == figures(drained), (
+        "the frame published while the retired root's debt was pending "
+        f"differs from the drained state:\npending={pending!r}\n"
+        f"drained={drained!r}")
+    assert pending["hero"] == before["hero"], (
+        f"the cycle hero moved: before={before['hero']!r} "
+        f"pending={pending['hero']!r}")
+    if path == "fallback":
+        assert pending["warnings"] == ["codex_metadata_incomplete"], pending
+    else:
+        assert pending == before, (
+            f"a relocated root changed the Codex frame:\nbefore={before!r}\n"
+            f"pending={pending!r}")
+    # The drained-plus-one-tick oracle, on both paths. The fallback path's
+    # deleted thread row stays deleted, so its tick stays `partial` with
+    # `codex_metadata_incomplete`; its figures are what is compared.
+    _ref, hub = _run_refresh(data_dir, bbf, monkeypatch=monkeypatch)
+    after = _published_figures(data_dir, bbf, hub)
+    if path == "fallback":
+        assert (after["availability"], after["warnings"]) == (
+            "partial", ["codex_metadata_incomplete"]), after
+        assert figures(after) == figures(drained), (
+            f"the first tick after the drain moved the Codex frame:\n"
+            f"drained={drained!r}\nafter={after!r}")
+        return
+    assert after == before, (
+        f"the first tick after the drain moved the Codex frame:\n"
+        f"before={before!r}\nafter={after!r}")

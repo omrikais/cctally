@@ -549,6 +549,44 @@ def test_the_route_accepts_the_unattributed_sentinel_on_codex(
         srv.server_close()
 
 
+def test_the_route_reads_the_published_snapshot_s_codex_root_scope(
+        ns, tmp_path, monkeypatch):
+    """#1108 T5 (the cycle-detail route). Failure it detects: the route
+    resolving the live boundary under no read scope (or one of its own)
+    while the published snapshot withholds a retired root, so the detail's
+    current cycle is judged against a retired root's reset. The route must
+    hand the published snapshot's scope, `None` included, to the identity
+    resolver unchanged."""
+    import dataclasses
+    import sys
+    srv, keys = _route(ns, tmp_path, monkeypatch)
+    sources = sys.modules["_cctally_dashboard_sources"]
+    real = sources.resolve_codex_cycle_detail_identity
+    seen = []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("root_scope"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sources, "resolve_codex_cycle_detail_identity", spy)
+    handler = ns["DashboardHTTPHandler"]
+    published = handler.snapshot_ref.get()
+    scope = sys.modules["_cctally_cache"]._CodexPruneScope(
+        configured_root_keys=frozenset({ROOT}),
+        recognized_root_keys=frozenset({ROOT}))
+    try:
+        for snapshot_scope in (scope, None):
+            handler.snapshot_ref = ns["_SnapshotRef"](
+                dataclasses.replace(published, codex_root_scope=snapshot_scope))
+            status, body = _fetch(srv, keys[None])
+            assert status == 200, (status, body)
+            assert seen and seen[-1] is snapshot_scope, seen
+        assert len(seen) == 2, seen
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_the_route_rejects_the_account_param_on_an_undecorated_claude_store(
         ns, tmp_path, monkeypatch):
     """F4, narrowed by #836 (spec 5.6). Claude history is account-partitioned

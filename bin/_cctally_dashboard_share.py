@@ -1669,6 +1669,9 @@ def _share_codex_state_for_period(data_snap, *, panel: str, options: dict):
                 week_start_name=semantics.week_start_name,
                 speed=semantics.speed,
                 codex_budget=semantics.codex_budget,
+                # #1108 spec §3.2: the published snapshot's read scope; a
+                # request path never discovers.
+                codex_root_scope=getattr(data_snap, "codex_root_scope", None),
             ),
             data_version=(
                 f"share:codex:{panel}:{range_start.isoformat()}:"

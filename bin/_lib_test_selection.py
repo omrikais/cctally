@@ -35,8 +35,12 @@ from typing import Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _lib_quarantine  # noqa: E402
 
-# Two entries name mirror-private files; the mirror's privacy guard classifies
-# paths, not contents, and a tree without a file skips its entry.
+# Entries may name mirror-private tests; a tree without a file skips its entry.
+# The public-dependency guard reads a whole repo-relative path literal as a
+# run-time reference, so the one whole-file private entry is named through its
+# own small waived assignment, keeping the waiver off every other entry of the
+# tuple (#1116).
+_QUOTA_MUTATION_COVERAGE = 'tests/test_quota_mutation_coverage.py'  # mirror-private-ok: a mirror-private test; pytest_legs keeps only entries whose file exists
 SERIAL: tuple[str, ...] = (
     'tests/test_rebuild_benchmark.py',
     'tests/test_bench_corpus_discriminators.py::test_the_session_fingerprint_backstop_fails_a_run_it_should_fail',
@@ -44,7 +48,7 @@ SERIAL: tuple[str, ...] = (
     'tests/test_stats_writer_storm_386.py::test_dashboard_source_reader_releases_rollback_snapshot',
     'tests/test_public_test_dep_closure.py::test_the_projected_public_tree_plans_and_collects',
     'tests/test_public_test_dep_closure.py::test_the_public_subset_runs_the_preflight_harness',
-    'tests/test_quota_mutation_coverage.py',
+    _QUOTA_MUTATION_COVERAGE,
     # A wall-clock scaling ratio (test regime reset, Task 5.5): under -n 10 it
     # measured scheduler contention, not the planner.
     'tests/test_retention_planner_scaling.py',

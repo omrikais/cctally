@@ -101,7 +101,7 @@ def _chip_for_model(name: str) -> str:
 # pinned in `bin/_lib_detector_access_registry.py`, so its registry test fails
 # until the affected pins are re-pinned through the reviewed procedure in that
 # module's docstring. Bulk regeneration of the pins alone is not acceptance.
-PRICING_SNAPSHOT_DATE = "2026-11-05"
+PRICING_SNAPSHOT_DATE = "2026-11-17"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 
@@ -313,10 +313,11 @@ LITELLM_PRICES_URL = (
 # identifier. Retained Preview rows therefore keep the explicit historical
 # rate rather than being rewritten to the successor's rate.
 #
-# gpt-5.6-sol (#643): OpenAI's pricing page states that "GPT-5.6 Sol's
+# gpt-5.6-sol (#643): OpenAI's pricing page stated that "GPT-5.6 Sol's
 # promotional pricing is available at least through November 21, 2026" and
-# publishes no post-promotional price, so LiteLLM's $4/$20 per MTok rate is
-# time-boxed. This table is date-blind and roughly half the retained Sol rows
+# published no post-promotional price, so LiteLLM's $4/$20 per MTok rate is
+# time-boxed. On 2026-11-17 (#1118) the page says the promotion "is available
+# until November 30, 2026", so the six entries now expire on that date. This table is date-blind and roughly half the retained Sol rows
 # predate the promotion, so the pre-promotional $5/$30 card is kept and the
 # promotion is suppressed here. `expires` is what stops the divergence
 # ossifying: `stale_allowlist_entries` only fires if LiteLLM reverts, so a
@@ -359,11 +360,13 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
     {
         "model": "gpt-5.6-sol",
         "field": field,
-        "expires": "2026-11-21",
+        "expires": "2026-11-30",
         "reason": (
-            "OpenAI's pricing page guarantees GPT-5.6 Sol's promotional "
-            "$4/$20 per MTok rate only 'at least through November 21, 2026' "
-            "and publishes no post-promotional price. This table is "
+            "OpenAI's pricing page says GPT-5.6 Sol's promotional $4/$20 "
+            "per MTok pricing is 'available until November 30, 2026' "
+            "(read 2026-11-17, #1118; previously 'at least through "
+            "November 21, 2026') and publishes no post-promotional price. "
+            "This table is "
             "date-blind, so the pre-promotional $5/$30 card is kept rather "
             "than adopting a rate that would have to be reverted by hand "
             "when the promotion ends (#643)."
@@ -464,13 +467,21 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 #   as Sonnet 5 and the standard 0.1x read multiplier. 1M context at standard
 #   pricing, so NO above-200k tier, and no fast mode, so no fast multiplier.
 #   Verified against LiteLLM's anthropic-provider row on 2026-09-29.
+#   2026-11-17 (#1118): added claude-fable-5-2 and claude-mythos-5-2 at
+#   Anthropic's published $8/$40 per MTok, $10 five-minute cache write and
+#   $0.20 cache read (0.025x base input, as for 5.1); the 1h write stays
+#   derived ($16). Both run the full 1M window at standard pricing, so NO
+#   above-200k tier, and both offer fast mode at 2x ($16/$80). Both were
+#   `pricing-check` missing_from_us and unpriced vendor models, pricing at $0.
+#   Verified against the vendor pricing and model pages and LiteLLM's
+#   anthropic-provider rows on 2026-11-17.
 # Anthropic prices a cache WRITE by TTL: 1.25x base input for a 5-minute write,
 # 2x for a 1-hour write. Both WRITE multipliers are documented as applying
 # consistently across all supported models, so the 1h rate is DERIVED from
 # input_cost_per_token rather than stored per-model — a model added later
 # cannot silently miss it (#195). Cache READS are NOT uniform and are NOT
 # derived: they are 0.1x base input on most models but 0.025x on Claude Fable
-# 5.1 and Claude Mythos 5.1 and 0.05x on Claude Opus 5.5, so the read rate stays stored per-model in
+# 5.1 / 5.2 and Claude Mythos 5.1 / 5.2 and 0.05x on Claude Opus 5.5, so the read rate stays stored per-model in
 # `cache_read_input_token_cost`, which represents a model-specific rate.
 CACHE_WRITE_1H_MULTIPLIER = 2.0
 
@@ -564,6 +575,15 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         # 0.025x base input, not the standard 0.1x — see the 2026-09-02 note.
         "cache_read_input_token_cost": 2.5e-07,
     },
+    "claude-fable-5-2": {
+        # Source: https://platform.claude.com/docs/en/about-claude/pricing and
+        # /docs/en/models/fable-5-2/overview (2026-11-17, #1118).
+        "input_cost_per_token": 8e-06,
+        "output_cost_per_token": 4e-05,
+        "cache_creation_input_token_cost": 1e-05,
+        # 0.025x base input, as for 5.1 — see the 2026-11-17 note.
+        "cache_read_input_token_cost": 2e-07,
+    },
     "claude-haiku-4-5": {
         "input_cost_per_token": 1e-06,
         "output_cost_per_token": 5e-06,
@@ -603,6 +623,15 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "cache_creation_input_token_cost": 1.25e-05,
         # 0.025x base input, not the standard 0.1x — see the 2026-09-02 note.
         "cache_read_input_token_cost": 2.5e-07,
+    },
+    "claude-mythos-5-2": {
+        # Source: https://platform.claude.com/docs/en/about-claude/pricing and
+        # /docs/en/models/mythos-5-2/overview (2026-11-17, #1118).
+        "input_cost_per_token": 8e-06,
+        "output_cost_per_token": 4e-05,
+        "cache_creation_input_token_cost": 1e-05,
+        # 0.025x base input, as for 5.1 — see the 2026-11-17 note.
+        "cache_read_input_token_cost": 2e-07,
     },
     "claude-mythos-preview": {
         "input_cost_per_token": 2.5e-05,
@@ -738,7 +767,8 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
 # deliberately have no fallback multiplier: only a retained authoritative
 # `usage.speed == "fast"` row on one of these exact model IDs is premium-priced.
 # The 4.6/4.7 entries are historical retention rules; current new fast requests
-# are supported only on Opus 5.5, Opus 5 and Opus 4.8.
+# are supported only on Opus 5.5, Opus 5, Opus 4.8, Fable 5.2 and Mythos 5.2
+# (#1118).
 CLAUDE_FAST_MULTIPLIER_OVERRIDES: dict[str, float] = {
     "claude-opus-4-6": 6.0,
     "claude-opus-4-6-20260205": 6.0,
@@ -747,6 +777,8 @@ CLAUDE_FAST_MULTIPLIER_OVERRIDES: dict[str, float] = {
     "claude-opus-4-8": 2.0,
     "claude-opus-5": 2.0,
     "claude-opus-5-5": 2.0,
+    "claude-fable-5-2": 2.0,
+    "claude-mythos-5-2": 2.0,
 }
 
 
@@ -779,8 +811,10 @@ _unknown_model_warnings: set[str] = set()
 #   (gpt-5.6-cyber), 2026-09-05 (gpt-6-astra), 2026-09-22 (gpt-6-sol,
 #   gpt-6-luna), 2026-09-23 (gpt-5.5-cyber), 2026-09-30 (gpt-6.1-sol) and
 #   2026-11-05 (gpt-6.1-terra / gpt-6-rosalind / gpt-6-astra-law and the
-#   gpt-5.5-cyber-preview alias). Codex values outside the cards each of
-#   those syncs names were NOT re-verified on those days.
+#   gpt-5.5-cyber-preview alias) and 2026-11-17 (gpt-6.2-astra / gpt-6.2-sol /
+#   gpt-6.2-astra-law / gpt-6-cyber, the gpt-6-astra-law long-context tier and
+#   the gpt-5.6-sol suppression expiry). Codex values outside the cards each
+#   of those syncs names were NOT re-verified on those days.
 # - As of the 2026-07-19 sync this carries every openai-provider
 #   gpt-5* model the LiteLLM snapshot lists, so `pricing-check`'s scope finds
 #   nothing missing. Models absent from this table still fall back to `gpt-5`
@@ -818,7 +852,9 @@ _unknown_model_warnings: set[str] = set()
 #   PRICING_DRIFT_ALLOWLIST with expires 2026-11-21 instead of being written
 #   into this date-blind table, because roughly half the retained Sol rows
 #   predate it. The accepted cost is that while the promotion runs, Sol
-#   reporting is high by 25% on input and 50% on output.
+#   reporting is high by 25% on input and 50% on output. (2026-11-17, #1118:
+#   OpenAI now says the promotion runs "until November 30, 2026", so the
+#   suppressions expire 2026-11-30.)
 #   2026-09-05 (#767): added gpt-6-astra at OpenAI's published $10.00 input /
 #   $1.00 cached input / $50.00 output per MTok. Prompts above 272,000 input
 #   tokens use the published $20.00 / $2.00 / $75.00 long-context card, and
@@ -854,13 +890,31 @@ _unknown_model_warnings: set[str] = set()
 #   $7.50, and 2x for Fast),
 #   gpt-6-rosalind (trusted-access life-sciences model, $15.00 / $1.50 /
 #   $75.00; above 272K $30.00 / $3.00 / $112.50) and gpt-6-astra-law ($10.00
-#   / $1.00 / $50.00, no long-context column; OpenAI marks this rate
+#   / $1.00 / $50.00, no long-context column at that capture; OpenAI marks this rate
 #   promotional "at least through December 31, 2026" and publishes no
 #   successor, so the only published rate is adopted and a later LiteLLM
 #   change will surface as value drift). gpt-5.5-cyber-preview has no vendor
 #   row and is aliased to gpt-5.5-cyber (see CODEX_MODEL_ALIASES). The fast
 #   multiplier of all three resolves to CODEX_FAST_MULTIPLIER_FALLBACK; the
 #   vendor publishes no Fast tier for Rosalind or Astra for Law.
+#   2026-11-17 (#1118): `pricing-check` reported four more OpenAI-provider
+#   identifiers missing; each card is from OpenAI's model and pricing pages,
+#   which agree with LiteLLM. Added gpt-6.2-astra (Standard $8.00 input /
+#   $0.40 cached / $40.00 output; above 272K $16.00 / $0.80 / $60.00) and
+#   gpt-6.2-sol ($2.00 / $0.10 / $10.00; above 272K $4.00 / $0.20 / $15.00),
+#   both with the published 2x Fast; gpt-6.2-astra-law at the same card as
+#   gpt-6.2-astra, which OpenAI marks promotional "at least through December
+#   31, 2026" with no successor, adopted as the only published Standard rate
+#   (no `expires`, no suppression; December 31 is a recheck date); and
+#   gpt-6-cyber ($20.00 / $2.00 / $100.00; above 272K $40.00 / $4.00 /
+#   $150.00), which requires Daybreak Red access and publishes no Fast tier.
+#   Fast for all four resolves to CODEX_FAST_MULTIPLIER_FALLBACK (2.0); for
+#   Astra for Law and Cyber that is compatibility behaviour, not a vendor
+#   rate. gpt-6-astra-law gains the long-context tier OpenAI and LiteLLM now
+#   publish ($20.00 / $2.00 / $75.00). Ultrafast, background discounts,
+#   Batch and Codex cache writes stay unpriced (docs/pricing-gotchas.md
+#   "Tiers cctally does not price"). gpt-5.6-sol's six suppressions now
+#   expire 2026-11-30, the date OpenAI now gives for the promotion's end.
 #
 # Billing rules:
 # - reasoning_output_tokens is billed at the *output* rate (matches
@@ -1076,12 +1130,70 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
         # Source: https://developers.openai.com/api/docs/pricing (#989), the
         # legal table: $10.00/M input, $1.00/M cached input, $50.00/M output,
         # marked promotional "at least through December 31, 2026" with no
-        # successor published. No long-context column is published (nor a
-        # LiteLLM tier), so none is inferred and long requests price at these
-        # base rates.
+        # successor published. The long-context tier ($20.00 / $2.00 / $75.00
+        # above 272K input) was published by 2026-11-17 (#1118) in both the
+        # vendor table and LiteLLM; at #989's 2026-11-05 capture neither
+        # carried it.
         "input_cost_per_token": 1e-05,
         "cache_read_input_token_cost": 1e-06,
         "output_cost_per_token": 5e-05,
+        "input_cost_per_token_above_272k_tokens": 2e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 2e-06,
+        "output_cost_per_token_above_272k_tokens": 7.5e-05,
+    },
+    "gpt-6.2-astra": {
+        # Source: https://developers.openai.com/api/docs/models/gpt-6.2-astra
+        # and /api/docs/pricing (2026-11-17, #1118). Standard $8.00/M input,
+        # $0.40/M cached input (5% of input), $40.00/M output; above 272K
+        # input, 2x input/cache and 1.5x output for the full request. Fast is
+        # 2x the Standard rate for the same context length.
+        "input_cost_per_token": 8e-06,
+        "cache_read_input_token_cost": 4e-07,
+        "output_cost_per_token": 4e-05,
+        "input_cost_per_token_above_272k_tokens": 1.6e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 8e-07,
+        "output_cost_per_token_above_272k_tokens": 6e-05,
+    },
+    "gpt-6.2-sol": {
+        # Source: https://developers.openai.com/api/docs/models/gpt-6.2-sol
+        # and /api/docs/pricing (2026-11-17, #1118). Standard $2.00/M input,
+        # $0.10/M cached input (5% of input), $10.00/M output; above 272K
+        # input, $4.00 / $0.20 / $15.00 for the full request. Fast is 2x.
+        "input_cost_per_token": 2e-06,
+        "cache_read_input_token_cost": 1e-07,
+        "output_cost_per_token": 1e-05,
+        "input_cost_per_token_above_272k_tokens": 4e-06,
+        "cache_read_input_token_cost_above_272k_tokens": 2e-07,
+        "output_cost_per_token_above_272k_tokens": 1.5e-05,
+    },
+    "gpt-6.2-astra-law": {
+        # Source: https://developers.openai.com/api/docs/pricing (2026-11-17,
+        # #1118), the specialized table's Standard tab, the only tier listed:
+        # $8.00 / $0.40 / $40.00; above 272K $16.00 / $0.80 / $60.00. OpenAI
+        # says promotional pricing "is available at least through December
+        # 31, 2026" and publishes no successor, so the only published rate is
+        # adopted with no expiry or suppression; a later upstream change
+        # surfaces as value drift. Forced fast at 2x is compatibility only.
+        "input_cost_per_token": 8e-06,
+        "cache_read_input_token_cost": 4e-07,
+        "output_cost_per_token": 4e-05,
+        "input_cost_per_token_above_272k_tokens": 1.6e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 8e-07,
+        "output_cost_per_token_above_272k_tokens": 6e-05,
+    },
+    "gpt-6-cyber": {
+        # Source: https://developers.openai.com/api/docs/models/gpt-6-cyber
+        # and /api/docs/pricing (2026-11-17, #1118): $20.00/M input, $2.00/M
+        # cached input, $100.00/M output; above 272K input $40.00 / $4.00 /
+        # $150.00. Requires Daybreak Red access. No Fast tier is published,
+        # so forced fast at 2x is compatibility behaviour. The
+        # gpt-daybreak-red-latest alias stays on gpt-5.6-cyber.
+        "input_cost_per_token": 2e-05,
+        "cache_read_input_token_cost": 2e-06,
+        "output_cost_per_token": 1e-04,
+        "input_cost_per_token_above_272k_tokens": 4e-05,
+        "cache_read_input_token_cost_above_272k_tokens": 4e-06,
+        "output_cost_per_token_above_272k_tokens": 1.5e-04,
     },
     # ── Issue #123: full gpt-5.x LiteLLM sync (2026-05-30 snapshot) ──
     # Exact model_prices_and_context_window.json values for every
@@ -1874,3 +1986,40 @@ def live_codex_pricing_identity() -> str:
         _LIVE_CODEX_PRICING_IDENTITY = codex_pricing_identity(
             current_pricing_snapshot())
     return _LIVE_CODEX_PRICING_IDENTITY
+
+
+def pricing_revision_identity(snapshot: PricingSnapshot) -> str:
+    """A short hash of every pricing input a served cost reads (#1118 D7).
+
+    The dashboard appends it to the wire ``data_version`` so an open detail
+    revalidates after an upgrade restart (#868) that changed only pricing: the
+    store, and so the DB-signature version, is the same across the two
+    binaries. It covers the snapshot date, the Codex identity above, and the
+    Claude cards, tier threshold, 1-hour cache-write multiplier and fast map.
+
+    Canonical JSON, as in ``codex_pricing_identity``.
+    """
+    payload = {
+        "snapshot_date": snapshot.snapshot_date,
+        "codex": codex_pricing_identity(snapshot),
+        "claude_pricing": snapshot.claude_pricing,
+        "claude_tier_threshold": snapshot.tier_thresholds.get("claude"),
+        "cache_write_1h_multiplier": snapshot.cache_write_1h_multiplier,
+        "claude_fast_multipliers": snapshot.fast_multipliers.get("claude"),
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()[:12]
+
+
+_LIVE_PRICING_REVISION_IDENTITY: "str | None" = None
+
+
+def live_pricing_revision_identity() -> str:
+    """``pricing_revision_identity`` of the live snapshot, computed once per
+    process for the reason ``live_codex_pricing_identity`` states."""
+    global _LIVE_PRICING_REVISION_IDENTITY
+    if _LIVE_PRICING_REVISION_IDENTITY is None:
+        _LIVE_PRICING_REVISION_IDENTITY = pricing_revision_identity(
+            current_pricing_snapshot())
+    return _LIVE_PRICING_REVISION_IDENTITY

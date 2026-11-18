@@ -401,6 +401,21 @@ _TYPED_PATTERNS = (
     (re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"), "<b64>"),
 )
 
+# The two headers of the controller's session-violation block, which
+# `tests/conftest.py` `pytest_sessionfinish` prints ahead of pytest's report
+# (#1109). The consumer owns this copy; the producer keeps its own literals,
+# and tests/test_isolation_contract.py holds the two in agreement. They are
+# NOT a scrub rule: `scrub_line` redacts them like any other line, and only
+# `build_scrubbed_extract` emits one, as this constant, at an index
+# `pytest_session_violation_ranges` recognised.
+SESSION_VIOLATION_HEADERS = (
+    "isolation contract violated after the reporting test finished (#529 S4):",
+    "temp hygiene violated outside any single test (#963):",
+)
+# SGR sequences only: `write_line(..., red=True)` wraps the block in them. Any
+# other control (an OSC, a BEL) is left in place, so it breaks the equality.
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
 # Two tiers, because `re.match` is prefix-only and a pattern without an end
 # anchor returns whatever follows it untouched.
 #
@@ -1148,6 +1163,76 @@ def _cluster_selection(total: int, ordered, budget: int):
     return None, tail
 
 
+def _session_extract_block(name, lines, ctx, budget, ordered, ranges, retained):
+    """One pytest subject's block when its log carries a session-violation
+    block (#1109): that block is promoted to the head part.
+
+    A recognised header is emitted as its SESSION_VIOLATION_HEADERS constant,
+    never as the raw line; every other line goes through `scrub_line`. Over
+    budget, at most half the body goes to the block's indices in admission
+    priority, and the rest never repeats a session index: the marker-less
+    rest is the log's suffix, the marker rest is the counts line plus the
+    latest cluster trimmed from its START (so the summary's FAILED lines and
+    the counts survive the reservation) and the earliest cluster whole when it
+    fits. Both clusters are measured by their lines outside the session part
+    and the counts line, so no line is paid for twice.
+    """
+    headers = {start: header for start, _stop, header in ranges}
+
+    def emit(idx):
+        if idx in headers:
+            return SESSION_VIOLATION_HEADERS[headers[idx]]
+        return scrub_line(lines[idx], ctx)
+
+    block = [f"---- {name} ----"]
+    if len(lines) <= budget - 1:
+        block.extend(emit(idx) for idx in range(len(lines)))
+        return block
+    body = budget - 2
+    order = _session_admission_order(ranges)
+    session = set(order)
+    chosen = set(order[:body // 2])
+    rest_budget = body - len(chosen)
+    rest = set()
+    if ordered and any(marker is not None for _s, _e, marker in ordered):
+        counts = None
+        for idx in range(len(lines) - 1, -1, -1):
+            if _PYTEST_COUNTER_LINE_RE.match(_SGR_RE.sub("", lines[idx])):
+                counts = idx
+                break
+        if counts is not None and counts not in session and rest_budget > 0:
+            rest.add(counts)
+            rest_budget -= 1
+        if rest_budget > 0:
+            excluded = session | rest
+            start, end, _marker = ordered[-1]
+            latest = [idx for idx in range(start, end + 1) if idx not in excluded]
+            picked = latest[max(0, len(latest) - rest_budget):]
+            left = rest_budget - len(picked)
+            low = picked[0] if picked else end + 1
+            earliest = ordered[0]
+            if len(ordered) > 1 and earliest[0] < low:
+                early = [idx for idx in range(earliest[0], earliest[1] + 1)
+                         if idx not in excluded]
+                if len(early) <= left:
+                    picked += early
+            rest.update(picked)
+    else:
+        for idx in range(len(lines) - 1, -1, -1):
+            if len(rest) >= rest_budget:
+                break
+            if idx not in session:
+                rest.add(idx)
+    omitted = len(lines) - len(chosen) - len(rest)
+    block.extend(emit(idx) for idx in sorted(chosen))
+    block.append(
+        f"[OMITTED: {omitted} lines outside the retained blocks; "
+        f"full log retained at {retained}]"
+    )
+    block.extend(emit(idx) for idx in sorted(rest))
+    return block
+
+
 def build_scrubbed_extract(subject_lines, ctx, alloc, log_names=None, clusters=None):
     """Assemble the extract: one labelled block per subject, every line
     scrubbed, each block reduced to its allocated line count.
@@ -1186,6 +1271,13 @@ def build_scrubbed_extract(subject_lines, ctx, alloc, log_names=None, clusters=N
         # One line buys a header with nothing underneath it, which reports
         # nothing the run manifest does not already carry.
         if budget <= 1:
+            continue
+        ranges = (pytest_session_violation_ranges(lines)
+                  if name in PYTEST_DETAIL_SUBJECTS else [])
+        if ranges:
+            out.extend(_session_extract_block(
+                name, lines, ctx, budget, ordered, ranges,
+                log_names.get(name) or f"logs/{name}.log"))
             continue
         out.append(f"---- {name} ----")
         if len(lines) <= budget - 1:
@@ -3206,6 +3298,57 @@ def _closing_banner(line, title) -> bool:
     return title in _PYTEST_CLOSING_TITLES or bool(_PYTEST_SLOWEST_RE.match(title))
 
 
+def _ends_pre_report_region(view) -> bool:
+    """A FAILURES/ERRORS banner, a closing banner, or the counts line, which
+    `_closing_banner` matches whatever the title."""
+    title = _pytest_banner_title(view)
+    return title in _PYTEST_REGION_TITLES or _closing_banner(view, title)
+
+
+def pytest_session_violation_ranges(lines):
+    """`(start, stop, header)` for each controller session-violation block.
+
+    `start`/`stop` are a half-open range into `lines` (newline-free, as
+    `str.splitlines()` gives them) and `header` indexes
+    SESSION_VIOLATION_HEADERS. Only the pre-report region is searched, the
+    lines before the first FAILURES/ERRORS banner, closing banner or counts
+    line, so a test's captured output, the warnings summary or the summary can
+    never be recognised. A block is a line whose SGR-stripped view equals a
+    header exactly, plus the following non-empty lines whose view starts with
+    a space or a tab; indentation is never stripped for the comparison, so an
+    indented header-like line is continuation text. Linear in total length.
+    """
+    ranges = []
+    current = None
+    stop = len(lines)
+    for idx, line in enumerate(lines):
+        view = _SGR_RE.sub("", line)
+        if _ends_pre_report_region(view):
+            stop = idx
+            break
+        if current is not None and view[:1] in (" ", "\t"):
+            continue
+        if current is not None:
+            ranges.append((current[0], idx, current[1]))
+            current = None
+        if view in SESSION_VIOLATION_HEADERS:
+            current = (idx, SESSION_VIOLATION_HEADERS.index(view))
+    if current is not None:
+        ranges.append((current[0], stop, current[1]))
+    return ranges
+
+
+def _session_admission_order(ranges):
+    """The ranges' indices in admission priority: every header, then each
+    header's first diagnostic, then the rest in log order."""
+    headers = [start for start, _stop, _header in ranges]
+    firsts = [start + 1 for start, stop, _header in ranges if start + 1 < stop]
+    taken = set(headers) | set(firsts)
+    rest = [idx for start, stop, _header in ranges for idx in range(start, stop)
+            if idx not in taken]
+    return headers + firsts + rest
+
+
 def extract_pytest_failure_sections(lines) -> dict:
     """pytest's failing sections, parsed from one log.
 
@@ -3493,6 +3636,32 @@ def _render_detail_pytest(lines, budget):
         # first failure's assertion rather than nothing but names.
         render = min(len(sections), DETAIL_MAX_SECTIONS,
                      max(1, budget // DETAIL_SECTION_FLOOR_BYTES))
+    fallback = (bool(parsed["unparsed_nodes"]) or not parsed["has_region"]
+                or parsed["empty_region"])
+    slots = render + (1 if fallback else 0)
+    # (#1109) The controller's session-violation block renders first, in its
+    # own slot, whenever it is present: it sits outside every parsed section,
+    # and outside the fallback's head and tail windows in a real bulk leg.
+    ranges = pytest_session_violation_ranges(lines)
+    session = set()
+    if ranges:
+        order = _session_admission_order(ranges)
+        session = set(order)
+        position = {}
+        source = []
+        for start, stop, _header in ranges:
+            for idx in range(start, stop):
+                position[idx] = len(source)
+                source.append(cut_detail_line(lines[idx]))
+        fill = _DetailFill(source, budget // (slots + 1))
+        admitted = 0
+        for idx in order:
+            if admitted >= PER_SUBJECT_LINE_CAP or not fill.add(position[idx]):
+                break
+            admitted += 1
+        part = fill.render()
+        remaining -= _detail_size(part)
+        out.extend(part)
     omitted_line = None
     if len(sections) > render:
         omitted_line = _names_line(
@@ -3503,9 +3672,6 @@ def _render_detail_pytest(lines, budget):
             omitted_line = None
         else:
             remaining -= _detail_line_bytes(omitted_line)
-    fallback = (bool(parsed["unparsed_nodes"]) or not parsed["has_region"]
-                or parsed["empty_region"])
-    slots = render + (1 if fallback else 0)
     for k, section in enumerate(sections[:render]):
         part = _render_detail_section(_cut_section(section),
                                       max(remaining, 0) // (slots - k))
@@ -3528,6 +3694,10 @@ def _render_detail_pytest(lines, budget):
             # The summary renders once, below, so the raw windows stop at its
             # banner rather than repeat its FAILED lines.
             raw = lines if parsed["summary_start"] is None else lines[:parsed["summary_start"]]
+            if session:
+                # Every recognised session line, admitted or not, so none
+                # renders twice.
+                raw = [line for idx, line in enumerate(raw) if idx not in session]
             windows = _render_detail_windows(raw, remaining)
             remaining -= _detail_size(windows)
             out.append(note)

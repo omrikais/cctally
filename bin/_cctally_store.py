@@ -1901,6 +1901,10 @@ def stats_open_guarded(
                         # own guided wording and must not be reworded into a
                         # maintenance-in-progress error.
                         _cctally_db.StatsPublicationFailedError,
+                        # #1100: a publication that could not read the
+                        # destination's header keeps its typed refusal; no
+                        # journal problem exists to resolve.
+                        _cctally_core.StoreUnavailable,
                     ):
                         raise
                     except Exception as exc:
@@ -2247,33 +2251,61 @@ def _stats_family_drained(path) -> "str | None":
     return None
 
 
+def _stats_header_unreadable():
+    """The typed refusal for a stats.db header that could not be read (#1100):
+    AD19's ``unavailable`` refusal, rendering as the existing sentence."""
+    import _cctally_store_access
+    return _cctally_store_access._unavailable(
+        "stats", "unavailable", "stats.db could not be read")
+
+
 def _stats_header_declares_wal(path) -> bool:
     """Whether the on-disk SQLite header declares WAL read/write versions.
 
-    This deliberately reads raw bytes instead of opening SQLite.  Opening a
-    previous-epoch WAL family is already enough to materialize SHM, and the
-    #538 transition must prove every old handle is gone before it asks SQLite
-    to convert that family to rollback journaling.
+    This deliberately never opens SQLite.  Opening a previous-epoch WAL
+    family is already enough to materialize SHM, and the #538 transition
+    must prove every old handle is gone before it asks SQLite to convert that
+    family to rollback journaling.
+
+    #1100: it never opens the file in this process either.  Closing any
+    descriptor on stats.db releases every POSIX lock this process holds on it,
+    including another connection's SQLite lock, so the header is read by the
+    AD19 child (`_cctally_store_access._stats_header_kind`) in its fresh mode,
+    which bypasses cached verdicts.  A positively missing file is not WAL;
+    any other stat error, or a header the child could not read from a file
+    that still exists, raises AD19's typed refusal: neither proves a
+    rollback index.
     """
+    import _cctally_store_access
     try:
-        with pathlib.Path(path).open("rb") as handle:
-            header = handle.read(20)
-    except OSError:
+        os.stat(path)
+    except FileNotFoundError:
         return False
-    return (
-        len(header) == 20
-        and header[:16] == b"SQLite format 3\x00"
-        and (header[18] == 2 or header[19] == 2)
-    )
+    except OSError:
+        raise _stats_header_unreadable() from None
+    kind = _cctally_store_access._stats_header_kind(
+        pathlib.Path(path), fresh=True)
+    if kind is None:
+        try:
+            os.stat(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            pass
+        raise _stats_header_unreadable()
+    return kind == "wal"
 
 
 def _stats_legacy_wal_family_present(path) -> bool:
-    """Whether `path` still carries any part of the retired stats WAL mode."""
+    """Whether `path` still carries any part of the retired stats WAL mode.
+
+    The sidecars are checked first: either one already proves the legacy
+    family, so the header child is spawned only when neither exists."""
     path = pathlib.Path(path)
     return (
-        _stats_header_declares_wal(path)
-        or pathlib.Path(f"{path}-wal").exists()
+        pathlib.Path(f"{path}-wal").exists()
         or pathlib.Path(f"{path}-shm").exists()
+        or _stats_header_declares_wal(path)
     )
 
 
@@ -4346,7 +4378,9 @@ def rebuild_worker_snapshot(worker: str) -> dict:
         pending = {
             "present": marker["present"],
             "since": marker["firstPendingAt"],
-            "indexPending": (stats_epoch_rebuild_pending()
+            # #1100: None when the header could not be read, so doctor's
+            # overdue-marker check keeps warning (it tests `is not False`).
+            "indexPending": (stats_epoch_rebuild_pending(if_unknown=None)
                              if marker["present"] else False),
         }
     else:
@@ -4815,7 +4849,13 @@ def _stats_epoch_rebuild_worker(args) -> str:
 
 def _stats_epoch_rebuild_body() -> str:
     """The epoch worker's work under its flock, after its run is recorded."""
-    if not stats_epoch_rebuild_pending():
+    pending = stats_epoch_rebuild_pending(if_unknown=None)
+    if pending is None:
+        # #1100: a header it could not read is never "current". The marker
+        # stays, so the next deferral retries.
+        _log_stats_epoch_rebuild("error", error=_stats_header_unreadable())
+        return "error"
+    if not pending:
         _unlink_stats_epoch_marker()
         _log_stats_epoch_rebuild("current")
         return "current"
@@ -4836,30 +4876,88 @@ def _stats_epoch_rebuild_body() -> str:
     return "success"
 
 
-def _raw_user_version(path) -> int:
-    """Read the SQLite header's user_version without opening the family.
+def _immutable_user_version(path) -> int:
+    """`PRAGMA user_version` through a transient immutable read-only
+    connection, normalized to the header's unsigned value; raises
+    `sqlite3.Error` when SQLite rejects the file (#1100).
+
+    ``immutable=1`` takes no lock, writes nothing, never reads or rolls back
+    a ``-journal``, never opens a WAL and creates no sidecar. Its close goes
+    through SQLite's unix VFS, which defers the descriptor close while this
+    process holds a lock on the inode through another connection of the same
+    library, so it never drops that lock. This is a narrow exception for a
+    main-file epoch hint, not a general immutable reader of a live store: the
+    guarded opener and the post-open epoch gate stay authoritative."""
+    uri = pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        return int(conn.execute("PRAGMA user_version").fetchone()[0]) & 0xFFFFFFFF
+    finally:
+        conn.close()
+
+
+def _stats_user_version_hint(path) -> "int | None":
+    """The header's user_version as the raw header reader classified it, read
+    without a descriptor of this process's own; None when it is unknown
+    (#1100).
 
     A raw read-only SQLite connection is not side-effect-free for a WAL
-    database: it can create SHM/WAL paths and, more importantly, it bypasses
-    the maintenance-shared opener fence.  The deferred-epoch probe needs only
-    the fixed big-endian header field, so read exactly that instead.
-    """
+    database (it can create SHM/WAL paths) and it bypasses the
+    maintenance-shared opener fence, and a raw ``open()``/close of stats.db
+    releases every POSIX lock this process holds on it, another connection's
+    SQLite lock included. So the hint reads through `_immutable_user_version`
+    and, when SQLite rejects the file, through the 64-byte AD19 child, which
+    reads the same bytes the raw reader read and applies the same magic
+    check. -1 for a missing, non-regular, permission-denied, short or
+    non-SQLite file, as the raw reader returned; None only when SQLite rejects
+    a readable file AND the child cannot read it (a transient failure, such as
+    a child that cannot start within its deadline or descriptor exhaustion)."""
     try:
-        with pathlib.Path(path).open("rb") as handle:
-            header = handle.read(64)
+        st = os.stat(path)
     except OSError:
+        return -1                      # missing or unreadable, as before
+    if not stat.S_ISREG(st.st_mode) or not os.access(path, os.R_OK):
+        # A directory or a permission-denied file: the raw reader's `open()`
+        # raised for it, deterministically, so it was -1. Neither check opens
+        # a descriptor. Only a transient failure below is unknown.
         return -1
-    if len(header) < 64 or header[:16] != b"SQLite format 3\x00":
+    if st.st_size < 64:
+        return -1                      # short or empty, as before
+    try:
+        return _immutable_user_version(path)
+    except sqlite3.Error:
+        pass                           # SQLite rejected the file: read its bytes
+    import _cctally_store_access
+    out = _cctally_store_access._run_header_probe(path, length=64)
+    if out is None:
+        try:
+            os.stat(path)
+        except FileNotFoundError:
+            return -1                  # removed meanwhile: missing, as before
+        except OSError:
+            pass
+        return None                    # unknown: rejected AND unreadable
+    if len(out) < 64 or out[:16] != b"SQLite format 3\x00":
         return -1
-    return int.from_bytes(header[60:64], "big", signed=False)
+    return int.from_bytes(out[60:64], "big", signed=False)
 
 
-def stats_epoch_rebuild_pending(path=None) -> bool:
+def _raw_user_version(path) -> int:
+    """The SQLite header's user_version (see `_stats_user_version_hint`), or
+    -1 when it is missing, unreadable, invalid or unknown."""
+    hint = _stats_user_version_hint(path)
+    return -1 if hint is None else hint
+
+
+def stats_epoch_rebuild_pending(path=None, *, if_unknown=False):
     """Whether an ordinary live open would require whole-journal replay.
 
     Missing indexes are cheap fresh installs. Invalid headers belong to the
     corruption classifier, and legacy indexes take the one-time cutover path.
     Only a post-legacy main-file header at a non-current epoch is deferrable.
+    A header whose epoch is unknown (#1100) answers IF_UNKNOWN: False for the
+    callers that go on to a guarded open, where the opener and the post-open
+    epoch gate decide; None for the epoch worker and its diagnostics.
     """
     candidate = pathlib.Path(
         _cctally_core.DB_PATH if path is None else path
@@ -4869,7 +4967,9 @@ def stats_epoch_rebuild_pending(path=None) -> bool:
             return False
     except OSError:
         return False
-    version = _raw_user_version(candidate)
+    version = _stats_user_version_hint(candidate)
+    if version is None:
+        return if_unknown
     if version < 0 or version <= _cctally_core.LEGACY_STATS_HEAD:
         return False
     return version != _cctally_core.STATS_INDEX_EPOCH
@@ -4905,13 +5005,18 @@ def resolve_stats_epoch_mismatch():
             # in-place journal-mode conversion under that old handle.
             _require_stats_legacy_wal_cold(path)
             # Locked re-check: a sibling process may have already rebuilt it.
-            if _raw_user_version(path) != _cctally_core.STATS_INDEX_EPOCH:
+            # #1100: an epoch it could not read refuses (the finally below
+            # releases maintenance first); it is never taken as a mismatch.
+            version = _stats_user_version_hint(path)
+            if version is None:
+                raise _stats_header_unreadable()
+            if version != _cctally_core.STATS_INDEX_EPOCH:
                 hw, journal_has_bytes = (
                     _cctally_journal._journal_rebuild_snapshot()
                 )
                 if hw is None or not journal_has_bytes:
                     raise _cctally_db.StatsEpochMismatchError(
-                        f"stats.db is at index epoch {_raw_user_version(path)}, "
+                        f"stats.db is at index epoch {version}, "
                         f"but this cctally builds epoch "
                         f"{_cctally_core.STATS_INDEX_EPOCH} and no journal is "
                         "present to rebuild from. The journal/ directory is the "

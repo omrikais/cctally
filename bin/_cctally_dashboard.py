@@ -1152,6 +1152,9 @@ def _codex_detail_context(snapshot):
             codex_quota_actual_thresholds=semantics.codex_quota_actual_thresholds,
             codex_quota_projected_thresholds=semantics.codex_quota_projected_thresholds,
             cache_report_anomaly_threshold_pp=semantics.cache_report_anomaly_threshold_pp,
+            # #1108 spec §3.2: the published snapshot's read scope (None
+            # included); a request path never discovers.
+            codex_root_scope=getattr(snapshot, "codex_root_scope", None),
         )
         yield context
     finally:
@@ -1309,6 +1312,7 @@ def _build_codex_project_detail(context, *, key: str) -> dict[str, Any]:
             dashboard_resource_key("project", "codex", candidate) == key
         ),
         cache_conn=context.cache_conn,
+        root_scope=context.codex_root_scope,
     )
     # `blocks` and `allocation_entries` are GONE, and removing them is what
     # makes a scoped read legitimate rather than a silent numeric change. They
@@ -1415,13 +1419,21 @@ def _build_codex_block_detail(context, *, key: str,
         if minutes is not None:
             predicate = " AND resets_at_utc=? AND window_minutes=?"
             params = (published_reset, minutes)
-    rows = context.stats_conn.execute(
-        "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, "
-        "limit_name, resets_at_utc, current_percent, orphaned_at, account_key "
-        "FROM quota_window_blocks WHERE source='codex'" + predicate + " "
-        "ORDER BY resets_at_utc DESC, source_root_key, logical_limit_key, observed_slot LIMIT 250",
-        params,
-    ).fetchall()
+    # #1108: under a withholding read scope the candidates are resolved on
+    # the CURRENT roots first, so a retired root's newer blocks cannot take the
+    # 250-row cap; a key found on no current root then resolves over every
+    # retained root exactly as before (historical lookup is unchanged).
+    scope = getattr(context, "codex_root_scope", None)
+    passes: list[tuple[str, tuple[object, ...]]] = []
+    if scope is not None and scope.recognized_root_keys:
+        current_keys = tuple(sorted(scope.configured_root_keys))
+        if current_keys:
+            passes.append((
+                predicate + " AND source_root_key IN ("
+                + ",".join("?" for _ in current_keys) + ")",
+                (*params, *current_keys),
+            ))
+    passes.append((predicate, params))
     # THE ACCOUNT IS PART OF THE BLOCK'S UNIQUENESS BUT NOT OF THE KEY. Two
     # accounts agreeing on root, limit key, slot, window and reset produce one
     # resource key, and the `ORDER BY` alone decided which one this loop
@@ -1432,24 +1444,34 @@ def _build_codex_block_detail(context, *, key: str,
     # therefore takes no predicate and its payload stays byte-identical.
     owner = published.get("account_key")
     matched = None
-    for candidate_row in rows:
-        candidate = dashboard_resource_key(
-            "block", "codex", candidate_row[0], candidate_row[1],
-            candidate_row[2], candidate_row[3], candidate_row[5],
-        )
-        if candidate != key:
-            continue
-        # The SAME coercion the wire applies (`_codex_quota_block_rows` builds
-        # `block_account` as `str(block_account or UNATTRIBUTED)`). The column
-        # is `TEXT NOT NULL DEFAULT 'unattributed'` so a NULL is unreachable
-        # today, but coercing it to `""` here while the wire published
-        # `unattributed` would make the two sides disagree and 404.
-        if owner is not None and str(
-            candidate_row[8] or _lib_accounts.UNATTRIBUTED
-        ) != str(owner):
-            continue
-        matched = candidate_row
-        break
+    for pass_predicate, pass_params in passes:
+        rows = context.stats_conn.execute(
+            "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, "
+            "limit_name, resets_at_utc, current_percent, orphaned_at, account_key "
+            "FROM quota_window_blocks WHERE source='codex'" + pass_predicate + " "
+            "ORDER BY resets_at_utc DESC, source_root_key, logical_limit_key, observed_slot LIMIT 250",
+            pass_params,
+        ).fetchall()
+        for candidate_row in rows:
+            candidate = dashboard_resource_key(
+                "block", "codex", candidate_row[0], candidate_row[1],
+                candidate_row[2], candidate_row[3], candidate_row[5],
+            )
+            if candidate != key:
+                continue
+            # The SAME coercion the wire applies (`_codex_quota_block_rows` builds
+            # `block_account` as `str(block_account or UNATTRIBUTED)`). The column
+            # is `TEXT NOT NULL DEFAULT 'unattributed'` so a NULL is unreachable
+            # today, but coercing it to `""` here while the wire published
+            # `unattributed` would make the two sides disagree and 404.
+            if owner is not None and str(
+                candidate_row[8] or _lib_accounts.UNATTRIBUTED
+            ) != str(owner):
+                continue
+            matched = candidate_row
+            break
+        if matched is not None:
+            break
     if matched is None:
         raise SourceResourceNotFound()
     matched_account = str(matched[8] or _lib_accounts.UNATTRIBUTED)
@@ -12836,9 +12858,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 # account the enumeration below is scoped to, or the focused
                 # account's own current cycle is judged against a sibling's
                 # reset and never resolves as current.
+                # #1108: the live boundary follows the PUBLISHED snapshot's
+                # read scope; this request thread never resolves one.
+                snapshot_ref = getattr(self, "snapshot_ref", None)
+                published = (
+                    snapshot_ref.get() if snapshot_ref is not None else None)
                 identity = resolve_codex_cycle_detail_identity(
                     cache_conn, source_root_keys=roots, now_utc=now_utc,
                     account_key=account_key, stats_conn=stats_conn,
+                    root_scope=getattr(published, "codex_root_scope", None),
                 )
                 result = c.build_codex_cycle_detail(
                     stats_conn, cache_conn, identity=identity, key=key,

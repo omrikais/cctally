@@ -141,6 +141,39 @@ def test_codex_blocks_wire_uses_current_cycle_five_hour_activity_and_models(
         ]
         assert rows[0]["model_breakdowns"][0]["inputTokens"] == 100
 
+        # #1108 T8 (A13). Failure it detects: newer 5-hour blocks of a root
+        # outside the cycle (a retired root while its prune debt is pending)
+        # consuming the wire's row cap ahead of the cycle's own block, so the
+        # current block silently drops out of the wire.
+        monkeypatch.setattr(source_module, "SOURCE_HISTORY_LIMIT", 3)
+        stats.executemany(
+            "INSERT INTO quota_window_blocks "
+            "(source, source_root_key, logical_limit_key, observed_slot, "
+            "window_minutes, limit_name, resets_at_utc, nominal_start_at_utc, "
+            "first_observed_at_utc, last_observed_at_utc, first_percent, "
+            "current_percent, last_source_path, last_line_offset, generation) "
+            "VALUES ('codex', 'root-retired', 'five-hour', 'primary', 300, "
+            "'5-hour limit', ?, ?, ?, ?, 1, 2, '/private/retired.jsonl', 1, 'g')",
+            tuple(
+                (
+                    f"2026-07-19T{hour:02d}:00:00+00:00",
+                    f"2026-07-19T{hour - 5:02d}:00:00+00:00",
+                    f"2026-07-19T{hour - 5:02d}:05:00+00:00",
+                    f"2026-07-19T{hour - 1:02d}:00:00+00:00",
+                )
+                for hour in range(10, 14)
+            ),
+        )
+        assert source_module._quota_wire(
+            stats,
+            accounting_entries=entries,
+            cycle=cycle,
+            now_utc=dt.datetime(2026, 7, 18, 13, tzinfo=UTC),
+            display_tz_name="UTC",
+        ) == rows
+        stats.execute(
+            "DELETE FROM quota_window_blocks WHERE source_root_key='root-retired'")
+
         stats.execute("DELETE FROM quota_window_blocks WHERE window_minutes=300")
         assert source_module._quota_wire(
             stats,
@@ -2516,6 +2549,35 @@ def test_rooted_fallback_sessions_never_discover_filesystem(tmp_path, monkeypatc
 
         assert state.data["sessions"]["total_sessions"] == 3
         assert len({row["key"] for row in state.data["sessions"]["rows"]}) == 3
+
+        # #1108 T5: a supplied read scope withholds a retired root's rows on
+        # the same filesystem-free path, discovery and recognition included.
+        cache_mod = sys.modules["_cctally_cache"]
+        current = frozenset(
+            row[0] for row in cache.execute(
+                "SELECT DISTINCT source_root_key FROM codex_session_entries"))
+        _insert_incomplete_accounting_row(
+            cache,
+            source_path="/cached/retired-root/retired-session.jsonl",
+            line_offset=10_006,
+            session_id="retired-native-session",
+            source_root_key="retired-root",
+        )
+        cache.commit()
+        for probe in ("_discover_codex_files_with_roots",
+                      "_codex_file_is_recognizable"):
+            monkeypatch.setattr(
+                cache_mod, probe,
+                lambda *_a, _probe=probe, **_k: (_ for _ in ()).throw(
+                    AssertionError(_probe)))
+        unscoped = build_codex_source_state(
+            context, data_version=f"rooted-{name}-unscoped")
+        assert unscoped.data["sessions"]["total_sessions"] == 4
+        scoped = build_codex_source_state(
+            dataclasses.replace(context, codex_root_scope=cache_mod._CodexPruneScope(
+                configured_root_keys=current, recognized_root_keys=current)),
+            data_version=f"rooted-{name}-scoped")
+        assert scoped.data["sessions"]["total_sessions"] == 3
     finally:
         cache.close()
         stats.close()
@@ -3716,10 +3778,11 @@ def test_codex_source_builder_loads_quota_and_projects_once_from_context(
 
     def projects_from_context(
         start, end, *, speed, sync, group="git-root", cache_conn=None,
-        inventory=None, project_resolver_cache=None,
+        inventory=None, project_resolver_cache=None, root_scope=None,
     ):
         # §4.3: the build hands the reader its ONE inventory.
         assert inventory is not None
+        assert root_scope is None
         assert start == START
         assert end == NOW + dt.timedelta(microseconds=1)
         assert speed == "standard"
@@ -6247,3 +6310,163 @@ def test_846_a10_a_failed_metadata_read_is_not_an_empty_store(
 # retention call, so no key was ever armed and "the armed retry key is cleared"
 # was never observed. Both sequences now run through real `_tui_build_source_bundle`
 # ticks with a key armed before the recovery tick.
+
+
+def _1108_insert_weekly_boundaries(stats, rows):
+    stats.executemany(
+        "INSERT INTO quota_window_blocks "
+        "(source, source_root_key, logical_limit_key, observed_slot, "
+        "window_minutes, limit_name, resets_at_utc, nominal_start_at_utc, "
+        "first_observed_at_utc, last_observed_at_utc, first_percent, "
+        "current_percent, last_source_path, last_line_offset, generation) "
+        "VALUES ('codex', ?, 'weekly', 'primary', 10080, '7-day limit', ?, ?, "
+        "?, ?, 0, ?, '/private/weekly.jsonl', 1, 'g')",
+        tuple(
+            (root, _1108_instant(reset), _1108_instant(start),
+             _1108_instant(start, minutes=5), _1108_instant(start, minutes=60),
+             percent)
+            for root, start, reset, percent in rows
+        ),
+    )
+    stats.commit()
+
+
+def _1108_instant(value, *, minutes=0):
+    """A date (midnight UTC) or a datetime, plus ``minutes``, as stored ISO."""
+    if isinstance(value, str):
+        value = dt.datetime.fromisoformat(value).replace(tzinfo=UTC)
+    return (value + dt.timedelta(minutes=minutes)).isoformat()
+
+
+def test_1108_displayed_quota_reads_only_current_roots(tmp_path, monkeypatch):
+    """#1108 T8 (A13) and the §3.4 root selection. Failure it detects: a
+    retired root still registered while its prune debt is pending reaches a
+    displayed quota read, so its newer weekly boundary clips the current
+    root's period (the native weekly rows move to the retired root's start)
+    and its observations share the bounded observation read. With the scope
+    every displayed read names only current roots, and the weekly rows equal
+    the store that never held the retired root."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    cache_mod = sys.modules["_cctally_cache"]
+    current = _cache_root_key(cache)
+    retired = "retired-root-key"
+    _1108_insert_weekly_boundaries(stats, (
+        (current, "2026-07-10", "2026-07-17", 40.0),
+        (current, "2026-07-17", "2026-07-24", 10.0),
+    ))
+    reads = {"observations": [], "weekly": []}
+    real_observations = source_module._cached_codex_quota_observations
+    real_periods = source_module._codex_weekly_periods
+
+    def observed(*args, **kwargs):
+        reads["observations"].append(frozenset(kwargs["source_root_keys"]))
+        return real_observations(*args, **kwargs)
+
+    def periods(*args, **kwargs):
+        reads["weekly"].append(frozenset(kwargs["source_root_keys"]))
+        return real_periods(*args, **kwargs)
+
+    monkeypatch.setattr(source_module, "_cached_codex_quota_observations", observed)
+    monkeypatch.setattr(source_module, "_codex_weekly_periods", periods)
+
+    def weekly(version, scope=None):
+        for value in reads.values():
+            value.clear()
+        state = source_module.build_codex_source_state(
+            source_module.DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC", codex_root_scope=scope,
+            ),
+            data_version=version,
+        )
+        return [
+            (row["label"], row.get("start_at"), row.get("end_at"),
+             row["total_tokens"], row.get("used_pct"))
+            for row in state.data["periods"]["weekly"]["rows"]
+        ]
+
+    try:
+        drained = weekly("drained")
+        assert drained and drained[0][0].startswith("07-10")
+        cache.execute(
+            "INSERT INTO codex_source_roots VALUES (?, '/retired/codex-home', "
+            "'2026-07-01T00:00:00+00:00', '2026-07-01T00:00:00+00:00')",
+            (retired,))
+        cache.commit()
+        # More than the read's row cap of NEWER retired boundaries beside the
+        # current ones: a weekly read that selected roots after its `LIMIT`
+        # would keep only retired rows and lose the current periods.
+        newest_current = dt.datetime(2026, 7, 17, tzinfo=UTC)
+        _1108_insert_weekly_boundaries(stats, tuple(
+            (retired, newest_current + dt.timedelta(minutes=1 + index),
+             newest_current + dt.timedelta(days=7, minutes=1 + index), 70.0)
+            for index in range(source_module.SOURCE_HISTORY_LIMIT + 10)
+        ))
+        unscoped = weekly("pending-unscoped")
+        assert unscoped != drained, (
+            "non-vacuity: the retired boundary must clip the current period")
+        assert reads["weekly"] and all(
+            retired in roots for roots in reads["weekly"])
+        scope = cache_mod._CodexPruneScope(
+            configured_root_keys=frozenset({current}),
+            recognized_root_keys=frozenset({current}))
+        assert weekly("pending-scoped", scope) == drained
+        assert reads["observations"] and reads["weekly"]
+        for roots in (*reads["observations"], *reads["weekly"]):
+            assert roots == {current}, roots
+
+        # The cycle-detail route: its live boundary follows the scope, while
+        # its cycle LOOKUP keys stay every retained root.
+        for root_scope, expected in ((None, {current, retired}),
+                                     (scope, {current})):
+            reads["observations"].clear()
+            identity = source_module.resolve_codex_cycle_detail_identity(
+                cache, source_root_keys=(current, retired), now_utc=NOW,
+                stats_conn=stats, root_scope=root_scope)
+            assert identity.source_root_keys == (current, retired)
+            assert reads["observations"] == [expected]
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_1108_the_cycle_rooted_block_wire_read_builds_no_temp_structure(
+    tmp_path, monkeypatch,
+):
+    """#1108 (A13): the 5-hour block wire now binds the cycle's roots ahead
+    of its `LIMIT`, a new statement text. Failure it detects: that statement
+    building a temp structure no #901 `ALLOWLIST` bound explains (its sorter
+    must stay the bounded top-N `LIMIT ?` sort the unrooted read had, now over
+    the cycle roots' rows only)."""
+    import _cctally_core
+    import _sql_plan_guard as guard
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    ns["open_db"]().close()
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    cycle = source_module.CodexCycleBoundary(
+        window_minutes=10_080,
+        start_at=dt.datetime(2026, 7, 13, tzinfo=UTC),
+        resets_at=dt.datetime(2026, 7, 20, tzinfo=UTC),
+        source_root_keys=("root-a", "root-b"),
+    )
+    with guard.capture_sql_plans() as recorder:
+        stats = sqlite3.connect(_cctally_core.DB_PATH)
+        try:
+            source_module._quota_wire(
+                stats, cycle=cycle,
+                now_utc=dt.datetime(2026, 7, 18, 13, tzinfo=UTC),
+                display_tz_name="UTC")
+        finally:
+            stats.close()
+    statements = [statement for statement in recorder.statements
+                  if "window_minutes=300" in statement.sql]
+    assert statements, "non-vacuity: the block wire read did not run"
+    assert all(
+        any("source_root_key=?" in step for step in statement.plan)
+        for statement in statements), [s.plan for s in statements]
+    unexplained, _stale = guard.classify(
+        statements, allowlist=guard.ALLOWLIST, pending=())
+    assert not unexplained, guard.format_findings(unexplained)

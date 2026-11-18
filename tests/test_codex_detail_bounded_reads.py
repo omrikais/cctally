@@ -1422,6 +1422,78 @@ def test_both_project_stages_read_one_snapshot(precedence, monkeypatch):
     )
 
 
+def test_1108_retired_blocks_never_hide_a_current_block_from_the_detail_route(
+    seeded,
+):
+    """#1108 §3.4. Failure it detects: the block route's unqualified candidate
+    scan (`ORDER BY resets_at_utc DESC … LIMIT 250`) filled by a retired
+    root's newer blocks while its prune debt is pending, so a current block's
+    detail answers a spurious 404. Under the published scope the current
+    roots are scanned first; a retired key still resolves (historical lookup
+    unchanged)."""
+    ns, root_key, codex, snap = seeded
+    dashboard = sys.modules["_cctally_dashboard"]
+    cache_mod = sys.modules["_cctally_cache"]
+    quota_module = sys.modules["_cctally_quota"]
+    requested = _requested_block_row(codex)
+    stats = ns["open_db"]()
+    try:
+        stats.executemany(
+            "INSERT INTO quota_window_blocks "
+            "(source, source_root_key, logical_limit_key, observed_slot, "
+            "window_minutes, limit_name, resets_at_utc, nominal_start_at_utc, "
+            "first_observed_at_utc, last_observed_at_utc, first_percent, "
+            "current_percent, last_source_path, last_line_offset, generation) "
+            "VALUES ('codex', 'retired-root', 'retired', ?, 300, 'Retired', ?, ?, "
+            "?, ?, 1, 2, '/private/retired.jsonl', 1, 'g')",
+            tuple(
+                (f"slot-{index}",
+                 _iso(NOW + dt.timedelta(days=30, minutes=index)),
+                 _iso(NOW + dt.timedelta(days=30, minutes=index - 300)),
+                 _iso(NOW + dt.timedelta(days=30, minutes=index - 299)),
+                 _iso(NOW + dt.timedelta(days=30, minutes=index - 290)))
+                for index in range(260)
+            ),
+        )
+        stats.commit()
+    finally:
+        stats.close()
+    retired_key = dashboard.dashboard_resource_key(
+        "block", "codex", "retired-root", "retired", "slot-259", 300,
+        _iso(NOW + dt.timedelta(days=30, minutes=259)))
+
+    for context in dashboard._codex_detail_context(snap):
+        with pytest.raises(dashboard.SourceResourceNotFound):
+            dashboard._build_codex_block_detail(
+                context, key=str(requested["key"]))
+    scope = cache_mod._CodexPruneScope(
+        configured_root_keys=frozenset({root_key}),
+        recognized_root_keys=frozenset({root_key}))
+    scoped = dataclasses.replace(snap, codex_root_scope=scope)
+    for context in dashboard._codex_detail_context(scoped):
+        detail = dashboard._build_codex_block_detail(
+            context, key=str(requested["key"]))
+        assert detail["key"] == str(requested["key"])
+        assert detail["observations"]
+        # Historical lookup: the retired key still resolves its candidate row
+        # (the complete-retained fallback scan), so its own root's evidence is
+        # loaded; it then has no observation here and is not found.
+        loaded_roots = []
+        real_load = quota_module.load_codex_quota_observations
+
+        def spy(*args, **kwargs):
+            loaded_roots.append(tuple(kwargs["source_root_keys"]))
+            return real_load(*args, **kwargs)
+
+        quota_module.load_codex_quota_observations = spy
+        try:
+            with pytest.raises(dashboard.SourceResourceNotFound):
+                dashboard._build_codex_block_detail(context, key=retired_key)
+        finally:
+            quota_module.load_codex_quota_observations = real_load
+        assert loaded_roots == [("retired-root",)]
+
+
 def _target_project_row(codex):
     rows = codex.data["projects"]["rows"]
     assert rows, "the fixture published no Codex project"
@@ -1440,7 +1512,7 @@ def _unscoped_project_detail(ns, snap, key):
     dashboard = sys.modules["_cctally_dashboard"]
 
     def _whole_year(start, end, *, speed, matches_project_key, cache_conn,
-                    group="git-root"):
+                    group="git-root", root_scope=None):
         return analytics.load_qualified_codex_entries(
             start, end, speed=speed, sync=False, group=group,
             cache_conn=cache_conn,

@@ -242,6 +242,18 @@ _ALLOWLISTED_UNPHASED_CALLS = {
         "One small JSON read, taken once per rebuild before the first child "
         "phase opens and reused by every consumer below it."
     ),
+    "_tui_codex_root_scope_identity": (
+        "#1108: a pure tuple built from the already-resolved read scope for "
+        "the dispatch key; no I/O, bounded by the configured root count."
+    ),
+    "_tui_dispatch_key_with_applied_scope": (
+        "#1108: rebuilds the dispatch tuple with the applied scope's identity "
+        "after the source build; no I/O, bounded by the configured root count."
+    ),
+    "_tui_published_codex_root_scope": (
+        "#1108: reads the published Codex generation's in-memory clock_data "
+        "stamp after the source build; no I/O, constant work."
+    ),
     "_resolve_display_tz_obj": (
         "Pure zone resolution over the config already in memory."
     ),

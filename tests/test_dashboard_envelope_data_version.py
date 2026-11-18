@@ -36,7 +36,8 @@ def _snap(ns, **over):
 def test_envelope_emits_data_version(ns):
     now = dt.datetime(2026, 4, 30, 12, 0, 0, tzinfo=dt.timezone.utc)
     env = ns["snapshot_to_envelope"](_snap(ns, data_version="7.42.3.1.0.0.5.9"), now_utc=now)
-    assert env["data_version"] == "7.42.3.1.0.0.5.9"
+    # #1118 D7: the wire value extends the internal version (see below).
+    assert env["data_version"].startswith("7.42.3.1.0.0.5.9")
 
 
 def test_envelope_data_version_defaults_to_empty(ns):
@@ -68,3 +69,82 @@ def test_data_version_helper_changes_only_on_signature_change(ns):
     assert make(base._replace(generation=6)) != v0
     # None → "" (non-precompute path).
     assert make(None) == ""
+
+
+def _pricing_variant(lp, change):
+    """The live pricing snapshot with exactly one served-cost input moved."""
+    live = lp.current_pricing_snapshot()
+    fields = {name: getattr(live, name) for name in lp.PricingSnapshot.__slots__}
+    if change == "same":
+        pass
+    elif change == "claude_card":
+        card = dict(live.claude_pricing["claude-fable-5-2"])
+        card["input_cost_per_token"] = card["input_cost_per_token"] * 2
+        fields["claude_pricing"] = dict(
+            live.claude_pricing, **{"claude-fable-5-2": card})
+    elif change == "claude_fast":
+        fields["fast_multipliers"] = dict(
+            live.fast_multipliers,
+            claude=dict(live.fast_multipliers["claude"],
+                        **{"claude-fable-5-2": 3.0}))
+    elif change == "codex_card":
+        card = dict(live.codex_pricing["gpt-6.2-sol"])
+        card["output_cost_per_token"] = card["output_cost_per_token"] * 2
+        fields["codex_pricing"] = dict(
+            live.codex_pricing, **{"gpt-6.2-sol": card})
+    elif change == "snapshot_date":
+        fields["snapshot_date"] = "2099-01-01"
+    else:
+        raise AssertionError(change)
+    return lp.PricingSnapshot(**fields)
+
+
+def _wire_version_under(ns, monkeypatch, snapshot, internal):
+    """Render one envelope as a process whose pricing is ``snapshot`` would.
+
+    Pricing is fixed per process since #868, so the live identities are
+    memoized; reset every memo so this render recomputes from ``snapshot``.
+    """
+    import _lib_pricing as lp
+    monkeypatch.setattr(lp, "_LIVE_PRICING_SNAPSHOT", snapshot)
+    monkeypatch.setattr(lp, "_LIVE_CODEX_PRICING_IDENTITY", None)
+    monkeypatch.setattr(lp, "_LIVE_PRICING_REVISION_IDENTITY", None,
+                        raising=False)
+    now = dt.datetime(2026, 4, 30, 12, 0, 0, tzinfo=dt.timezone.utc)
+    env = ns["snapshot_to_envelope"](
+        _snap(ns, data_version=internal), now_utc=now)
+    return env["data_version"]
+
+
+@pytest.mark.parametrize("change", (
+    "claude_card", "claude_fast", "codex_card", "snapshot_date"))
+def test_wire_data_version_moves_with_pricing(ns, monkeypatch, change):
+    """#1118 D7. Detects: an open session/project/source detail or
+    conversation keeping its pre-upgrade cost after a pricing upgrade. The
+    upgrade path restarts the dashboard in place (#868) over the same store,
+    so the internal DB-signature version is byte-identical across the two
+    binaries; only a pricing-revision token in the wire ``data_version``
+    makes the browser's ``revalToken`` refetch an open detail."""
+    import _lib_pricing as lp
+    internal = "7.42.3.1.0.0.5.9"
+    live = lp.current_pricing_snapshot()
+    before = _wire_version_under(ns, monkeypatch, live, internal)
+    assert before == _wire_version_under(ns, monkeypatch, live, internal), (
+        "the same snapshot under the same pricing must not revalidate")
+    assert before == _wire_version_under(
+        ns, monkeypatch, _pricing_variant(lp, "same"), internal), (
+        "equal pricing semantics must yield the same token")
+    after = _wire_version_under(
+        ns, monkeypatch, _pricing_variant(lp, change), internal)
+    assert after != before, f"{change} moved a served cost but not data_version"
+    assert after.startswith(internal) and before.startswith(internal)
+
+
+def test_wire_empty_data_version_stays_the_no_signal_sentinel(ns, monkeypatch):
+    """#1118 D7. Detects: the pricing token turning the empty "no signal"
+    sentinel into a value, which would stop ``revalToken`` falling back to
+    ``generated_at`` on the non-precompute path."""
+    import _lib_pricing as lp
+    for change in ("same", "claude_card", "snapshot_date"):
+        assert _wire_version_under(
+            ns, monkeypatch, _pricing_variant(lp, change), "") == ""

@@ -62,6 +62,7 @@ from _lib_dashboard_sources import (
 )
 from _lib_display_tz import _compute_display_block, format_display_dt
 from _lib_pricing import _chip_for_model, _short_model_name
+import _lib_pricing
 
 
 def _ensure_sibling_loaded(name: str) -> None:
@@ -97,6 +98,21 @@ from _cctally_dashboard_cache_report import _cache_report_snapshot_to_dict
 _ensure_sibling_loaded("_lib_json_envelope")
 from _lib_json_envelope import _iso_z
 from _lib_five_hour import latest_five_hour_reading
+
+
+def _wire_data_version(internal: str) -> str:
+    """The envelope's published ``data_version`` (#1118 D7).
+
+    A non-empty internal version gains ``.p<pricing revision>``: an upgrade
+    restart in place (#868) keeps the store, so the DB-signature version is
+    byte-identical across binaries whose pricing differs, and an open detail
+    keyed on ``revalToken`` would keep its pre-upgrade cost. ``""`` stays
+    ``""``, the client's "no signal" sentinel. Wire-only: ``DataSnapshot`` and
+    source states keep their internal versions, which the server keys on.
+    """
+    if not internal:
+        return ""
+    return f"{internal}.p{_lib_pricing.live_pricing_revision_identity()}"
 
 
 def _model_breakdowns_to_models(model_breakdowns: list[dict[str, Any]],
@@ -2331,8 +2347,10 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # finished/static session/project/conversation is not re-GET every tick.
         # ``getattr`` default keeps positionally-constructed fixture snapshots
         # serializing; "" is the client's "no signal" sentinel (falls back to
-        # ``generated_at``).
-        "data_version":     str(getattr(snap, "data_version", "") or ""),
+        # ``generated_at``). #1118 D7: the WIRE value carries the pricing
+        # revision too (``_wire_data_version``); the internal one does not.
+        "data_version":     _wire_data_version(
+            str(getattr(snap, "data_version", "") or "")),
         # last_sync_at in DataSnapshot is a monotonic float, not a wall
         # clock — the envelope's wall-clock moment is unknowable from
         # here, so expose it as None and rely on sync_age_s for the UI.
